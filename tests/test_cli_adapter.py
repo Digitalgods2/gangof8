@@ -126,6 +126,46 @@ def test_claude_without_images_uses_plain_json(stub_run):
     assert "stream-json" not in calls["cmd"]
 
 
+def test_gemini_vision_uses_genai_sdk(monkeypatch, tmp_path):
+    img = tmp_path / "p.png"
+    img.write_bytes(b"\x89PNG fake")
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    from google import genai as genai_mod
+
+    captured = {}
+
+    class FakeResp:
+        text = "SDK-VISION"
+
+    class FakeModels:
+        def generate_content(self, model, contents):
+            captured["model"] = model
+            captured["contents"] = contents
+            return FakeResp()
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.models = FakeModels()
+
+    monkeypatch.setattr(genai_mod, "Client", FakeClient)
+    out = CliAdapter("gemini").call(
+        Role.researcher, "read it", timeout_s=60,
+        images=[{"path": str(img), "media_type": "image/png"}],
+    )
+    assert out.content == "SDK-VISION"
+    assert captured["model"] == "gemini-2.5-flash"
+    assert len(captured["contents"]) == 2          # one image Part + the prompt
+    assert captured["contents"][-1] == "read it"   # prompt is the last content
+
+
+def test_gemini_without_images_uses_cli(stub_run):
+    calls = stub_run(_Proc(stdout="cli answer"))
+    out = CliAdapter("gemini").call(Role.researcher, "x", timeout_s=30)  # no images
+    assert out.content == "cli answer"
+    assert calls["cmd"][0].endswith("gemini")
+    assert "-p" in calls["cmd"]
+
+
 def test_unknown_agent_raises():
     with pytest.raises(AgentError, match="unknown CLI agent"):
         CliAdapter("llama").call(Role.researcher, "x", timeout_s=30)
