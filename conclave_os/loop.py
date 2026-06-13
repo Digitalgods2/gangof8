@@ -510,8 +510,8 @@ def _deliberate(
 
     # 7b. Governed action execution: collect the implementer's artifact
     # proposals, gate every action on a human approval, execute approved ones.
-    # If the task should produce files but the draft only described them
-    # (resolve-mode summary), materialize each file with a focused call.
+    # If the task should produce files but the draft only described them,
+    # materialize each file with a focused single-file call.
     _collect_proposals(session, store)
     if not session.proposed_actions and cls.produces_output:
         _materialize_artifacts(session, compose_call, store)
@@ -629,8 +629,8 @@ def _intended_filenames(session: Session) -> list[str]:
 
 
 def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:
-    """Recover multi-file output that a resolve-mode draft only described: fetch
-    each intended file with its own focused single-file call, one write_file
+    """Recover multi-file output that a draft only described: fetch each
+    intended file with its own focused single-file call, one write_file
     ProposedAction per file. Idempotent (skips if proposals already exist);
     degrades gracefully on budget/agent errors."""
     if session.proposed_actions:

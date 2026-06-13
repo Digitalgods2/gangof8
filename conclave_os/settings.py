@@ -5,8 +5,7 @@ environment variables › code defaults in `config.py`. `load_settings` seeds a
 `Settings` from config/env, then overlays whatever the JSON file contains, so a
 missing file (or a partial one) yields exactly today's behaviour.
 
-API keys are NEVER persisted here — they live in the Switchboard and are only
-ever proxied. Nothing in this module reads or writes a secret value.
+No secrets are ever persisted here. The agent CLIs manage their own auth.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ class Settings(BaseModel):
     """
 
     backend: str = Field(default_factory=lambda: config.BACKEND)
-    switchboard_url: str = Field(default_factory=lambda: config.SWITCHBOARD_URL)
     role_agents: dict[str, str] = {}
     budgets: dict[str, dict] = {}
     risk_boundary: str = Field(default_factory=lambda: config.RISK_BOUNDARY.value)

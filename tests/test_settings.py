@@ -1,8 +1,8 @@
-"""Milestone 6 Part B: settings / preferences / API keys.
+"""Settings / preferences.
 
 Covers the Settings model + precedence (settings.json › env › config default),
-service consumption (no settings.json ⇒ unchanged behaviour), and the new
-FastAPI endpoints including the Switchboard-unreachable proxy paths.
+service consumption (no settings.json ⇒ unchanged behaviour), the settings
+endpoints, and the local-CLI seat listing.
 """
 
 import json
@@ -21,7 +21,6 @@ from conclave_os.settings import Settings, load_settings, save_settings
 def test_defaults_when_no_file(tmp_path):
     s = load_settings(tmp_path)
     assert s.backend == config.BACKEND
-    assert s.switchboard_url == config.SWITCHBOARD_URL
     assert s.role_agents == {}
     assert s.risk_boundary == config.RISK_BOUNDARY.value
     assert s.composer.prose_min_chars == config.COMPOSER_PROSE_MIN_CHARS
@@ -30,13 +29,13 @@ def test_defaults_when_no_file(tmp_path):
 
 
 def test_round_trip(tmp_path):
-    s = Settings(backend="switchboard", role_agents={"critic": "deepseek"})
+    s = Settings(backend="cli", role_agents={"critic": "codex"})
     s.ui.poll_interval_ms = 5000
     save_settings(s, tmp_path)
     assert (tmp_path / "settings.json").exists()
     loaded = load_settings(tmp_path)
-    assert loaded.backend == "switchboard"
-    assert loaded.role_agents == {"critic": "deepseek"}
+    assert loaded.backend == "cli"
+    assert loaded.role_agents == {"critic": "codex"}
     assert loaded.ui.poll_interval_ms == 5000
 
 
@@ -52,7 +51,7 @@ def test_partial_file_overlays(tmp_path):
 
 
 def test_env_respected_when_file_lacks_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONCLAVE_OS_BACKEND", "switchboard")
+    monkeypatch.setenv("CONCLAVE_OS_BACKEND", "cli")
     import importlib
 
     from conclave_os import config as cfg
@@ -62,7 +61,7 @@ def test_env_respected_when_file_lacks_key(tmp_path, monkeypatch):
     try:
         # No settings.json ⇒ env-derived config default wins.
         s = settings_mod.load_settings(tmp_path)
-        assert s.backend == "switchboard"
+        assert s.backend == "cli"
         # settings.json value overrides env.
         (tmp_path / "settings.json").write_text(
             json.dumps({"backend": "mock"}), encoding="utf-8"
@@ -99,7 +98,7 @@ def test_service_consumes_settings_file(tmp_path):
 
 
 def test_explicit_backend_arg_wins(tmp_path):
-    save_settings(Settings(backend="switchboard"), tmp_path)
+    save_settings(Settings(backend="cli"), tmp_path)
     svc = ConclaveService(data_dir=tmp_path, backend="mock")
     assert svc.backend == "mock"
 
@@ -140,38 +139,14 @@ def test_put_settings_persists_and_reflects(client):
 
 
 def test_put_settings_role_mapping(client):
-    r = client.put("/settings", json={"role_agents": {"researcher": "qwen"}})
+    r = client.put("/settings", json={"role_agents": {"researcher": "gemini"}})
     assert r.status_code == 200
-    assert r.json()["resolved_role_agents"]["researcher"] == "qwen"
+    assert r.json()["resolved_role_agents"]["researcher"] == "gemini"
 
 
-# Point the Switchboard at an unused port so proxy calls fail fast in CI.
-@pytest.fixture()
-def offline_client(tmp_path):
-    from conclave_os import main as main_mod
-
-    save_settings(Settings(switchboard_url="http://127.0.0.1:1"), tmp_path)
-    main_mod.service = ConclaveService(data_dir=tmp_path)
-    return TestClient(main_mod.app)
-
-
-def test_seats_graceful_when_unreachable(offline_client):
-    r = offline_client.get("/settings/seats")
+def test_seats_lists_local_cli_agents(client):
+    r = client.get("/settings/seats")
     assert r.status_code == 200
-    data = r.json()
-    assert data["seats"] == []
-    assert "error" in data
-
-
-def test_api_keys_graceful_when_unreachable(offline_client):
-    r = offline_client.get("/settings/api-keys")
-    assert r.status_code == 200
-    data = r.json()
-    assert data["keys"] == {}
-    assert "error" in data
-
-
-def test_set_api_key_error_when_unreachable(offline_client):
-    r = offline_client.put("/settings/api-keys/openrouter", json={"value": "x"})
-    assert r.status_code == 502
-    assert "detail" in r.json()
+    seats = {s["name"] for s in r.json()["seats"]}
+    assert seats == {"claude", "codex", "gemini"}
+    assert all(s["kind"] == "cli" for s in r.json()["seats"])

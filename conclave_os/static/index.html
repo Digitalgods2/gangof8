@@ -443,23 +443,19 @@ let settingsCache = null, seatsCache = [];
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
-  backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'switchboard' drives the real Codex / Gemini / Claude-code agents via Conclave AI.",
-  url: "URL of the Conclave AI Switchboard that actually executes agent calls. Default http://127.0.0.1:8787.",
-  roles: "Map each council role to a Switchboard seat. Cheaper API seats (deepseek, glm, qwen, kimi) can stand in for the CLI seats. '(backend default)' uses the preset.",
-  researcher: "Seat that gathers the relevant facts and constraints in the first round.",
-  architect: "Seat that proposes design / structure when a task needs design work.",
-  critic: "Seat that challenges the strongest claims and surfaces disagreements.",
-  implementer: "Seat that drafts the working result or artifact — the only role allowed to propose file writes.",
-  summarizer: "Seat that composes the final, reconciled answer.",
+  backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'cli' runs the local claude/codex/gemini CLIs directly in generation mode, so the implementer emits real file contents — fully self-contained.",
+  roles: "Map each council role to a local CLI agent (claude, codex, gemini). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
+  researcher: "Agent that gathers the relevant facts and constraints in the first round.",
+  architect: "Agent that proposes design / structure when a task needs design work.",
+  critic: "Agent that challenges the strongest claims and surfaces disagreements.",
+  implementer: "Agent that drafts the working result or artifact — the only role allowed to propose file writes.",
+  summarizer: "Agent that composes the final, reconciled answer.",
   risk: "Tasks classified above this risk level pause for your approval before any deliberation runs.",
-  prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried — a workaround for the Switchboard's protocol envelope.",
+  prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried.",
   reserved: "Agent calls held back from deliberation so the composer (and its one retry) can always run.",
   critic_tests: "Maximum disagreements the critic actively tests per round; the rest are ruled on constraints to save budget.",
   poll: "How often the dashboard refreshes session state, in milliseconds.",
   collapse: "Collapse the contributions / disagreements sections by default once a session has finished.",
-  keys: "Keys are stored and used by the Switchboard, never saved in Conclave OS. Values are masked in the UI and never logged.",
-  key_name: "The provider or seat name the key belongs to (e.g. openrouter, deepseek).",
-  key_value: "The secret API key. It is sent to the Switchboard, masked here, and never echoed to the console.",
 };
 const tip = k => TIPS[k] ? `<i class="tip" title="${esc(TIPS[k])}">i</i>` : "";
 const lbl = (text, k) => `<span class="lbl">${esc(text)}${tip(k)}</span>`;
@@ -468,14 +464,13 @@ async function openSettings() {
   document.getElementById("settingsOverlay").classList.add("open");
   document.getElementById("savedNote").textContent = "";
   document.getElementById("settingsBody").innerHTML = '<div class="empty">Loading…</div>';
-  const [settings, seatsResp, keysResp] = await Promise.all([
+  const [settings, seatsResp] = await Promise.all([
     api("/settings"),
     api("/settings/seats").catch(() => ({seats: []})),
-    api("/settings/api-keys").catch(() => ({keys: {}})),
   ]);
   settingsCache = settings;
   seatsCache = seatsResp.seats || [];
-  renderSettings(settings, seatsCache, keysResp);
+  renderSettings(settings, seatsCache);
 }
 
 function closeSettings() {
@@ -494,37 +489,25 @@ function seatOptions(selected) {
   return opts.join("");
 }
 
-function renderSettings(s, seats, keysResp) {
+function renderSettings(s, seats) {
   const c = s.composer || {};
   const ui = s.ui || {};
   const ra = s.role_agents || {};
-  const seatErr = (seats === seatsCache && seatsCache.length === 0)
-    ? '<div class="sub" style="margin-top:4px">no seats — Switchboard unreachable</div>' : "";
-  const keys = (keysResp && keysResp.keys) || {};
-  const keyErr = keysResp && keysResp.error
-    ? '<div class="sub" style="margin-top:4px">Switchboard unreachable</div>' : "";
-
-  const keyRows = Object.entries(keys).map(([name, info]) => `
-    <div class="keyrow">
-      <span class="kn">${esc(name)}</span>
-      <span class="kstat ${info && info.set ? "set" : ""}">${info && info.set ? esc(info.masked || "set") : "not set"}</span>
-      <button class="ghost" onclick="revealKey('${esc(name)}')">Reveal</button>
-    </div>`).join("");
+  const seatErr = (seatsCache.length === 0)
+    ? '<div class="sub" style="margin-top:4px">no CLI agents found on PATH</div>' : "";
 
   document.getElementById("settingsBody").innerHTML = `
     <div class="sset">
       <label>Backend</label>
       <div class="field">${lbl("Backend", "backend")}
         <select id="set_backend">
-          <option value="mock" ${s.backend === "mock" ? "selected" : ""}>mock</option>
-          <option value="switchboard" ${s.backend === "switchboard" ? "selected" : ""}>switchboard</option>
+          <option value="mock" ${s.backend === "mock" ? "selected" : ""}>mock (offline)</option>
+          <option value="cli" ${s.backend === "cli" ? "selected" : ""}>cli (local CLIs, real files)</option>
         </select></div>
-      <div class="field">${lbl("Switchboard URL", "url")}
-        <input type="text" id="set_url" value="${esc(s.switchboard_url)}"></div>
     </div>
 
     <div class="sset">
-      <label>Role mapping → seat ${tip("roles")}</label>
+      <label>Role mapping → agent ${tip("roles")}</label>
       ${ROLES.map(r => `
         <div class="field">${lbl(r, r)}
           <select id="role_${r}">${seatOptions(ra[r] || "")}</select></div>`).join("")}
@@ -552,17 +535,6 @@ function renderSettings(s, seats, keysResp) {
         <input type="number" id="set_poll" value="${esc(ui.poll_interval_ms)}"></div>
       <div class="field">${lbl("Collapse finished", "collapse")}
         <input type="checkbox" id="set_collapse" ${ui.collapse_finished ? "checked" : ""}></div>
-    </div>
-
-    <div class="sset">
-      <label>API keys (stored in the Switchboard, never here) ${tip("keys")}</label>
-      ${keyRows || '<div class="sub">no keys reported</div>'}
-      ${keyErr}
-      <div class="field" style="margin-top:10px">${lbl("Set / update key", "key_name")}
-        <input type="text" id="key_name" placeholder="seat / provider name" style="flex:0 0 160px" title="${esc(TIPS.key_name)}">
-        <input type="password" id="key_value" placeholder="key value (not echoed)" title="${esc(TIPS.key_value)}">
-        <button onclick="setKey()">Set</button>
-      </div>
     </div>`;
 }
 
@@ -580,7 +552,6 @@ async function saveSettings() {
   });
   const patch = {
     backend: document.getElementById("set_backend").value,
-    switchboard_url: document.getElementById("set_url").value.trim(),
     role_agents,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
@@ -603,32 +574,6 @@ async function saveSettings() {
     note.style.color = "var(--bad)";
     note.textContent = "save failed";
   }
-}
-
-async function setKey() {
-  const name = document.getElementById("key_name").value.trim();
-  const value = document.getElementById("key_value").value;
-  const note = document.getElementById("savedNote");
-  if (!name || !value) { note.textContent = "name + value required"; return; }
-  const r = await fetch("/settings/api-keys/" + encodeURIComponent(name), {
-    method: "PUT", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({value})});
-  document.getElementById("key_value").value = "";  // never keep the secret around
-  if (r.ok) {
-    note.textContent = "key saved ✓";
-    const keysResp = await api("/settings/api-keys").catch(() => ({keys: {}}));
-    renderSettings(settingsCache, seatsCache, keysResp);
-  } else {
-    note.style.color = "var(--bad)";
-    note.textContent = "key save failed";
-  }
-}
-
-async function revealKey(name) {
-  const r = await fetch("/settings/api-keys/" + encodeURIComponent(name) + "/reveal");
-  if (!r.ok) { alert("reveal failed"); return; }
-  const d = await r.json();
-  alert(name + ": " + (d.value || "(empty)"));  // shown on demand only; not logged
 }
 
 loadHealth();

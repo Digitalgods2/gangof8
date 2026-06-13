@@ -5,21 +5,24 @@ agent council with explicit roles, runs a **bounded** deliberation loop under
 **human authority**, logs everything, and returns a structured final answer.
 Full design in [DESIGN.md](DESIGN.md).
 
-**Phase 1** (current): two backends behind one adapter interface —
-`mock` (offline, deterministic, default) and `switchboard` (Conclave AI at
-`127.0.0.1:8787` driving the real codex / gemini / claude-code CLIs).
-Each role contribution becomes one single-agent `resolve` task on the
-Switchboard with **all Switchboard permissions denied** — Conclave OS
-governance remains the only path to side effects.
+Conclave OS is **fully self-contained**: it runs the local agent CLIs itself.
+Two backends sit behind one adapter interface — `mock` (offline, deterministic,
+default) and `cli` (the real backend: Conclave OS invokes the local `claude` /
+`codex` / `gemini` CLIs directly, in plain non-interactive generation mode,
+e.g. `claude -p --output-format json --tools ""`). Tools are disabled /
+read-only in those calls, so agents perform **no** side effects themselves —
+Conclave OS governance remains the only path to side effects.
 
 ```powershell
-# real agents (Switchboard must be running: cd "..\Conclave AI"; uvicorn app.main:app --port 8787)
-.venv\Scripts\python cli.py submit "your task" --backend switchboard
-# or: $env:CONCLAVE_OS_BACKEND = "switchboard"
+# real agents — nothing else to start; the CLIs manage their own auth
+.venv\Scripts\python cli.py serve --backend cli
+# or one-shot: .venv\Scripts\python cli.py submit "your task" --backend cli
+# or: $env:CONCLAVE_OS_BACKEND = "cli"
 ```
 
-Default role mapping (edit `conclave_os/config.py` → `ROLE_AGENTS_SWITCHBOARD`):
-researcher→gemini, critic→codex, architect/implementer/summarizer→claude-code.
+Default role mapping (edit `conclave_os/config.py` → `ROLE_AGENTS_CLI`):
+researcher→gemini, critic→codex, architect/implementer/summarizer→claude.
+Any role is remappable in settings (chosen from the local CLIs claude/codex/gemini).
 
 ## Setup
 
@@ -70,25 +73,24 @@ python -m venv .venv
 
 ## Validated against real agents
 
-The full pipeline has been proven with real agents through the Switchboard
-(2026-06-13), not just mocks:
+The full pipeline has been proven with real agents, not just mocks:
 
 - **Deliberation run** (`s_20260613_142ffb8d`): gemini researched, codex raised
   disagreements that were critic-tested and ruled on evidence (one correctly
-  narrowed an overclaim), gemini reconciled, claude-code composed — ~3.5 min,
+  narrowed an overclaim), gemini reconciled, claude composed — ~3.5 min,
   6 agent calls, 3 bounded rounds.
 - **Artifact run** (`s_20260613_689ece67`): three agent-question pause/resume
-  cycles (gemini and claude-code both asked clarifying questions answered via
-  `cli.py answer`), then claude-code proposed `ARTIFACT: README.md`, the
+  cycles (gemini and claude both asked clarifying questions answered via
+  `cli.py answer`), then claude proposed `ARTIFACT: README.md`, the
   session paused on a `file_write` approval, and the file was written into the
   session sandbox only after explicit `cli.py approve`.
 
-Hard-won protocol lesson encoded throughout: **plain-text output contracts
-(`DISAGREEMENT:`, `VERDICT:`, `ARTIFACT:`, labeled sections) survive the
-Switchboard's protocol envelope; JSON-shaped contracts do not.** The composer
-accepts substantial prose at medium confidence rather than discarding good
-answers. Known cosmetic issue: agent framing prose can leak into artifacts
-around the `ARTIFACT:` content — the human approval step is the review gate.
+Hard-won contract lesson encoded throughout: **plain-text output contracts
+(`DISAGREEMENT:`, `VERDICT:`, `ARTIFACT:`, labeled sections) parse reliably
+from CLI output; JSON-shaped contracts do not.** The composer accepts
+substantial prose at medium confidence rather than discarding good answers.
+Known cosmetic issue: agent framing prose can leak into artifacts around the
+`ARTIFACT:` content — the human approval step is the review gate.
 
 ## Known issues / follow-ups
 
@@ -99,26 +101,20 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
   very result already in the transcript. Fix: a fuller compose window
   (`COMPOSER_CONTEXT_CONTRIBUTIONS` × `COMPOSER_CONTEXT_CHARS`) plus an explicit
   "do not ask the user; synthesize from the deliberation" instruction. (Verify
-  on the next real switchboard run.)
+  on the next real `cli` backend run.)
 - Agent framing prose can leak into artifacts around `ARTIFACT:` content —
   human approval is the review gate.
-- **Multi-file artifacts: scaffolding done; verbatim file CONTENT is blocked by
-  the Switchboard (root cause confirmed 2026-06-13).** The loop parses every
+- **Multi-file artifacts: resolved by the `cli` backend.** The loop parses every
   `ARTIFACT: <filename>` block into a separate approval-gated `write_file`, and
   when an output task yields no full blocks it materializes each intended file
   with a focused single-file call (`_materialize_artifacts`); resume no longer
   re-runs deliberation after an approval. A real 4-file FastAPI run produced 4
-  named, gated, written files (was "cannot resolve"). BUT the file *content* is
-  still a description, not code. Investigated and ruled out: the Switchboard
-  artifact channel is empty (`/api/tasks/{id}/artifacts` → `[]`); the agent
-  message `content` is empty; only `PrimaryResponse.summary` comes back.
-  **Confirmed root cause:** the Switchboard's claude adapter runs the CLI with
-  `--permission-mode plan --tools ""` (default haiku) and extracts the
-  structured `summary` — i.e. it is architecturally a *planner that describes*,
-  not a generator that emits files. **Fix belongs in the Conclave AI Switchboard
-  project**, not here: add a generation/raw mode that runs the agent without
-  plan-mode and returns the raw `result` field. Conclave OS materialization will
-  then yield real file bodies with no further change. Separately,
+  named, gated, written files. The `cli` backend calls the agent directly in
+  plain generation mode (no plan-mode) and returns its raw output, so real file
+  *content* now flows through to materialization — the implementer emits actual
+  code, not a description. (The earlier symptom — files materialized as
+  descriptions, not bodies — came from an indirect planner-style invocation;
+  driving the local CLI directly removes that layer.) Separately,
   `_GOVERNANCE_CONTEXT` was added to all role prompts so non-implementer roles
   stop treating `can_write_files=false` as a blocker.
 - **Skill loop wired (2026-06-13):** agents may pull a no-approval skill
@@ -139,22 +135,20 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
 ## Status
 
 - [x] Phase 0 — skeleton + MockAdapter
-- [x] Phase 1 — SwitchboardAdapter (Conclave AI as agent backend); agent
-      failures degrade to a partial answer, never a crash. Live integration
-      tests use the Switchboard's zero-cost `fake` agent and auto-skip when
-      the service is down.
+- [x] Phase 1 — CliAdapter (Conclave OS drives the local claude/codex/gemini
+      CLIs itself); agent failures degrade to a partial answer, never a crash.
+      Live integration tests auto-skip when a CLI is not on PATH.
 - [x] Phase 2 — approval resolution (API + CLI) with session resume: approving
       the gate continues deliberation from where it paused (state reloaded
       from SQLite); denying cancels the session before any agent runs.
-- [x] Phase 3 — agent-question passthrough: a Switchboard `awaiting_user_input`
-      pause becomes a Conclave OS input request (`awaiting_input` status); the
-      human's answer resumes the same Switchboard task and the session
-      continues. Plus richer disagreement detection (bullets, any case,
-      multi-line claims, PASS, claim-role attribution) and composer polish
-      (one strict retry on unparseable JSON, graceful fallbacks). Known
-      simplification: step 8 of a round paused mid-call is skipped on resume;
-      remote *action* approvals (`waiting_for_user`) are still cancelled —
-      actions are governed only on the Conclave OS side.
+- [x] Phase 3 — agent-question passthrough: when an agent asks a clarifying
+      question it becomes a Conclave OS input request (`awaiting_input` status);
+      the human's answer resumes the session and deliberation continues. Plus
+      richer disagreement detection (bullets, any case, multi-line claims, PASS,
+      claim-role attribution) and composer polish (one strict retry on
+      unparseable JSON, graceful fallbacks). Known simplification: step 8 of a
+      round paused mid-call is skipped on resume — actions are governed only on
+      the Conclave OS side.
 - [x] Phase 4 — governed tool execution: the implementer can head its draft
       with `ARTIFACT: <filename>` to propose saving it as a file. The proposal
       becomes a `file_write` approval; only an explicit human approval executes

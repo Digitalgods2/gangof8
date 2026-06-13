@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     p_submit.add_argument("text")
     p_submit.add_argument("--source", default="cli")
     p_submit.add_argument(
-        "--backend", default=None, choices=["mock", "switchboard"],
+        "--backend", default=None, choices=["mock", "cli"],
         help="agent backend (default: CONCLAVE_OS_BACKEND env or mock)",
     )
 
@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser("serve", help="run the Conclave OS service + web dashboard")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8790)
-    p_serve.add_argument("--backend", default=None, choices=["mock", "switchboard"])
+    p_serve.add_argument("--backend", default=None, choices=["mock", "cli"])
     sub.add_parser("pending", help="list pending approvals across sessions")
 
     p_approve = sub.add_parser("approve", help="approve a pending approval (resumes the session)")
