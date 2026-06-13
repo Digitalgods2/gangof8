@@ -102,7 +102,12 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     if human_approval_required:
         notes.append(f"risk above boundary ({config.RISK_BOUNDARY.value}) — human approval required")
 
-    needs_facts = task_type in (TaskType.question, TaskType.research, TaskType.design, TaskType.content)
+    # code included: a coding task benefits from a context-gathering round first
+    # (read/search the existing code, surface constraints) — and it's the role
+    # the researcher seat (gemini by default) fills.
+    needs_facts = task_type in (
+        TaskType.question, TaskType.research, TaskType.design, TaskType.content, TaskType.code
+    )
     needs_design = task_type in (TaskType.design, TaskType.code)
     produces_output = task_type in (TaskType.code, TaskType.content, TaskType.design, TaskType.action)
     quality_matters = complexity != Complexity.trivial or risk != Risk.none

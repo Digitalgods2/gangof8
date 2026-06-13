@@ -18,6 +18,19 @@ def test_build_an_app_is_code():
     assert cls.tools_allowed is True
 
 
+def test_code_tasks_activate_the_researcher():
+    """Code tasks gather context first, so the researcher seat (gemini) works
+    on them too — not just question/research/design/content."""
+    from conclave_os.roles import build_council
+    from conclave_os.models import Role
+
+    cls = classify("Edit main.py to add a logging line")
+    assert cls.task_type == TaskType.code
+    assert cls.needs_facts is True
+    council = build_council(cls)
+    assert council.is_active(Role.researcher)
+
+
 def test_fastapi_app_with_filenames_is_code():
     cls = classify(
         "Create a simple FastAPI hello-world app with main.py, README.md, "
