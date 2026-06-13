@@ -8,6 +8,7 @@ Backends:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,9 @@ class ConclaveService:
         self.store = LogStore(Path(data_dir) if data_dir else config.DATA_DIR)
         self.manager = SessionManager(self.store)
         self.governance = Governance(self.store)
+        # background workers for service mode — sessions on real backends take
+        # minutes, so the dashboard submits and polls instead of blocking
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
         self.registry = AgentRegistry()
         if self.backend == "switchboard":
             for agent in sorted(set(self.role_agents.values())):
@@ -53,6 +57,41 @@ class ConclaveService:
             session, self.manager, self.registry, self.governance, self.store,
             role_agents=self.role_agents,
         )
+
+    def submit_background(self, text: str, source: str = "api",
+                          budgets: Optional[Budgets] = None) -> Session:
+        """Create the session and run it on a worker thread; the caller polls
+        GET /sessions/{id} for progress."""
+        session = intake.receive(text, source, self.manager, budgets)
+        session.backend = self.backend
+        self.store.save_session(session)
+        self._pool.submit(self._safely, session, self._run_full)
+        return session
+
+    def _run_full(self, session: Session) -> Session:
+        return run_session(
+            session, self.manager, self.registry, self.governance, self.store,
+            role_agents=self.role_agents,
+        )
+
+    def _resume_full(self, session: Session) -> Session:
+        return resume_session(
+            session, self.manager, self.registry, self.governance, self.store,
+            role_agents=self.role_agents,
+        )
+
+    def _safely(self, session: Session, fn, *args) -> Session:
+        """Background guard: a session must never die silently in a thread."""
+        try:
+            return fn(session, *args)
+        except Exception as e:  # noqa: BLE001 — last-resort containment
+            self.store.log_event(session.session_id, "internal_error", {"detail": str(e)})
+            try:
+                self.manager.transition(session, SessionStatus.failed)
+            except ValueError:
+                session.status = SessionStatus.failed
+                self.store.save_session(session)
+            return session
 
     def _ensure_adapters(self, session: Session) -> None:
         """A loaded session must be resumable regardless of how this service
@@ -71,7 +110,8 @@ class ConclaveService:
     def list(self) -> list[dict]:
         return self.store.list_sessions()
 
-    def approve(self, session_id: str, approval_id: str, approved: bool, by: str = "user") -> Session:
+    def approve(self, session_id: str, approval_id: str, approved: bool,
+                by: str = "user", background: bool = False) -> Session:
         """Resolve an approval. Approving the last pending approval on a paused
         session resumes it. Denying a session gate cancels the session; denying
         an action approval (action_ref set) skips just that action — the
@@ -89,10 +129,10 @@ class ConclaveService:
             return session
         if session.has_pending_approval:
             return session  # other gates still open; stay paused
-        return resume_session(
-            session, self.manager, self.registry, self.governance, self.store,
-            role_agents=self.role_agents,
-        )
+        if background:
+            self._pool.submit(self._safely, session, self._resume_full)
+            return session
+        return self._resume_full(session)
 
     def pending_approvals(self) -> list[dict]:
         return self._pending(SessionStatus.awaiting_approval, "approvals")
@@ -127,7 +167,8 @@ class ConclaveService:
             raise ValueError(f"input request {input_id} already {req.status}")
         return session, req
 
-    def answer(self, session_id: str, input_id: str, answer_text: str, by: str = "user") -> Session:
+    def answer(self, session_id: str, input_id: str, answer_text: str,
+               by: str = "user", background: bool = False) -> Session:
         """Answer an agent's question: the paused backend call is resumed with
         the human's answer and the session continues to completion."""
         if not (answer_text or "").strip():
@@ -138,11 +179,18 @@ class ConclaveService:
         req.resolved_at = utcnow()
         req.resolved_by = by
         self.store.log_event(session_id, "input_answered", req.model_dump())
+        self.store.save_session(session)
+        if background:
+            self._pool.submit(self._safely, session, self._answer_continue, req)
+            return session
+        return self._answer_continue(session, req)
+
+    def _answer_continue(self, session: Session, req) -> Session:
         try:
-            result = self.registry.resume(req.agent, req.resume_token, answer_text)
+            result = self.registry.resume(req.agent, req.resume_token, req.answer)
         except AgentError as e:
             session.unresolved.append(f"resume after user input failed: {e}")
-            self.store.log_event(session_id, "agent_error", {"detail": str(e)})
+            self.store.log_event(session.session_id, "agent_error", {"detail": str(e)})
             self.manager.transition(session, SessionStatus.composing)
             session.final = fallback_final(session, "agent resume failed")
             self.manager.transition(session, SessionStatus.done)

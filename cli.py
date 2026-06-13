@@ -28,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sub.add_parser("list", help="list sessions")
+
+    p_serve = sub.add_parser("serve", help="run the Conclave OS service + web dashboard")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8790)
+    p_serve.add_argument("--backend", default=None, choices=["mock", "switchboard"])
     sub.add_parser("pending", help="list pending approvals across sessions")
 
     p_approve = sub.add_parser("approve", help="approve a pending approval (resumes the session)")
@@ -60,6 +65,18 @@ def main(argv: list[str] | None = None) -> int:
     p_log.add_argument("session_id")
 
     args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        import os
+
+        import uvicorn
+
+        if args.backend:
+            os.environ["CONCLAVE_OS_BACKEND"] = args.backend
+        print(f"Conclave OS dashboard: http://{args.host}:{args.port}/")
+        uvicorn.run("conclave_os.main:app", host=args.host, port=args.port)
+        return 0
+
     service = ConclaveService(backend=getattr(args, "backend", None))
 
     if args.command == "submit":

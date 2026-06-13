@@ -1,34 +1,46 @@
 """FastAPI surface for the Coordinator OS.
 
-Run with:  uvicorn conclave_os.main:app --port 8790
+Run with:  python cli.py serve   (or: uvicorn conclave_os.main:app --port 8790)
+Dashboard: http://127.0.0.1:8790/
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import __version__
 from .service import ConclaveService
 
 app = FastAPI(title="Conclave OS — Coordinator", version=__version__)
-service = ConclaveService()
+# env read here (not from config.BACKEND) so `cli.py serve --backend X` can
+# set it just before uvicorn imports this module
+service = ConclaveService(backend=os.environ.get("CONCLAVE_OS_BACKEND"))
+
+_STATIC = Path(__file__).parent / "static"
 
 
 class TaskIn(BaseModel):
     text: str
     source: str = "api"
+    background: bool = False  # True: return immediately, poll GET /sessions/{id}
 
 
 class ApprovalIn(BaseModel):
     approved: bool
     by: str = "user"
+    background: bool = False
 
 
 class InputAnswerIn(BaseModel):
     answer: str | None = None
     decline: bool = False
     by: str = "user"
+    background: bool = False
 
 
 def _summary(session) -> dict:
@@ -48,15 +60,23 @@ def _summary(session) -> dict:
     }
 
 
+@app.get("/")
+def dashboard() -> FileResponse:
+    return FileResponse(_STATIC / "index.html")
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "version": __version__}
+    return {"ok": True, "version": __version__, "backend": service.backend}
 
 
 @app.post("/tasks")
 def submit_task(body: TaskIn) -> dict:
     try:
-        session = service.run(body.text, source=body.source)
+        if body.background:
+            session = service.submit_background(body.text, source=body.source)
+        else:
+            session = service.run(body.text, source=body.source)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return _summary(session)
@@ -65,7 +85,9 @@ def submit_task(body: TaskIn) -> dict:
 @app.post("/sessions/{session_id}/approvals/{approval_id}")
 def resolve_approval(session_id: str, approval_id: str, body: ApprovalIn) -> dict:
     try:
-        session = service.approve(session_id, approval_id, body.approved, by=body.by)
+        session = service.approve(
+            session_id, approval_id, body.approved, by=body.by, background=body.background
+        )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -86,7 +108,9 @@ def resolve_input(session_id: str, input_id: str, body: InputAnswerIn) -> dict:
         else:
             if not (body.answer or "").strip():
                 raise HTTPException(status_code=422, detail="answer required unless decline=true")
-            session = service.answer(session_id, input_id, body.answer, by=body.by)
+            session = service.answer(
+                session_id, input_id, body.answer, by=body.by, background=body.background
+            )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:

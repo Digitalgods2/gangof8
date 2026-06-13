@@ -19,10 +19,13 @@ class LogStore:
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        # timeout covers writer contention between the API thread and
+        # background session workers (Phase 5 service mode)
+        return sqlite3.connect(self.db_path, timeout=10)
 
     def _init_db(self) -> None:
         with self._conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS sessions (
                        session_id TEXT PRIMARY KEY,
@@ -55,15 +58,37 @@ class LogStore:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def list_sessions(self) -> list[dict]:
+    def list_sessions(self, limit: int = 100) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT session_id, status, created_at, updated_at FROM sessions ORDER BY created_at DESC"
+                "SELECT session_id, status, created_at, updated_at, json "
+                "FROM sessions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
-        return [
-            {"session_id": r[0], "status": r[1], "created_at": r[2], "updated_at": r[3]}
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            task_text, pending_approvals, pending_inputs = "", 0, 0
+            try:
+                data = json.loads(r[4])
+                task_text = (data.get("task") or {}).get("text", "")
+                pending_approvals = sum(
+                    1 for a in data.get("approvals", []) if a.get("status") == "pending"
+                )
+                pending_inputs = sum(
+                    1 for i in data.get("input_requests", []) if i.get("status") == "pending"
+                )
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            out.append(
+                {
+                    "session_id": r[0], "status": r[1],
+                    "created_at": r[2], "updated_at": r[3],
+                    "task_text": task_text[:160],
+                    "pending_approvals": pending_approvals,
+                    "pending_inputs": pending_inputs,
+                }
+            )
+        return out
 
     def session_log_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{session_id}.jsonl"
