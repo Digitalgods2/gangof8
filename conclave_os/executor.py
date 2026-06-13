@@ -36,6 +36,23 @@ def artifacts_dir(data_dir: Path, session_id: str) -> Path:
     return Path(data_dir) / "artifacts" / session_id
 
 
+def resolve_in_workspace(root: Path, relpath: str) -> Path:
+    """Resolve a relative path inside a workspace root, allowing subdirectories
+    (src/main.py) but rejecting anything that escapes the root — `..` traversal,
+    absolute paths, or drive-qualified paths. The containment check on the
+    resolved path is the real security boundary."""
+    raw = (relpath or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or ":" in raw.split("/", 1)[0]:
+        raise ExecutionError(f"workspace path must be relative: {relpath!r}")
+    root = Path(root).resolve()
+    target = (root / raw).resolve()
+    if target == root:
+        raise ExecutionError(f"path resolves to the workspace root itself: {relpath!r}")
+    if root not in target.parents:
+        raise ExecutionError(f"path escapes the workspace root: {relpath!r}")
+    return target
+
+
 def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Dispatch the action to its registered skill handler and return the
     handler's result string (e.g. the written path, or file contents)."""

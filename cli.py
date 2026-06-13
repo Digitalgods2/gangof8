@@ -64,6 +64,16 @@ def main(argv: list[str] | None = None) -> int:
     p_log = sub.add_parser("log", help="print a session's JSONL event trail")
     p_log.add_argument("session_id")
 
+    p_ws = sub.add_parser("workspace", help="manage workspaces (allowed work areas)")
+    ws_sub = p_ws.add_subparsers(dest="ws_command", required=True)
+    ws_sub.add_parser("list", help="list workspaces (* = active)")
+    p_ws_add = ws_sub.add_parser("add", help="register a workspace and activate it")
+    p_ws_add.add_argument("name")
+    p_ws_add.add_argument("root")
+    p_ws_use = ws_sub.add_parser("use", help="activate a workspace by id")
+    p_ws_use.add_argument("workspace_id")
+    ws_sub.add_parser("none", help="clear the active workspace (use the per-session sandbox)")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -153,6 +163,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         for s in service.list():
             print(f"{s['session_id']}  {s['status']:<20} {s['created_at']}")
+        return 0
+
+    if args.command == "workspace":
+        if args.ws_command == "add":
+            try:
+                ws = service.create_workspace(args.name, args.root)
+                service.set_active_workspace(ws.id)
+            except Exception as e:  # noqa: BLE001
+                print(str(e), file=sys.stderr)
+                return 1
+            print(f"added + activated {ws.id}: {ws.name} -> {ws.root}")
+            return 0
+        if args.ws_command == "use":
+            try:
+                service.set_active_workspace(args.workspace_id)
+            except Exception as e:  # noqa: BLE001
+                print(str(e), file=sys.stderr)
+                return 1
+            print(f"active workspace: {args.workspace_id}")
+            return 0
+        if args.ws_command == "none":
+            service.set_active_workspace(None)
+            print("active workspace cleared (per-session sandbox)")
+            return 0
+        data = service.list_workspaces()  # list
+        if not data["workspaces"]:
+            print("no workspaces (add one: python cli.py workspace add <name> <root>)")
+        for w in data["workspaces"]:
+            mark = "*" if w["id"] == data["active"] else " "
+            print(f"{mark} {w['id']}  {w['name']}  -> {w['root']}")
         return 0
 
     if args.command == "status":

@@ -200,6 +200,16 @@ class ProposedAction(BaseModel):
     proposed_at: str = Field(default_factory=utcnow)
 
 
+class Workspace(BaseModel):
+    """An allowed work area — a real project directory the council may read and
+    (with approval) write into, instead of the throwaway per-session sandbox."""
+
+    id: str = Field(default_factory=lambda: f"ws_{short_id()}")
+    name: str
+    root: str  # absolute path to the workspace root
+    created_at: str = Field(default_factory=utcnow)
+
+
 class Budgets(BaseModel):
     max_rounds: int = 4
     max_turns_per_round: int = 2
@@ -219,6 +229,7 @@ class Session(BaseModel):
     session_id: str
     status: SessionStatus = SessionStatus.received
     backend: str = "mock"  # which adapter family this session runs on; resume must match
+    workspace_root: Optional[str] = None  # allowed work area; None ⇒ per-session sandbox
     budgets: Budgets = Field(default_factory=Budgets)
     budgets_locked: bool = False  # True when caller supplied explicit budgets
     task: Task

@@ -57,6 +57,7 @@ def _summary(session) -> dict:
             for p in session.proposed_actions
         ],
         "files_changed": session.files_changed,
+        "workspace_root": session.workspace_root,
     }
 
 
@@ -180,5 +181,48 @@ def get_seats() -> dict:
     """The local CLI agents (claude/codex/gemini) with PATH availability, for
     the role→agent dropdowns in settings."""
     return service.seats()
+
+
+# ---- Workspaces --------------------------------------------------------------
+
+
+class WorkspaceIn(BaseModel):
+    name: str
+    root: str
+
+
+class ActiveWorkspaceIn(BaseModel):
+    id: str | None = None  # null clears the active workspace (→ per-session sandbox)
+
+
+@app.get("/workspaces")
+def list_workspaces() -> dict:
+    """All registered workspaces plus the active one. The active workspace is
+    the allowed work area new sessions read/write within (governed)."""
+    return service.list_workspaces()
+
+
+@app.post("/workspaces")
+def create_workspace(body: WorkspaceIn) -> dict:
+    try:
+        ws = service.create_workspace(body.name, body.root)
+    except Exception as e:  # noqa: BLE001 — surface a clean validation error
+        raise HTTPException(status_code=422, detail=str(e))
+    return ws.model_dump()
+
+
+@app.put("/workspaces/active")
+def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
+    try:
+        service.set_active_workspace(body.id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=str(e))
+    return service.list_workspaces()
+
+
+@app.delete("/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: str) -> dict:
+    service.remove_workspace(workspace_id)
+    return service.list_workspaces()
 
 

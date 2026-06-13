@@ -25,6 +25,7 @@ from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
 from .settings import Settings, budgets_overrides, load_settings, save_settings
+from .workspaces import WorkspaceStore
 
 
 class ConclaveService:
@@ -43,6 +44,7 @@ class ConclaveService:
         self.store = LogStore(self._data_dir)
         self.manager = SessionManager(self.store)
         self.governance = Governance(self.store)
+        self.workspaces = WorkspaceStore(self._data_dir)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
@@ -99,9 +101,17 @@ class ConclaveService:
         self._apply_settings()
         return self.settings
 
-    def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None) -> Session:
+    def _open(self, text: str, source: str, budgets: Optional[Budgets]) -> Session:
+        """Create a session, stamping the backend and the active workspace root
+        (so file skills operate in that project; None ⇒ per-session sandbox)."""
         session = intake.receive(text, source, self.manager, budgets)
         session.backend = self.backend
+        active = self.workspaces.active()
+        session.workspace_root = active.root if active else None
+        return session
+
+    def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None) -> Session:
+        session = self._open(text, source, budgets)
         return run_session(
             session, self.manager, self.registry, self.governance, self.store,
             role_agents=self.role_agents,
@@ -111,11 +121,28 @@ class ConclaveService:
                           budgets: Optional[Budgets] = None) -> Session:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
-        session = intake.receive(text, source, self.manager, budgets)
-        session.backend = self.backend
+        session = self._open(text, source, budgets)
         self.store.save_session(session)
         self._pool.submit(self._safely, session, self._run_full)
         return session
+
+    # ---- Workspaces ----------------------------------------------------------
+
+    def list_workspaces(self) -> dict:
+        active = self.workspaces.active()
+        return {
+            "workspaces": [w.model_dump() for w in self.workspaces.list()],
+            "active": active.id if active else None,
+        }
+
+    def create_workspace(self, name: str, root: str):
+        return self.workspaces.add(name, root)
+
+    def set_active_workspace(self, workspace_id):
+        return self.workspaces.set_active(workspace_id)
+
+    def remove_workspace(self, workspace_id: str) -> None:
+        self.workspaces.remove(workspace_id)
 
     def _run_full(self, session: Session) -> Session:
         return run_session(
