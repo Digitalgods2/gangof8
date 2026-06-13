@@ -20,6 +20,30 @@ AgentCall = Callable[[CouncilMember, str], Contribution]
 VALID_CONFIDENCE = {"high", "medium", "low"}
 
 
+def _actions_summary(session: Session) -> str:
+    """What the coordinator actually DID — the authoritative outcome of every
+    governed action, so the summarizer reports facts instead of guessing (or
+    confabulating filesystem checks it can't run)."""
+    lines = []
+    for a in session.proposed_actions:
+        if a.kind in ("write_file", "edit_file"):
+            if a.status == "executed":
+                lines.append(f"- {a.kind} '{a.filename}': APPLIED (written to {a.result_path})")
+            elif a.status == "denied":
+                lines.append(f"- {a.kind} '{a.filename}': DENIED by the human (not written)")
+            elif a.status == "failed":
+                lines.append(f"- {a.kind} '{a.filename}': FAILED — {a.error}")
+            else:
+                lines.append(f"- {a.kind} '{a.filename}': {a.status}")
+        elif a.kind == "run_tests":
+            out = (a.result_path or "").strip()
+            lines.append(f"- run_tests ({a.status}): {out[:600]}" if out
+                         else f"- run_tests: {a.status}")
+        elif a.kind in ("read_file", "search_project") and a.status == "executed":
+            lines.append(f"- {a.kind} '{a.filename or (a.args or {}).get('query','')}': ran")
+    return "\n".join(lines)
+
+
 def compose_prompt(session: Session) -> str:
     recent = "\n\n".join(
         f"[{c.role.value} r{c.round}] {c.content[:config.COMPOSER_CONTEXT_CHARS]}"
@@ -28,6 +52,7 @@ def compose_prompt(session: Session) -> str:
     rulings = "\n".join(
         f"- {d.topic}: ruled '{d.ruling}' ({d.ruling_basis})" for d in session.disagreements
     ) or "(none)"
+    actions = _actions_summary(session)
     # Plain-text labeled sections, NOT JSON: asking an agent for a JSON object
     # whose keys overlap a wrapping protocol can contaminate its output
     # (learned from real runs). Text labels survive — like DISAGREEMENT:/VERDICT:.
@@ -38,12 +63,18 @@ def compose_prompt(session: Session) -> str:
         "the user any questions and do NOT request more information; if anything "
         "is still uncertain, record it under ASSUMPTIONS or RISKS and give your "
         "best answer anyway.\n"
+        "The 'Actions performed' list is the AUTHORITATIVE record of what the "
+        "coordinator did. Trust it as fact: if an action shows APPLIED, that file "
+        "WAS written — report it as done with high confidence. You have NO "
+        "filesystem access, so never claim a file is missing/unconfirmed and "
+        "never say you ran Glob/find/ls (you cannot) — rely on this record.\n"
         "Use EXACTLY these labeled plain-text sections (no JSON):\n"
         "ANSWER: <the final answer; may span multiple lines>\n"
         "CONFIDENCE: <high, medium, or low>\n"
         "ASSUMPTIONS:\n- <one per line, or '- none'>\n"
         "RISKS:\n- <unresolved risks, one per line, or '- none'>\n"
         "NEXT_ACTION: <one line, or 'none'>\n"
+        f"Actions performed (authoritative):\n{actions or '(none)'}\n"
         f"Disagreement rulings:\n{rulings}\n"
         f"Deliberation:\n{recent}"
     )

@@ -32,6 +32,24 @@ def _session_with(contents: list[tuple[Role, str]]) -> tuple[Session, RoundSpec]
     return session, spec
 
 
+def test_compose_prompt_includes_authoritative_action_outcomes():
+    """The summarizer must see what the coordinator actually did, so it reports
+    an applied edit as done (not 'couldn't confirm')."""
+    from conclave_os.composer import compose_prompt
+    from conclave_os.models import ProposedAction
+
+    session = Session(session_id="s_x", task=Task(task_id="t", session_id="s_x", text="edit it"))
+    session.proposed_actions.append(ProposedAction(
+        session_id="s_x", kind="edit_file", filename="app.py", status="executed",
+        result_path="C:/proj/app.py",
+    ))
+    prompt = compose_prompt(session)
+    assert "edit_file 'app.py': APPLIED" in prompt
+    assert "C:/proj/app.py" in prompt
+    assert "no filesystem access" in prompt.lower() or "NO filesystem access" in prompt
+    assert "authoritative" in prompt.lower()
+
+
 def test_detects_bullets_case_and_multiline():
     session, spec = _session_with([
         (Role.researcher, "- SQLite has transactions."),
