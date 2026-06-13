@@ -90,6 +90,19 @@ accepts substantial prose at medium confidence rather than discarding good
 answers. Known cosmetic issue: agent framing prose can leak into artifacts
 around the `ARTIFACT:` content — the human approval step is the review gate.
 
+## Known issues / follow-ups
+
+- **Summarizer redundantly asks the human for content the council already
+  produced.** Observed in real switchboard runs (e.g. the white-bread task,
+  2026-06-13): the summarizer pauses with an `awaiting_input` question asking
+  the user to hand it the reconciled result, even though that result is already
+  in the round contributions / disagreement verdicts. The composer/summarizer
+  prompt should read from the deliberation transcript instead of pausing to ask.
+  Workaround today: answer with the reconciled content (it's in the
+  Disagreements section) or Decline to let it summarize with what it has.
+- Agent framing prose can leak into artifacts around `ARTIFACT:` content (see
+  above) — human approval is the review gate.
+
 ## Utilities
 
 - `inspect_session.py <sid>` — round/contribution/disagreement overview
