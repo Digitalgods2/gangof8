@@ -21,8 +21,9 @@ VALID_CONFIDENCE = {"high", "medium", "low"}
 
 
 def compose_prompt(session: Session) -> str:
-    recent = "\n".join(
-        f"[{c.role.value} r{c.round}] {c.content[:400]}" for c in session.contributions[-5:]
+    recent = "\n\n".join(
+        f"[{c.role.value} r{c.round}] {c.content[:config.COMPOSER_CONTEXT_CHARS]}"
+        for c in session.contributions[-config.COMPOSER_CONTEXT_CONTRIBUTIONS:]
     )
     rulings = "\n".join(
         f"- {d.topic}: ruled '{d.ruling}' ({d.ruling_basis})" for d in session.disagreements
@@ -33,15 +34,19 @@ def compose_prompt(session: Session) -> str:
     # 3). Text labels survive wrapping — like DISAGREEMENT:/VERDICT: do.
     return (
         f"Task: {session.task.text}\n"
-        "Your role: summarizer. Compose the final response using EXACTLY these "
-        "labeled plain-text sections (no JSON):\n"
+        "Your role: summarizer. Synthesize the final response from the "
+        "deliberation below — the council has already done the work. Do NOT ask "
+        "the user any questions and do NOT request more information; if anything "
+        "is still uncertain, record it under ASSUMPTIONS or RISKS and give your "
+        "best answer anyway.\n"
+        "Use EXACTLY these labeled plain-text sections (no JSON):\n"
         "ANSWER: <the final answer; may span multiple lines>\n"
         "CONFIDENCE: <high, medium, or low>\n"
         "ASSUMPTIONS:\n- <one per line, or '- none'>\n"
         "RISKS:\n- <unresolved risks, one per line, or '- none'>\n"
         "NEXT_ACTION: <one line, or 'none'>\n"
         f"Disagreement rulings:\n{rulings}\n"
-        f"Contributions:\n{recent}"
+        f"Deliberation:\n{recent}"
     )
 
 

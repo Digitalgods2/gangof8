@@ -82,3 +82,10 @@ MAX_CRITIC_TESTS_PER_ROUND = 3
 # the labeled format. Substantial prose (>= this many chars) is accepted as
 # the answer at medium confidence; shorter unparseable output gets one retry.
 COMPOSER_PROSE_MIN_CHARS = 200
+
+# How much deliberation the summarizer sees when composing. The earlier
+# 5×400-char window truncated long reconciliations mid-sentence, so the
+# summarizer would pause to ask the human for the very result the council had
+# already produced. Give it the tail of the deliberation in full-enough form.
+COMPOSER_CONTEXT_CONTRIBUTIONS = 6
+COMPOSER_CONTEXT_CHARS = 1400
