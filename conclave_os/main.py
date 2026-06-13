@@ -237,6 +237,12 @@ def fs_list(path: str | None = None) -> dict:
     return service.list_dir(path)
 
 
+@app.get("/fs/shortcuts")
+def fs_shortcuts() -> dict:
+    """Quick-access locations (Home/Desktop/Documents/… + This PC)."""
+    return service.fs_shortcuts()
+
+
 class MkdirIn(BaseModel):
     path: str
     name: str

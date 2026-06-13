@@ -327,6 +327,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         dirs.sort(key=str.lower)
         return {"path": str(p), "parent": parent, "dirs": dirs}
 
+    def fs_shortcuts(self) -> dict:
+        """Quick-access locations for the folder browser sidebar: Home + the
+        common user folders that exist, then This PC (drives)."""
+        home = Path.home()
+        items = [{"label": "Home", "icon": "🏠", "path": str(home)}]
+        for label, sub, icon in [
+            ("Desktop", "Desktop", "🖥"), ("Documents", "Documents", "📄"),
+            ("Downloads", "Downloads", "⬇"), ("Pictures", "Pictures", "🖼"),
+            ("Videos", "Videos", "🎬"), ("Music", "Music", "🎵"),
+        ]:
+            p = home / sub
+            if p.is_dir():
+                items.append({"label": label, "icon": icon, "path": str(p)})
+        items.append({"label": "This PC", "icon": "💻", "path": ""})
+        return {"shortcuts": items}
+
     def make_dir(self, path: str, name: str) -> dict:
         """Create a sub-folder for the in-page browser's New-folder button, then
         return the refreshed listing of the parent."""

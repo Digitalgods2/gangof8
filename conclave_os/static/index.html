@@ -136,8 +136,15 @@
   #fsCrumbs .cr { color:var(--accent); cursor:pointer; padding:2px 5px; border-radius:4px; }
   #fsCrumbs .cr:hover { background:var(--bg); }
   #fsCrumbs .sep { color:var(--dim); padding:0 1px; }
-  #fsList { flex:1 1 auto; overflow-y:auto; min-height:140px; border:1px solid var(--line);
-            border-radius:8px; background:var(--bg); }
+  #fsBody { flex:1 1 auto; display:flex; min-height:150px; border:1px solid var(--line);
+            border-radius:8px; overflow:hidden; }
+  #fsNav { flex:0 0 152px; overflow-y:auto; background:var(--bg); border-right:1px solid var(--line); }
+  #fsNav .fsnav { padding:8px 11px; cursor:pointer; font-size:12.5px; display:flex; gap:8px;
+                  align-items:center; color:var(--text); }
+  #fsNav .fsnav:hover { background:var(--panel); }
+  #fsNav .fsnav.sec { color:var(--dim); font-size:10.5px; text-transform:uppercase;
+                      letter-spacing:.5px; cursor:default; padding:8px 11px 4px; }
+  #fsList { flex:1 1 auto; overflow-y:auto; background:var(--bg); }
   .fsrow { padding:8px 12px; cursor:pointer; border-bottom:1px solid var(--line);
            font-size:13px; display:flex; gap:10px; align-items:center; }
   .fsrow:last-child { border-bottom:0; }
@@ -220,7 +227,10 @@
       <button class="ghost" onclick="fsNewFolder()">＋ New folder</button>
     </div>
     <div id="fsCrumbs"></div>
-    <div id="fsList"></div>
+    <div id="fsBody">
+      <div id="fsNav"></div>
+      <div id="fsList"></div>
+    </div>
     <div class="fsfoot">
       <span class="sel" id="fsSel">Select a folder</span>
       <button onclick="useFsFolder()">Use this folder</button>
@@ -814,11 +824,25 @@ const escAttr = s => esc(s).replaceAll('"', "&quot;");
 const baseName = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || p;
 const isDrive = p => /^[a-z]:\\?$/i.test(p);
 
-function openFs() {
+async function openFs() {
   document.getElementById("fsOverlay").classList.add("open");
-  fsNavigate(document.getElementById("ws_root").value.trim() || "");
+  await fsLoadNav();
+  const cur = document.getElementById("ws_root").value.trim();
+  // open at the current path, else Desktop, else Home, else drives
+  const start = cur || (fsShortcuts.find(s => s.label === "Desktop") || fsShortcuts.find(s => s.label === "Home") || {}).path || "";
+  fsNavigate(start);
 }
 function closeFs() { document.getElementById("fsOverlay").classList.remove("open"); }
+
+let fsShortcuts = [];
+async function fsLoadNav() {
+  if (!fsShortcuts.length)
+    fsShortcuts = (await api("/fs/shortcuts").catch(() => ({shortcuts: []}))).shortcuts || [];
+  const nav = document.getElementById("fsNav");
+  nav.innerHTML = '<div class="fsnav sec">Quick access</div>' + fsShortcuts.map(s =>
+    `<div class="fsnav" data-path="${escAttr(s.path)}"><span>${s.icon}</span> ${esc(s.label)}</div>`).join("");
+  nav.onclick = e => { const n = e.target.closest(".fsnav[data-path]"); if (n) fsNavigate(n.dataset.path); };
+}
 
 async function fsNavigate(path) {
   const list = document.getElementById("fsList");
