@@ -37,14 +37,15 @@ class CliAdapter:
              images: list[dict] | None = None) -> AdapterResult:
         t0 = time.monotonic()
         if self.agent == "claude":
-            # only claude has a verified vision path; with images, send them as
-            # content blocks so the model actually sees them
+            # claude sees images as content blocks via stream-json (no tools)
             content = self._run_claude_vision(prompt, images, timeout_s) if images \
                 else self._run_claude(prompt, timeout_s)
         elif self.agent == "codex":
-            content = self._run_codex(prompt, timeout_s)  # text-only; images ignored
+            content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
-            content = self._run_gemini(prompt, timeout_s)  # text-only; images ignored
+            # gemini has no clean headless image input (only via risky --yolo tool
+            # access), so it stays text-only; it still sees the attachment note.
+            content = self._run_gemini(prompt, timeout_s)
         else:
             raise AgentError(f"unknown CLI agent: {self.agent!r}")
         content = content.strip()
@@ -128,14 +129,18 @@ class CliAdapter:
             cmd += ["-m", self.model]
         return self._exec(cmd, "", timeout_s)
 
-    def _run_codex(self, prompt: str, timeout_s: int) -> str:
+    def _run_codex(self, prompt: str, timeout_s: int, images: list[dict] | None = None) -> str:
         # codex exec writes its final message cleanly to --output-last-message.
+        # Images attach with --image=<path> (verified: reads text in images).
         fd, outfile = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
         try:
             cmd = ["codex", "exec", "--color", "never", "--output-last-message", outfile]
             if self.model:
                 cmd += ["-m", self.model]
+            for img in images or []:
+                if Path(img["path"]).is_file():
+                    cmd.append(f"--image={img['path']}")
             cmd.append("-")  # read the prompt from stdin
             self._exec(cmd, prompt, timeout_s)
             return Path(outfile).read_text(encoding="utf-8", errors="replace")
