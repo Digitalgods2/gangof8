@@ -92,16 +92,16 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
 
 ## Known issues / follow-ups
 
-- **Summarizer redundantly asks the human for content the council already
-  produced.** Observed in real switchboard runs (e.g. the white-bread task,
-  2026-06-13): the summarizer pauses with an `awaiting_input` question asking
-  the user to hand it the reconciled result, even though that result is already
-  in the round contributions / disagreement verdicts. The composer/summarizer
-  prompt should read from the deliberation transcript instead of pausing to ask.
-  Workaround today: answer with the reconciled content (it's in the
-  Disagreements section) or Decline to let it summarize with what it has.
-- Agent framing prose can leak into artifacts around `ARTIFACT:` content (see
-  above) — human approval is the review gate.
+- **Fixed (2026-06-13): summarizer redundantly asked the human for content the
+  council already produced.** Root cause was mechanical: `compose_prompt` fed
+  the summarizer only the last 5 contributions truncated to 400 chars, so long
+  reconciliations were cut off and it paused (`awaiting_input`) to ask for the
+  very result already in the transcript. Fix: a fuller compose window
+  (`COMPOSER_CONTEXT_CONTRIBUTIONS` × `COMPOSER_CONTEXT_CHARS`) plus an explicit
+  "do not ask the user; synthesize from the deliberation" instruction. (Verify
+  on the next real switchboard run.)
+- Agent framing prose can leak into artifacts around `ARTIFACT:` content —
+  human approval is the review gate.
 
 ## Utilities
 
