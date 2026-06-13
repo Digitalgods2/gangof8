@@ -102,6 +102,13 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
   on the next real switchboard run.)
 - Agent framing prose can leak into artifacts around `ARTIFACT:` content —
   human approval is the review gate.
+- **Skill loop wired (2026-06-13):** agents may pull a no-approval skill
+  mid-deliberation with a plain-text `SKILL: read_file <name>` line; the kernel
+  authorizes it (role-gated, no approval for reads) and the result is fed back
+  on a single re-call (capped by `MAX_SKILL_REQUESTS_PER_TURN`). The grammar is
+  surfaced in the round prompt only when the session sandbox holds a readable
+  file. Approval-gated skills (write_file) stay on the `ARTIFACT:` proposal
+  path. Behavioral confirmation against real agents is still pending a run.
 
 ## Utilities
 
