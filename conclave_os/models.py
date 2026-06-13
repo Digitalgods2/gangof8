@@ -230,6 +230,7 @@ class Session(BaseModel):
     status: SessionStatus = SessionStatus.received
     backend: str = "mock"  # which adapter family this session runs on; resume must match
     workspace_root: Optional[str] = None  # allowed work area; None ⇒ per-session sandbox
+    attachments: list[dict] = []  # [{id, name, kind}] folded into the task text
     budgets: Budgets = Field(default_factory=Budgets)
     budgets_locked: bool = False  # True when caller supplied explicit budgets
     task: Task

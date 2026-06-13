@@ -25,6 +25,7 @@ from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
 from .settings import Settings, budgets_overrides, load_settings, save_settings
+from .uploads import UploadStore, attachment_context
 from .workspaces import WorkspaceStore
 
 
@@ -45,6 +46,7 @@ class ConclaveService:
         self.manager = SessionManager(self.store)
         self.governance = Governance(self.store)
         self.workspaces = WorkspaceStore(self._data_dir)
+        self.uploads = UploadStore(self._data_dir)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
@@ -101,30 +103,42 @@ class ConclaveService:
         self._apply_settings()
         return self.settings
 
-    def _open(self, text: str, source: str, budgets: Optional[Budgets]) -> Session:
-        """Create a session, stamping the backend and the active workspace root
-        (so file skills operate in that project; None ⇒ per-session sandbox)."""
-        session = intake.receive(text, source, self.manager, budgets)
+    def _open(self, text: str, source: str, budgets: Optional[Budgets],
+              attachments: Optional[list[str]] = None) -> Session:
+        """Create a session, stamping the backend, the active workspace root
+        (so file skills operate in that project; None ⇒ per-session sandbox),
+        and folding any attachment text into the task the council reads."""
+        full_text = (text or "") + attachment_context(self.uploads, attachments or [])
+        session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
+        for uid in attachments or []:
+            rec = self.uploads.get(uid)
+            if rec:
+                session.attachments.append({"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
+        self.store.save_session(session)
         return session
 
-    def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None) -> Session:
-        session = self._open(text, source, budgets)
+    def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None,
+            attachments: Optional[list[str]] = None) -> Session:
+        session = self._open(text, source, budgets, attachments)
         return run_session(
             session, self.manager, self.registry, self.governance, self.store,
             role_agents=self.role_agents,
         )
 
     def submit_background(self, text: str, source: str = "api",
-                          budgets: Optional[Budgets] = None) -> Session:
+                          budgets: Optional[Budgets] = None,
+                          attachments: Optional[list[str]] = None) -> Session:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
-        session = self._open(text, source, budgets)
-        self.store.save_session(session)
+        session = self._open(text, source, budgets, attachments)
         self._pool.submit(self._safely, session, self._run_full)
         return session
+
+    def save_upload(self, name: str, content_b64: str) -> dict:
+        return self.uploads.save(name, content_b64)
 
     # ---- Workspaces ----------------------------------------------------------
 
