@@ -106,13 +106,22 @@ _GOVERNANCE_CONTEXT = (
 def build_prompt(
     session: Session, spec: RoundSpec, role: Role, readable: list[str] = ()
 ) -> str:
-    cap = ""
-    if readable and role in (Role.researcher, Role.implementer):
-        cap = (
-            "You may read a file already saved in this session by writing a line "
-            "'SKILL: read_file <name>' (the file's contents are returned to you, no "
-            f"approval needed). Available files: {', '.join(readable)}.\n"
+    # Advertise the no-approval skills this role may pull mid-round, but only
+    # when they'd be useful (a workspace to search, or files to read).
+    hints: list[str] = []
+    sp = get_skill("search_project")
+    if session.workspace_root and sp and role in sp.allowed_roles:
+        hints.append(
+            "search the project (existing files) with a line 'SKILL: search_project <query>'"
         )
+    rf = get_skill("read_file")
+    if (readable or session.workspace_root) and rf and role in rf.allowed_roles:
+        avail = f" Available now: {', '.join(readable)}." if readable else ""
+        hints.append(f"read a file with a line 'SKILL: read_file <path>'.{avail}")
+    cap = (
+        "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
+        if hints else ""
+    )
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
@@ -160,7 +169,10 @@ def _resolve_skill_requests(
                 f"SKILL {name}: not available mid-deliberation (requires approval) — "
                 "produce it as an ARTIFACT instead")
             continue
-        action = ProposedAction(session_id=sid, kind=name, args={"filename": arg}, role=member.role)
+        # map the single positional arg to the skill's first declared input
+        # (read_file→filename, search_project→query)
+        arg_key = skill.inputs[0] if skill.inputs else "filename"
+        action = ProposedAction(session_id=sid, kind=name, args={arg_key: arg}, role=member.role)
         governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
         session.proposed_actions.append(action)
         if action.status == "denied":

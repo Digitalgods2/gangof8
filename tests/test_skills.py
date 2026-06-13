@@ -32,10 +32,49 @@ def session(tmp_path) -> Session:
 # --- registry metadata --------------------------------------------------------
 
 
-def test_registry_contains_both_skills():
-    assert set(SKILLS) == {"write_file", "read_file"}
-    assert set(HANDLERS) == {"write_file", "read_file"}
+def test_registry_contains_skills():
+    assert set(SKILLS) == {"write_file", "read_file", "search_project"}
+    assert set(HANDLERS) == {"write_file", "read_file", "search_project"}
     assert all(isinstance(s, Skill) for s in SKILLS.values())
+
+
+def test_search_project_metadata():
+    s = get_skill("search_project")
+    assert s.category == "read"
+    assert s.requires_approval is False
+    assert s.inputs == ["query"]
+    assert Role.architect in s.allowed_roles
+
+
+def test_search_project_finds_names_and_content(governance, session, tmp_path):
+    root = tmp_path / "proj"
+    (root / "app").mkdir(parents=True)
+    (root / "app" / "main.py").write_text("from fastapi import FastAPI\napp = FastAPI()\n", encoding="utf-8")
+    (root / "README.md").write_text("A demo project.\n", encoding="utf-8")
+    (root / "app" / ".venv").mkdir()  # skipped dir
+    (root / "app" / ".venv" / "junk.py").write_text("FastAPI noise", encoding="utf-8")
+    session.workspace_root = str(root)
+
+    action = ProposedAction(
+        session_id=session.session_id, kind="search_project", role=Role.researcher,
+        args={"query": "FastAPI"},
+    )
+    assert governance.authorize_action(session, action) is None  # no approval
+    out = execute(session, action, tmp_path)
+    assert "app/main.py:1:" in out                # content hit with path:line
+    assert ".venv" not in out                     # skipped directory excluded
+
+
+def test_search_project_no_match(governance, session, tmp_path):
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "a.txt").write_text("nothing here", encoding="utf-8")
+    session.workspace_root = str(root)
+    action = ProposedAction(
+        session_id=session.session_id, kind="search_project", role=Role.researcher,
+        args={"query": "zzznope"},
+    )
+    assert "No matches" in execute(session, action, tmp_path)
 
 
 def test_write_file_metadata():

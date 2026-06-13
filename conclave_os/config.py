@@ -104,3 +104,9 @@ SKILL_RESULT_MAX_CHARS = 2000
 # ARTIFACT blocks, the coordinator fetches each intended file with its own
 # focused call (nothing to summarize). Cap how many files one task may produce.
 MAX_ARTIFACT_FILES = 8
+
+# search_project skill bounds: keep a search cheap and the result feed-back small.
+SEARCH_MAX_FILES = 400          # files whose contents are scanned
+SEARCH_MAX_MATCHES = 60         # content-match lines returned
+SEARCH_MAX_FILE_BYTES = 500_000  # skip files larger than this
+SEARCH_RESULT_MAX_CHARS = 4000  # cap the formatted result fed back to the agent
