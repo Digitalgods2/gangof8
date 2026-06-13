@@ -202,6 +202,30 @@ def test_pick_folder_cancel_returns_none(tmp_path, monkeypatch):
     assert svc.pick_folder() == {"path": None}
 
 
+def test_list_dir_lists_subdirs_and_parent(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")  # files excluded
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    out = svc.list_dir(str(tmp_path))
+    names = {Path(d).name for d in out["dirs"]}
+    assert names == {"a", "b", "data"}  # only directories
+    assert out["parent"] == str(tmp_path.parent)
+
+
+def test_list_dir_bad_path_errors_gracefully(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    out = svc.list_dir(str(tmp_path / "does_not_exist"))
+    assert out["dirs"] == [] and "error" in out
+
+
+def test_fs_list_endpoint(client, tmp_path):
+    (tmp_path / "sub").mkdir()
+    r = client.get("/fs/list", params={"path": str(tmp_path)})
+    assert r.status_code == 200
+    assert any(Path(d).name == "sub" for d in r.json()["dirs"])
+
+
 def test_workspace_endpoints(client, tmp_path):
     assert client.get("/workspaces").json() == {"workspaces": [], "active": None}
     created = client.post("/workspaces", json={"name": "p", "root": str(tmp_path / "p")}).json()
