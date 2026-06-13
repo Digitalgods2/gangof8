@@ -86,6 +86,12 @@ class ConclaveService:
         else:
             self.registry.register(MockAdapter())
 
+    # role_agents/budgets are the COMPLETE intended set (the dashboard sends all
+    # non-default picks each save), so replace them wholesale — merging would
+    # make stale entries linger and break "reset to backend default". Nested
+    # composer/ui are partial-friendly and still merge.
+    _REPLACE_KEYS = {"role_agents", "budgets"}
+
     def update_settings(self, patch: dict) -> Settings:
         """Apply a partial settings patch, persist it, and re-derive the
         backend/role mapping/registry. Some changes (backend, role mapping)
@@ -94,7 +100,7 @@ class ConclaveService:
         for key, value in (patch or {}).items():
             if key not in merged:
                 continue
-            if isinstance(merged[key], dict) and isinstance(value, dict):
+            if key not in self._REPLACE_KEYS and isinstance(merged[key], dict) and isinstance(value, dict):
                 merged[key].update(value)
             else:
                 merged[key] = value
