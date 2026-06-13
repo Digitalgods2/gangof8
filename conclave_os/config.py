@@ -59,6 +59,7 @@ RISK_BOUNDARY = Risk.low
 
 APPROVAL_CATEGORIES = [
     "file_write",
+    "file_edit",
     "file_delete",
     "code_exec",
     "send_message",
@@ -67,6 +68,11 @@ APPROVAL_CATEGORIES = [
     "external",
     "read",
 ]
+
+# run_tests (code execution) bounds — the command runs in the workspace only
+# after explicit human approval; keep it time- and output-bounded.
+RUN_TESTS_TIMEOUT = 300
+RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 
 # The ONLY capability that never needs approval (default-deny everything else).
 ALWAYS_ALLOWED_CAPABILITIES = {"generate_text"}

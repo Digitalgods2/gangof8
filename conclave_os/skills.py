@@ -96,6 +96,55 @@ def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Surgically replace a unique OLD snippet with NEW in an existing file
+    (workspace or sandbox). Fails if the file is missing or OLD is absent /
+    not unique — never a blind overwrite."""
+    raw_name = _arg(action, "filename")
+    old = _arg(action, "old")
+    new = _arg(action, "new")
+    if not old:
+        raise ExecutionError("edit_file requires non-empty OLD text")
+    path = _target_path(session, data_dir, raw_name)
+    if not path.is_file():
+        raise ExecutionError(f"file not found to edit: {raw_name!r}")
+    text = path.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count == 0:
+        raise ExecutionError(f"OLD text not found in {raw_name!r}")
+    if count > 1:
+        raise ExecutionError(f"OLD text not unique in {raw_name!r} ({count} matches)")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return str(path)
+
+
+def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Run a (human-approved) test command in the workspace/sandbox and return
+    its output. The first code-execution capability — bounded by timeout and
+    output cap; only ever runs after explicit approval (requires_approval)."""
+    import subprocess
+
+    cmd = (_arg(action, "command") or "").strip() or "pytest -q"
+    cwd = Path(session.workspace_root) if session.workspace_root \
+        else artifacts_dir(data_dir, session.session_id)
+    if not cwd.is_dir():
+        raise ExecutionError("no directory to run tests in")
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, cwd=str(cwd), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=config.RUN_TESTS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ExecutionError(f"command timed out after {config.RUN_TESTS_TIMEOUT}s") from e
+    except OSError as e:
+        raise ExecutionError(f"could not run command: {e}") from e
+    body = (proc.stdout or "")
+    if proc.stderr:
+        body += f"\n[stderr]\n{proc.stderr}"
+    status = "passed" if proc.returncode == 0 else f"exit {proc.returncode}"
+    return f"$ {cmd}  (cwd: {cwd})\n[{status}]\n{body}"[: config.RUN_TESTS_OUTPUT_MAX_CHARS]
+
+
 def _search_root(session: Session, data_dir: Path) -> Path:
     if session.workspace_root:
         return Path(session.workspace_root)
@@ -180,12 +229,32 @@ SKILLS: dict[str, Skill] = {
         allowed_roles=[Role.researcher, Role.architect, Role.implementer],
         inputs=["query"],
     ),
+    "edit_file": Skill(
+        name="edit_file",
+        description="Replace a unique snippet in an existing file (surgical edit).",
+        category="file_edit",
+        risk=Risk.medium,
+        requires_approval=True,
+        allowed_roles=[Role.implementer],
+        inputs=["filename", "old", "new"],
+    ),
+    "run_tests": Skill(
+        name="run_tests",
+        description="Run a test command in the workspace and return its output.",
+        category="code_exec",
+        risk=Risk.high,
+        requires_approval=True,
+        allowed_roles=[Role.implementer, Role.critic],
+        inputs=["command"],
+    ),
 }
 
 HANDLERS: dict[str, Handler] = {
     "write_file": _write_file,
     "read_file": _read_file,
     "search_project": _search_project,
+    "edit_file": _edit_file,
+    "run_tests": _run_tests,
 }
 
 
