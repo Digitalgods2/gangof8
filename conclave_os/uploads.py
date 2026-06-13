@@ -29,6 +29,12 @@ _TEXT_EXTS = {
     ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h", ".html", ".css", ".sh", ".sql",
 }
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+# media types the vision path can send (Claude supports these); others are
+# stored + text-noted only.
+_VISION_MEDIA_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
 _MAX_TEXT_CHARS = 20_000  # per-attachment cap injected into the prompt
 
 
@@ -100,7 +106,7 @@ class UploadStore:
             except Exception as e:  # noqa: BLE001 — never fail the upload
                 return "", f"PDF text extraction failed: {e}"
         if kind == "image":
-            return "", "image stored; text-only agents cannot view it (path provided)"
+            return "", "image stored; shown to vision-capable agents (e.g. claude)"
         return "", ""
 
 
@@ -113,8 +119,8 @@ def attachment_context(store: UploadStore, upload_ids: list[str]) -> str:
             continue
         if rec["kind"] == "image":
             blocks.append(
-                f"[Attached image: {rec['name']} — saved at {rec['path']}; "
-                "not visually interpreted by text-only agents]"
+                f"[Attached image: {rec['name']} — shown to vision-capable agents; "
+                f"text-only agents see only this note. Saved at {rec['path']}]"
             )
         elif (rec.get("text") or "").strip():
             blocks.append(f"--- Attached {rec['kind']} file: {rec['name']} ---\n{rec['text']}")
@@ -123,3 +129,22 @@ def attachment_context(store: UploadStore, upload_ids: list[str]) -> str:
     if not blocks:
         return ""
     return "\n\nAttachments provided by the user:\n" + "\n\n".join(blocks)
+
+
+def image_inputs(data_dir: Path, attachments: list[dict]) -> list[dict]:
+    """Resolve the session's image attachments to vision inputs the CLI adapter
+    can send as content blocks: [{path, media_type}]. Unsupported image types
+    (e.g. svg/bmp) and missing files are skipped — they remain text-noted only."""
+    store = UploadStore(data_dir)
+    out: list[dict] = []
+    for att in attachments or []:
+        if att.get("kind") != "image":
+            continue
+        rec = store.get(att.get("id"))
+        if not rec:
+            continue
+        media = _VISION_MEDIA_TYPES.get(Path(rec["name"]).suffix.lower())
+        path = rec.get("path")
+        if media and path and Path(path).is_file():
+            out.append({"path": path, "media_type": media})
+    return out
