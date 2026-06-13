@@ -102,20 +102,25 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
   on the next real switchboard run.)
 - Agent framing prose can leak into artifacts around `ARTIFACT:` content —
   human approval is the review gate.
-- **Multi-file artifacts supported; real-agent emission is unreliable
-  (2026-06-13).** The loop now parses every `ARTIFACT: <filename>` block into a
-  separate approval-gated `write_file` (unit-tested end to end), and resume no
-  longer re-runs deliberation after an action approval. BUT on real switchboard
-  runs the `claude-code` implementer tends to *describe* multi-file output
-  ("delivering four files…") instead of emitting the literal ARTIFACT blocks —
-  a single file emits fine. Leading hypothesis: under the Switchboard protocol
-  the agent routes file content into the Switchboard's own artifact channel
-  (`/api/tasks/{id}/artifacts`) rather than inline response text, which our
-  adapter doesn't read. Follow-up: either consume the Switchboard artifact
-  channel in `adapters/switchboard.py`, or enforce a stricter implementer
-  contract. Added `_GOVERNANCE_CONTEXT` to all role prompts so non-implementer
-  roles stop treating `can_write_files=false` as a blocker and asking the human
-  to enable it (separate real-run finding).
+- **Multi-file artifacts: scaffolding done; verbatim file CONTENT is blocked by
+  the Switchboard (root cause confirmed 2026-06-13).** The loop parses every
+  `ARTIFACT: <filename>` block into a separate approval-gated `write_file`, and
+  when an output task yields no full blocks it materializes each intended file
+  with a focused single-file call (`_materialize_artifacts`); resume no longer
+  re-runs deliberation after an approval. A real 4-file FastAPI run produced 4
+  named, gated, written files (was "cannot resolve"). BUT the file *content* is
+  still a description, not code. Investigated and ruled out: the Switchboard
+  artifact channel is empty (`/api/tasks/{id}/artifacts` → `[]`); the agent
+  message `content` is empty; only `PrimaryResponse.summary` comes back.
+  **Confirmed root cause:** the Switchboard's claude adapter runs the CLI with
+  `--permission-mode plan --tools ""` (default haiku) and extracts the
+  structured `summary` — i.e. it is architecturally a *planner that describes*,
+  not a generator that emits files. **Fix belongs in the Conclave AI Switchboard
+  project**, not here: add a generation/raw mode that runs the agent without
+  plan-mode and returns the raw `result` field. Conclave OS materialization will
+  then yield real file bodies with no further change. Separately,
+  `_GOVERNANCE_CONTEXT` was added to all role prompts so non-implementer roles
+  stop treating `can_write_files=false` as a blocker.
 - **Skill loop wired (2026-06-13):** agents may pull a no-approval skill
   mid-deliberation with a plain-text `SKILL: read_file <name>` line; the kernel
   authorizes it (role-gated, no approval for reads) and the result is fed back
