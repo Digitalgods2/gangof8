@@ -108,6 +108,20 @@ def test_update_settings_persists_and_rederives(tmp_path):
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})
     assert load_settings(tmp_path).ui.poll_interval_ms == 7000
     assert svc.settings.ui.poll_interval_ms == 7000
+    # nested composer still merges (partial patch keeps other composer keys)
+    svc.update_settings({"composer": {"reserved_calls": 5}})
+    assert svc.settings.composer.reserved_calls == 5
+    assert svc.settings.ui.poll_interval_ms == 7000
+
+
+def test_role_agents_replace_not_merge(tmp_path):
+    """role_agents is the complete intended set — a new map replaces the old, so
+    resetting (or shrinking) the mapping actually takes effect."""
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"role_agents": {"researcher": "gemini", "critic": "codex"}})
+    assert svc.settings.role_agents == {"researcher": "gemini", "critic": "codex"}
+    svc.update_settings({"role_agents": {"researcher": "claude"}})  # replaces, not merges
+    assert svc.settings.role_agents == {"researcher": "claude"}
 
 
 # ---- Endpoints ---------------------------------------------------------------
