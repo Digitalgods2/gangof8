@@ -235,6 +235,16 @@ def draft_prompt(session: Session) -> str:
         "ARTIFACT: requirements.txt\n"
         "fastapi\n"
         "uvicorn\n"
+        "\nTo MODIFY an existing file (instead of overwriting it), emit a surgical "
+        "edit — the OLD snippet must be unique in the file:\n"
+        "EDIT: path/to/file.py\n"
+        "<<<<<<< OLD\n"
+        "<exact existing text to replace>\n"
+        "=======\n"
+        "<replacement text>\n"
+        ">>>>>>> NEW\n"
+        "To run the test suite (executed only after human approval), add a line:\n"
+        "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
         f"\nContext so far:\n{_recent_context(session, limit=5)}"
     )
 
@@ -557,13 +567,32 @@ _ARTIFACT_MARKER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# 'EDIT: <filename>' + a git-conflict-style OLD/NEW block proposes a surgical
+# replace in an existing file. Self-delimited (>>>>>>> ends it).
+_EDIT_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
+    r"[ \t]*<{3,}[^\n]*\n(?P<old>.*?)\n[ \t]*={3,}[^\n]*\n(?P<new>.*?)\n[ \t]*>{3,}[^\n]*",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+# 'RUNTESTS: <command>' proposes a (human-approved) test run; command optional.
+_RUNTESTS_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?RUN_?TESTS(?:\*\*)?[ \t]*:[ \t]*(?P<cmd>.*?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# any block start — bounds ARTIFACT content so a following EDIT/RUNTESTS isn't
+# swallowed into the file body.
+_BLOCK_START = re.compile(
+    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS)\b", re.IGNORECASE | re.MULTILINE
+)
+
 
 def _collect_proposals(session: Session, store: LogStore) -> None:
-    """Turn the implementer's final draft into one ProposedAction per
-    'ARTIFACT: <filename>' block (loop step 7b). Each block's content runs from
-    its marker to the next marker (or end of draft); leading framing prose
-    before the first marker is dropped. Idempotent: proposals survive a pause
-    and are not re-collected on resume."""
+    """Turn the implementer's final draft into ProposedActions (loop step 7b):
+    'ARTIFACT: <file>' → write_file, an 'EDIT: <file>' OLD/NEW block →
+    edit_file, and 'RUNTESTS: <cmd>' → run_tests. Collected in document order so
+    writes/edits precede a test run. Idempotent: not re-collected on resume."""
     if session.proposed_actions:
         return
     draft = next(
@@ -571,26 +600,36 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     )
     if draft is None:
         return
-    markers = list(_ARTIFACT_MARKER.finditer(draft.content))
-    if not markers:
-        return
-    for i, m in enumerate(markers):
-        filename = m.group(1).strip()
-        end = markers[i + 1].start() if i + 1 < len(markers) else len(draft.content)
-        content = _strip_code_fence(draft.content[m.end():end].strip())
-        action = ProposedAction(
-            session_id=session.session_id,
-            kind="write_file",
-            role=Role.implementer,
-            filename=filename,
-            content=content,
-            args={"filename": filename, "content": content},
-        )
+    text = draft.content
+    sid = session.session_id
+    starts = sorted(m.start() for m in _BLOCK_START.finditer(text))
+
+    def _content_end(after: int) -> int:
+        return next((s for s in starts if s > after), len(text))
+
+    found: list[tuple[int, ProposedAction]] = []
+    for m in _ARTIFACT_MARKER.finditer(text):
+        fn = m.group(1).strip()
+        body = _strip_code_fence(text[m.end():_content_end(m.start())].strip())
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="write_file", role=Role.implementer,
+            filename=fn, content=body, args={"filename": fn, "content": body})))
+    for m in _EDIT_MARKER.finditer(text):
+        fn = m.group("file").strip()
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="edit_file", role=Role.implementer, filename=fn,
+            args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
+    for m in _RUNTESTS_MARKER.finditer(text):
+        cmd = (m.group("cmd") or "").strip()
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="run_tests", role=Role.implementer,
+            filename=cmd or "pytest -q", args={"command": cmd})))
+
+    for _, action in sorted(found, key=lambda t: t[0]):
         session.proposed_actions.append(action)
         store.log_event(
             session.session_id, "action_proposed",
-            {"action_id": action.action_id, "kind": action.kind,
-             "filename": action.filename, "chars": len(action.content)},
+            {"action_id": action.action_id, "kind": action.kind, "filename": action.filename},
         )
 
 
@@ -729,14 +768,17 @@ def _execute_actions(
                 continue
         if action.status == "approved":
             try:
-                path = executor.execute(session, action, store.data_dir)
+                result = executor.execute(session, action, store.data_dir)
                 action.status = "executed"
-                action.result_path = str(path)
-                session.files_changed.append(str(path))
+                action.result_path = result  # path for writes/edits; output for run_tests
+                if action.kind in ("write_file", "edit_file"):
+                    session.files_changed.append(result)
+                else:  # run_tests (or other non-file actions) — keep the output visible
+                    session.unresolved.append(f"{action.kind} '{action.filename}':\n{result}")
                 session.tools_called.append(action.kind)
                 store.log_event(
                     sid, "action_executed",
-                    {"action_id": action.action_id, "path": str(path)},
+                    {"action_id": action.action_id, "kind": action.kind, "result": result[:500]},
                 )
             except ExecutionError as e:
                 action.status = "failed"
