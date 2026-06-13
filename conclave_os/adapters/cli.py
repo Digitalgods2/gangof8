@@ -43,9 +43,14 @@ class CliAdapter:
         elif self.agent == "codex":
             content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
-            # gemini has no clean headless image input (only via risky --yolo tool
-            # access), so it stays text-only; it still sees the attachment note.
-            content = self._run_gemini(prompt, timeout_s)
+            # The gemini CLI has no clean headless image input, so for image
+            # calls use the google-genai SDK inline-image route (a pure inference
+            # call — no tools, governed). Text calls stay on the CLI (its
+            # existing auth). No key ⇒ fall back to text-only CLI + the note.
+            if images and (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+                content = self._run_gemini_sdk(prompt, images)
+            else:
+                content = self._run_gemini(prompt, timeout_s)
         else:
             raise AgentError(f"unknown CLI agent: {self.agent!r}")
         content = content.strip()
@@ -128,6 +133,32 @@ class CliAdapter:
         if self.model:
             cmd += ["-m", self.model]
         return self._exec(cmd, "", timeout_s)
+
+    def _run_gemini_sdk(self, prompt: str, images: list[dict]) -> str:
+        """Vision for the gemini role via the google-genai SDK: inline image
+        Parts + the prompt in a single generate_content call. No tools, no file
+        access — a pure inference request, governed like every other agent call."""
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as e:
+            raise AgentError(f"google-genai not installed (needed for gemini vision): {e}")
+        contents: list = []
+        for img in images:
+            try:
+                data = Path(img["path"]).read_bytes()
+            except OSError:
+                continue
+            contents.append(types.Part.from_bytes(
+                data=data, mime_type=img.get("media_type", "image/png")))
+        contents.append(prompt)
+        try:
+            client = genai.Client()
+            resp = client.models.generate_content(
+                model=self.model or "gemini-2.5-flash", contents=contents)
+        except Exception as e:  # noqa: BLE001 — surface as a normal agent error
+            raise AgentError(f"gemini SDK error: {e}")
+        return resp.text or ""
 
     def _run_codex(self, prompt: str, timeout_s: int, images: list[dict] | None = None) -> str:
         # codex exec writes its final message cleanly to --output-last-message.
