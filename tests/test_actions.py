@@ -148,6 +148,15 @@ def test_safe_filename_rules():
             _safe_filename(bad)
 
 
+def test_artifact_content_strips_code_fence(tmp_path):
+    service = ConclaveService(data_dir=tmp_path)
+    service.registry.register(
+        ArtifactAdapter(draft="ARTIFACT: app.py\n```python\nprint('x')\n```\n")
+    )
+    session = service.run(TASK, source="test")
+    assert session.proposed_actions[0].content == "print('x')", "wrapping fence is stripped"
+
+
 def test_draft_without_marker_proposes_nothing(tmp_path):
     service = ConclaveService(data_dir=tmp_path)  # plain MockAdapter draft has no marker
     session = service.run(TASK, source="test")
