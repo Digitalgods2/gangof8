@@ -666,8 +666,9 @@ function renderSettings(s, seats) {
                          : '<span class="badge">active ✓</span>'}
       </div>
       <div class="field" style="margin-top:8px">${lbl("Add workspace", "workspace")}
-        <input type="text" id="ws_name" placeholder="name" style="flex:0 0 120px">
-        <input type="text" id="ws_root" placeholder="absolute path (created if missing)">
+        <input type="text" id="ws_name" placeholder="name" style="flex:0 0 110px">
+        <input type="text" id="ws_root" placeholder="path (or Browse…)">
+        <button class="ghost" onclick="pickFolder()" title="Choose a folder">Browse…</button>
         <button onclick="addWorkspace()">Add</button>
       </div>
     </div>
@@ -761,6 +762,24 @@ async function activateWorkspace(id) {
   const r = await fetch("/workspaces/active", {method: "PUT",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})});
   if (r.ok) { wsCache = await r.json(); _renderWsAfterChange("workspace updated ✓"); }
+}
+
+async function pickFolder() {
+  const note = document.getElementById("savedNote");
+  note.style.color = ""; note.textContent = "opening folder picker on the host…";
+  try {
+    const d = await fetch("/workspaces/pick-folder", {method: "POST"}).then(r => r.json());
+    if (d.path) {
+      document.getElementById("ws_root").value = d.path;
+      if (!document.getElementById("ws_name").value.trim())
+        document.getElementById("ws_name").value = d.path.split(/[\\/]/).filter(Boolean).pop() || "";
+      note.textContent = "selected " + d.path;
+    } else {
+      note.textContent = d.error ? ("picker: " + d.error) : "no folder selected";
+    }
+  } catch (e) {
+    note.style.color = "var(--bad)"; note.textContent = "folder picker failed";
+  }
 }
 
 async function addWorkspace() {

@@ -174,6 +174,34 @@ def client(tmp_path):
     return TestClient(main_mod.app)
 
 
+def test_pick_folder_returns_selected_path(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    class _P:
+        stdout = "C:\\Users\\me\\proj"
+        returncode = 0
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    assert svc.pick_folder() == {"path": "C:\\Users\\me\\proj"}
+
+
+def test_pick_folder_cancel_returns_none(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    class _P:
+        stdout = ""  # user cancelled
+        returncode = 0
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    assert svc.pick_folder() == {"path": None}
+
+
 def test_workspace_endpoints(client, tmp_path):
     assert client.get("/workspaces").json() == {"workspaces": [], "active": None}
     created = client.post("/workspaces", json={"name": "p", "root": str(tmp_path / "p")}).json()
