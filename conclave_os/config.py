@@ -96,3 +96,10 @@ COMPOSER_CONTEXT_CHARS = 1400
 # balloon the prompt or the budget.
 MAX_SKILL_REQUESTS_PER_TURN = 2
 SKILL_RESULT_MAX_CHARS = 2000
+
+# Per-file artifact materialization: resolve-mode agents return a concise
+# summary, so a single draft call describes multi-file output instead of
+# emitting it. When an output task yields no full ARTIFACT blocks, the
+# coordinator fetches each intended file with its own focused call (nothing to
+# summarize). Cap how many files one task may materialize.
+MAX_ARTIFACT_FILES = 8

@@ -509,8 +509,12 @@ def _deliberate(
         session.unresolved.append("round cap reached with an unaccepted draft")
 
     # 7b. Governed action execution: collect the implementer's artifact
-    # proposal, gate every action on a human approval, execute approved ones.
+    # proposals, gate every action on a human approval, execute approved ones.
+    # If the task should produce files but the draft only described them
+    # (resolve-mode summary), materialize each file with a focused call.
     _collect_proposals(session, store)
+    if not session.proposed_actions and cls.produces_output:
+        _materialize_artifacts(session, compose_call, store)
     if _execute_actions(session, manager, governance, store):
         return session  # paused in awaiting_approval
 
@@ -571,6 +575,98 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
             session.session_id, "action_proposed",
             {"action_id": action.action_id, "kind": action.kind,
              "filename": action.filename, "chars": len(action.content)},
+        )
+
+
+# Filenames mentioned anywhere (main.py, requirements.txt) — used to recover the
+# intended file set when the implementer described files instead of emitting them.
+_FILENAME_RE = re.compile(
+    r"\b([\w\-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|rb|php|c|cpp|h|hpp|cs|md|txt|"
+    r"json|ya?ml|toml|ini|cfg|csv|html|css|scss|sh|bat|ps1|sql))\b",
+    re.IGNORECASE,
+)
+
+
+def materialize_prompt(session: Session, filename: str) -> str:
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"Output the COMPLETE contents of the file '{filename}' and NOTHING else: no "
+        "explanation, no commentary, no markdown code fences — just the raw file body, "
+        "ready to save verbatim, consistent with the agreed design below.\n"
+        f"Agreed design / context:\n{_recent_context(session, limit=6)}"
+    )
+
+
+def _strip_code_fence(text: str) -> str:
+    """Drop a single wrapping ``` / ```lang fence if the agent added one despite
+    being asked for the raw body."""
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.splitlines()
+    lines = lines[1:]  # opening fence (``` or ```lang)
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _intended_filenames(session: Session) -> list[str]:
+    """The files this task means to produce: explicit ARTIFACT names first, then
+    any filename-like tokens in the implementer's draft and the task text."""
+    draft = next(
+        (c for c in reversed(session.contributions) if c.role == Role.implementer), None
+    )
+    text = f"{draft.content if draft else ''}\n{session.task.text}"
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in list(_ARTIFACT_MARKER.finditer(text)) + list(_FILENAME_RE.finditer(text)):
+        name = m.group(1).strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+    return out[: config.MAX_ARTIFACT_FILES]
+
+
+def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:
+    """Recover multi-file output that a resolve-mode draft only described: fetch
+    each intended file with its own focused single-file call, one write_file
+    ProposedAction per file. Idempotent (skips if proposals already exist);
+    degrades gracefully on budget/agent errors."""
+    if session.proposed_actions:
+        return
+    implementer = session.council.get(Role.implementer)
+    if not (implementer and implementer.active):
+        return
+    filenames = _intended_filenames(session)
+    if not filenames:
+        return
+    sid = session.session_id
+    store.log_event(sid, "materialize_start", {"files": filenames})
+    for fn in filenames:
+        try:
+            result = call(implementer, materialize_prompt(session, fn))
+        except (BudgetExceeded, AgentError) as e:
+            session.unresolved.append(f"could not materialize '{fn}': {e}")
+            store.log_event(sid, "materialize_skipped", {"file": fn, "error": str(e)})
+            continue
+        except AgentInputRequired:
+            session.unresolved.append(f"materialization of '{fn}' needed input; skipped")
+            store.log_event(sid, "materialize_skipped", {"file": fn, "reason": "input_required"})
+            continue
+        content = _strip_code_fence(result.content)
+        if not content:
+            session.unresolved.append(f"materialized '{fn}' was empty; skipped")
+            continue
+        action = ProposedAction(
+            session_id=sid, kind="write_file", role=Role.implementer,
+            filename=fn, content=content, args={"filename": fn, "content": content},
+        )
+        session.proposed_actions.append(action)
+        store.log_event(
+            sid, "action_proposed",
+            {"action_id": action.action_id, "kind": action.kind,
+             "filename": fn, "chars": len(content)},
         )
 
 
