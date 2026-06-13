@@ -226,6 +226,14 @@ def test_fs_list_endpoint(client, tmp_path):
     assert any(Path(d).name == "sub" for d in r.json()["dirs"])
 
 
+def test_fs_mkdir(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    out = svc.make_dir(str(tmp_path), "fresh")
+    assert (tmp_path / "fresh").is_dir()
+    assert any(Path(d).name == "fresh" for d in out["dirs"])
+    assert "error" in svc.make_dir(str(tmp_path), "bad/name")
+
+
 def test_workspace_endpoints(client, tmp_path):
     assert client.get("/workspaces").json() == {"workspaces": [], "active": None}
     created = client.post("/workspaces", json={"name": "p", "root": str(tmp_path / "p")}).json()

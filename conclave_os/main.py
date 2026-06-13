@@ -237,6 +237,17 @@ def fs_list(path: str | None = None) -> dict:
     return service.list_dir(path)
 
 
+class MkdirIn(BaseModel):
+    path: str
+    name: str
+
+
+@app.post("/fs/mkdir")
+def fs_mkdir(body: MkdirIn) -> dict:
+    """Create a sub-folder (in-page browser's New-folder button)."""
+    return service.make_dir(body.path, body.name)
+
+
 @app.put("/workspaces/active")
 def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
     try:

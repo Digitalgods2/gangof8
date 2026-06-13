@@ -123,19 +123,29 @@
   #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
                      display:none; z-index:100; }  /* above the composer (60) */
   /* in-page folder browser (above settings) */
-  #fsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; z-index:120; }
+  #fsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.62); display:none; z-index:120; }
   #fsOverlay.open { display:flex; align-items:center; justify-content:center; }
-  #fsPanel { width:min(640px,92vw); max-height:80vh; display:flex; flex-direction:column;
-             background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
-  #fsPath { color:var(--dim); font-size:12px; margin-bottom:8px; word-break:break-all;
-            font-family:Consolas, monospace; }
-  #fsList { flex:1 1 auto; overflow-y:auto; min-height:80px; border:1px solid var(--line);
+  #fsPanel { width:min(720px,94vw); max-height:82vh; display:flex; flex-direction:column;
+             background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:16px 18px; box-shadow:0 12px 44px rgba(0,0,0,.55); }
+  #fsTools { display:flex; gap:8px; margin-bottom:10px; }
+  #fsInput { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--line);
+             border-radius:6px; padding:7px 10px; font:12.5px Consolas, monospace; min-width:0; }
+  #fsInput:focus { outline:none; border-color:var(--accent); }
+  #fsCrumbs { display:flex; flex-wrap:wrap; gap:1px; align-items:center; margin-bottom:8px; font-size:12px; }
+  #fsCrumbs .cr { color:var(--accent); cursor:pointer; padding:2px 5px; border-radius:4px; }
+  #fsCrumbs .cr:hover { background:var(--bg); }
+  #fsCrumbs .sep { color:var(--dim); padding:0 1px; }
+  #fsList { flex:1 1 auto; overflow-y:auto; min-height:140px; border:1px solid var(--line);
             border-radius:8px; background:var(--bg); }
-  .fsrow { padding:7px 11px; cursor:pointer; border-bottom:1px solid var(--line);
-           font-size:13px; display:flex; gap:8px; align-items:center; }
+  .fsrow { padding:8px 12px; cursor:pointer; border-bottom:1px solid var(--line);
+           font-size:13px; display:flex; gap:10px; align-items:center; }
   .fsrow:last-child { border-bottom:0; }
-  .fsrow:hover { background:var(--panel); border-color:var(--accent); }
-  #fsPanel > .row { flex:0 0 auto; margin-top:12px; }
+  .fsrow:hover { background:var(--panel); }
+  .fsrow .ic { width:18px; text-align:center; flex:none; }
+  .fsfoot { display:flex; align-items:center; gap:10px; margin-top:12px; }
+  .fsfoot .sel { flex:1; color:var(--dim); font:12px Consolas, monospace;
+                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #settingsOverlay.open { display:block; }
   #settingsPanel { position:absolute; top:0; right:0; height:100%; width:520px;
                    max-width:100%; background:var(--bg); border-left:1px solid var(--line);
@@ -203,11 +213,17 @@
   <div id="fsPanel">
     <div class="shead"><h2>Choose a folder</h2>
       <button class="ghost x" onclick="closeFs()">Cancel</button></div>
-    <div id="fsPath" class="mono">…</div>
+    <div id="fsTools">
+      <input id="fsInput" placeholder="type or paste a path, then Enter"
+             onkeydown="if(event.key==='Enter')fsNavigate(this.value)">
+      <button class="ghost" onclick="fsNavigate(document.getElementById('fsInput').value)">Go</button>
+      <button class="ghost" onclick="fsNewFolder()">＋ New folder</button>
+    </div>
+    <div id="fsCrumbs"></div>
     <div id="fsList"></div>
-    <div class="row">
+    <div class="fsfoot">
+      <span class="sel" id="fsSel">Select a folder</span>
       <button onclick="useFsFolder()">Use this folder</button>
-      <span class="sub" id="fsNote"></span>
     </div>
   </div>
 </div>
@@ -796,28 +812,56 @@ async function activateWorkspace(id) {
 let fsCurrent = "";  // "" = drive roots
 const escAttr = s => esc(s).replaceAll('"', "&quot;");
 const baseName = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || p;
+const isDrive = p => /^[a-z]:\\?$/i.test(p);
 
-function openFs() { document.getElementById("fsOverlay").classList.add("open"); fsNavigate(""); }
+function openFs() {
+  document.getElementById("fsOverlay").classList.add("open");
+  fsNavigate(document.getElementById("ws_root").value.trim() || "");
+}
 function closeFs() { document.getElementById("fsOverlay").classList.remove("open"); }
 
 async function fsNavigate(path) {
   const list = document.getElementById("fsList");
-  list.innerHTML = '<div class="sub" style="padding:10px">loading…</div>';
+  list.innerHTML = '<div class="sub" style="padding:12px">loading…</div>';
   const d = await api("/fs/list?path=" + encodeURIComponent(path || ""));
   fsCurrent = d.path || "";
-  document.getElementById("fsPath").textContent = fsCurrent || "(drives)";
-  document.getElementById("fsNote").textContent = d.error || "";
+  document.getElementById("fsInput").value = fsCurrent;
+  document.getElementById("fsSel").textContent = fsCurrent ? "Selected: " + fsCurrent : "Select a folder";
+  fsCrumbs(fsCurrent);
   let rows = "";
   if (d.parent !== null && d.parent !== undefined)
-    rows += `<div class="fsrow" data-path="${escAttr(d.parent)}"><span>⬆</span> .. (up)</div>`;
+    rows += `<div class="fsrow" data-path="${escAttr(d.parent)}"><span class="ic">⬆</span> ..</div>`;
   rows += (d.dirs || []).map(p =>
-    `<div class="fsrow" data-path="${escAttr(p)}"><span>📁</span> ${esc(baseName(p))}</div>`).join("");
-  list.innerHTML = rows || '<div class="sub" style="padding:10px">(no sub-folders)</div>';
+    `<div class="fsrow" data-path="${escAttr(p)}"><span class="ic">${isDrive(p) ? "💾" : "📁"}</span> ${esc(isDrive(p) ? p : baseName(p))}</div>`
+  ).join("");
+  list.innerHTML = rows || `<div class="sub" style="padding:12px">${esc(d.error || "(no sub-folders)")}</div>`;
   list.onclick = e => { const r = e.target.closest(".fsrow"); if (r) fsNavigate(r.dataset.path); };
 }
 
+function fsCrumbs(path) {
+  const el = document.getElementById("fsCrumbs");
+  let html = `<span class="cr" data-p="">Drives</span>`;
+  let acc = "";
+  (path || "").split(/[\\/]+/).filter(Boolean).forEach((seg, i) => {
+    acc = i === 0 ? seg + "\\" : acc.replace(/\\?$/, "\\") + seg;
+    html += `<span class="sep">›</span><span class="cr" data-p="${escAttr(acc)}">${esc(seg)}</span>`;
+  });
+  el.innerHTML = html;
+  el.querySelectorAll(".cr").forEach(c => c.onclick = () => fsNavigate(c.dataset.p));
+}
+
+async function fsNewFolder() {
+  if (!fsCurrent) { document.getElementById("fsSel").textContent = "open a folder first"; return; }
+  const name = prompt("New folder name in:\n" + fsCurrent);
+  if (!name) return;
+  const d = await fetch("/fs/mkdir", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({path: fsCurrent, name})}).then(r => r.json());
+  if (d.error) document.getElementById("fsSel").textContent = "error: " + d.error;
+  else fsNavigate(fsCurrent + "\\" + name);  // jump into the new folder
+}
+
 function useFsFolder() {
-  if (!fsCurrent) { document.getElementById("fsNote").textContent = "open a folder first"; return; }
+  if (!fsCurrent) { document.getElementById("fsSel").textContent = "open a folder first"; return; }
   document.getElementById("ws_root").value = fsCurrent;
   if (!document.getElementById("ws_name").value.trim())
     document.getElementById("ws_name").value = baseName(fsCurrent);

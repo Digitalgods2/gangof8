@@ -327,6 +327,21 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         dirs.sort(key=str.lower)
         return {"path": str(p), "parent": parent, "dirs": dirs}
 
+    def make_dir(self, path: str, name: str) -> dict:
+        """Create a sub-folder for the in-page browser's New-folder button, then
+        return the refreshed listing of the parent."""
+        name = (name or "").strip()
+        if not name or any(c in name for c in '<>:"/\\|?*'):
+            return {"error": "invalid folder name"}
+        base = Path(path)
+        if not base.is_dir():
+            return {"error": "parent is not a directory"}
+        try:
+            (base / name).mkdir(exist_ok=True)
+        except OSError as e:
+            return {"error": str(e)}
+        return self.list_dir(str(base))
+
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)
 
