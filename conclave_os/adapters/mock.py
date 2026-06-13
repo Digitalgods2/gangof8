@@ -56,7 +56,8 @@ FINAL_JSON = (
 class MockAdapter:
     name = "mock"
 
-    def call(self, role: Role, prompt: str, timeout_s: int) -> AdapterResult:
+    def call(self, role: Role, prompt: str, timeout_s: int,
+             images: list[dict] | None = None) -> AdapterResult:
         lower = prompt.lower()
         if role == Role.summarizer:
             content = FINAL_JSON

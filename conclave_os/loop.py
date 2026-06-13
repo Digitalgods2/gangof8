@@ -32,6 +32,7 @@ from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegist
 from .roles import build_council, plan_rounds
 from .sessions import SessionManager
 from .skills import get_skill
+from .uploads import image_inputs
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
@@ -39,6 +40,7 @@ AgentCall = Callable[[CouncilMember, str], Contribution]
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
     member: CouncilMember, prompt: str, timeout_s: int = 120, reserve: int = 0,
+    images: Optional[list[dict]] = None,
 ) -> Contribution:
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
@@ -49,7 +51,7 @@ def _agent_call(
             + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
         )
     try:
-        result = registry.call(member.agent, member.role, prompt, timeout_s)
+        result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
@@ -428,13 +430,15 @@ def _deliberate(
 
     start = time.monotonic()
     verdict: Optional[str] = None
+    # image attachments are shown to vision-capable agents on every call
+    images = image_inputs(store.data_dir, session.attachments)
 
     def call(member: CouncilMember, prompt: str) -> Contribution:
         return _agent_call(session, registry, store, member, prompt,
-                           reserve=config.COMPOSER_RESERVED_CALLS)
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
     def compose_call(member: CouncilMember, prompt: str) -> Contribution:
-        return _agent_call(session, registry, store, member, prompt)
+        return _agent_call(session, registry, store, member, prompt, images=images)
 
     try:
         for spec in plan[completed_rounds:]:

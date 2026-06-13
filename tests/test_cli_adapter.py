@@ -74,6 +74,35 @@ def test_non_json_raises(stub_run):
         CliAdapter("claude").call(Role.researcher, "x", timeout_s=30)
 
 
+def test_claude_vision_sends_image_content_block(stub_run, tmp_path):
+    img = tmp_path / "pic.png"
+    img.write_bytes(b"\x89PNG fake")
+    stream_out = "\n".join([
+        json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "VISIONTEST"}]}}),
+        json.dumps({"type": "result", "is_error": False, "result": "VISIONTEST"}),
+    ])
+    calls = stub_run(_Proc(stdout=stream_out))
+    out = CliAdapter("claude").call(
+        Role.researcher, "read the text", timeout_s=60,
+        images=[{"path": str(img), "media_type": "image/png"}],
+    )
+    assert out.content == "VISIONTEST"
+    # vision uses the stream-json input/output path
+    assert "stream-json" in calls["cmd"]
+    assert "--input-format" in calls["cmd"]
+    # the image is sent as a base64 content block in the message on stdin
+    msg = json.loads(calls["input"])
+    blocks = msg["message"]["content"]
+    assert any(b.get("type") == "image" for b in blocks)
+    assert any(b.get("type") == "text" for b in blocks)
+
+
+def test_claude_without_images_uses_plain_json(stub_run):
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "hi"})))
+    CliAdapter("claude").call(Role.researcher, "x", timeout_s=30)  # no images
+    assert "stream-json" not in calls["cmd"]
+
+
 def test_unknown_agent_raises():
     with pytest.raises(AgentError, match="unknown CLI agent"):
         CliAdapter("llama").call(Role.researcher, "x", timeout_s=30)

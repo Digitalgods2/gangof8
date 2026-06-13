@@ -13,6 +13,7 @@ Supported agents: claude (fully exercised), codex, gemini.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -32,16 +33,21 @@ class CliAdapter:
         self.name = name or agent
         self.model = model
 
-    def call(self, role: Role, prompt: str, timeout_s: int) -> AdapterResult:
+    def call(self, role: Role, prompt: str, timeout_s: int,
+             images: list[dict] | None = None) -> AdapterResult:
         t0 = time.monotonic()
-        runner = {
-            "claude": self._run_claude,
-            "codex": self._run_codex,
-            "gemini": self._run_gemini,
-        }.get(self.agent)
-        if runner is None:
+        if self.agent == "claude":
+            # only claude has a verified vision path; with images, send them as
+            # content blocks so the model actually sees them
+            content = self._run_claude_vision(prompt, images, timeout_s) if images \
+                else self._run_claude(prompt, timeout_s)
+        elif self.agent == "codex":
+            content = self._run_codex(prompt, timeout_s)  # text-only; images ignored
+        elif self.agent == "gemini":
+            content = self._run_gemini(prompt, timeout_s)  # text-only; images ignored
+        else:
             raise AgentError(f"unknown CLI agent: {self.agent!r}")
-        content = runner(prompt, timeout_s).strip()
+        content = content.strip()
         if not content:
             raise AgentError(f"{self.agent} CLI returned empty output")
         return AdapterResult(content=content, duration_ms=int((time.monotonic() - t0) * 1000))
@@ -81,6 +87,39 @@ class CliAdapter:
         if data.get("is_error"):
             raise AgentError(f"claude CLI error: {data.get('result') or data.get('subtype')}")
         return data.get("result") or ""
+
+    def _run_claude_vision(self, prompt: str, images: list[dict], timeout_s: int) -> str:
+        """Send the prompt + image content blocks via stream-json so the model
+        actually sees the images (verified: reads text, interprets content). No
+        tools enabled — the image is in the message, not fetched from disk."""
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for img in images:
+            try:
+                data = base64.b64encode(Path(img["path"]).read_bytes()).decode("ascii")
+            except OSError:
+                continue  # missing/unreadable image — skip, keep the text
+            content.append({
+                "type": "image",
+                "source": {"type": "base64",
+                           "media_type": img.get("media_type", "image/png"), "data": data},
+            })
+        message = {"type": "user", "message": {"role": "user", "content": content}}
+        cmd = ["claude", "-p", "--output-format", "stream-json",
+               "--input-format", "stream-json", "--verbose", "--tools", ""]
+        if self.model:
+            cmd += ["--model", self.model]
+        out = self._exec(cmd, json.dumps(message) + "\n", timeout_s)
+        result = ""
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                if ev.get("is_error"):
+                    raise AgentError(f"claude vision error: {ev.get('result') or ev.get('subtype')}")
+                result = ev.get("result") or result
+        return result
 
     def _run_gemini(self, prompt: str, timeout_s: int) -> str:
         # -p = non-interactive; plan approval-mode = read-only (no side effects).

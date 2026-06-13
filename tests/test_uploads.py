@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conclave_os.service import ConclaveService
-from conclave_os.uploads import UploadError, UploadStore, attachment_context
+from conclave_os.uploads import UploadError, UploadStore, attachment_context, image_inputs
 
 
 def _b64(s: str) -> str:
@@ -35,7 +35,7 @@ def test_save_image_stored_not_extracted(tmp_path):
     rec = store.save("pic.png", _b64("\x89PNG fake bytes"))
     assert rec["kind"] == "image"
     assert rec["chars"] == 0
-    assert "cannot view" in rec["note"]
+    assert "vision-capable" in rec["note"]
     assert (tmp_path / "uploads").exists()
 
 
@@ -64,6 +64,22 @@ def test_attachment_context_blocks(tmp_path):
     assert "hello world" in ctx
     assert "Attached image: p.jpg" in ctx
     assert attachment_context(store, []) == ""
+
+
+def test_image_inputs_resolves_supported_images(tmp_path):
+    store = UploadStore(tmp_path)
+    png = store.save("shot.png", _b64("pngbytes"))
+    svg = store.save("logo.svg", _b64("<svg/>"))
+    txt = store.save("a.txt", _b64("hi"))
+    atts = [
+        {"id": png["id"], "name": "shot.png", "kind": "image"},
+        {"id": svg["id"], "name": "logo.svg", "kind": "image"},   # unsupported → skipped
+        {"id": txt["id"], "name": "a.txt", "kind": "text"},        # not an image → skipped
+    ]
+    inputs = image_inputs(tmp_path, atts)
+    assert len(inputs) == 1
+    assert inputs[0]["media_type"] == "image/png"
+    assert inputs[0]["path"].endswith("shot.png")
 
 
 # ---- service + endpoint ------------------------------------------------------

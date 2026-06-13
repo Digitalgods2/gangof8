@@ -37,7 +37,8 @@ class AdapterResult(BaseModel):
 class Adapter(Protocol):
     name: str
 
-    def call(self, role: Role, prompt: str, timeout_s: int) -> AdapterResult: ...
+    def call(self, role: Role, prompt: str, timeout_s: int,
+             images: list[dict] | None = None) -> AdapterResult: ...
 
 
 class AgentRegistry:
@@ -50,11 +51,16 @@ class AgentRegistry:
     def names(self) -> list[str]:
         return sorted(self._adapters)
 
-    def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 120) -> AdapterResult:
+    def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 120,
+             images: list[dict] | None = None) -> AdapterResult:
         if agent not in self._adapters:
             raise KeyError(f"no adapter registered for agent '{agent}'")
         t0 = time.perf_counter()
-        result = self._adapters[agent].call(role, prompt, timeout_s)
+        adapter = self._adapters[agent]
+        # Only pass images when present, so adapters that don't take the kwarg
+        # (simple/text-only doubles) keep working unchanged.
+        result = adapter.call(role, prompt, timeout_s, images=images) if images \
+            else adapter.call(role, prompt, timeout_s)
         return self._normalize(result, t0)
 
     def resume(self, agent: str, resume_token: str, answer: str, timeout_s: int = 180) -> AdapterResult:
