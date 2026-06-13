@@ -154,3 +154,73 @@ def test_draft_without_marker_proposes_nothing(tmp_path):
     assert session.status == SessionStatus.done
     assert session.proposed_actions == []
     assert session.files_changed == []
+
+
+# --- multi-file artifacts + resume-after-approval -----------------------------
+
+MULTI_DRAFT = (
+    "Here is the app.\n"
+    "ARTIFACT: main.py\n"
+    "print('hello world')\n"
+    "ARTIFACT: README.md\n"
+    "# Hello App\nRun with python main.py\n"
+    "ARTIFACT: requirements.txt\n"
+    "fastapi\n"
+)
+
+
+class MultiArtifactAdapter:
+    """Implementer proposes several files; critic accepts the draft so
+    deliberation early-stops (exercising the resume guard) and never raises a
+    disagreement."""
+
+    name = "mock"
+
+    def __init__(self):
+        self._inner = MockAdapter()
+
+    def call(self, role, prompt, timeout_s):
+        if role == Role.implementer:
+            return AdapterResult(content=MULTI_DRAFT, duration_ms=1)
+        if role == Role.critic:
+            return AdapterResult(content="acceptable", duration_ms=1)
+        return self._inner.call(role, prompt, timeout_s)
+
+
+@pytest.fixture()
+def multi_service(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.registry.register(MultiArtifactAdapter())
+    return svc
+
+
+def test_multiple_artifacts_each_proposed(multi_service):
+    session = multi_service.run("Build a tiny app with main.py and a readme.", source="test")
+    assert session.status == SessionStatus.awaiting_approval
+    files = {a.filename for a in session.proposed_actions}
+    assert files == {"main.py", "README.md", "requirements.txt"}
+    # one approval per action, each linked back to its action
+    assert len([a for a in session.approvals if a.status == "pending"]) == 3
+    contents = {a.filename: a.content for a in session.proposed_actions}
+    assert contents["main.py"] == "print('hello world')"
+    assert "Hello App" in contents["README.md"]
+    assert "ARTIFACT:" not in contents["main.py"], "next marker is not swallowed into content"
+
+
+def test_multi_artifact_writes_all_after_approvals(multi_service, tmp_path):
+    session = multi_service.run("Build a tiny app with main.py and a readme.", source="test")
+    rounds_at_pause = len(session.rounds)
+    sid = session.session_id
+
+    # approve every pending gate; the session resumes when the last one clears
+    done = session
+    for approval in [a for a in session.approvals if a.status == "pending"]:
+        done = multi_service.approve(sid, approval.approval_id, approved=True)
+
+    assert done.status == SessionStatus.done
+    assert len(done.rounds) == rounds_at_pause, "resume must NOT re-run deliberation rounds"
+    sandbox = tmp_path / "artifacts" / sid
+    assert {p.name for p in sandbox.iterdir()} == {"main.py", "README.md", "requirements.txt"}
+    assert (sandbox / "main.py").read_text(encoding="utf-8") == "print('hello world')"
+    assert all(a.status == "executed" for a in done.proposed_actions)
+    assert len(done.files_changed) == 3

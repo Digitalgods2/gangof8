@@ -185,11 +185,28 @@ def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
 def draft_prompt(session: Session) -> str:
     return (
         f"Task: {session.task.text}\n"
-        "Your role: implementer. Draft the working result (answer, artifact, or plan).\n"
-        "If the task calls for producing a file (document, code, config), begin your "
-        "draft with a line 'ARTIFACT: <filename>' followed by the complete file "
-        "content. The file is only written after explicit human approval.\n"
-        f"Context so far:\n{_recent_context(session, limit=5)}"
+        "Your role: implementer. Produce the ACTUAL working result, not a description "
+        "of it. If the task calls for files (code, docs, config), emit each file "
+        "literally in this format, with its COMPLETE contents — never a summary of what "
+        "the file would contain:\n"
+        "ARTIFACT: <filename>\n"
+        "<full file contents>\n"
+        "ARTIFACT: <next filename>\n"
+        "<full file contents>\n"
+        "Use one ARTIFACT block per file and include EVERY file the task asks for. Do "
+        "not describe the files in prose — write them out in full. They are saved for "
+        "you only after human approval, so you need no filesystem access yourself.\n"
+        "Example of the exact format:\n"
+        "ARTIFACT: main.py\n"
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "@app.get('/')\n"
+        "def root():\n"
+        "    return {'message': 'Hello, World!'}\n"
+        "ARTIFACT: requirements.txt\n"
+        "fastapi\n"
+        "uvicorn\n"
+        f"\nContext so far:\n{_recent_context(session, limit=5)}"
     )
 
 
@@ -374,6 +391,12 @@ def _deliberate(
     # skip the rounds that already ran
     plan = plan_rounds(cls, council, session.budgets)
     completed_rounds = len(session.rounds)
+    # If proposals were already collected, deliberation finished and we paused
+    # in the action gate (step 7b). On resume, do NOT re-run the remaining
+    # planned rounds (deliberation can early-stop on an accepted draft, leaving
+    # rounds unrun) — fall straight through to execution/compose.
+    if session.proposed_actions:
+        completed_rounds = len(plan)
     manager.transition(session, SessionStatus.deliberating)
 
     start = time.monotonic()
@@ -501,8 +524,11 @@ _ARTIFACT_MARKER = re.compile(
 
 
 def _collect_proposals(session: Session, store: LogStore) -> None:
-    """Turn the implementer's final draft into a ProposedAction (loop step 7b).
-    Idempotent: proposals survive a pause and are not re-collected on resume."""
+    """Turn the implementer's final draft into one ProposedAction per
+    'ARTIFACT: <filename>' block (loop step 7b). Each block's content runs from
+    its marker to the next marker (or end of draft); leading framing prose
+    before the first marker is dropped. Idempotent: proposals survive a pause
+    and are not re-collected on resume."""
     if session.proposed_actions:
         return
     draft = next(
@@ -510,24 +536,27 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     )
     if draft is None:
         return
-    m = _ARTIFACT_MARKER.search(draft.content)
-    if not m:
+    markers = list(_ARTIFACT_MARKER.finditer(draft.content))
+    if not markers:
         return
-    content = (draft.content[: m.start()] + draft.content[m.end():]).strip()
-    action = ProposedAction(
-        session_id=session.session_id,
-        kind="write_file",
-        role=Role.implementer,
-        filename=m.group(1),
-        content=content,
-        args={"filename": m.group(1), "content": content},
-    )
-    session.proposed_actions.append(action)
-    store.log_event(
-        session.session_id, "action_proposed",
-        {"action_id": action.action_id, "kind": action.kind,
-         "filename": action.filename, "chars": len(action.content)},
-    )
+    for i, m in enumerate(markers):
+        filename = m.group(1).strip()
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(draft.content)
+        content = draft.content[m.end():end].strip()
+        action = ProposedAction(
+            session_id=session.session_id,
+            kind="write_file",
+            role=Role.implementer,
+            filename=filename,
+            content=content,
+            args={"filename": filename, "content": content},
+        )
+        session.proposed_actions.append(action)
+        store.log_event(
+            session.session_id, "action_proposed",
+            {"action_id": action.action_id, "kind": action.kind,
+             "filename": action.filename, "chars": len(action.content)},
+        )
 
 
 def _execute_actions(
