@@ -39,10 +39,11 @@
   .pill.deliberating, .pill.composing, .pill.received, .pill.classified
        { background:#1d2a3a; color:var(--accent); }
   /* ---- bottom-center chat composer ---- */
-  #composer { position:fixed; left:50%; transform:translateX(-50%); bottom:18px;
-              width:min(1100px, 96vw); background:var(--panel); border:1px solid var(--line);
-              border-radius:14px; padding:14px 16px; z-index:60;
-              box-shadow:0 8px 30px rgba(0,0,0,.45); }
+  /* anchored to the right working panel (left rail is 430px) and centered in it */
+  #composer { position:fixed; bottom:18px; left:430px; right:0; margin:0 auto;
+              width:min(1000px, calc(100vw - 478px)); background:var(--panel);
+              border:1px solid var(--line); border-radius:14px; padding:14px 16px;
+              z-index:60; box-shadow:0 8px 30px rgba(0,0,0,.45); }
   #attachments { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
   #attachments:empty { display:none; }
   .chip { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text);
