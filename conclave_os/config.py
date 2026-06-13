@@ -89,3 +89,10 @@ COMPOSER_PROSE_MIN_CHARS = 200
 # already produced. Give it the tail of the deliberation in full-enough form.
 COMPOSER_CONTEXT_CONTRIBUTIONS = 6
 COMPOSER_CONTEXT_CHARS = 1400
+
+# In-deliberation skill requests: an agent may emit 'SKILL: <name> <arg>' to
+# pull a no-approval capability (e.g. read_file) mid-round. Bound how many it
+# can request per turn and how much result text is fed back, so a turn can't
+# balloon the prompt or the budget.
+MAX_SKILL_REQUESTS_PER_TURN = 2
+SKILL_RESULT_MAX_CHARS = 2000

@@ -31,6 +31,7 @@ from .models import (
 from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegistry
 from .roles import build_council, plan_rounds
 from .sessions import SessionManager
+from .skills import get_skill
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
@@ -80,14 +81,93 @@ def _recent_context(session: Session, limit: int = 3) -> str:
     return "\n".join(parts) if parts else "(none yet)"
 
 
-def build_prompt(session: Session, spec: RoundSpec, role: Role) -> str:
+def _readable_files(session: Session, data_dir) -> list[str]:
+    """Files already saved in this session's artifacts sandbox — the only
+    things an agent may pull mid-deliberation via the read_file skill."""
+    d = executor.artifacts_dir(data_dir, session.session_id)
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.is_file())
+
+
+def build_prompt(
+    session: Session, spec: RoundSpec, role: Role, readable: list[str] = ()
+) -> str:
+    cap = ""
+    if readable and role in (Role.researcher, Role.implementer):
+        cap = (
+            "You may read a file already saved in this session by writing a line "
+            "'SKILL: read_file <name>' (the file's contents are returned to you, no "
+            f"approval needed). Available files: {', '.join(readable)}.\n"
+        )
     return (
         f"Task: {session.task.text}\n"
         f"Round {spec.round} objective: {spec.goal}\n"
         f"Your role: {role.value}. Answer only from this role.\n"
         f"Output requirement: {spec.output_requirement}\n"
+        f"{cap}"
         f"Context so far:\n{_recent_context(session)}"
     )
+
+
+# An agent pulls a no-approval capability mid-round with a plain-text line
+# 'SKILL: <name> <arg>' (bullets, bold, and :—–- separators tolerated — the
+# same envelope-surviving style as ARTIFACT:/DISAGREEMENT:).
+_SKILL_REQUEST_MARKER = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?SKILL(?:\*\*)?\s*[:—–-]\s*(?:\*\*)?\s*(\w+)\s+(.+?)\s*(?:\*\*)?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _resolve_skill_requests(
+    session: Session, member: CouncilMember, prompt: str, contribution: Contribution,
+    call: AgentCall, governance: Governance, store: LogStore,
+) -> Contribution:
+    """If the agent requested no-approval skills (SKILL: <name> <arg>), run each
+    through the permission kernel, execute the authorized ones, and re-call the
+    agent ONCE with the results appended so it can use them. Approval-gated
+    skills (write_file) are NOT honored here — those go through the ARTIFACT
+    proposal path. Returns the (possibly re-called) contribution."""
+    reqs = _SKILL_REQUEST_MARKER.findall(contribution.content)
+    if not reqs:
+        return contribution
+    sid = session.session_id
+    results: list[str] = []
+    for raw_name, arg in reqs[: config.MAX_SKILL_REQUESTS_PER_TURN]:
+        name, arg = raw_name.lower(), arg.strip()
+        store.log_event(sid, "skill_requested",
+                        {"skill": name, "role": member.role.value, "arg": arg})
+        skill = get_skill(name)
+        if skill is None:
+            results.append(f"SKILL {name}: unknown skill")
+            continue
+        if skill.requires_approval:
+            results.append(
+                f"SKILL {name}: not available mid-deliberation (requires approval) — "
+                "produce it as an ARTIFACT instead")
+            continue
+        action = ProposedAction(session_id=sid, kind=name, args={"filename": arg}, role=member.role)
+        governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
+        session.proposed_actions.append(action)
+        if action.status == "denied":
+            results.append(f"SKILL {name}: denied — {action.error}")
+            continue
+        try:
+            out = executor.execute(session, action, store.data_dir)
+            action.status = "executed"
+            session.tools_called.append(name)
+            store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
+            results.append(f"SKILL {name} '{arg}' result:\n{out[: config.SKILL_RESULT_MAX_CHARS]}")
+        except ExecutionError as e:
+            action.status = "failed"
+            action.error = str(e)
+            store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
+            results.append(f"SKILL {name}: error — {e}")
+    followup = (
+        f"{prompt}\n\nSkill results (use these; do not request them again):\n"
+        + "\n\n".join(results)
+    )
+    return call(member, followup)
 
 
 def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
@@ -315,13 +395,16 @@ def _deliberate(
             store.log_event(sid, "round_start", spec.model_dump())
 
             # 5. Run agent round
+            readable = _readable_files(session, store.data_dir)
             for role in spec.agents:
                 member = council.get(role)
                 if not (member and member.active):
                     continue
                 for _ in range(spec.max_turns):
                     governance.check(session, "generate_text")
-                    c = call(member, build_prompt(session, spec, role))
+                    p = build_prompt(session, spec, role, readable)
+                    c = call(member, p)
+                    c = _resolve_skill_requests(session, member, p, c, call, governance, store)
                     if c.content.strip():  # output requirement met (Phase 0: non-empty)
                         break
 
