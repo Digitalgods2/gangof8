@@ -17,8 +17,16 @@ from typing import Callable, Optional
 
 from pydantic import BaseModel
 
+from . import config
 from .executor import ExecutionError, _safe_filename, artifacts_dir, resolve_in_workspace
 from .models import ProposedAction, Risk, Role, Session
+
+# Directories never worth searching (vendored / generated / VCS noise).
+_SEARCH_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env",
+    "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+    ".idea", ".vscode", ".next", "target",
+}
 
 
 class Skill(BaseModel):
@@ -88,6 +96,62 @@ def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _search_root(session: Session, data_dir: Path) -> Path:
+    if session.workspace_root:
+        return Path(session.workspace_root)
+    return artifacts_dir(data_dir, session.session_id)
+
+
+def _search_project(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Search the workspace (or session sandbox) for a string in file names and
+    contents — a bounded, read-only grep so agents can see existing code before
+    writing. Returns matching file names and `path:line: text` content hits."""
+    query = _arg(action, "query").strip()
+    if not query:
+        raise ExecutionError("search_project requires a non-empty query")
+    root = _search_root(session, data_dir).resolve()
+    if not root.is_dir():
+        return f"No project directory to search for {query!r}."
+
+    q = query.lower()
+    name_hits: list[str] = []
+    matches: list[str] = []
+    scanned = 0
+    for p in sorted(root.rglob("*")):
+        if any(part in _SEARCH_SKIP_DIRS for part in p.relative_to(root).parts):
+            continue
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if q in rel.lower():
+            name_hits.append(rel)
+        if scanned >= config.SEARCH_MAX_FILES or len(matches) >= config.SEARCH_MAX_MATCHES:
+            continue
+        try:
+            if p.stat().st_size > config.SEARCH_MAX_FILE_BYTES:
+                continue
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable / binary
+        scanned += 1
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if q in line.lower():
+                matches.append(f"  {rel}:{lineno}: {line.strip()[:200]}")
+                if len(matches) >= config.SEARCH_MAX_MATCHES:
+                    break
+
+    if not name_hits and not matches:
+        return f"No matches for {query!r} in {root.name or 'the project'}."
+    parts = []
+    if name_hits:
+        shown = name_hits[:30]
+        parts.append("Files with matching names:\n" + "\n".join(f"  {n}" for n in shown)
+                     + ("\n  …" if len(name_hits) > len(shown) else ""))
+    if matches:
+        parts.append(f"Content matches ({len(matches)}):\n" + "\n".join(matches))
+    return "\n\n".join(parts)[: config.SEARCH_RESULT_MAX_CHARS]
+
+
 SKILLS: dict[str, Skill] = {
     "write_file": Skill(
         name="write_file",
@@ -100,18 +164,28 @@ SKILLS: dict[str, Skill] = {
     ),
     "read_file": Skill(
         name="read_file",
-        description="Read a file from the session's artifacts sandbox.",
+        description="Read a file from the workspace (or the session's sandbox).",
         category="read",
         risk=Risk.low,
         requires_approval=False,
         allowed_roles=[Role.researcher, Role.implementer],
         inputs=["filename"],
     ),
+    "search_project": Skill(
+        name="search_project",
+        description="Search the workspace for a string in file names and contents.",
+        category="read",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        inputs=["query"],
+    ),
 }
 
 HANDLERS: dict[str, Handler] = {
     "write_file": _write_file,
     "read_file": _read_file,
+    "search_project": _search_project,
 }
 
 

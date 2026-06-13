@@ -80,6 +80,24 @@ def test_resolved_read_recalls_agent_with_content(tmp_path, store, governance, s
     assert "read_file" in session.tools_called
 
 
+def test_search_project_request_maps_query_arg(tmp_path, store, governance, session):
+    # a workspace with a file the query should hit
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "main.py").write_text("import fastapi\n", encoding="utf-8")
+    session.workspace_root = str(root)
+    member = _member(Role.researcher)
+    contribution = _contribution(Role.researcher, "Let me look first.\nSKILL: search_project fastapi")
+    call, prompts = _recording_call()
+
+    loop._resolve_skill_requests(session, member, "ORIGINAL", contribution, call, governance, store)
+
+    assert "main.py:1:" in prompts[0], "search result (path:line) is fed back to the agent"
+    act = [a for a in session.proposed_actions if a.kind == "search_project"][0]
+    assert act.args == {"query": "fastapi"}  # positional arg mapped to the skill's input
+    assert act.status == "executed"
+
+
 def test_no_marker_is_a_noop(tmp_path, store, governance, session):
     member = _member(Role.researcher)
     contribution = _contribution(Role.researcher, "Just a normal answer, no skills.")
