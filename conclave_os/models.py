@@ -177,14 +177,22 @@ class ApprovalRequest(BaseModel):
 
 class ProposedAction(BaseModel):
     """A concrete side effect an agent wants — never executed without an
-    explicitly approved ApprovalRequest. Phase 4 supports kind='write_file'
-    into the session's sandboxed artifacts folder only."""
+    explicitly approved ApprovalRequest (unless the skill's metadata declares
+    no approval needed). The `kind` names a skill in the registry-driven
+    permission kernel (conclave_os.skills); the kernel role-gates and gates on
+    that skill's metadata rather than on hardcoded write_file literals.
+
+    `args` carries the skill inputs (preferred); `filename`/`content` remain for
+    back-compat with the write_file artifact path. `role` is the proposing role,
+    so the kernel can role-gate the action."""
 
     action_id: str = Field(default_factory=lambda: f"act_{short_id()}")
     session_id: str
     kind: str = "write_file"
-    filename: str
-    content: str
+    role: Role = Role.implementer
+    args: dict[str, str] = {}
+    filename: str = ""
+    content: str = ""
     status: str = "proposed"  # proposed | awaiting_approval | approved | denied | executed | failed
     approval_id: Optional[str] = None
     result_path: Optional[str] = None

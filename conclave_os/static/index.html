@@ -70,6 +70,49 @@
           color:var(--dim); }
   .seat.on { border-color:var(--accent); color:var(--accent); }
   .seat.spoke { border-color:var(--ok); color:var(--ok); }
+  .card.summary { border-color:var(--accent); background:#15202e; }
+  .card.summary pre { margin:0; }
+  .stats { display:flex; flex-wrap:wrap; gap:6px 14px; color:var(--dim); font-size:12.5px;
+           margin-top:6px; }
+  .stats b { color:var(--text); font-weight:600; }
+  .ruling { color:var(--dim); font-size:12.5px; margin-top:6px; }
+  .collapse > .chd { display:flex; gap:8px; align-items:center; cursor:pointer;
+                     user-select:none; }
+  .collapse > .chd:hover h3 { color:var(--text); }
+  .collapse > .chd h3 { margin:0; flex:1; }
+  .collapse > .chd .tw { color:var(--dim); font-size:11px; transition:transform .12s ease;
+                         flex:none; }
+  .collapse.open > .chd .tw { transform:rotate(90deg); }
+  .collapse > .body { display:none; margin-top:4px; }
+  .collapse.open > .body { display:block; }
+
+  /* ---- settings panel (overlay, independent of the session view) ---- */
+  header .gear { margin-left:auto; background:transparent; border:1px solid var(--line);
+                 color:var(--dim); font-size:15px; padding:4px 10px; line-height:1; }
+  header .gear:hover { color:var(--text); border-color:var(--accent); }
+  #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
+                     display:none; z-index:50; }
+  #settingsOverlay.open { display:block; }
+  #settingsPanel { position:absolute; top:0; right:0; height:100%; width:520px;
+                   max-width:100%; background:var(--bg); border-left:1px solid var(--line);
+                   overflow-y:auto; padding:18px 22px; box-shadow:-8px 0 24px rgba(0,0,0,.4); }
+  #settingsPanel h2 { font-size:16px; margin:0 0 4px; }
+  #settingsPanel .shead { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+  #settingsPanel .shead .x { margin-left:auto; }
+  .sset { margin-bottom:18px; }
+  .sset > label { display:block; font-size:11px; color:var(--dim); text-transform:uppercase;
+                  letter-spacing:.5px; margin-bottom:8px; }
+  .field { display:flex; align-items:center; gap:8px; margin-top:6px; }
+  .field span { flex:0 0 150px; color:var(--dim); font-size:12.5px; }
+  .field input[type=text], .field input[type=number], .field select, .field input[type=password] {
+      flex:1; background:var(--panel); color:var(--text); border:1px solid var(--line);
+      border-radius:6px; padding:5px 8px; font-size:12.5px; min-width:0; }
+  .field input[type=checkbox] { transform:scale(1.1); }
+  .keyrow { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12.5px; }
+  .keyrow .kn { flex:0 0 120px; color:var(--text); }
+  .keyrow .kstat { color:var(--dim); flex:1; font-family:Consolas, monospace; }
+  .keyrow .kstat.set { color:var(--ok); }
+  #savedNote { color:var(--ok); font-size:12px; margin-left:8px; }
 </style>
 </head>
 <body>
@@ -77,7 +120,22 @@
   <h1>Conclave OS</h1>
   <span class="sub" id="backend">backend: …</span>
   <span class="sub">human authority preserved — nothing executes without your approval</span>
+  <button class="gear" title="Settings" onclick="openSettings()">⚙</button>
 </header>
+
+<div id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
+  <div id="settingsPanel">
+    <div class="shead">
+      <h2>Settings</h2>
+      <button class="ghost x" onclick="closeSettings()">Close</button>
+    </div>
+    <div id="settingsBody"><div class="empty">Loading…</div></div>
+    <div class="row">
+      <button onclick="saveSettings()">Save settings</button>
+      <span id="savedNote"></span>
+    </div>
+  </div>
+</div>
 <main>
   <div id="left">
     <textarea id="task" placeholder="Describe a task for the council…"></textarea>
@@ -92,6 +150,34 @@
 <script>
 let current = null;
 let liveKey = null, liveSince = 0;  // drives the ticking elapsed timer
+// Expand/collapse state for rollup sections, keyed by stable id (e.g.
+// "sec_contributions"). Tracked here rather than read off the DOM because
+// renderDetail() rebuilds #right.innerHTML every 3s, which would otherwise
+// snap every collapsible shut. The header click handler toggles this map and
+// re-renders, so open/closed state survives each poll deterministically.
+let openSections = {};
+
+function toggleSection(key) {
+  openSections[key] = !openSections[key];
+  const el = document.querySelector(`.collapse[data-sec="${key}"]`);
+  if (el) el.classList.toggle("open", openSections[key]);
+}
+
+// Render a collapsible block. `key` is the persistent section id, `summary`
+// the informative header text shown even when collapsed, `body` the full HTML
+// revealed on expand. `defaultOpen` seeds first-seen state (e.g. while live).
+function collapsible(key, summary, body, defaultOpen) {
+  if (!(key in openSections)) openSections[key] = !!defaultOpen;
+  const open = openSections[key];
+  return `
+    <div class="card collapse ${open ? "open" : ""}" data-sec="${key}">
+      <div class="chd" onclick="toggleSection('${key}')">
+        <span class="tw">▶</span>
+        <h3>${summary}</h3>
+      </div>
+      <div class="body">${body}</div>
+    </div>`;
+}
 
 const esc = s => (s ?? "").toString()
   .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
@@ -174,12 +260,60 @@ function renderDetail(s) {
   const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${waitRole}` : null;
   if (key !== liveKey) { liveKey = key; liveSince = working ? Date.now() : 0; }
 
+  // ---- client-side rollup stats (no walls of text) ----
+  const contribs = s.contributions || [];
+  const disagreements = s.disagreements || [];
+  const byAgent = {};
+  contribs.forEach(c => { byAgent[c.agent] = (byAgent[c.agent] || 0) + 1; });
+  const agentCount = Object.keys(byAgent).length;
+  const roundCount = (s.rounds || []).length ||
+    new Set(contribs.map(c => c.round)).size;
+  const calls = s.agent_calls ?? contribs.length;
+  // "7 agent calls · 3 agents · 4 disagreements · 2 rounds"
+  const statBits = [];
+  if (calls) statBits.push(`<b>${calls}</b> agent call${calls === 1 ? "" : "s"}`);
+  if (agentCount) statBits.push(`<b>${agentCount}</b> agent${agentCount === 1 ? "" : "s"}`);
+  if (disagreements.length) statBits.push(`<b>${disagreements.length}</b> disagreement${disagreements.length === 1 ? "" : "s"}`);
+  if (roundCount) statBits.push(`<b>${roundCount}</b> round${roundCount === 1 ? "" : "s"}`);
+
+  // per-agent breakdown e.g. "gemini ×2, codex ×4"
+  const agentBreak = Object.entries(byAgent)
+    .map(([a, n]) => `${esc(a)} ×${n}`).join(", ");
+
+  // ruling rollup e.g. "all ruled on evidence" / "3 on evidence, 1 on constraint"
+  let rulingSummary = "";
+  if (disagreements.length) {
+    const byBasis = {};
+    disagreements.forEach(d => {
+      const b = d.ruling_basis || "unspecified";
+      byBasis[b] = (byBasis[b] || 0) + 1;
+    });
+    const bases = Object.entries(byBasis);
+    if (bases.length === 1) rulingSummary = `all ruled on ${esc(bases[0][0])}`;
+    else rulingSummary = bases.map(([b, n]) => `${n} on ${esc(b)}`).join(", ");
+  }
+
+  const showSummary = !!final || contribs.length || disagreements.length;
+  // finished sessions collapse by default; live ones expand so progress shows
+  const collapseDefault = working;
+
   right.innerHTML = `
     <div class="card">
       <h3>Task — <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
           ${s.stop_reason ? `<span class="sub"> · ${esc(s.stop_reason)}</span>` : ""}</h3>
       <div class="mono">${esc(s.task?.text)}</div>
     </div>
+
+    ${showSummary ? `
+      <div class="card summary">
+        <h3>Summary</h3>
+        ${final ? `
+          <div class="row" style="margin-top:0"><span class="conf-${esc(final.confidence)}">${esc(final.confidence)} confidence</span></div>
+          <pre>${esc(final.answer)}</pre>` : ``}
+        ${statBits.length ? `<div class="stats">${statBits.join("<span>·</span>")}</div>` : ``}
+        ${agentBreak ? `<div class="ruling">${agentBreak}</div>` : ``}
+        ${rulingSummary ? `<div class="ruling">disagreements — ${rulingSummary}</div>` : ``}
+      </div>` : ``}
 
     ${working ? `
       <div class="card live">
@@ -219,10 +353,8 @@ function renderDetail(s) {
         </div>
       </div>`).join("")}
 
-    ${final ? `
+    ${final && (final.assumptions?.length || final.risks_unresolved?.length || final.next_action) ? `
       <div class="card">
-        <h3>Final answer — <span class="conf-${esc(final.confidence)}">${esc(final.confidence)} confidence</span></h3>
-        <pre>${esc(final.answer)}</pre>
         ${final.assumptions?.length ? `<h3>Assumptions</h3><ul>${final.assumptions.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>` : ""}
         ${final.risks_unresolved?.length ? `<h3>Risks / unresolved</h3><ul>${final.risks_unresolved.map(x=>`<li>${esc(x)}</li>`).join("")}</ul>` : ""}
         ${final.next_action ? `<h3>Next action</h3><div>${esc(final.next_action)}</div>` : ""}
@@ -232,9 +364,9 @@ function renderDetail(s) {
       <div class="card"><h3>Files written</h3>
         <ul>${s.files_changed.map(f=>`<li class="mono">${esc(f)}</li>`).join("")}</ul></div>` : ""}
 
-    ${(s.disagreements||[]).length ? `
-      <div class="card"><h3>Disagreements (${s.disagreements.length})</h3>
-        ${s.disagreements.map(d => `
+    ${disagreements.length ? collapsible("sec_disagreements",
+        `Disagreements (${disagreements.length})${rulingSummary ? ` — ${rulingSummary}` : ""}`,
+        disagreements.map(d => `
           <div class="contrib">
             <div class="hd"><span class="who">${esc(d.topic)}</span>
               <span class="len">ruled on ${esc(d.ruling_basis)}</span></div>
@@ -242,17 +374,19 @@ function renderDetail(s) {
               <ul>${(d.positions||[]).map(p=>`<li><b>${esc(p.role)}:</b> ${esc(p.claim)}</li>`).join("")}</ul>
               ${d.critic_test ? `<div class="mono">${esc(d.critic_test)}</div>` : ""}
             </div>
-          </div>`).join("")}</div>` : ""}
+          </div>`).join(""),
+        collapseDefault) : ""}
 
-    ${(s.contributions||[]).length ? `
-      <div class="card"><h3>Contributions (${s.contributions.length}, ${s.agent_calls} agent calls)</h3>
-        ${s.contributions.map(c => `
+    ${contribs.length ? collapsible("sec_contributions",
+        `Contributions (${contribs.length})${agentBreak ? ` — ${agentBreak}` : ""}`,
+        contribs.map(c => `
           <div class="contrib">
             <div class="hd"><span class="rnd">r${c.round}</span>
               <span class="who">${esc(c.role)} · ${esc(c.agent)}</span>
               <span class="len">${(c.content||"").length} chars</span></div>
             <pre>${esc(c.content)}</pre>
-          </div>`).join("")}</div>` : ""}
+          </div>`).join(""),
+        collapseDefault) : ""}
   `;
 
   // Restore answer-in-progress + scroll position that survived this re-render.
@@ -294,6 +428,179 @@ async function declineInput(iid) {
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({decline:true})});
   refresh();
+}
+
+// ============================ Settings panel ============================
+// Self-contained: its own open/close + render, sharing only esc/api helpers.
+// Opening overlays the dashboard; closing returns to it untouched.
+const ROLES = ["researcher", "architect", "critic", "implementer", "summarizer"];
+let settingsCache = null, seatsCache = [];
+
+async function openSettings() {
+  document.getElementById("settingsOverlay").classList.add("open");
+  document.getElementById("savedNote").textContent = "";
+  document.getElementById("settingsBody").innerHTML = '<div class="empty">Loading…</div>';
+  const [settings, seatsResp, keysResp] = await Promise.all([
+    api("/settings"),
+    api("/settings/seats").catch(() => ({seats: []})),
+    api("/settings/api-keys").catch(() => ({keys: {}})),
+  ]);
+  settingsCache = settings;
+  seatsCache = seatsResp.seats || [];
+  renderSettings(settings, seatsCache, keysResp);
+}
+
+function closeSettings() {
+  document.getElementById("settingsOverlay").classList.remove("open");
+}
+
+function seatOptions(selected) {
+  const names = seatsCache.map(s => s.name).filter(Boolean);
+  const opts = ['<option value="">(backend default)</option>'].concat(
+    names.map(n => `<option value="${esc(n)}" ${n === selected ? "selected" : ""}>${esc(n)}</option>`)
+  );
+  // include a current value that isn't in the seat list, so it isn't lost
+  if (selected && !names.includes(selected)) {
+    opts.push(`<option value="${esc(selected)}" selected>${esc(selected)} (current)</option>`);
+  }
+  return opts.join("");
+}
+
+function renderSettings(s, seats, keysResp) {
+  const c = s.composer || {};
+  const ui = s.ui || {};
+  const ra = s.role_agents || {};
+  const seatErr = (seats === seatsCache && seatsCache.length === 0)
+    ? '<div class="sub" style="margin-top:4px">no seats — Switchboard unreachable</div>' : "";
+  const keys = (keysResp && keysResp.keys) || {};
+  const keyErr = keysResp && keysResp.error
+    ? '<div class="sub" style="margin-top:4px">Switchboard unreachable</div>' : "";
+
+  const keyRows = Object.entries(keys).map(([name, info]) => `
+    <div class="keyrow">
+      <span class="kn">${esc(name)}</span>
+      <span class="kstat ${info && info.set ? "set" : ""}">${info && info.set ? esc(info.masked || "set") : "not set"}</span>
+      <button class="ghost" onclick="revealKey('${esc(name)}')">Reveal</button>
+    </div>`).join("");
+
+  document.getElementById("settingsBody").innerHTML = `
+    <div class="sset">
+      <label>Backend</label>
+      <div class="field"><span>Backend</span>
+        <select id="set_backend">
+          <option value="mock" ${s.backend === "mock" ? "selected" : ""}>mock</option>
+          <option value="switchboard" ${s.backend === "switchboard" ? "selected" : ""}>switchboard</option>
+        </select></div>
+      <div class="field"><span>Switchboard URL</span>
+        <input type="text" id="set_url" value="${esc(s.switchboard_url)}"></div>
+    </div>
+
+    <div class="sset">
+      <label>Role mapping → seat</label>
+      ${ROLES.map(r => `
+        <div class="field"><span>${esc(r)}</span>
+          <select id="role_${r}">${seatOptions(ra[r] || "")}</select></div>`).join("")}
+      ${seatErr}
+    </div>
+
+    <div class="sset">
+      <label>Governance / composer</label>
+      <div class="field"><span>Risk boundary</span>
+        <select id="set_risk">
+          ${["none","low","medium","high"].map(rk =>
+            `<option value="${rk}" ${s.risk_boundary === rk ? "selected" : ""}>${rk}</option>`).join("")}
+        </select></div>
+      <div class="field"><span>Prose min chars</span>
+        <input type="number" id="set_prose" value="${esc(c.prose_min_chars)}"></div>
+      <div class="field"><span>Reserved calls</span>
+        <input type="number" id="set_reserved" value="${esc(c.reserved_calls)}"></div>
+      <div class="field"><span>Max critic tests</span>
+        <input type="number" id="set_critic" value="${esc(c.max_critic_tests)}"></div>
+    </div>
+
+    <div class="sset">
+      <label>UI preferences</label>
+      <div class="field"><span>Poll interval (ms)</span>
+        <input type="number" id="set_poll" value="${esc(ui.poll_interval_ms)}"></div>
+      <div class="field"><span>Collapse finished</span>
+        <input type="checkbox" id="set_collapse" ${ui.collapse_finished ? "checked" : ""}></div>
+    </div>
+
+    <div class="sset">
+      <label>API keys (stored in the Switchboard, never here)</label>
+      ${keyRows || '<div class="sub">no keys reported</div>'}
+      ${keyErr}
+      <div class="field" style="margin-top:10px"><span>Set / update key</span>
+        <input type="text" id="key_name" placeholder="seat / provider name" style="flex:0 0 160px">
+        <input type="password" id="key_value" placeholder="key value (not echoed)">
+        <button onclick="setKey()">Set</button>
+      </div>
+    </div>`;
+}
+
+function _num(id, fallback) {
+  const v = parseInt(document.getElementById(id).value, 10);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+async function saveSettings() {
+  const note = document.getElementById("savedNote");
+  const role_agents = {};
+  ROLES.forEach(r => {
+    const v = document.getElementById("role_" + r).value;
+    if (v) role_agents[r] = v;  // empty ⇒ backend default
+  });
+  const patch = {
+    backend: document.getElementById("set_backend").value,
+    switchboard_url: document.getElementById("set_url").value.trim(),
+    role_agents,
+    risk_boundary: document.getElementById("set_risk").value,
+    composer: {
+      prose_min_chars: _num("set_prose", 200),
+      reserved_calls: _num("set_reserved", 2),
+      max_critic_tests: _num("set_critic", 3),
+    },
+    ui: {
+      poll_interval_ms: _num("set_poll", 3000),
+      collapse_finished: document.getElementById("set_collapse").checked,
+    },
+  };
+  const r = await fetch("/settings", {method: "PUT",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
+  if (r.ok) {
+    note.textContent = "saved ✓";
+    settingsCache = await r.json();
+    loadHealth();  // header backend label may have changed
+  } else {
+    note.style.color = "var(--bad)";
+    note.textContent = "save failed";
+  }
+}
+
+async function setKey() {
+  const name = document.getElementById("key_name").value.trim();
+  const value = document.getElementById("key_value").value;
+  const note = document.getElementById("savedNote");
+  if (!name || !value) { note.textContent = "name + value required"; return; }
+  const r = await fetch("/settings/api-keys/" + encodeURIComponent(name), {
+    method: "PUT", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({value})});
+  document.getElementById("key_value").value = "";  // never keep the secret around
+  if (r.ok) {
+    note.textContent = "key saved ✓";
+    const keysResp = await api("/settings/api-keys").catch(() => ({keys: {}}));
+    renderSettings(settingsCache, seatsCache, keysResp);
+  } else {
+    note.style.color = "var(--bad)";
+    note.textContent = "key save failed";
+  }
+}
+
+async function revealKey(name) {
+  const r = await fetch("/settings/api-keys/" + encodeURIComponent(name) + "/reveal");
+  if (!r.ok) { alert("reveal failed"); return; }
+  const d = await r.json();
+  alert(name + ": " + (d.value || "(empty)"));  // shown on demand only; not logged
 }
 
 loadHealth();

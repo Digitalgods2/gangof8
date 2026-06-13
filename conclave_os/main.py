@@ -136,3 +136,75 @@ def get_session(session_id: str) -> dict:
     return data
 
 
+# ---- Settings / preferences / API keys ---------------------------------------
+
+
+class SettingsPatch(BaseModel):
+    # All optional — a partial patch. Unknown keys are ignored by the service.
+    backend: str | None = None
+    switchboard_url: str | None = None
+    role_agents: dict[str, str] | None = None
+    budgets: dict[str, dict] | None = None
+    risk_boundary: str | None = None
+    composer: dict | None = None
+    ui: dict | None = None
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    """Current effective settings plus the role→agent mapping actually in use."""
+    data = service.settings.model_dump()
+    data["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
+    data["effective_backend"] = service.backend
+    return data
+
+
+@app.put("/settings")
+def put_settings(body: SettingsPatch) -> dict:
+    """Apply a partial settings patch, persist it, and return the new settings.
+    Backend / role-mapping changes take effect for new sessions; sessions
+    already running keep the backend they started on."""
+    patch = body.model_dump(exclude_none=True)
+    try:
+        service.update_settings(patch)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    out = service.settings.model_dump()
+    out["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
+    out["effective_backend"] = service.backend
+    out["note"] = "saved — backend/role changes apply to new sessions"
+    return out
+
+
+@app.get("/settings/seats")
+def get_seats() -> dict:
+    """Switchboard seats for the role-mapping dropdowns. Empty list + error if
+    the Switchboard is unreachable (HTTP 200, never crashes the dashboard)."""
+    return service.seats()
+
+
+@app.get("/settings/api-keys")
+def get_api_keys() -> dict:
+    """Proxy the Switchboard's masked api-key list."""
+    return service.api_keys()
+
+
+@app.put("/settings/api-keys/{name}")
+def put_api_key(name: str, body: dict) -> dict:
+    """Proxy a set-key request to the Switchboard. The secret is never stored
+    locally or logged."""
+    try:
+        return service.set_api_key(name, body)
+    except Exception as e:  # noqa: BLE001 — surface a clean error, no key value
+        raise HTTPException(status_code=502, detail=f"switchboard set-key failed: {e}")
+
+
+@app.get("/settings/api-keys/{name}/reveal")
+def reveal_api_key(name: str) -> dict:
+    """Proxy the Switchboard reveal endpoint (plaintext value; not logged)."""
+    try:
+        return service.reveal_api_key(name)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"switchboard reveal failed: {e}")
+
+

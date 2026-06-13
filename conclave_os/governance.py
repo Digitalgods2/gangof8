@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from .config import ALWAYS_ALLOWED_CAPABILITIES
 from .logstore import LogStore
-from .models import ApprovalRequest, Risk, Session, utcnow
+from .models import ApprovalRequest, ProposedAction, Risk, Session, utcnow
 
 
 class ApprovalRequired(Exception):
@@ -45,6 +45,56 @@ class Governance:
             if a.action == action and a.status == "approved":
                 return
         raise ApprovalRequired(self.request_approval(session, action, category, risk))
+
+    def authorize_action(
+        self, session: Session, action: ProposedAction
+    ) -> ApprovalRequest | None:
+        """Permission kernel: decide whether a proposed action may execute,
+        using the skill's metadata instead of hardcoded literals.
+
+        - Unknown skill / role not allowed → mark the action denied (with a
+          clear error) and return None. The action is skipped, not raised on,
+          so a single bad proposal never kills the session.
+        - requires_approval and no matching approved approval → create and
+          return an ApprovalRequest (the caller must pause).
+        - requires_approval False (or already approved) → return None; the
+          action may proceed straight to execution.
+        """
+        from .skills import get_skill  # local import: skills imports nothing here
+
+        skill = get_skill(action.kind)
+        if skill is None:
+            self._deny_action(session, action, f"unknown skill: {action.kind!r}")
+            return None
+        if action.role not in skill.allowed_roles:
+            self._deny_action(
+                session, action,
+                f"role {action.role.value!r} may not use skill {skill.name!r}",
+            )
+            return None
+        if not skill.requires_approval:
+            return None
+        for a in session.approvals:
+            if a.action_ref == action.action_id and a.status == "approved":
+                return None
+        return self.request_approval(
+            session,
+            action=(
+                f"{skill.name}: {action.filename or skill.description} "
+                f"in data/artifacts/{session.session_id}/"
+            ),
+            category=skill.category,
+            risk=skill.risk,
+            action_ref=action.action_id,
+        )
+
+    def _deny_action(self, session: Session, action: ProposedAction, reason: str) -> None:
+        action.status = "denied"
+        action.error = reason
+        self.store.log_event(
+            session.session_id, "action_denied",
+            {"action_id": action.action_id, "kind": action.kind, "reason": reason},
+        )
 
     def request_approval(
         self, session: Session, action: str, category: str,

@@ -22,7 +22,6 @@ from .models import (
     Disagreement,
     InputRequest,
     ProposedAction,
-    Risk,
     RoundSpec,
     Session,
     SessionStatus,
@@ -433,7 +432,12 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
         return
     content = (draft.content[: m.start()] + draft.content[m.end():]).strip()
     action = ProposedAction(
-        session_id=session.session_id, filename=m.group(1), content=content
+        session_id=session.session_id,
+        kind="write_file",
+        role=Role.implementer,
+        filename=m.group(1),
+        content=content,
+        args={"filename": m.group(1), "content": content},
     )
     session.proposed_actions.append(action)
     store.log_event(
@@ -453,16 +457,21 @@ def _execute_actions(
     pending = False
     for action in session.proposed_actions:
         if action.status == "proposed":
-            approval = governance.request_approval(
-                session,
-                action=f"write artifact '{action.filename}' ({len(action.content)} chars) "
-                       f"to data/artifacts/{sid}/",
-                category="file_write",
-                risk=Risk.medium,
-                action_ref=action.action_id,
-            )
-            action.approval_id = approval.approval_id
-            action.status = "awaiting_approval"
+            # Permission kernel: skill metadata drives the decision. It may
+            # deny the action (unknown skill / role not allowed → status set
+            # to 'denied' with an error), require approval (returns a pending
+            # ApprovalRequest), or clear it to run straight through (None).
+            approval = governance.authorize_action(session, action)
+            if action.status == "denied":
+                session.unresolved.append(
+                    f"action '{action.kind}' denied: {action.error}"
+                )
+                continue
+            if approval is not None:
+                action.approval_id = approval.approval_id
+                action.status = "awaiting_approval"
+            else:
+                action.status = "approved"
         if action.status == "awaiting_approval":
             approval = next(
                 (a for a in session.approvals if a.approval_id == action.approval_id), None
