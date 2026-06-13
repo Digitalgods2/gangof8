@@ -28,6 +28,12 @@ class TaskIn(BaseModel):
     text: str
     source: str = "api"
     background: bool = False  # True: return immediately, poll GET /sessions/{id}
+    attachments: list[str] = []  # upload ids whose text is folded into the task
+
+
+class UploadIn(BaseModel):
+    name: str
+    content_base64: str
 
 
 class ApprovalIn(BaseModel):
@@ -58,6 +64,7 @@ def _summary(session) -> dict:
         ],
         "files_changed": session.files_changed,
         "workspace_root": session.workspace_root,
+        "attachments": session.attachments,
     }
 
 
@@ -75,12 +82,24 @@ def health() -> dict:
 def submit_task(body: TaskIn) -> dict:
     try:
         if body.background:
-            session = service.submit_background(body.text, source=body.source)
+            session = service.submit_background(
+                body.text, source=body.source, attachments=body.attachments)
         else:
-            session = service.run(body.text, source=body.source)
+            session = service.run(
+                body.text, source=body.source, attachments=body.attachments)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return _summary(session)
+
+
+@app.post("/uploads")
+def upload_file(body: UploadIn) -> dict:
+    """Accept a base64-encoded attachment (text/PDF/image), store + extract its
+    text, and return a record. Submit the returned id in TaskIn.attachments."""
+    try:
+        return service.save_upload(body.name, body.content_base64)
+    except Exception as e:  # noqa: BLE001 — clean error, never 500 the composer
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @app.post("/sessions/{session_id}/approvals/{approval_id}")
