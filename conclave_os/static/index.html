@@ -125,10 +125,15 @@
   #settingsOverlay.open { display:block; }
   #settingsPanel { position:absolute; top:0; right:0; height:100%; width:520px;
                    max-width:100%; background:var(--bg); border-left:1px solid var(--line);
-                   overflow-y:auto; padding:18px 22px; box-shadow:-8px 0 24px rgba(0,0,0,.4); }
+                   display:flex; flex-direction:column; padding:18px 22px;
+                   box-shadow:-8px 0 24px rgba(0,0,0,.4); }
   #settingsPanel h2 { font-size:16px; margin:0 0 4px; }
-  #settingsPanel .shead { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+  #settingsPanel .shead { flex:0 0 auto; display:flex; align-items:center; gap:10px; margin-bottom:14px; }
   #settingsPanel .shead .x { margin-left:auto; }
+  /* body scrolls; the Save footer stays pinned and always visible */
+  #settingsBody { flex:1 1 auto; overflow-y:auto; min-height:0; padding-right:4px; }
+  #settingsPanel > .row { flex:0 0 auto; border-top:1px solid var(--line);
+                          padding-top:12px; margin-top:10px; }
   .sset { margin-bottom:18px; }
   .sset > label { display:block; font-size:11px; color:var(--dim); text-transform:uppercase;
                   letter-spacing:.5px; margin-bottom:8px; }
