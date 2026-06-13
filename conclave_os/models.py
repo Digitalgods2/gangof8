@@ -144,8 +144,8 @@ class Disagreement(BaseModel):
 
 
 class InputRequest(BaseModel):
-    """An agent paused mid-call to ask the human a question (e.g. Switchboard
-    awaiting_user_input). The answer resumes the same underlying agent task."""
+    """An agent paused mid-call to ask the human a question. The answer resumes
+    the same underlying agent task."""
 
     input_id: str = Field(default_factory=lambda: f"i_{short_id()}")
     session_id: str
@@ -154,7 +154,7 @@ class InputRequest(BaseModel):
     round: int = 0
     purpose: str = "deliberation"  # deliberation | compose
     question: str
-    resume_token: str  # backend handle for the paused call (Switchboard task id)
+    resume_token: str  # backend handle for the paused call
     status: str = "pending"  # pending | answered | declined
     answer: Optional[str] = None
     asked_at: str = Field(default_factory=utcnow)

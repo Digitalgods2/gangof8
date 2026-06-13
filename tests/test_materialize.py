@@ -1,8 +1,8 @@
 """Per-file artifact materialization.
 
-Resolve-mode agents return a concise summary, so a single draft call describes
-multi-file output ("I'll deliver main.py, README.md, requirements.txt") instead
-of emitting it. When an output task yields no full ARTIFACT blocks, the
+An agent sometimes describes multi-file output in one draft ("I'll deliver
+main.py, README.md, requirements.txt") instead of emitting it. When an
+output task yields no full ARTIFACT blocks, the
 coordinator fetches each intended file with its own focused single-file call and
 proposes one approval-gated write_file per file.
 """
@@ -17,7 +17,7 @@ from conclave_os.models import Role, SessionStatus
 from conclave_os.registry import AdapterResult
 from conclave_os.service import ConclaveService
 
-# claude-code-style: the draft only NAMES the files; bodies arrive one at a time.
+# real-agent-style: the draft only NAMES the files; bodies arrive one at a time.
 DRAFT_DESCRIPTION = (
     "I will deliver a minimal app: main.py with the entrypoint, README.md with "
     "instructions, and requirements.txt with dependencies. All ready for write-through."

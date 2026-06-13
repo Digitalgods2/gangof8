@@ -2,8 +2,9 @@
 governance, used by both the FastAPI app and the CLI.
 
 Backends:
-  mock        — deterministic offline adapter (default; tests, Phase 0)
-  switchboard — Conclave AI at 127.0.0.1:8787 driving codex/gemini/claude-code
+  mock — deterministic offline adapter (default; tests, Phase 0)
+  cli  — Conclave OS runs the local claude/codex/gemini CLIs itself, in plain
+         generation mode → real file content; fully self-contained
 """
 
 from __future__ import annotations
@@ -13,8 +14,8 @@ from pathlib import Path
 from typing import Optional
 
 from . import config, intake
+from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
-from .adapters.switchboard import SwitchboardAdapter
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
@@ -48,12 +49,12 @@ class ConclaveService:
         self._apply_settings(backend=backend)
 
     def _apply_settings(self, backend: Optional[str] = None) -> None:
-        """(Re)derive backend, role mapping, switchboard URL and registry from
+        """(Re)derive backend, role mapping and registry from
         the explicit args + current self.settings. Precedence for backend:
         explicit arg › settings.json › env/config default."""
         self.backend = backend or self.settings.backend
         if self.backend not in config.ROLE_AGENTS_BY_BACKEND:
-            raise ValueError(f"unknown backend '{self.backend}' (mock | switchboard)")
+            raise ValueError(f"unknown backend '{self.backend}' (mock | cli)")
         # role mapping: explicit arg › settings (non-empty) › backend default
         if self._explicit_role_agents:
             self.role_agents = self._explicit_role_agents
@@ -63,7 +64,6 @@ class ConclaveService:
             }
         else:
             self.role_agents = config.ROLE_AGENTS_BY_BACKEND[self.backend]
-        self.switchboard_url = self.settings.switchboard_url
 
         # Push governance/composer tunables into the config module so the loop,
         # classifier and composer (which read config.* at call time) honour
@@ -76,9 +76,9 @@ class ConclaveService:
         config.BUDGETS_BY_COMPLEXITY = budgets_overrides(self.settings)
 
         self.registry = AgentRegistry()
-        if self.backend == "switchboard":
+        if self.backend == "cli":
             for agent in sorted(set(self.role_agents.values())):
-                self.registry.register(SwitchboardAdapter(agent=agent, base_url=self.switchboard_url))
+                self.registry.register(CliAdapter(agent=agent))
         else:
             self.registry.register(MockAdapter())
 
@@ -145,63 +145,27 @@ class ConclaveService:
     def _ensure_adapters(self, session: Session) -> None:
         """A loaded session must be resumable regardless of how this service
         instance was configured — register the adapters its agents need."""
-        if session.backend != "switchboard":
+        if session.backend != "cli":
             return
         needed = {m.agent for m in session.council.members if m.agent and m.agent != "system"}
         needed |= {r.agent for r in session.input_requests if r.agent}
         for agent in sorted(needed):
-            if agent not in self.registry.names() and agent not in ("mock", "unknown"):
-                self.registry.register(SwitchboardAdapter(agent=agent, base_url=self.switchboard_url))
+            if agent in self.registry.names() or agent in ("mock", "unknown"):
+                continue
+            self.registry.register(CliAdapter(agent=agent))
 
-    # ---- Switchboard proxy (settings panel) ----------------------------------
-    # Keys live in the Switchboard; Conclave OS only proxies. Never store or log
-    # a secret value here.
-
-    def _switchboard(self, method: str, path: str, body: Optional[dict] = None,
-                     timeout: int = 10):
-        """Minimal stdlib HTTP call to the configured Switchboard, reusing the
-        adapter's urllib style. Raises urllib/OS errors to the caller."""
-        import json as _json
-        import urllib.request
-
-        url = f"{self.switchboard_url.rstrip('/')}{path}"
-        data = _json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(
-            url, data=data, method=method, headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _json.loads(resp.read().decode("utf-8"))
+    # ---- CLI seats (settings panel) ------------------------------------------
 
     def seats(self) -> dict:
-        """List Switchboard seats (name/available/kind). On any failure return
-        an empty list + error so the dashboard never crashes."""
-        try:
-            data = self._switchboard("GET", "/api/health")
-        except Exception as e:  # noqa: BLE001 — never crash the dashboard
-            return {"seats": [], "error": str(e)}
-        seats = [
-            {"name": s.get("name"), "available": bool(s.get("available")),
-             "kind": s.get("kind")}
-            for s in (data.get("seats") or [])
-        ]
-        return {"seats": seats}
+        """The local CLI agents Conclave OS can drive, with availability from
+        PATH — used to populate the role→agent dropdowns in settings."""
+        import shutil
 
-    def api_keys(self) -> dict:
-        """Proxy the Switchboard's masked api-key list."""
-        try:
-            return {"keys": self._switchboard("GET", "/api/settings/api-keys")}
-        except Exception as e:  # noqa: BLE001
-            return {"keys": {}, "error": str(e)}
-
-    def set_api_key(self, name: str, body: dict) -> dict:
-        """Proxy a set-key request to the Switchboard. The body is forwarded
-        as-is; the secret value is never stored or logged here."""
-        return self._switchboard("POST", f"/api/settings/api-keys/{name}", body or {})
-
-    def reveal_api_key(self, name: str) -> dict:
-        """Proxy the Switchboard reveal endpoint (returns the plaintext value;
-        not logged here)."""
-        return self._switchboard("GET", f"/api/settings/api-keys/{name}/reveal")
+        agents = ["claude", "codex", "gemini"]
+        return {"seats": [
+            {"name": a, "available": shutil.which(a) is not None, "kind": "cli"}
+            for a in agents
+        ]}
 
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)

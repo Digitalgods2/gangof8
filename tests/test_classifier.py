@@ -1,6 +1,6 @@
 """Classifier: 'build an app' / file-producing tasks must classify as code.
 
-Regression for a real switchboard run where "Build a tiny app ... main.py,
+Regression for a real run where "Build a tiny app ... main.py,
 requirements.txt" classified as a plain question, so the implementer (the only
 role that can propose a write_file/ARTIFACT) never joined the council and the
 conclave concluded the task was impossible. Build/app verbs and filenames with

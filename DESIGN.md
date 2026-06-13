@@ -7,17 +7,22 @@ receives a user task, decides which AI agents or tools should participate, assig
 roles, manages the discussion, prevents runaway loops, records the reasoning trail,
 and returns a final answer to the user. The human always has final authority.
 
-## Relationship to Conclave AI (the Switchboard)
+## Agent backend (self-contained)
 
-The existing app at `C:\Users\gosmo\Desktop\Conclave AI` is a Python 3.13 / FastAPI /
-SQLite service at `127.0.0.1:8787` that already orchestrates Codex, Gemini, and Claude
-Code CLIs, with three deliberation modes (conclave / resolve / consult), pause-for-user
-(`awaiting_user_input`), decision recording, task threading, a versioned charter, and
-full audit logging.
+**Conclave OS owns its agent backend.** It is fully self-contained — there is no
+external service, no HTTP, no API-key proxy. Agent invocation lives behind a small
+adapter interface with two implementations:
 
-**Coordinator OS does not re-implement agent invocation.** It sits above the
-Switchboard as a coordination layer; the Switchboard is its first (and initially only)
-real agent backend, behind an adapter interface.
+- **`mock`** — a deterministic offline adapter returning canned contributions; the
+  default, used by the test suite. Zero cost, zero external dependencies.
+- **`cli`** — the real backend. Conclave OS runs the local `claude`, `codex`, and
+  `gemini` CLIs itself, in plain non-interactive generation mode (e.g.
+  `claude -p --output-format json --tools ""`). Tools are disabled / read-only in
+  those calls, so the agents perform no side effects of their own — every write
+  stays governed by Conclave OS. The CLIs manage their own authentication.
+
+Adding another backend later is just another adapter; the coordinator, governance,
+and logging are agnostic to which one is active.
 
 ## Hard rules
 
@@ -33,8 +38,8 @@ real agent backend, behind an adapter interface.
 
 ## 1. Architecture
 
-One local Python service (FastAPI + SQLite), same stack as Conclave AI so adapters and
-skills carry over.
+One local Python service (FastAPI + SQLite). It is self-contained: it drives the local
+agent CLIs directly through the `cli` adapter — no external service to run first.
 
 ```
                  ┌─────────────────────────────────────────────┐
@@ -62,8 +67,9 @@ skills carry over.
                         AGENT REGISTRY / ADAPTERS
                                     │
                  ┌──────────────────┴──────────────────┐
-                 │ MockAdapter   SwitchboardAdapter     │
-                 │ (testing)     (POST 127.0.0.1:8787)  │
+                 │ MockAdapter   CliAdapter             │
+                 │ (testing)     (local claude/codex/   │
+                 │                gemini CLIs)          │
                  └──────────────────────────────────────┘
 ```
 
@@ -242,8 +248,7 @@ def run_session(task_text, source):
     return finish(session, "done")                              # persists session log
 
 # Governance.requires_approval / request_approval is the ONLY path to side effects.
-# await_human() pauses the session and returns on POST /sessions/{id}/approvals/{aid}
-# — mirrors Conclave AI's awaiting_user_input.
+# await_human() pauses the session and returns on POST /sessions/{id}/approvals/{aid}.
 # Every loop above is bounded by session.budgets; exceeding any cap force-stops
 # with a partial answer.
 ```
@@ -253,9 +258,9 @@ def run_session(task_text, source):
 - **Phase 0 — skeleton (no AI at all).** FastAPI app, SQLite schema, session state
   machine, `MockAdapter` returning canned text. Prove: intake → classify (rules only)
   → council → bounded rounds → compose → log → answer. Fully testable offline, free.
-- **Phase 1 — one real backend.** `SwitchboardAdapter` calling Conclave AI at
-  `127.0.0.1:8787` per role. (Direct CLI adapters later; Switchboard already handles
-  the CLIs, timeouts, and logging.)
+- **Phase 1 — one real backend.** `CliAdapter` running the local claude/codex/gemini
+  CLIs per role, in plain non-interactive generation mode with tools disabled. The
+  adapter owns the CLI invocation, timeouts, and output parsing.
 - **Phase 2 — human authority surface.** Approval endpoints + a tiny CLI
   (`conclave-os approve <id>`); pending approvals block the session. Rule-based
   classifier flags any task mentioning files/exec/network/money as
@@ -284,7 +289,7 @@ Conclave OS/
 │   ├── registry.py            # Agent Registry + adapter protocol
 │   ├── adapters/
 │   │   ├── mock.py            # canned responses for testing
-│   │   └── switchboard.py     # calls Conclave AI at 127.0.0.1:8787
+│   │   └── cli.py             # runs local claude/codex/gemini CLIs directly
 │   ├── roles.py               # Role Assignment Engine + round planner
 │   ├── loop.py                # Deliberation Loop
 │   ├── governance.py          # Governance Layer + Tool Permission Manager
@@ -318,5 +323,5 @@ summary), so the test asserts the entire pipeline:
 6. JSONL log contains every step.
 7. FinalAnswer has all four required fields.
 
-Then re-run the identical task through `SwitchboardAdapter` as the first live test —
-same harness, real agents, still nothing but text.
+Then re-run the identical task through `CliAdapter` as the first live test —
+same harness, real local CLIs, still nothing but text.

@@ -20,10 +20,9 @@ def budgets_for(complexity: Complexity) -> Budgets:
     return BUDGETS_BY_COMPLEXITY[complexity].model_copy()
 
 
-# Backend selection: "mock" (offline, default) or "switchboard"
-# (Conclave AI at 127.0.0.1:8787 driving the real codex/gemini/claude-code CLIs).
+# Backend selection: "mock" (offline, default for tests) or "cli" (Conclave OS
+# runs the local claude/codex/gemini CLIs itself, in plain generation mode).
 BACKEND = os.environ.get("CONCLAVE_OS_BACKEND", "mock")
-SWITCHBOARD_URL = os.environ.get("CONCLAVE_OS_SWITCHBOARD_URL", "http://127.0.0.1:8787")
 
 ROLE_AGENTS_MOCK: dict[Role, str] = {
     Role.researcher: "mock",
@@ -33,18 +32,21 @@ ROLE_AGENTS_MOCK: dict[Role, str] = {
     Role.summarizer: "mock",
 }
 
-# Switchboard agent ids are its registry names: "codex", "gemini", "claude-code".
-ROLE_AGENTS_SWITCHBOARD: dict[Role, str] = {
+# Direct local-CLI backend: Conclave OS invokes the agent CLIs itself in plain
+# generation mode (no plan-mode), so the implementer emits real file bodies.
+# Multi-model conclave via the local CLIs — gemini researches, codex critiques,
+# claude designs/implements/summarizes. Remap any role in settings.
+ROLE_AGENTS_CLI: dict[Role, str] = {
     Role.researcher: "gemini",
-    Role.architect: "claude-code",
+    Role.architect: "claude",
     Role.critic: "codex",
-    Role.implementer: "claude-code",
-    Role.summarizer: "claude-code",
+    Role.implementer: "claude",
+    Role.summarizer: "claude",
 }
 
 ROLE_AGENTS_BY_BACKEND: dict[str, dict[Role, str]] = {
     "mock": ROLE_AGENTS_MOCK,
-    "switchboard": ROLE_AGENTS_SWITCHBOARD,
+    "cli": ROLE_AGENTS_CLI,
 }
 
 # Default mapping for the configured backend (modules that need a specific
@@ -78,9 +80,9 @@ COMPOSER_RESERVED_CALLS = 2
 # critic and rule the rest on constraints, instead of burning the budget.
 MAX_CRITIC_TESTS_PER_ROUND = 3
 
-# Protocol-wrapped backends often return the final answer as plain prose, not
-# the labeled format. Substantial prose (>= this many chars) is accepted as
-# the answer at medium confidence; shorter unparseable output gets one retry.
+# Agents often return the final answer as plain prose, not the labeled format.
+# Substantial prose (>= this many chars) is accepted as the answer at medium
+# confidence; shorter unparseable output gets one retry.
 COMPOSER_PROSE_MIN_CHARS = 200
 
 # How much deliberation the summarizer sees when composing. The earlier
@@ -97,9 +99,8 @@ COMPOSER_CONTEXT_CHARS = 1400
 MAX_SKILL_REQUESTS_PER_TURN = 2
 SKILL_RESULT_MAX_CHARS = 2000
 
-# Per-file artifact materialization: resolve-mode agents return a concise
-# summary, so a single draft call describes multi-file output instead of
-# emitting it. When an output task yields no full ARTIFACT blocks, the
-# coordinator fetches each intended file with its own focused call (nothing to
-# summarize). Cap how many files one task may materialize.
+# Per-file artifact materialization: an agent sometimes describes multi-file
+# output in one draft instead of emitting it. When an output task yields no full
+# ARTIFACT blocks, the coordinator fetches each intended file with its own
+# focused call (nothing to summarize). Cap how many files one task may produce.
 MAX_ARTIFACT_FILES = 8

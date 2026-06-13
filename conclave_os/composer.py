@@ -28,10 +28,9 @@ def compose_prompt(session: Session) -> str:
     rulings = "\n".join(
         f"- {d.topic}: ruled '{d.ruling}' ({d.ruling_basis})" for d in session.disagreements
     ) or "(none)"
-    # Plain-text labeled sections, NOT JSON: backends like the Switchboard wrap
-    # agent output in their own JSON protocol, and asking for a JSON object with
-    # overlapping keys contaminates that envelope (learned from real runs 2 and
-    # 3). Text labels survive wrapping — like DISAGREEMENT:/VERDICT: do.
+    # Plain-text labeled sections, NOT JSON: asking an agent for a JSON object
+    # whose keys overlap a wrapping protocol can contaminate its output
+    # (learned from real runs). Text labels survive — like DISAGREEMENT:/VERDICT:.
     return (
         f"Task: {session.task.text}\n"
         "Your role: summarizer. Synthesize the final response from the "
