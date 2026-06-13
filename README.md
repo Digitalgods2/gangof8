@@ -102,6 +102,20 @@ around the `ARTIFACT:` content — the human approval step is the review gate.
   on the next real switchboard run.)
 - Agent framing prose can leak into artifacts around `ARTIFACT:` content —
   human approval is the review gate.
+- **Multi-file artifacts supported; real-agent emission is unreliable
+  (2026-06-13).** The loop now parses every `ARTIFACT: <filename>` block into a
+  separate approval-gated `write_file` (unit-tested end to end), and resume no
+  longer re-runs deliberation after an action approval. BUT on real switchboard
+  runs the `claude-code` implementer tends to *describe* multi-file output
+  ("delivering four files…") instead of emitting the literal ARTIFACT blocks —
+  a single file emits fine. Leading hypothesis: under the Switchboard protocol
+  the agent routes file content into the Switchboard's own artifact channel
+  (`/api/tasks/{id}/artifacts`) rather than inline response text, which our
+  adapter doesn't read. Follow-up: either consume the Switchboard artifact
+  channel in `adapters/switchboard.py`, or enforce a stricter implementer
+  contract. Added `_GOVERNANCE_CONTEXT` to all role prompts so non-implementer
+  roles stop treating `can_write_files=false` as a blocker and asking the human
+  to enable it (separate real-run finding).
 - **Skill loop wired (2026-06-13):** agents may pull a no-approval skill
   mid-deliberation with a plain-text `SKILL: read_file <name>` line; the kernel
   authorizes it (role-gated, no approval for reads) and the result is fed back
