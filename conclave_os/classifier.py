@@ -14,8 +14,17 @@ ACTION_WORDS = [
 ]
 CODE_WORDS = [
     "code", "script", "function", "implement", "refactor", "compile",
-    "program", "bug", "fix",
+    "program", "bug", "fix", "build", "app", "application", "api",
+    "module", "package", "library", "cli", "endpoint", "backend",
+    "frontend", "class",
 ]
+# A filename with a known code/text extension (main.py, requirements.txt) is a
+# strong signal the task produces files even when no code verb is present.
+_FILE_ARTIFACT = re.compile(
+    r"\b[\w\-]+\.(py|js|ts|tsx|jsx|go|rs|java|rb|php|c|cpp|h|hpp|cs|md|txt|"
+    r"json|ya?ml|toml|ini|cfg|csv|html|css|scss|sh|bat|ps1|sql)\b",
+    re.IGNORECASE,
+)
 EXEC_WORDS = ["execute", "run", "install", "launch"]
 DESIGN_WORDS = ["design", "architecture", "architect", "blueprint", "schema", "structure"]
 RESEARCH_WORDS = ["research", "investigate", "survey", "look up", "find out"]
@@ -37,7 +46,7 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     notes: list[str] = []
 
     action = _any(ACTION_WORDS, lower)
-    code = _any(CODE_WORDS, lower)
+    code = _any(CODE_WORDS, lower) or bool(_FILE_ARTIFACT.search(text))
     execs = _any(EXEC_WORDS, lower)
     design = _any(DESIGN_WORDS, lower)
     research = _any(RESEARCH_WORDS, lower)
@@ -49,7 +58,10 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         notes.append("matched action words (external side effects implied)")
     elif code:
         task_type = TaskType.code
-        notes.append("matched code words")
+        notes.append(
+            "matched filename artifact" if _FILE_ARTIFACT.search(text) and not _any(CODE_WORDS, lower)
+            else "matched code words"
+        )
     elif design:
         task_type = TaskType.design
         notes.append("matched design words")
