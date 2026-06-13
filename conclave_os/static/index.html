@@ -118,12 +118,20 @@
   .keyrow .kstat { color:var(--dim); flex:1; font-family:Consolas, monospace; }
   .keyrow .kstat.set { color:var(--ok); }
   #savedNote { color:var(--ok); font-size:12px; margin-left:8px; }
+  .wsrow { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12.5px;
+           padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  .wsrow.active { border-color:var(--accent); }
+  .wsrow .wsname { color:var(--text); font-weight:600; flex:0 0 auto; }
+  .wsrow .wsroot { color:var(--dim); font-family:Consolas, monospace; flex:1;
+                   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .wsrow .badge { color:var(--accent); font-size:11px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Conclave OS</h1>
   <span class="sub" id="backend">backend: …</span>
+  <span class="sub" id="workspace">workspace: …</span>
   <span class="sub">human authority preserved — nothing executes without your approval</span>
   <button class="gear" title="Settings" onclick="openSettings()">⚙</button>
 </header>
@@ -191,6 +199,13 @@ const api = (path, opts) => fetch(path, opts).then(r => r.json());
 async function loadHealth() {
   const h = await api("/health");
   document.getElementById("backend").textContent = "backend: " + h.backend;
+}
+
+async function loadWorkspace() {
+  wsCache = await api("/workspaces").catch(() => ({workspaces: [], active: null}));
+  const active = (wsCache.workspaces || []).find(w => w.id === wsCache.active);
+  document.getElementById("workspace").textContent =
+    "workspace: " + (active ? active.name : "(sandbox)");
 }
 
 async function submitTask() {
@@ -439,7 +454,7 @@ async function declineInput(iid) {
 // Self-contained: its own open/close + render, sharing only esc/api helpers.
 // Opening overlays the dashboard; closing returns to it untouched.
 const ROLES = ["researcher", "architect", "critic", "implementer", "summarizer"];
-let settingsCache = null, seatsCache = [];
+let settingsCache = null, seatsCache = [], wsCache = {workspaces: [], active: null};
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
@@ -456,6 +471,7 @@ const TIPS = {
   critic_tests: "Maximum disagreements the critic actively tests per round; the rest are ruled on constraints to save budget.",
   poll: "How often the dashboard refreshes session state, in milliseconds.",
   collapse: "Collapse the contributions / disagreements sections by default once a session has finished.",
+  workspace: "The active workspace is the real project directory the council reads and (with approval) writes into. With no workspace active, files go to a throwaway per-session sandbox. New sessions capture whichever workspace is active when they start.",
 };
 const tip = k => TIPS[k] ? `<i class="tip" title="${esc(TIPS[k])}">i</i>` : "";
 const lbl = (text, k) => `<span class="lbl">${esc(text)}${tip(k)}</span>`;
@@ -464,12 +480,14 @@ async function openSettings() {
   document.getElementById("settingsOverlay").classList.add("open");
   document.getElementById("savedNote").textContent = "";
   document.getElementById("settingsBody").innerHTML = '<div class="empty">Loading…</div>';
-  const [settings, seatsResp] = await Promise.all([
+  const [settings, seatsResp, wsResp] = await Promise.all([
     api("/settings"),
     api("/settings/seats").catch(() => ({seats: []})),
+    api("/workspaces").catch(() => ({workspaces: [], active: null})),
   ]);
   settingsCache = settings;
   seatsCache = seatsResp.seats || [];
+  wsCache = wsResp;
   renderSettings(settings, seatsCache);
 }
 
@@ -496,7 +514,34 @@ function renderSettings(s, seats) {
   const seatErr = (seatsCache.length === 0)
     ? '<div class="sub" style="margin-top:4px">no CLI agents found on PATH</div>' : "";
 
+  const wsRows = (wsCache.workspaces || []).map(w => {
+    const on = w.id === wsCache.active;
+    return `<div class="wsrow ${on ? "active" : ""}">
+      <span class="wsname">${esc(w.name)}</span>
+      <span class="wsroot" title="${esc(w.root)}">${esc(w.root)}</span>
+      ${on ? '<span class="badge">active ✓</span>'
+           : `<button class="ghost" onclick="activateWorkspace('${esc(w.id)}')">Activate</button>`}
+      <button class="deny" onclick="deleteWorkspace('${esc(w.id)}')">✕</button>
+    </div>`;
+  }).join("");
+
   document.getElementById("settingsBody").innerHTML = `
+    <div class="sset">
+      <label>Workspace ${tip("workspace")}</label>
+      ${wsRows || '<div class="sub">no workspaces — add one below</div>'}
+      <div class="wsrow ${wsCache.active ? "" : "active"}">
+        <span class="wsname">(sandbox)</span>
+        <span class="wsroot">per-session throwaway folder</span>
+        ${wsCache.active ? '<button class="ghost" onclick="activateWorkspace(null)">Use this</button>'
+                         : '<span class="badge">active ✓</span>'}
+      </div>
+      <div class="field" style="margin-top:8px">${lbl("Add workspace", "workspace")}
+        <input type="text" id="ws_name" placeholder="name" style="flex:0 0 120px">
+        <input type="text" id="ws_root" placeholder="absolute path (created if missing)">
+        <button onclick="addWorkspace()">Add</button>
+      </div>
+    </div>
+
     <div class="sset">
       <label>Backend</label>
       <div class="field">${lbl("Backend", "backend")}
@@ -576,7 +621,37 @@ async function saveSettings() {
   }
 }
 
+function _renderWsAfterChange(msg) {
+  loadWorkspace();                            // update the header indicator
+  renderSettings(settingsCache, seatsCache);  // re-render the panel from wsCache
+  if (msg) document.getElementById("savedNote").textContent = msg;
+}
+
+async function activateWorkspace(id) {
+  const r = await fetch("/workspaces/active", {method: "PUT",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})});
+  if (r.ok) { wsCache = await r.json(); _renderWsAfterChange("workspace updated ✓"); }
+}
+
+async function addWorkspace() {
+  const name = document.getElementById("ws_name").value.trim();
+  const root = document.getElementById("ws_root").value.trim();
+  const note = document.getElementById("savedNote");
+  if (!name || !root) { note.textContent = "name + path required"; return; }
+  const r = await fetch("/workspaces", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({name, root})});
+  if (r.ok) { wsCache = await api("/workspaces"); _renderWsAfterChange("workspace added ✓"); }
+  else { const d = await r.json().catch(() => ({})); note.style.color = "var(--bad)";
+         note.textContent = "add failed: " + (d.detail || r.status); }
+}
+
+async function deleteWorkspace(id) {
+  const r = await fetch("/workspaces/" + encodeURIComponent(id), {method: "DELETE"});
+  if (r.ok) { wsCache = await r.json(); _renderWsAfterChange("workspace removed"); }
+}
+
 loadHealth();
+loadWorkspace();
 refresh();
 setInterval(refresh, 3000);
 setInterval(tickElapsed, 1000);

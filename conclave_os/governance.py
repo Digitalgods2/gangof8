@@ -77,12 +77,13 @@ class Governance:
         for a in session.approvals:
             if a.action_ref == action.action_id and a.status == "approved":
                 return None
+        where = (
+            f"workspace {session.workspace_root}" if session.workspace_root
+            else f"data/artifacts/{session.session_id}/"
+        )
         return self.request_approval(
             session,
-            action=(
-                f"{skill.name}: {action.filename or skill.description} "
-                f"in data/artifacts/{session.session_id}/"
-            ),
+            action=f"{skill.name}: {action.filename or skill.description} in {where}",
             category=skill.category,
             risk=skill.risk,
             action_ref=action.action_id,

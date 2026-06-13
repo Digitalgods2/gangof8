@@ -17,7 +17,7 @@ from typing import Callable, Optional
 
 from pydantic import BaseModel
 
-from .executor import ExecutionError, _safe_filename, artifacts_dir
+from .executor import ExecutionError, _safe_filename, artifacts_dir, resolve_in_workspace
 from .models import ProposedAction, Risk, Role, Session
 
 
@@ -51,7 +51,7 @@ def _arg(action: ProposedAction, key: str, legacy: str = "") -> str:
 
 def _sandboxed_path(session: Session, data_dir: Path, raw_name: str) -> Path:
     """Resolve raw_name inside the session's artifacts sandbox, rejecting any
-    path that escapes it. Shared by write_file and read_file."""
+    path that escapes it (flat — directory components are dropped)."""
     name = _safe_filename(raw_name)
     out_dir = artifacts_dir(data_dir, session.session_id)
     path = (out_dir / name).resolve()
@@ -60,23 +60,31 @@ def _sandboxed_path(session: Session, data_dir: Path, raw_name: str) -> Path:
     return path
 
 
+def _target_path(session: Session, data_dir: Path, raw_name: str) -> Path:
+    """Where a file skill operates: inside the session's workspace root (real
+    project, subdirs allowed) when one is bound, else the flat per-session
+    artifacts sandbox."""
+    if session.workspace_root:
+        return resolve_in_workspace(Path(session.workspace_root), raw_name)
+    return _sandboxed_path(session, data_dir, raw_name)
+
+
 def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Write content to data/artifacts/<session_id>/<filename> (sandboxed)."""
+    """Write content to the session's workspace (if bound) or artifacts sandbox."""
     raw_name = _arg(action, "filename")
     content = _arg(action, "content")
-    out_dir = artifacts_dir(data_dir, session.session_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = _sandboxed_path(session, data_dir, raw_name)
+    path = _target_path(session, data_dir, raw_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return str(path)
 
 
 def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Read data/artifacts/<session_id>/<filename> (same sandbox as write)."""
+    """Read a file from the session's workspace (if bound) or artifacts sandbox."""
     raw_name = _arg(action, "filename")
-    path = _sandboxed_path(session, data_dir, raw_name)
+    path = _target_path(session, data_dir, raw_name)
     if not path.is_file():
-        raise ExecutionError(f"file not found in artifacts sandbox: {raw_name!r}")
+        raise ExecutionError(f"file not found: {raw_name!r}")
     return path.read_text(encoding="utf-8")
 
 
