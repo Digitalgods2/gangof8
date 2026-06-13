@@ -7,6 +7,7 @@ descriptions.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -95,6 +96,28 @@ def test_claude_vision_sends_image_content_block(stub_run, tmp_path):
     blocks = msg["message"]["content"]
     assert any(b.get("type") == "image" for b in blocks)
     assert any(b.get("type") == "text" for b in blocks)
+
+
+def test_codex_vision_attaches_image_flag(monkeypatch, tmp_path):
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG fake")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # codex writes its final message to the --output-last-message path
+        outfile = cmd[cmd.index("--output-last-message") + 1]
+        Path(outfile).write_text("CODE-READ", encoding="utf-8")
+        return _Proc(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    out = CliAdapter("codex").call(
+        Role.critic, "read it", timeout_s=60,
+        images=[{"path": str(img), "media_type": "image/png"}],
+    )
+    assert out.content == "CODE-READ"
+    assert any(a == f"--image={img}" for a in captured["cmd"])
 
 
 def test_claude_without_images_uses_plain_json(stub_run):
