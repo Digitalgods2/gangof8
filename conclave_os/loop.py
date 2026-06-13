@@ -34,6 +34,16 @@ from .sessions import SessionManager
 from .skills import get_skill
 from .uploads import image_inputs
 
+# Approval-gated draft proposals (the artifact/exec gate) — distinct from the
+# read-skill actions (read_file/search_project) that also land in
+# proposed_actions for audit. The "did we collect / are we past deliberation"
+# guards must count only these, not read requests.
+_PROPOSAL_KINDS = {"write_file", "edit_file", "run_tests"}
+
+
+def _has_proposals(session: Session) -> bool:
+    return any(a.kind in _PROPOSAL_KINDS for a in session.proposed_actions)
+
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
 
@@ -430,11 +440,11 @@ def _deliberate(
     # skip the rounds that already ran
     plan = plan_rounds(cls, council, session.budgets)
     completed_rounds = len(session.rounds)
-    # If proposals were already collected, deliberation finished and we paused
-    # in the action gate (step 7b). On resume, do NOT re-run the remaining
+    # If draft proposals were already collected, deliberation finished and we
+    # paused in the action gate (step 7b). On resume, do NOT re-run the remaining
     # planned rounds (deliberation can early-stop on an accepted draft, leaving
     # rounds unrun) — fall straight through to execution/compose.
-    if session.proposed_actions:
+    if _has_proposals(session):
         completed_rounds = len(plan)
     manager.transition(session, SessionStatus.deliberating)
 
@@ -539,7 +549,7 @@ def _deliberate(
     # If the task should produce files but the draft only described them,
     # materialize each file with a focused single-file call.
     _collect_proposals(session, store)
-    if not session.proposed_actions and cls.produces_output:
+    if not _has_proposals(session) and cls.produces_output:
         _materialize_artifacts(session, compose_call, store)
     if _execute_actions(session, manager, governance, store):
         return session  # paused in awaiting_approval
@@ -593,7 +603,7 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     'ARTIFACT: <file>' → write_file, an 'EDIT: <file>' OLD/NEW block →
     edit_file, and 'RUNTESTS: <cmd>' → run_tests. Collected in document order so
     writes/edits precede a test run. Idempotent: not re-collected on resume."""
-    if session.proposed_actions:
+    if _has_proposals(session):
         return
     draft = next(
         (c for c in reversed(session.contributions) if c.role == Role.implementer), None
@@ -688,7 +698,7 @@ def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -
     intended file with its own focused single-file call, one write_file
     ProposedAction per file. Idempotent (skips if proposals already exist);
     degrades gracefully on budget/agent errors."""
-    if session.proposed_actions:
+    if _has_proposals(session):
         return
     implementer = session.council.get(Role.implementer)
     if not (implementer and implementer.active):
