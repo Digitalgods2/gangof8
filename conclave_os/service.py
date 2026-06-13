@@ -296,6 +296,37 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             for a in agents
         ]}
 
+    def list_dir(self, path: Optional[str] = None) -> dict:
+        """List sub-directories of `path` for the in-page folder browser. With no
+        path, list drive roots (Windows) or '/'. Folders only — never reads file
+        contents. Localhost convenience for picking a workspace."""
+        import os
+        import string
+        import sys
+
+        if not path:
+            if sys.platform == "win32":
+                drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+                return {"path": "", "parent": None, "dirs": drives}
+            path = "/"
+        p = Path(path)
+        if not p.is_dir():
+            return {"path": str(path), "parent": "", "dirs": [], "error": "not a directory"}
+        p = p.resolve()
+        parent = "" if p.parent == p else str(p.parent)
+        dirs: list[str] = []
+        try:
+            for child in p.iterdir():
+                try:
+                    if child.is_dir():
+                        dirs.append(str(child))
+                except OSError:
+                    continue  # unreadable entry — skip
+        except (PermissionError, OSError) as e:
+            return {"path": str(p), "parent": parent, "dirs": [], "error": str(e)}
+        dirs.sort(key=str.lower)
+        return {"path": str(p), "parent": parent, "dirs": dirs}
+
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)
 

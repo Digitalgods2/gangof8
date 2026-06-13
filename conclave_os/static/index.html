@@ -122,6 +122,20 @@
   header .gear:hover { color:var(--text); border-color:var(--accent); }
   #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
                      display:none; z-index:100; }  /* above the composer (60) */
+  /* in-page folder browser (above settings) */
+  #fsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; z-index:120; }
+  #fsOverlay.open { display:flex; align-items:center; justify-content:center; }
+  #fsPanel { width:min(640px,92vw); max-height:80vh; display:flex; flex-direction:column;
+             background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px 18px; }
+  #fsPath { color:var(--dim); font-size:12px; margin-bottom:8px; word-break:break-all;
+            font-family:Consolas, monospace; }
+  #fsList { flex:1 1 auto; overflow-y:auto; min-height:80px; border:1px solid var(--line);
+            border-radius:8px; background:var(--bg); }
+  .fsrow { padding:7px 11px; cursor:pointer; border-bottom:1px solid var(--line);
+           font-size:13px; display:flex; gap:8px; align-items:center; }
+  .fsrow:last-child { border-bottom:0; }
+  .fsrow:hover { background:var(--panel); border-color:var(--accent); }
+  #fsPanel > .row { flex:0 0 auto; margin-top:12px; }
   #settingsOverlay.open { display:block; }
   #settingsPanel { position:absolute; top:0; right:0; height:100%; width:520px;
                    max-width:100%; background:var(--bg); border-left:1px solid var(--line);
@@ -184,6 +198,20 @@
     </div>
   </div>
 </div>
+
+<div id="fsOverlay" onclick="if(event.target===this)closeFs()">
+  <div id="fsPanel">
+    <div class="shead"><h2>Choose a folder</h2>
+      <button class="ghost x" onclick="closeFs()">Cancel</button></div>
+    <div id="fsPath" class="mono">…</div>
+    <div id="fsList"></div>
+    <div class="row">
+      <button onclick="useFsFolder()">Use this folder</button>
+      <span class="sub" id="fsNote"></span>
+    </div>
+  </div>
+</div>
+
 <main>
   <div id="left">
     <h2>Sessions</h2>
@@ -668,7 +696,7 @@ function renderSettings(s, seats) {
       <div class="field" style="margin-top:8px">${lbl("Add workspace", "workspace")}
         <input type="text" id="ws_name" placeholder="name" style="flex:0 0 110px">
         <input type="text" id="ws_root" placeholder="path (or Browse…)">
-        <button class="ghost" onclick="pickFolder()" title="Choose a folder">Browse…</button>
+        <button class="ghost" onclick="openFs()" title="Browse folders">Browse…</button>
         <button onclick="addWorkspace()">Add</button>
       </div>
     </div>
@@ -764,22 +792,36 @@ async function activateWorkspace(id) {
   if (r.ok) { wsCache = await r.json(); _renderWsAfterChange("workspace updated ✓"); }
 }
 
-async function pickFolder() {
-  const note = document.getElementById("savedNote");
-  note.style.color = ""; note.textContent = "opening folder picker on the host…";
-  try {
-    const d = await fetch("/workspaces/pick-folder", {method: "POST"}).then(r => r.json());
-    if (d.path) {
-      document.getElementById("ws_root").value = d.path;
-      if (!document.getElementById("ws_name").value.trim())
-        document.getElementById("ws_name").value = d.path.split(/[\\/]/).filter(Boolean).pop() || "";
-      note.textContent = "selected " + d.path;
-    } else {
-      note.textContent = d.error ? ("picker: " + d.error) : "no folder selected";
-    }
-  } catch (e) {
-    note.style.color = "var(--bad)"; note.textContent = "folder picker failed";
-  }
+// ---- in-page folder browser ----
+let fsCurrent = "";  // "" = drive roots
+const escAttr = s => esc(s).replaceAll('"', "&quot;");
+const baseName = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || p;
+
+function openFs() { document.getElementById("fsOverlay").classList.add("open"); fsNavigate(""); }
+function closeFs() { document.getElementById("fsOverlay").classList.remove("open"); }
+
+async function fsNavigate(path) {
+  const list = document.getElementById("fsList");
+  list.innerHTML = '<div class="sub" style="padding:10px">loading…</div>';
+  const d = await api("/fs/list?path=" + encodeURIComponent(path || ""));
+  fsCurrent = d.path || "";
+  document.getElementById("fsPath").textContent = fsCurrent || "(drives)";
+  document.getElementById("fsNote").textContent = d.error || "";
+  let rows = "";
+  if (d.parent !== null && d.parent !== undefined)
+    rows += `<div class="fsrow" data-path="${escAttr(d.parent)}"><span>⬆</span> .. (up)</div>`;
+  rows += (d.dirs || []).map(p =>
+    `<div class="fsrow" data-path="${escAttr(p)}"><span>📁</span> ${esc(baseName(p))}</div>`).join("");
+  list.innerHTML = rows || '<div class="sub" style="padding:10px">(no sub-folders)</div>';
+  list.onclick = e => { const r = e.target.closest(".fsrow"); if (r) fsNavigate(r.dataset.path); };
+}
+
+function useFsFolder() {
+  if (!fsCurrent) { document.getElementById("fsNote").textContent = "open a folder first"; return; }
+  document.getElementById("ws_root").value = fsCurrent;
+  if (!document.getElementById("ws_name").value.trim())
+    document.getElementById("ws_name").value = baseName(fsCurrent);
+  closeFs();
 }
 
 async function addWorkspace() {

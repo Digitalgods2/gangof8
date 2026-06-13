@@ -230,11 +230,11 @@ def create_workspace(body: WorkspaceIn) -> dict:
     return ws.model_dump()
 
 
-@app.post("/workspaces/pick-folder")
-def pick_folder() -> dict:
-    """Open the host's native folder dialog and return the chosen absolute path
-    (localhost convenience for the Add-workspace field)."""
-    return service.pick_folder()
+@app.get("/fs/list")
+def fs_list(path: str | None = None) -> dict:
+    """List sub-directories under `path` (drives at the root) for the in-page
+    folder browser. Folders only; localhost convenience."""
+    return service.list_dir(path)
 
 
 @app.put("/workspaces/active")
