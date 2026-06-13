@@ -156,24 +156,46 @@ class ConclaveService:
 
         if sys.platform != "win32":
             return {"path": None, "error": "folder picker is available on Windows only"}
-        # A tiny topmost, transparent owner window is shown + activated so the
-        # folder dialog is parented to a foreground window and appears on top
-        # (otherwise it opens behind the browser and looks like nothing happened).
-        ps = (
-            "Add-Type -AssemblyName System.Windows.Forms\n"
-            "$o = New-Object System.Windows.Forms.Form\n"
-            "$o.TopMost = $true\n"
-            "$o.ShowInTaskbar = $false\n"
-            "$o.Opacity = 0\n"
-            "$o.Show(); $o.Activate()\n"
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
-            "$d.Description = 'Select a workspace folder for Conclave OS'\n"
-            "$d.ShowNewFolderButton = $true\n"
-            "$r = $d.ShowDialog($o)\n"
-            "$o.Close()\n"
-            "if ($r -eq [System.Windows.Forms.DialogResult]::OK) "
-            "{ [Console]::Out.Write($d.SelectedPath) }\n"
-        )
+        # The dialog is spawned by the (background) server process, which can't
+        # steal focus from the foreground browser, so it opens BEHIND it. Force
+        # it forward with the AttachThreadInput trick (attach to the foreground
+        # thread, then SetForegroundWindow on a transparent topmost owner that
+        # parents the modal folder dialog).
+        ps = r'''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Fg {
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
+  [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int n);
+  public static void Force(IntPtr h) {
+    uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+    uint cur = GetCurrentThreadId();
+    AttachThreadInput(fg, cur, true);
+    ShowWindow(h, 5); BringWindowToTop(h); SetForegroundWindow(h);
+    AttachThreadInput(fg, cur, false);
+  }
+}
+"@
+$o = New-Object System.Windows.Forms.Form
+$o.TopMost = $true
+$o.ShowInTaskbar = $false
+$o.Opacity = 0
+$o.Show()
+[Fg]::Force($o.Handle)
+$d = New-Object System.Windows.Forms.FolderBrowserDialog
+$d.Description = 'Select a workspace folder for Conclave OS'
+$d.ShowNewFolderButton = $true
+$r = $d.ShowDialog($o)
+$o.Close()
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }
+'''
         enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
         try:
             proc = subprocess.run(
