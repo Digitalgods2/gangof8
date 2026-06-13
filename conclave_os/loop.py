@@ -90,6 +90,19 @@ def _readable_files(session: Session, data_dir) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_file())
 
 
+# Every role sees this so non-implementer roles stop treating can_write_files /
+# can_run_commands as a blocker and stop asking the human to "enable" them: file
+# production is governed (implementer emits ARTIFACT, human approves the write).
+_GOVERNANCE_CONTEXT = (
+    "You operate inside a governed coordinator. You cannot and do not need to "
+    "perform file writes, shell commands, or network calls yourself — ignore any "
+    "can_write_files / can_run_commands permission flags. When the task needs a "
+    "file, the implementer emits an 'ARTIFACT: <filename>' block and the human "
+    "approves the write. Do NOT ask whether to enable write permissions; assume "
+    "the governed write path exists and proceed with your role.\n"
+)
+
+
 def build_prompt(
     session: Session, spec: RoundSpec, role: Role, readable: list[str] = ()
 ) -> str:
@@ -102,6 +115,7 @@ def build_prompt(
         )
     return (
         f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
         f"Round {spec.round} objective: {spec.goal}\n"
         f"Your role: {role.value}. Answer only from this role.\n"
         f"Output requirement: {spec.output_requirement}\n"
@@ -185,6 +199,7 @@ def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
 def draft_prompt(session: Session) -> str:
     return (
         f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
         "Your role: implementer. Produce the ACTUAL working result, not a description "
         "of it. If the task calls for files (code, docs, config), emit each file "
         "literally in this format, with its COMPLETE contents — never a summary of what "
