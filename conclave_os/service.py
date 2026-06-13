@@ -156,16 +156,23 @@ class ConclaveService:
 
         if sys.platform != "win32":
             return {"path": None, "error": "folder picker is available on Windows only"}
+        # A tiny topmost, transparent owner window is shown + activated so the
+        # folder dialog is parented to a foreground window and appears on top
+        # (otherwise it opens behind the browser and looks like nothing happened).
         ps = (
             "Add-Type -AssemblyName System.Windows.Forms\n"
             "$o = New-Object System.Windows.Forms.Form\n"
             "$o.TopMost = $true\n"
+            "$o.ShowInTaskbar = $false\n"
+            "$o.Opacity = 0\n"
+            "$o.Show(); $o.Activate()\n"
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
             "$d.Description = 'Select a workspace folder for Conclave OS'\n"
             "$d.ShowNewFolderButton = $true\n"
-            "if ($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK) "
+            "$r = $d.ShowDialog($o)\n"
+            "$o.Close()\n"
+            "if ($r -eq [System.Windows.Forms.DialogResult]::OK) "
             "{ [Console]::Out.Write($d.SelectedPath) }\n"
-            "$o.Dispose()\n"
         )
         enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
         try:
