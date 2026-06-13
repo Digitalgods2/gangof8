@@ -156,44 +156,64 @@ class ConclaveService:
 
         if sys.platform != "win32":
             return {"path": None, "error": "folder picker is available on Windows only"}
-        # The dialog is spawned by the (background) server process, which can't
-        # steal focus from the foreground browser, so it opens BEHIND it. Force
-        # it forward with the AttachThreadInput trick (attach to the foreground
-        # thread, then SetForegroundWindow on a transparent topmost owner that
-        # parents the modal folder dialog).
+        # The dialog is spawned by the (background, no-console) server process,
+        # which can't steal focus from the foreground browser (Windows
+        # foreground lock), so it opens BEHIND it. A background thread finds the
+        # dialog window (class #32770) once it appears and repeatedly forces it
+        # to the front (AttachThreadInput + foreground-lock-timeout disabled).
         ps = r'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
+using System.Threading;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 public static class Fg {
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int max);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr p);
   [DllImport("user32.dll")] static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
   [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int n);
-  public static void Force(IntPtr h) {
-    uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
-    uint cur = GetCurrentThreadId();
-    AttachThreadInput(fg, cur, true);
-    ShowWindow(h, 5); BringWindowToTop(h); SetForegroundWindow(h);
-    AttachThreadInput(fg, cur, false);
+  [DllImport("user32.dll")] static extern bool SystemParametersInfo(int a, int b, IntPtr c, int d);
+  public static void StartForcer() {
+    var t = new Thread(() => {
+      int mypid = Process.GetCurrentProcess().Id;
+      for (int i = 0; i < 30; i++) {
+        Thread.Sleep(120);
+        IntPtr dlg = IntPtr.Zero;
+        EnumWindows((h, l) => {
+          uint pid; GetWindowThreadProcessId(h, out pid);
+          if ((int)pid == mypid && IsWindowVisible(h)) {
+            var sb = new StringBuilder(64); GetClassName(h, sb, 64);
+            if (sb.ToString() == "#32770") { dlg = h; return false; }
+          }
+          return true;
+        }, IntPtr.Zero);
+        if (dlg != IntPtr.Zero) {
+          SystemParametersInfo(0x2001, 0, IntPtr.Zero, 0);
+          uint fg; GetWindowThreadProcessId(GetForegroundWindow(), out fg);
+          uint cur = GetCurrentThreadId();
+          AttachThreadInput(fg, cur, true);
+          BringWindowToTop(dlg); SetForegroundWindow(dlg);
+          AttachThreadInput(fg, cur, false);
+        }
+      }
+    });
+    t.IsBackground = true; t.Start();
   }
 }
 "@
-$o = New-Object System.Windows.Forms.Form
-$o.TopMost = $true
-$o.ShowInTaskbar = $false
-$o.Opacity = 0
-$o.Show()
-[Fg]::Force($o.Handle)
+[Fg]::StartForcer()
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
 $d.Description = 'Select a workspace folder for Conclave OS'
 $d.ShowNewFolderButton = $true
-$r = $d.ShowDialog($o)
-$o.Close()
+$r = $d.ShowDialog()
 if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }
 '''
         enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
@@ -201,6 +221,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             proc = subprocess.run(
                 ["powershell", "-NoProfile", "-STA", "-EncodedCommand", enc],
                 capture_output=True, text=True, timeout=300,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # no console flash
             )
         except Exception as e:  # noqa: BLE001 — never crash the dashboard
             return {"path": None, "error": str(e)}
