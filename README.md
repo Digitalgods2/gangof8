@@ -24,12 +24,24 @@ Default role mapping (edit `conclave_os/config.py` → `ROLE_AGENTS_CLI`):
 researcher→gemini, critic→codex, architect/implementer/summarizer→claude.
 Any role is remappable in settings (chosen from the local CLIs claude/codex/gemini).
 
+It ships a **web dashboard** with a chat composer, governs file writes through
+human-approved **skills**, can operate on a real project directory
+(**workspaces**), and **reads attached images** (text, diagrams, screenshots) —
+all detailed below.
+
 ## Setup
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install pydantic fastapi uvicorn pytest httpx
+.venv\Scripts\python -m pip install pydantic fastapi uvicorn pytest httpx pypdf google-genai Pillow
 ```
+
+- `pypdf` — extract text from attached PDFs.
+- `google-genai` — gemini image vision (inline-image inference; needs `GEMINI_API_KEY`).
+- `Pillow` — used only by the test suite to generate images.
+
+The `cli` backend uses your locally-installed agent CLIs (`claude`, `codex`,
+`gemini` on PATH), each with its own auth — there is no external service.
 
 ## Use
 
@@ -46,18 +58,100 @@ python -m venv .venv
 .venv\Scripts\python cli.py answer <session_id> <input_id> your answer text
 .venv\Scripts\python cli.py decline <session_id> <input_id>      # cancels the session
 
+# Workspaces (allowed work areas — see below)
+.venv\Scripts\python cli.py workspace list
+.venv\Scripts\python cli.py workspace add <name> <absolute_path>   # registers + activates
+.venv\Scripts\python cli.py workspace use <workspace_id>
+.venv\Scripts\python cli.py workspace none                         # back to the sandbox
+
 # API
 .venv\Scripts\uvicorn conclave_os.main:app --port 8790
-# POST /tasks {"text": "..."} · GET /sessions · GET /sessions/{id} · GET /health
+# POST /tasks {"text": "...", "attachments": ["up_..."]} · GET /sessions · GET /sessions/{id}
+# POST /uploads {"name": "...", "content_base64": "..."}  → {id, kind, ...}
 # GET /approvals · POST /sessions/{id}/approvals/{aid} {"approved": true|false}
 # GET /inputs · POST /sessions/{id}/inputs/{iid} {"answer": "..."} or {"decline": true}
+# GET/PUT /settings · GET /settings/seats · GET/POST /workspaces · PUT /workspaces/active
 ```
+
+## Web dashboard
+
+`python cli.py serve --backend cli` (or `--backend mock`) opens a single-page
+dashboard at `http://127.0.0.1:8790/`:
+
+- **Bottom-center chat composer** — auto-growing text box (Enter sends,
+  Shift+Enter for a newline), a **Clear** button, and a **+** menu to attach a
+  **document (text / PDF)** or **image**. Attachments show as removable chips.
+- **Live progress** — each session shows a pulsing status banner (current round
+  goal, the seat being awaited, a ticking elapsed timer) and a council roster
+  that green-checks each agent as it contributes.
+- **Rollups** — the final answer plus a one-line stats summary; contributions
+  and disagreements collapse to informative one-line summaries (expandable),
+  with open/closed state preserved across the 3 s refresh.
+- **Approvals & questions** — file-write gates surface **Approve / Deny**
+  buttons (naming the exact target path); agent questions surface an
+  **Answer / Decline** box.
+- **Settings gear** — backend, per-role agent mapping, workspaces (add /
+  activate / use-sandbox), governance / composer tunables, and UI prefs, each
+  with a hover tooltip explaining its purpose.
 
 ## Test
 
 ```powershell
 .venv\Scripts\python -m pytest tests -q
 ```
+
+## Skills & permission kernel
+
+Side effects are governed by a data-driven **skill registry** (`skills.py`) and
+a **permission kernel** (`governance.authorize_action`). Each `Skill` declares
+its category, risk, `requires_approval`, allowed roles, and inputs; the kernel
+role-gates every action and decides on that metadata — never on hardcoded
+behaviour.
+
+| Skill | Approval | Roles | What it does |
+|-------|----------|-------|--------------|
+| `write_file` | **required** (human) | implementer | Write a file (workspace or sandbox) |
+| `read_file` | none (read) | researcher, implementer | Read a file |
+| `search_project` | none (read) | researcher, architect, implementer | grep file names + contents in the workspace |
+
+- **Producing files**: the implementer heads a block with `ARTIFACT: <filename>`
+  (one per file) followed by the full contents; each becomes an approval-gated
+  `write_file`. If an output task names files but emits no full blocks, the
+  coordinator **materializes** each with a focused single-file call.
+- **Reading mid-deliberation**: any allowed role may emit a plain-text
+  `SKILL: read_file <path>` or `SKILL: search_project <query>` line; the kernel
+  authorizes it (reads need no approval) and the result is fed back on a single
+  re-call. The grammar is advertised to a role only when it's useful.
+- **No agent does I/O itself** — every write flows through the executor +
+  human approval; the only ungated capability is `generate_text`.
+
+## Workspaces (allowed work areas)
+
+By default file skills are confined to a throwaway per-session sandbox
+(`data/artifacts/<session_id>/`). Register a **workspace** to let the council
+read and (with approval) write into a real project directory instead:
+
+- `cli.py workspace add <name> <path>` (or the dashboard Workspace panel)
+  registers + activates it; new sessions capture the active workspace.
+- Paths resolve **inside** the root — subdirectories like `src/main.py` are
+  allowed, but `..`, absolute, and drive-qualified paths are rejected
+  (`executor.resolve_in_workspace`). Approvals name the absolute target.
+
+## Multi-modal input & vision
+
+Attach **text**, **PDF**, or **image** files in the dashboard composer (stored
+under `data/uploads/`):
+
+- **Text / PDF** — text is extracted (PDF via `pypdf`) and folded into the task
+  the council reads.
+- **Images** — **really seen** by the agents (reads text in screenshots/scans,
+  interprets diagrams), with no tools or filesystem access:
+  - **claude** — base64 image content blocks via `--input-format stream-json`.
+  - **codex** — `codex exec --image=<path>`.
+  - **gemini** — google-genai SDK inline image (`Part.from_bytes`), used when an
+    image is attached and `GEMINI_API_KEY` is set; gemini text calls stay on the
+    CLI. (The gemini CLI has no clean headless image input — see
+    [gemini-cli#3311](https://github.com/google-gemini/gemini-cli/issues/3311).)
 
 ## Guarantees (enforced by tests)
 
@@ -85,45 +179,37 @@ The full pipeline has been proven with real agents, not just mocks:
   session paused on a `file_write` approval, and the file was written into the
   session sandbox only after explicit `cli.py approve`.
 
+Proven on the self-contained `cli` backend (2026-06-13):
+
+- **Build into a real workspace** — a "build a tiny FastAPI app (main.py,
+  README.md, requirements.txt, test_main.py)" task: classified as code, the
+  implementer drafted, each file paused on a `file_write` gate naming the
+  workspace path, and on approval **real, runnable code** was written into the
+  workspace — the generated `test_main.py` passes under pytest.
+- **Image vision, all three seats** — an attached PNG whose text existed only as
+  pixels was read correctly end to end by claude, by codex, and (with the whole
+  council mapped to it) by gemini.
+
 Hard-won contract lesson encoded throughout: **plain-text output contracts
-(`DISAGREEMENT:`, `VERDICT:`, `ARTIFACT:`, labeled sections) parse reliably
-from CLI output; JSON-shaped contracts do not.** The composer accepts
-substantial prose at medium confidence rather than discarding good answers.
-Known cosmetic issue: agent framing prose can leak into artifacts around the
-`ARTIFACT:` content — the human approval step is the review gate.
+(`DISAGREEMENT:`, `VERDICT:`, `ARTIFACT:`, labeled sections) parse reliably from
+CLI output; JSON-shaped contracts do not.** The composer accepts substantial
+prose at medium confidence rather than discarding good answers, and uses a wide
+compose window so the summarizer never pauses to ask for a result already in the
+transcript. `_GOVERNANCE_CONTEXT` is prepended to every role prompt so agents
+ignore `can_write_files` flags and never ask the human to "enable writes" —
+files are produced via `ARTIFACT:` + approval.
 
-## Known issues / follow-ups
+## Known limitations
 
-- **Fixed (2026-06-13): summarizer redundantly asked the human for content the
-  council already produced.** Root cause was mechanical: `compose_prompt` fed
-  the summarizer only the last 5 contributions truncated to 400 chars, so long
-  reconciliations were cut off and it paused (`awaiting_input`) to ask for the
-  very result already in the transcript. Fix: a fuller compose window
-  (`COMPOSER_CONTEXT_CONTRIBUTIONS` × `COMPOSER_CONTEXT_CHARS`) plus an explicit
-  "do not ask the user; synthesize from the deliberation" instruction. (Verify
-  on the next real `cli` backend run.)
-- Agent framing prose can leak into artifacts around `ARTIFACT:` content —
-  human approval is the review gate.
-- **Multi-file artifacts: resolved by the `cli` backend.** The loop parses every
-  `ARTIFACT: <filename>` block into a separate approval-gated `write_file`, and
-  when an output task yields no full blocks it materializes each intended file
-  with a focused single-file call (`_materialize_artifacts`); resume no longer
-  re-runs deliberation after an approval. A real 4-file FastAPI run produced 4
-  named, gated, written files. The `cli` backend calls the agent directly in
-  plain generation mode (no plan-mode) and returns its raw output, so real file
-  *content* now flows through to materialization — the implementer emits actual
-  code, not a description. (The earlier symptom — files materialized as
-  descriptions, not bodies — came from an indirect planner-style invocation;
-  driving the local CLI directly removes that layer.) Separately,
-  `_GOVERNANCE_CONTEXT` was added to all role prompts so non-implementer roles
-  stop treating `can_write_files=false` as a blocker.
-- **Skill loop wired (2026-06-13):** agents may pull a no-approval skill
-  mid-deliberation with a plain-text `SKILL: read_file <name>` line; the kernel
-  authorizes it (role-gated, no approval for reads) and the result is fed back
-  on a single re-call (capped by `MAX_SKILL_REQUESTS_PER_TURN`). The grammar is
-  surfaced in the round prompt only when the session sandbox holds a readable
-  file. Approval-gated skills (write_file) stay on the `ARTIFACT:` proposal
-  path. Behavioral confirmation against real agents is still pending a run.
+- Agent framing prose can occasionally leak into an artifact around the
+  `ARTIFACT:` content — the human approval step is the review gate.
+- **gemini image vision needs `GEMINI_API_KEY`** (it uses the google-genai SDK,
+  since the gemini CLI lacks clean headless image input). Without a key, gemini
+  stays text-only and sees only the attachment note; claude/codex vision use the
+  local CLIs and need no key.
+- Each agent call re-sends an attached image, so vision adds token cost per call.
+- A session paused mid-round for an agent question skips that round's step 8 on
+  resume (a deliberate simplification — actions are governed Conclave-OS-side).
 
 ## Utilities
 
@@ -155,4 +241,13 @@ Known cosmetic issue: agent framing prose can leak into artifacts around the
       the write, confined to `data/artifacts/<session_id>/` (sanitized
       filenames, no path escape). Denying the action skips the artifact but
       the session still completes; denying a session gate still cancels.
-      `write_file` is the only action kind — by design.
+- [x] Phase 5 — service mode + web dashboard (`cli.py serve`): background
+      workers run long real-agent sessions while the dashboard submits-and-polls;
+      live progress, rollups, approvals/inputs in the browser.
+- [x] Milestone 6 — skill registry + permission kernel (`write_file`,
+      `read_file`, `search_project`), the `SKILL:` request grammar, per-file
+      artifact materialization, persisted **settings**, and dashboard rollups.
+- [x] Workspaces — operate on a real project directory (allowed work area) with
+      hard path containment; the first Type-2 module.
+- [x] Multi-modal input — text / PDF attachments folded in as context; **image
+      vision** for claude, codex, and gemini (no tools, governed).
