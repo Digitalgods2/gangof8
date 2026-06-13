@@ -63,6 +63,7 @@ APPROVAL_CATEGORIES = [
     "spend",
     "settings",
     "external",
+    "read",
 ]
 
 # The ONLY capability that never needs approval (default-deny everything else).

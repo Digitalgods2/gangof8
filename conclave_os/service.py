@@ -19,10 +19,11 @@ from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
 from .loop import resume_session, resume_with_input, run_session
-from .models import Budgets, Role, Session, SessionStatus, utcnow
+from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
 from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
+from .settings import Settings, budgets_overrides, load_settings, save_settings
 
 
 class ConclaveService:
@@ -32,23 +33,71 @@ class ConclaveService:
         backend: Optional[str] = None,
         role_agents: Optional[dict[Role, str]] = None,
     ):
-        self.backend = backend or config.BACKEND
-        if self.backend not in config.ROLE_AGENTS_BY_BACKEND:
-            raise ValueError(f"unknown backend '{self.backend}' (mock | switchboard)")
-        self.role_agents = role_agents or config.ROLE_AGENTS_BY_BACKEND[self.backend]
+        self._data_dir = Path(data_dir) if data_dir else config.DATA_DIR
+        # Persisted settings layer over config/env. With no settings.json this
+        # returns the pure config/env defaults, so behaviour is unchanged.
+        self.settings = load_settings(self._data_dir)
+        self._explicit_role_agents = role_agents  # explicit arg always wins
 
-        self.store = LogStore(Path(data_dir) if data_dir else config.DATA_DIR)
+        self.store = LogStore(self._data_dir)
         self.manager = SessionManager(self.store)
         self.governance = Governance(self.store)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
+        self._apply_settings(backend=backend)
+
+    def _apply_settings(self, backend: Optional[str] = None) -> None:
+        """(Re)derive backend, role mapping, switchboard URL and registry from
+        the explicit args + current self.settings. Precedence for backend:
+        explicit arg › settings.json › env/config default."""
+        self.backend = backend or self.settings.backend
+        if self.backend not in config.ROLE_AGENTS_BY_BACKEND:
+            raise ValueError(f"unknown backend '{self.backend}' (mock | switchboard)")
+        # role mapping: explicit arg › settings (non-empty) › backend default
+        if self._explicit_role_agents:
+            self.role_agents = self._explicit_role_agents
+        elif self.settings.role_agents:
+            self.role_agents = {
+                Role(role): agent for role, agent in self.settings.role_agents.items()
+            }
+        else:
+            self.role_agents = config.ROLE_AGENTS_BY_BACKEND[self.backend]
+        self.switchboard_url = self.settings.switchboard_url
+
+        # Push governance/composer tunables into the config module so the loop,
+        # classifier and composer (which read config.* at call time) honour
+        # settings. With no settings.json these equal the existing config
+        # values, so this is a no-op and behaviour is unchanged.
+        config.RISK_BOUNDARY = Risk(self.settings.risk_boundary)
+        config.COMPOSER_PROSE_MIN_CHARS = self.settings.composer.prose_min_chars
+        config.COMPOSER_RESERVED_CALLS = self.settings.composer.reserved_calls
+        config.MAX_CRITIC_TESTS_PER_ROUND = self.settings.composer.max_critic_tests
+        config.BUDGETS_BY_COMPLEXITY = budgets_overrides(self.settings)
+
         self.registry = AgentRegistry()
         if self.backend == "switchboard":
             for agent in sorted(set(self.role_agents.values())):
-                self.registry.register(SwitchboardAdapter(agent=agent, base_url=config.SWITCHBOARD_URL))
+                self.registry.register(SwitchboardAdapter(agent=agent, base_url=self.switchboard_url))
         else:
             self.registry.register(MockAdapter())
+
+    def update_settings(self, patch: dict) -> Settings:
+        """Apply a partial settings patch, persist it, and re-derive the
+        backend/role mapping/registry. Some changes (backend, role mapping)
+        affect new sessions; in-flight sessions keep their own backend."""
+        merged = self.settings.model_dump()
+        for key, value in (patch or {}).items():
+            if key not in merged:
+                continue
+            if isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key].update(value)
+            else:
+                merged[key] = value
+        self.settings = Settings.model_validate(merged)
+        save_settings(self.settings, self._data_dir)
+        self._apply_settings()
+        return self.settings
 
     def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None) -> Session:
         session = intake.receive(text, source, self.manager, budgets)
@@ -102,7 +151,57 @@ class ConclaveService:
         needed |= {r.agent for r in session.input_requests if r.agent}
         for agent in sorted(needed):
             if agent not in self.registry.names() and agent not in ("mock", "unknown"):
-                self.registry.register(SwitchboardAdapter(agent=agent, base_url=config.SWITCHBOARD_URL))
+                self.registry.register(SwitchboardAdapter(agent=agent, base_url=self.switchboard_url))
+
+    # ---- Switchboard proxy (settings panel) ----------------------------------
+    # Keys live in the Switchboard; Conclave OS only proxies. Never store or log
+    # a secret value here.
+
+    def _switchboard(self, method: str, path: str, body: Optional[dict] = None,
+                     timeout: int = 10):
+        """Minimal stdlib HTTP call to the configured Switchboard, reusing the
+        adapter's urllib style. Raises urllib/OS errors to the caller."""
+        import json as _json
+        import urllib.request
+
+        url = f"{self.switchboard_url.rstrip('/')}{path}"
+        data = _json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            url, data=data, method=method, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+
+    def seats(self) -> dict:
+        """List Switchboard seats (name/available/kind). On any failure return
+        an empty list + error so the dashboard never crashes."""
+        try:
+            data = self._switchboard("GET", "/api/health")
+        except Exception as e:  # noqa: BLE001 — never crash the dashboard
+            return {"seats": [], "error": str(e)}
+        seats = [
+            {"name": s.get("name"), "available": bool(s.get("available")),
+             "kind": s.get("kind")}
+            for s in (data.get("seats") or [])
+        ]
+        return {"seats": seats}
+
+    def api_keys(self) -> dict:
+        """Proxy the Switchboard's masked api-key list."""
+        try:
+            return {"keys": self._switchboard("GET", "/api/settings/api-keys")}
+        except Exception as e:  # noqa: BLE001
+            return {"keys": {}, "error": str(e)}
+
+    def set_api_key(self, name: str, body: dict) -> dict:
+        """Proxy a set-key request to the Switchboard. The body is forwarded
+        as-is; the secret value is never stored or logged here."""
+        return self._switchboard("POST", f"/api/settings/api-keys/{name}", body or {})
+
+    def reveal_api_key(self, name: str) -> dict:
+        """Proxy the Switchboard reveal endpoint (returns the plaintext value;
+        not logged here)."""
+        return self._switchboard("GET", f"/api/settings/api-keys/{name}/reveal")
 
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)

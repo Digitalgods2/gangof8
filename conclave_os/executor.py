@@ -1,9 +1,10 @@
 """Action executor — the ONLY code that performs side effects for agents.
 
-Phase 4 supports exactly one action kind: write_file, confined to the
-session's own artifacts folder (data/artifacts/<session_id>/). Every call
-must already carry an approved ApprovalRequest — the loop enforces that;
-this module enforces the sandbox.
+Dispatch is registry-driven: `execute` looks up the handler for
+`action.kind` in conclave_os.skills.HANDLERS. Every approval-requiring call
+must already carry an approved ApprovalRequest — the kernel enforces that;
+the skill handlers enforce their own sandboxes (the shared filename/sandbox
+helpers live here so skills.py can reuse them without a circular import).
 """
 
 from __future__ import annotations
@@ -35,14 +36,12 @@ def artifacts_dir(data_dir: Path, session_id: str) -> Path:
     return Path(data_dir) / "artifacts" / session_id
 
 
-def execute(session: Session, action: ProposedAction, data_dir: Path) -> Path:
-    if action.kind != "write_file":
+def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Dispatch the action to its registered skill handler and return the
+    handler's result string (e.g. the written path, or file contents)."""
+    from .skills import HANDLERS  # local import avoids a circular dependency
+
+    handler = HANDLERS.get(action.kind)
+    if handler is None:
         raise ExecutionError(f"unsupported action kind: {action.kind!r}")
-    name = _safe_filename(action.filename)
-    out_dir = artifacts_dir(data_dir, session.session_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = (out_dir / name).resolve()
-    if path.parent != out_dir.resolve():
-        raise ExecutionError(f"path escapes the artifacts sandbox: {name!r}")
-    path.write_text(action.content, encoding="utf-8")
-    return path
+    return handler(session, action, Path(data_dir))
