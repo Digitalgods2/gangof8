@@ -32,6 +32,8 @@ def stub_run(monkeypatch):
             calls["input"] = kwargs.get("input")
             return proc
         monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+        # resolve any CLI name to a fake path so tests don't need a real install
+        monkeypatch.setattr(cli_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
         return calls
 
     return _set
@@ -42,7 +44,8 @@ def test_claude_returns_result_field(stub_run):
                                               "result": "from fastapi import FastAPI\n"})))
     out = CliAdapter("claude").call(Role.implementer, "make main.py", timeout_s=60)
     assert out.content == "from fastapi import FastAPI"
-    assert calls["cmd"][:2] == ["claude", "-p"]
+    assert calls["cmd"][0].endswith("claude")  # resolved via PATH
+    assert calls["cmd"][1] == "-p"
     assert "--tools" in calls["cmd"]  # tools disabled — no side effects
     assert calls["input"] == "make main.py"  # prompt goes on stdin
 

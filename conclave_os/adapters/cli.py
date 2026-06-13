@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -46,7 +47,13 @@ class CliAdapter:
         return AdapterResult(content=content, duration_ms=int((time.monotonic() - t0) * 1000))
 
     def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
-        """Run a CLI command with the prompt on stdin; return stdout."""
+        """Run a CLI command with the prompt on stdin; return stdout. The
+        executable is resolved via PATH (shutil.which) so Windows .cmd/.exe
+        shims for npm-installed CLIs are found and run directly."""
+        exe = shutil.which(cmd[0])
+        if not exe:
+            raise AgentError(f"{self.agent} CLI not found on PATH ({cmd[0]!r})")
+        cmd = [exe, *cmd[1:]]
         try:
             proc = subprocess.run(
                 cmd, input=prompt, capture_output=True, text=True,
