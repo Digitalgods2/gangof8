@@ -103,7 +103,12 @@
   .sset > label { display:block; font-size:11px; color:var(--dim); text-transform:uppercase;
                   letter-spacing:.5px; margin-bottom:8px; }
   .field { display:flex; align-items:center; gap:8px; margin-top:6px; }
-  .field span { flex:0 0 150px; color:var(--dim); font-size:12.5px; }
+  .field span, .field .lbl { flex:0 0 150px; color:var(--dim); font-size:12.5px; }
+  .tip { display:inline-block; width:13px; height:13px; line-height:13px; text-align:center;
+         border:1px solid var(--line); border-radius:50%; color:var(--dim); font-size:9px;
+         font-style:normal; cursor:help; margin-left:5px; vertical-align:middle; }
+  .tip:hover { color:var(--accent); border-color:var(--accent); }
+  .sset > label .tip { margin-left:7px; }
   .field input[type=text], .field input[type=number], .field select, .field input[type=password] {
       flex:1; background:var(--panel); color:var(--text); border:1px solid var(--line);
       border-radius:6px; padding:5px 8px; font-size:12.5px; min-width:0; }
@@ -436,6 +441,29 @@ async function declineInput(iid) {
 const ROLES = ["researcher", "architect", "critic", "implementer", "summarizer"];
 let settingsCache = null, seatsCache = [];
 
+// Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
+const TIPS = {
+  backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'switchboard' drives the real Codex / Gemini / Claude-code agents via Conclave AI.",
+  url: "URL of the Conclave AI Switchboard that actually executes agent calls. Default http://127.0.0.1:8787.",
+  roles: "Map each council role to a Switchboard seat. Cheaper API seats (deepseek, glm, qwen, kimi) can stand in for the CLI seats. '(backend default)' uses the preset.",
+  researcher: "Seat that gathers the relevant facts and constraints in the first round.",
+  architect: "Seat that proposes design / structure when a task needs design work.",
+  critic: "Seat that challenges the strongest claims and surfaces disagreements.",
+  implementer: "Seat that drafts the working result or artifact — the only role allowed to propose file writes.",
+  summarizer: "Seat that composes the final, reconciled answer.",
+  risk: "Tasks classified above this risk level pause for your approval before any deliberation runs.",
+  prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried — a workaround for the Switchboard's protocol envelope.",
+  reserved: "Agent calls held back from deliberation so the composer (and its one retry) can always run.",
+  critic_tests: "Maximum disagreements the critic actively tests per round; the rest are ruled on constraints to save budget.",
+  poll: "How often the dashboard refreshes session state, in milliseconds.",
+  collapse: "Collapse the contributions / disagreements sections by default once a session has finished.",
+  keys: "Keys are stored and used by the Switchboard, never saved in Conclave OS. Values are masked in the UI and never logged.",
+  key_name: "The provider or seat name the key belongs to (e.g. openrouter, deepseek).",
+  key_value: "The secret API key. It is sent to the Switchboard, masked here, and never echoed to the console.",
+};
+const tip = k => TIPS[k] ? `<i class="tip" title="${esc(TIPS[k])}">i</i>` : "";
+const lbl = (text, k) => `<span class="lbl">${esc(text)}${tip(k)}</span>`;
+
 async function openSettings() {
   document.getElementById("settingsOverlay").classList.add("open");
   document.getElementById("savedNote").textContent = "";
@@ -486,53 +514,53 @@ function renderSettings(s, seats, keysResp) {
   document.getElementById("settingsBody").innerHTML = `
     <div class="sset">
       <label>Backend</label>
-      <div class="field"><span>Backend</span>
+      <div class="field">${lbl("Backend", "backend")}
         <select id="set_backend">
           <option value="mock" ${s.backend === "mock" ? "selected" : ""}>mock</option>
           <option value="switchboard" ${s.backend === "switchboard" ? "selected" : ""}>switchboard</option>
         </select></div>
-      <div class="field"><span>Switchboard URL</span>
+      <div class="field">${lbl("Switchboard URL", "url")}
         <input type="text" id="set_url" value="${esc(s.switchboard_url)}"></div>
     </div>
 
     <div class="sset">
-      <label>Role mapping → seat</label>
+      <label>Role mapping → seat ${tip("roles")}</label>
       ${ROLES.map(r => `
-        <div class="field"><span>${esc(r)}</span>
+        <div class="field">${lbl(r, r)}
           <select id="role_${r}">${seatOptions(ra[r] || "")}</select></div>`).join("")}
       ${seatErr}
     </div>
 
     <div class="sset">
       <label>Governance / composer</label>
-      <div class="field"><span>Risk boundary</span>
+      <div class="field">${lbl("Risk boundary", "risk")}
         <select id="set_risk">
           ${["none","low","medium","high"].map(rk =>
             `<option value="${rk}" ${s.risk_boundary === rk ? "selected" : ""}>${rk}</option>`).join("")}
         </select></div>
-      <div class="field"><span>Prose min chars</span>
+      <div class="field">${lbl("Prose min chars", "prose")}
         <input type="number" id="set_prose" value="${esc(c.prose_min_chars)}"></div>
-      <div class="field"><span>Reserved calls</span>
+      <div class="field">${lbl("Reserved calls", "reserved")}
         <input type="number" id="set_reserved" value="${esc(c.reserved_calls)}"></div>
-      <div class="field"><span>Max critic tests</span>
+      <div class="field">${lbl("Max critic tests", "critic_tests")}
         <input type="number" id="set_critic" value="${esc(c.max_critic_tests)}"></div>
     </div>
 
     <div class="sset">
       <label>UI preferences</label>
-      <div class="field"><span>Poll interval (ms)</span>
+      <div class="field">${lbl("Poll interval (ms)", "poll")}
         <input type="number" id="set_poll" value="${esc(ui.poll_interval_ms)}"></div>
-      <div class="field"><span>Collapse finished</span>
+      <div class="field">${lbl("Collapse finished", "collapse")}
         <input type="checkbox" id="set_collapse" ${ui.collapse_finished ? "checked" : ""}></div>
     </div>
 
     <div class="sset">
-      <label>API keys (stored in the Switchboard, never here)</label>
+      <label>API keys (stored in the Switchboard, never here) ${tip("keys")}</label>
       ${keyRows || '<div class="sub">no keys reported</div>'}
       ${keyErr}
-      <div class="field" style="margin-top:10px"><span>Set / update key</span>
-        <input type="text" id="key_name" placeholder="seat / provider name" style="flex:0 0 160px">
-        <input type="password" id="key_value" placeholder="key value (not echoed)">
+      <div class="field" style="margin-top:10px">${lbl("Set / update key", "key_name")}
+        <input type="text" id="key_name" placeholder="seat / provider name" style="flex:0 0 160px" title="${esc(TIPS.key_name)}">
+        <input type="password" id="key_value" placeholder="key value (not echoed)" title="${esc(TIPS.key_value)}">
         <button onclick="setKey()">Set</button>
       </div>
     </div>`;
