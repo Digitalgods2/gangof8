@@ -146,6 +146,38 @@ class ConclaveService:
     def save_upload(self, name: str, content_b64: str) -> dict:
         return self.uploads.save(name, content_b64)
 
+    def pick_folder(self) -> dict:
+        """Open the host's native folder dialog and return the chosen absolute
+        path. Localhost-dashboard convenience (browsers can't expose a real path
+        from a folder picker). Windows only; the dialog requires user selection."""
+        import base64
+        import subprocess
+        import sys
+
+        if sys.platform != "win32":
+            return {"path": None, "error": "folder picker is available on Windows only"}
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms\n"
+            "$o = New-Object System.Windows.Forms.Form\n"
+            "$o.TopMost = $true\n"
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
+            "$d.Description = 'Select a workspace folder for Conclave OS'\n"
+            "$d.ShowNewFolderButton = $true\n"
+            "if ($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ [Console]::Out.Write($d.SelectedPath) }\n"
+            "$o.Dispose()\n"
+        )
+        enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-EncodedCommand", enc],
+                capture_output=True, text=True, timeout=300,
+            )
+        except Exception as e:  # noqa: BLE001 — never crash the dashboard
+            return {"path": None, "error": str(e)}
+        path = (proc.stdout or "").strip()
+        return {"path": path or None}
+
     # ---- Workspaces ----------------------------------------------------------
 
     def list_workspaces(self) -> dict:

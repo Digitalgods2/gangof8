@@ -230,6 +230,13 @@ def create_workspace(body: WorkspaceIn) -> dict:
     return ws.model_dump()
 
 
+@app.post("/workspaces/pick-folder")
+def pick_folder() -> dict:
+    """Open the host's native folder dialog and return the chosen absolute path
+    (localhost convenience for the Add-workspace field)."""
+    return service.pick_folder()
+
+
 @app.put("/workspaces/active")
 def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
     try:
