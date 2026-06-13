@@ -561,7 +561,7 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     for i, m in enumerate(markers):
         filename = m.group(1).strip()
         end = markers[i + 1].start() if i + 1 < len(markers) else len(draft.content)
-        content = draft.content[m.end():end].strip()
+        content = _strip_code_fence(draft.content[m.end():end].strip())
         action = ProposedAction(
             session_id=session.session_id,
             kind="write_file",
