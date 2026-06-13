@@ -55,6 +55,9 @@
                      50% { opacity:.35; transform:scale(.7); } }
   .live .what { font-weight:600; text-transform:capitalize; }
   .live .meta { color:var(--dim); font-size:12px; }
+  .ell::after { content:""; animation:ell 1.4s steps(4,end) infinite; }
+  @keyframes ell { 0%{content:""} 25%{content:"."} 50%{content:".."} 75%{content:"..."} }
+  #elapsed { color:var(--text); font-variant-numeric:tabular-nums; }
   .contrib { border:1px solid var(--line); border-radius:6px; margin-top:8px; }
   .contrib > .hd { display:flex; gap:8px; align-items:center; padding:6px 10px;
                    background:#141a24; border-bottom:1px solid var(--line); font-size:12px; }
@@ -88,6 +91,7 @@
 </main>
 <script>
 let current = null;
+let liveKey = null, liveSince = 0;  // drives the ticking elapsed timer
 
 const esc = s => (s ?? "").toString()
   .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
@@ -147,8 +151,28 @@ function renderDetail(s) {
 
   const working = ["received","classified","deliberating","composing"].includes(s.status);
   const spokenRoles = new Set((s.contributions||[]).map(c => c.role));
-  const roster = ((s.council||{}).members||[])
-    .filter(m => m.active && m.agent && m.agent !== "system");
+  const members = ((s.council||{}).members||[]);
+  const roster = members.filter(m => m.active && m.agent && m.agent !== "system");
+  const agentOf = Object.fromEntries(members.map(m => [m.role, m.agent]));
+
+  // What is it doing right now? Current round's goal + the seat we're waiting
+  // on, so a long single agent call doesn't read as frozen.
+  let liveGoal = "", waitRole = "", waitAgent = "";
+  if (working) {
+    const cr = s.current_round ?? 0;
+    if (s.status === "composing") {
+      waitRole = "summarizer"; waitAgent = agentOf["summarizer"] || ""; liveGoal = "composing answer";
+    } else {
+      const round = (s.rounds||[]).find(r => r.round === cr);
+      liveGoal = (round?.goal || "").split(/[;.]/)[0].trim();
+      const doneHere = new Set((s.contributions||[]).filter(c => c.round === cr).map(c => c.role));
+      waitRole = (round?.agents||[]).find(role => !doneHere.has(role)) || "";
+      waitAgent = waitRole ? (agentOf[waitRole] || "") : "";
+    }
+  }
+  // reset the elapsed clock whenever the live situation actually changes
+  const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${waitRole}` : null;
+  if (key !== liveKey) { liveKey = key; liveSince = working ? Date.now() : 0; }
 
   right.innerHTML = `
     <div class="card">
@@ -161,8 +185,8 @@ function renderDetail(s) {
       <div class="card live">
         <span class="dot"></span>
         <div>
-          <div class="what">${esc(s.status)}…</div>
-          <div class="meta">round ${s.current_round ?? 0} · ${s.agent_calls||0} agent call${(s.agent_calls===1)?"":"s"} so far · updates live</div>
+          <div class="what">${esc(s.status)}<span class="ell"></span></div>
+          <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""} · <span id="elapsed">0:00</span></div>
         </div>
       </div>` : ""}
 
@@ -239,6 +263,14 @@ function renderDetail(s) {
     if (d.focused) { t.focus(); try { t.setSelectionRange(d.start, d.end); } catch {} }
   }
   right.scrollTop = scrollTop;
+  tickElapsed();
+}
+
+function tickElapsed() {
+  const el = document.getElementById("elapsed");
+  if (!el || !liveSince) return;
+  const t = Math.floor((Date.now() - liveSince) / 1000);
+  el.textContent = Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
 }
 
 async function resolveApproval(aid, approved) {
@@ -267,6 +299,7 @@ async function declineInput(iid) {
 loadHealth();
 refresh();
 setInterval(refresh, 3000);
+setInterval(tickElapsed, 1000);
 </script>
 </body>
 </html>
