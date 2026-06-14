@@ -56,6 +56,15 @@ def compose_prompt(session: Session) -> str:
     # Plain-text labeled sections, NOT JSON: asking an agent for a JSON object
     # whose keys overlap a wrapping protocol can contaminate its output
     # (learned from real runs). Text labels survive — like DISAGREEMENT:/VERDICT:.
+    grounding = (
+        "This task concerns the real codebase at "
+        f"{session.established_root}. Keep the final answer GROUNDED in specifics "
+        "the council surfaced (files, functions, features). Do NOT pad it with "
+        "generic advice ('add documentation', 'add tests', 'improve observability', "
+        "'audit privacy') unless the council actually found that gap — prefer "
+        "concrete, app-specific points a developer could act on.\n"
+        if session.established_root else ""
+    )
     return (
         f"Task: {session.task.text}\n"
         "Your role: summarizer. Synthesize the final response from the "
@@ -63,6 +72,7 @@ def compose_prompt(session: Session) -> str:
         "the user any questions and do NOT request more information; if anything "
         "is still uncertain, record it under ASSUMPTIONS or RISKS and give your "
         "best answer anyway.\n"
+        f"{grounding}"
         "The 'Actions performed' list is the AUTHORITATIVE record of what the "
         "coordinator did. Trust it as fact: if an action shows APPLIED, that file "
         "WAS written — report it as done with high confidence. You have NO "
