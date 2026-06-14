@@ -175,36 +175,69 @@ def parse_final(session: Session, content: str) -> Optional[FinalAnswer]:
     return final
 
 
+def _fallback_agents(session: Session, failed_agent: str) -> list[str]:
+    """Reliable agents to compose with instead of a failed summarizer: agents
+    that already produced real contributions THIS run (so they're registered and
+    working), most-used first, excluding the one that just failed."""
+    from collections import Counter
+
+    counts = Counter(
+        c.agent for c in session.contributions
+        if c.agent and c.agent not in ("system", "user")
+        and c.agent != failed_agent and c.content.strip()
+    )
+    return [a for a, _ in counts.most_common()]
+
+
+def _summarize(session: Session, call: AgentCall, prompt: str,
+               member: CouncilMember) -> tuple[Optional[Contribution], CouncilMember]:
+    """Call the summarizer; if its agent ERRORS (e.g. a gemini timeout), retry
+    with a reliable fallback agent that already worked this run — so one flaky
+    seat can't collapse the final answer. Returns (contribution|None, member_used).
+    AgentInputRequired propagates so the loop can pause for the human."""
+    try:
+        return call(member, prompt), member
+    except BudgetExceeded:
+        session.unresolved.append("composer skipped: budget exhausted")
+        return None, member
+    except AgentError as e:
+        for alt in _fallback_agents(session, member.agent):
+            sub = CouncilMember(role=Role.summarizer, agent=alt, active=True)
+            try:
+                contribution = call(sub, prompt)
+            except (AgentError, BudgetExceeded):
+                continue
+            session.unresolved.append(
+                f"summarizer '{member.agent}' failed ({e}); recomposed with '{alt}'")
+            return contribution, sub
+        session.unresolved.append(f"composer skipped: agent error: {e}")
+        return None, member
+
+
 def compose(session: Session, council: Council, call: AgentCall) -> FinalAnswer:
-    """One summarizer call, plus at most one stricter retry on unparseable
-    output (still bounded by the session's agent-call budget).
+    """Compose the final answer via the summarizer, falling back to a working
+    agent if it errors, plus at most one stricter retry on unparseable output.
     AgentInputRequired propagates — the loop pauses the session for the human."""
     member = council.get(Role.summarizer)
     if member is None or not member.active:
         return fallback_final(session, "no summarizer in council")
-    try:
-        contribution = call(member, compose_prompt(session))
-    except BudgetExceeded:
-        session.unresolved.append("composer skipped: budget exhausted")
-        return fallback_final(session, "budget exhausted")
-    except AgentError as e:
-        session.unresolved.append(f"composer skipped: agent error: {e}")
+
+    contribution, member = _summarize(session, call, compose_prompt(session), member)
+    if contribution is None:
         return fallback_final(session, "agent error")
 
     final = parse_final(session, contribution.content) or _accept_prose(session, contribution.content)
     if final:
         return final
 
-    try:
-        retry = call(
-            member,
-            compose_prompt(session)
-            + "\n\nIMPORTANT: your previous reply could not be parsed. Use the labeled "
-            "sections EXACTLY as specified, starting each label at the beginning of a "
-            "line: ANSWER:, CONFIDENCE:, ASSUMPTIONS:, RISKS:, NEXT_ACTION:.",
-        )
-    except (BudgetExceeded, AgentError) as e:
-        session.unresolved.append(f"composer retry skipped: {e}")
+    retry, member = _summarize(
+        session, call,
+        compose_prompt(session)
+        + "\n\nIMPORTANT: your previous reply could not be parsed. Use the labeled "
+        "sections EXACTLY as specified, starting each label at the beginning of a "
+        "line: ANSWER:, CONFIDENCE:, ASSUMPTIONS:, RISKS:, NEXT_ACTION:.",
+        member)
+    if retry is None:
         return fallback_final(session, "unparseable output, retry unavailable")
     return (
         parse_final(session, retry.content)

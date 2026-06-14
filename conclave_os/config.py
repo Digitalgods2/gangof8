@@ -109,8 +109,11 @@ RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 # before timing out. A seat that still times out is dropped gracefully (the
 # round continues without it) rather than aborting the whole deliberation.
 AGENT_TIMEOUT_DEFAULT = 120
+# gemini headless either answers reasonably fast or hangs; a long timeout just
+# makes a hang painful (you wait the whole time for nothing). Keep it short so a
+# stall surfaces quickly and the seat-drop / composer fallback can take over.
 AGENT_TIMEOUTS: dict[str, int] = {
-    "gemini": 300,
+    "gemini": 150,
 }
 
 
