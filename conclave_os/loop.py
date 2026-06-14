@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import re
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor
+from . import config, executor, skills
 from .classifier import classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
@@ -106,6 +107,55 @@ def _readable_files(session: Session, data_dir) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_file())
 
 
+# Files worth auto-reading from an established folder so the council starts with
+# real signal (what the app is, its stack) instead of having to discover it.
+_OVERVIEW_KEY_FILES = (
+    "README.md", "README", "readme.md", "README.txt", "package.json", "go.mod",
+    "pyproject.toml", "requirements.txt", "Cargo.toml", "wails.json", "main.go",
+    "main.py", "app.go", "index.js", "src/main.py", "src/index.ts", "CLAUDE.md",
+)
+
+
+def _established_overview(session: Session, data_dir) -> str:
+    """Proactively read the established folder (a directory listing + a few key
+    files) so EVERY agent starts with concrete content — the council shouldn't
+    depend on a flaky agent remembering to request a SKILL just to see the code
+    it was asked to examine. Bounded; read-only."""
+    if not session.established_root:
+        return ""
+    parts: list[str] = []
+    try:
+        listing = skills.HANDLERS["list_dir"](
+            session,
+            ProposedAction(session_id=session.session_id, kind="list_dir",
+                           role=Role.researcher, args={"path": ".", "target": "established"}),
+            Path(data_dir))
+        if listing:
+            parts.append("Directory tree:\n" + listing)
+    except Exception:  # noqa: BLE001 — overview is best-effort context
+        pass
+    seen = 0
+    for name in _OVERVIEW_KEY_FILES:
+        if seen >= 4:
+            break
+        try:
+            body = skills.HANDLERS["read_file"](
+                session,
+                ProposedAction(session_id=session.session_id, kind="read_file",
+                               role=Role.researcher, args={"filename": name, "target": "established"}),
+                Path(data_dir))
+        except Exception:  # noqa: BLE001 — file absent/unreadable: skip
+            continue
+        if body and body.strip():
+            parts.append(f"--- {name} ---\n{body[:1500]}")
+            seen += 1
+    if not parts:
+        return ""
+    return ("ESTABLISHED FOLDER (read-only source you are analyzing — this is real "
+            f"content the coordinator read for you from {session.established_root}):\n"
+            + "\n\n".join(parts))[:7000]
+
+
 # Every role sees this so non-implementer roles stop treating can_write_files /
 # can_run_commands as a blocker and stop asking the human to "enable" them: file
 # production is governed (implementer emits ARTIFACT, human approves the write).
@@ -116,11 +166,20 @@ _GOVERNANCE_CONTEXT = (
     "file, the implementer emits an 'ARTIFACT: <filename>' block and the human "
     "approves the write. Do NOT ask whether to enable write permissions; assume "
     "the governed write path exists and proceed with your role.\n"
+    "READING FILES: you have NO direct filesystem access and do not need it — and "
+    "this is NOT a restriction on what you can analyze. NEVER say you 'cannot "
+    "access' a path or that a folder is 'outside your workspace'; that is false "
+    "here. The coordinator reads files FOR you, including folders outside its own "
+    "directory. To see a folder, emit 'SKILL: list_dir .'; to read a file, "
+    "'SKILL: read_file <path>'; to search, 'SKILL: search_project <query>'. The "
+    "results are handed back to you. Use these instead of refusing, and base your "
+    "analysis on what they return — never invent file contents.\n"
 )
 
 
 def build_prompt(
-    session: Session, spec: RoundSpec, role: Role, readable: list[str] = ()
+    session: Session, spec: RoundSpec, role: Role, readable: list[str] = (),
+    established_overview: str = "",
 ) -> str:
     # Advertise the no-approval discovery skills this role may pull mid-round,
     # but only when there's something to look at: an established folder being
@@ -146,6 +205,7 @@ def build_prompt(
         "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
         if hints else ""
     )
+    overview = f"{established_overview}\n\n" if established_overview else ""
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
@@ -153,6 +213,7 @@ def build_prompt(
         f"Your role: {role.value}. Answer only from this role.\n"
         f"Output requirement: {spec.output_requirement}\n"
         f"{cap}"
+        f"{overview}"
         f"Context so far:\n{_recent_context(session)}"
     )
 
@@ -235,7 +296,7 @@ def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
     )
 
 
-def draft_prompt(session: Session) -> str:
+def draft_prompt(session: Session, established_overview: str = "") -> str:
     # When an established folder is in play, the implementer drafts freely in the
     # sandbox and PROMOTES the finished files into the real folder (the one gate).
     if session.established_root:
@@ -286,6 +347,7 @@ def draft_prompt(session: Session) -> str:
         ">>>>>>> NEW\n"
         "To run the test suite in your sandbox (free, no approval), add a line:\n"
         "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
+        f"{chr(10) + established_overview if established_overview else ''}"
         f"\nContext so far:\n{_recent_context(session, limit=5)}"
     )
 
@@ -502,6 +564,11 @@ def _deliberate(
     verdict: Optional[str] = None
     # image attachments are shown to vision-capable agents on every call
     images = image_inputs(store.data_dir, session.attachments)
+    # Read the established folder ONCE up front so every agent starts with the
+    # real code it was asked to examine (no dependence on an agent requesting it).
+    established_overview = _established_overview(session, store.data_dir)
+    if established_overview:
+        store.log_event(sid, "established_overview", {"chars": len(established_overview)})
 
     def call(member: CouncilMember, prompt: str) -> Contribution:
         return _agent_call(session, registry, store, member, prompt,
@@ -526,7 +593,7 @@ def _deliberate(
                     continue
                 for _ in range(spec.max_turns):
                     governance.check(session, "generate_text")
-                    p = build_prompt(session, spec, role, readable)
+                    p = build_prompt(session, spec, role, readable, established_overview)
                     try:
                         c = call(member, p)
                         c = _resolve_skill_requests(session, member, p, c, call, governance, store)
@@ -574,7 +641,7 @@ def _deliberate(
             # 8. Produce working result: draft -> critique -> coordinator verdict
             implementer = council.get(Role.implementer)
             if implementer and implementer.active:
-                draft = call(implementer, draft_prompt(session))
+                draft = call(implementer, draft_prompt(session, established_overview))
                 if critic and critic.active:
                     review = call(critic, review_prompt(session, draft))
                     verdict = "accept" if "acceptable" in review.content.lower() else "revise"

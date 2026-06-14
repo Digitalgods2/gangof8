@@ -166,25 +166,32 @@ def test_requests_are_capped_per_turn(tmp_path, store, governance, session):
 # --- prompt advertises the skill only when relevant ---------------------------
 
 
+# The governance context now always explains the read skills, so these check
+# the per-role ADVERTISEMENT phrasing ("read a file with a line", "Available
+# now:") rather than the bare skill name.
+_READ_AD = "read a file with a line"
+_LIST_AD = "with a line 'SKILL: list_dir"
+
+
 def test_build_prompt_advertises_read_only_with_files_and_allowed_role(session):
     from conclave_os.models import RoundSpec
 
     spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
-    # no files → no mention
-    assert "read_file" not in loop.build_prompt(session, spec, Role.researcher, [])
-    # files + allowed role → mentioned
+    # no files → not advertised (no "Available now")
+    assert "Available now:" not in loop.build_prompt(session, spec, Role.researcher, [])
+    # files + allowed role → advertised with the filename
     p = loop.build_prompt(session, spec, Role.researcher, ["notes.md"])
-    assert "read_file" in p and "notes.md" in p
-    # files but a role not allowed to read → no mention
-    assert "read_file" not in loop.build_prompt(session, spec, Role.critic, ["notes.md"])
+    assert _READ_AD in p and "notes.md" in p
+    # files but a role not allowed to read → not advertised
+    assert _READ_AD not in loop.build_prompt(session, spec, Role.critic, ["notes.md"])
 
 
 def test_build_prompt_advertises_list_dir_when_workspace_bound(session, tmp_path):
     from conclave_os.models import RoundSpec
 
     spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
-    # no workspace → no list_dir mention (nothing to enumerate)
-    assert "list_dir" not in loop.build_prompt(session, spec, Role.researcher, [])
+    # no workspace/established → list_dir not advertised (nothing to enumerate)
+    assert _LIST_AD not in loop.build_prompt(session, spec, Role.researcher, [])
     # workspace bound + allowed role → advertised so the council can DISCOVER files
     session.workspace_root = str(tmp_path)
-    assert "list_dir" in loop.build_prompt(session, spec, Role.researcher, [])
+    assert _LIST_AD in loop.build_prompt(session, spec, Role.researcher, [])
