@@ -125,6 +125,31 @@ def test_answer_workspace_keeps_in_council_space(tmp_path):
     assert session.status == SessionStatus.done  # no promote, free writes → completes
 
 
+def test_free_write_into_established_subfolder_is_refused(tmp_path):
+    """A subfolder of the source IS the source: a free write (workspace target)
+    that resolves inside the established folder must be refused — only an approved
+    promote may reach it."""
+    from conclave_os.executor import ExecutionError, execute
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import ProposedAction
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "pushmodo"
+    est.mkdir()
+    store = LogStore(tmp_path / "data")
+    s = SessionManager(store).create("work", source="test")
+    s.established_root = str(est)
+    # workspace mistakenly pointed at a SUBFOLDER of the established source
+    s.workspace_root = str(est / "sub")
+    action = ProposedAction(
+        session_id=s.session_id, kind="write_file", role=Role.implementer,
+        args={"filename": "x.py", "content": "nope", "target": "workspace"},
+    )
+    with pytest.raises(ExecutionError):
+        execute(s, action, store.data_dir)
+    assert not (est / "sub" / "x.py").exists()  # nothing written into the source tree
+
+
 def test_established_overview_injected_into_prompts(tmp_path):
     """The council must START with the established folder's real content, not
     depend on an agent remembering to request a SKILL (the gemini-refusal bug)."""
