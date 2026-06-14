@@ -420,7 +420,7 @@ async function submitTask() {
   note.style.color = ""; note.textContent = "submitted " + r.session_id;
   current = r.session_id;
   clearComposer();
-  await refresh();
+  pollLoop();  // a new run just started → fast polling
 }
 
 async function refresh() {
@@ -438,6 +438,26 @@ async function refresh() {
       </div>
     </div>`).join("");
   if (current) renderDetail(await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null));
+  return sessions;
+}
+
+// Adaptive polling: only "heartbeat" the server while something is actually
+// working. Idle (everything done/cancelled/failed) → slow checks; tab hidden →
+// no requests at all; resume instantly when the tab is shown again.
+const TERMINAL_STATES = new Set(["done", "cancelled", "failed"]);
+const POLL_ACTIVE = 3000, POLL_IDLE = 20000, POLL_HIDDEN = 30000;
+let _pollTimer = null;
+async function pollLoop() {
+  if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
+  let delay = POLL_IDLE;
+  if (document.hidden) {
+    delay = POLL_HIDDEN;  // tab not visible: skip the fetch entirely
+  } else {
+    const sessions = await refresh().catch(() => []);
+    const working = (sessions || []).some(s => !TERMINAL_STATES.has(s.status));
+    delay = working ? POLL_ACTIVE : POLL_IDLE;
+  }
+  _pollTimer = setTimeout(pollLoop, delay);
 }
 
 async function deleteSession(id, ev) {
@@ -655,7 +675,7 @@ async function resolveApproval(aid, approved) {
   await api(`/sessions/${current}/approvals/${aid}`, {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({approved, background:true})});
-  refresh();
+  pollLoop();  // work may resume → return to fast polling
 }
 
 async function answerInput(iid) {
@@ -664,7 +684,7 @@ async function answerInput(iid) {
   await api(`/sessions/${current}/inputs/${iid}`, {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({answer: text, background:true})});
-  refresh();
+  pollLoop();  // deliberation resumes → return to fast polling
 }
 
 async function declineInput(iid) {
@@ -959,9 +979,10 @@ async function emptyWorkspace() {
 
 loadHealth();
 loadWorkspace();
-refresh();
-setInterval(refresh, 3000);
+pollLoop();
 setInterval(tickElapsed, 1000);
+// when a task is submitted or an action resolved, jump back to fast polling
+document.addEventListener("visibilitychange", () => { if (!document.hidden) pollLoop(); });
 </script>
 </body>
 </html>
