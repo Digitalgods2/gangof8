@@ -119,23 +119,53 @@ def _readable_files(session: Session, data_dir) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_file())
 
 
-# Files worth auto-reading from an established folder so the council starts with
-# real signal (what the app is, its stack) instead of having to discover it.
-_OVERVIEW_KEY_FILES = (
+# README / manifests give the app's self-description; source files give how it
+# ACTUALLY works. The council needs BOTH or it produces README-grade advice.
+_OVERVIEW_DOC_FILES = (
     "README.md", "README", "readme.md", "README.txt", "package.json", "go.mod",
-    "pyproject.toml", "requirements.txt", "Cargo.toml", "wails.json", "main.go",
-    "main.py", "app.go", "index.js", "src/main.py", "src/index.ts", "CLAUDE.md",
+    "pyproject.toml", "requirements.txt", "Cargo.toml", "wails.json", "CLAUDE.md",
 )
+# Entry points worth always reading if present (the app's "spine").
+_OVERVIEW_ENTRY_FILES = (
+    "main.go", "app.go", "main.py", "app.py", "cmd/main.go", "src/main.py",
+    "src/index.ts", "src/index.js", "src/App.svelte", "src/App.tsx", "index.js",
+)
+_OVERVIEW_CODE_EXTS = {
+    ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".java", ".rb", ".php",
+    ".c", ".cpp", ".cs", ".svelte", ".vue", ".kt", ".swift",
+}
+_OVERVIEW_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "__pycache__",
+    ".mypy_cache", ".pytest_cache", "dist", "build", ".idea", ".vscode", ".next",
+    "target", "vendor", "third_party", "testdata", "tests", "test", "__tests__",
+}
+
+
+def _read_established(session: Session, data_dir, name: str) -> str:
+    try:
+        return skills.HANDLERS["read_file"](
+            session,
+            ProposedAction(session_id=session.session_id, kind="read_file",
+                           role=Role.researcher, args={"filename": name, "target": "established"}),
+            Path(data_dir))
+    except Exception:  # noqa: BLE001 — absent/unreadable: skip
+        return ""
 
 
 def _established_overview(session: Session, data_dir) -> str:
-    """Proactively read the established folder (a directory listing + a few key
-    files) so EVERY agent starts with concrete content — the council shouldn't
-    depend on a flaky agent remembering to request a SKILL just to see the code
-    it was asked to examine. Bounded; read-only."""
+    """Proactively read the established folder so EVERY agent starts with concrete
+    content — NOT just the README/manifests (which yield generic advice) but the
+    ACTUAL SOURCE: entry points plus the largest code files (the core logic). The
+    council shouldn't depend on a flaky agent remembering to request a SKILL just
+    to see the code it was asked to examine. Bounded; read-only."""
     if not session.established_root:
         return ""
+    root = Path(session.established_root)
+    if not root.is_dir():
+        return ""
     parts: list[str] = []
+
+    # 1. directory tree
     try:
         listing = skills.HANDLERS["list_dir"](
             session,
@@ -143,29 +173,70 @@ def _established_overview(session: Session, data_dir) -> str:
                            role=Role.researcher, args={"path": ".", "target": "established"}),
             Path(data_dir))
         if listing:
-            parts.append("Directory tree:\n" + listing)
-    except Exception:  # noqa: BLE001 — overview is best-effort context
+            parts.append("Directory tree:\n" + listing[:2500])
+    except Exception:  # noqa: BLE001
         pass
-    seen = 0
-    for name in _OVERVIEW_KEY_FILES:
-        if seen >= 4:
+
+    # 2. README + manifests (the app's self-description) — trimmed
+    docs = 0
+    for name in _OVERVIEW_DOC_FILES:
+        if docs >= 3:
             break
-        try:
-            body = skills.HANDLERS["read_file"](
-                session,
-                ProposedAction(session_id=session.session_id, kind="read_file",
-                               role=Role.researcher, args={"filename": name, "target": "established"}),
-                Path(data_dir))
-        except Exception:  # noqa: BLE001 — file absent/unreadable: skip
-            continue
+        body = _read_established(session, data_dir, name)
         if body and body.strip():
-            parts.append(f"--- {name} ---\n{body[:1500]}")
-            seen += 1
+            parts.append(f"--- {name} ---\n{body[:1100]}")
+            docs += 1
+
+    # 3. ACTUAL SOURCE — entry points first, then the largest code files (core
+    # logic), excluding tests/vendored/generated. Shows HOW the app works.
+    picked: list[Path] = []
+    for name in _OVERVIEW_ENTRY_FILES:
+        p = (root / name)
+        if p.is_file():
+            picked.append(p)
+    candidates: list[tuple[int, Path]] = []
+    for p in root.rglob("*"):
+        rel = p.relative_to(root)
+        if any(part in _OVERVIEW_SKIP_DIRS for part in rel.parts):
+            continue
+        if not p.is_file() or p.suffix.lower() not in _OVERVIEW_CODE_EXTS:
+            continue
+        low = p.name.lower()
+        if "test" in low or ".min." in low or low.endswith(".d.ts"):
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size > 250_000:  # skip generated/bundled
+            continue
+        candidates.append((size, p))
+    candidates.sort(key=lambda t: t[0], reverse=True)  # largest = core logic
+    for _, p in candidates:
+        if len(picked) >= 6:
+            break
+        if p not in picked:
+            picked.append(p)
+    for p in picked[:6]:
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if body.strip():
+            parts.append(f"--- {p.relative_to(root).as_posix()} (source, head) ---\n{body[:1500]}")
+
     if not parts:
         return ""
-    return ("ESTABLISHED FOLDER (read-only source you are analyzing — this is real "
-            f"content the coordinator read for you from {session.established_root}):\n"
-            + "\n\n".join(parts))[:7000]
+    directive = (
+        "\n\nWhen recommending improvements, GROUND each one in the specific code "
+        "above — name the file/function/feature it concerns. Do NOT give generic "
+        "advice ('add documentation', 'add tests', 'improve observability', 'do a "
+        "privacy audit') unless the code visibly lacks it AND you point to where. "
+        "Prefer concrete, app-specific improvements a developer could start today."
+    )
+    return ("ESTABLISHED FOLDER (real content the coordinator read for you from "
+            f"{session.established_root} — analyze THIS, not assumptions):\n"
+            + "\n\n".join(parts))[:14000] + directive
 
 
 # Every role sees this so non-implementer roles stop treating can_write_files /
