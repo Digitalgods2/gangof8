@@ -157,6 +157,13 @@ def get_session(session_id: str) -> dict:
     return data
 
 
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str) -> dict:
+    if not service.delete_session(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"deleted": session_id}
+
+
 # ---- Settings / preferences --------------------------------------------------
 
 

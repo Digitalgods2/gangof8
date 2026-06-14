@@ -387,6 +387,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)
 
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session from the store (DB + JSONL log)."""
+        return self.store.delete_session(session_id)
+
     def list(self) -> list[dict]:
         return self.store.list_sessions()
 

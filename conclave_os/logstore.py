@@ -93,6 +93,18 @@ class LogStore:
     def session_log_path(self, session_id: str) -> Path:
         return self.sessions_dir / f"{session_id}.jsonl"
 
+    def delete_session(self, session_id: str) -> bool:
+        """Remove a session from the store (DB row + its JSONL log). Returns
+        True if a row was deleted."""
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            deleted = cur.rowcount > 0
+        try:
+            self.session_log_path(session_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return deleted
+
     def log_event(self, session_id: str, event: str, payload: Optional[dict] = None) -> None:
         record = {"ts": utcnow(), "event": event, "payload": payload or {}}
         with open(self.session_log_path(session_id), "a", encoding="utf-8") as f:

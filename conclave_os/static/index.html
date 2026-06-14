@@ -27,10 +27,15 @@
   button.ghost { background:transparent; border:1px solid var(--line); color:var(--dim); }
   button.deny { background:var(--bad); }
   .row { display:flex; gap:8px; margin-top:8px; align-items:center; }
-  .session { padding:10px 12px; margin-top:8px; background:var(--panel); border:1px solid var(--line);
+  .session { position:relative; padding:10px 12px; margin-top:8px; background:var(--panel); border:1px solid var(--line);
              border-radius:8px; cursor:pointer; }
   .session:hover, .session.active { border-color:var(--accent); }
-  .session .text { font-size:13px; }
+  .session .text { font-size:13px; padding-right:20px; }
+  .session .trash { position:absolute; top:6px; right:6px; background:none; border:none; padding:2px 4px;
+                    font-size:13px; line-height:1; cursor:pointer; opacity:0; color:var(--dim);
+                    transition:opacity .12s; }
+  .session:hover .trash { opacity:.6; }
+  .session .trash:hover { opacity:1; color:var(--deny, #f85149); }
   .session .meta { color:var(--dim); font-size:11px; margin-top:3px; display:flex; gap:8px; }
   .pill { display:inline-block; padding:1px 8px; border-radius:9px; font-size:11px; }
   .pill.done { background:#1d3a2c; color:var(--ok); }
@@ -423,6 +428,7 @@ async function refresh() {
   const el = document.getElementById("sessions");
   el.innerHTML = sessions.map(s => `
     <div class="session ${s.session_id===current?"active":""}" onclick="select('${s.session_id}')">
+      <button class="trash" title="Delete this session" onclick="deleteSession('${s.session_id}', event)">🗑</button>
       <div class="text">${esc(s.task_text) || "(no text)"}</div>
       <div class="meta">
         <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
@@ -432,6 +438,16 @@ async function refresh() {
       </div>
     </div>`).join("");
   if (current) renderDetail(await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null));
+}
+
+async function deleteSession(id, ev) {
+  ev.stopPropagation();  // don't also select the row
+  if (!confirm("Delete this session permanently? Its transcript and log will be removed.")) return;
+  const r = await fetch("/sessions/" + encodeURIComponent(id), {method: "DELETE"});
+  if (r.ok) {
+    if (current === id) { current = null; document.getElementById("right").innerHTML = '<div class="empty">Select a session</div>'; }
+    await refresh();
+  }
 }
 
 function select(id) { current = id; refresh(); }

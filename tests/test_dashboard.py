@@ -50,6 +50,19 @@ def test_health_reports_backend(client):
     assert h["backend"] == "mock"
 
 
+def test_delete_session_removes_it(client):
+    sid = client.post("/tasks", json={"text": "What is 2+2?", "source": "test"}).json()["session_id"]
+    assert any(s["session_id"] == sid for s in client.get("/sessions").json())
+    r = client.delete(f"/sessions/{sid}")
+    assert r.status_code == 200 and r.json()["deleted"] == sid
+    assert not any(s["session_id"] == sid for s in client.get("/sessions").json())
+    assert client.get(f"/sessions/{sid}").status_code == 404
+
+
+def test_delete_missing_session_404(client):
+    assert client.delete("/sessions/s_nope").status_code == 404
+
+
 def test_background_submit_completes(client):
     created = client.post("/tasks", json={"text": TASK, "background": True}).json()
     assert created["status"] == "received", "background submit must return immediately"
