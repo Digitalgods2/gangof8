@@ -33,7 +33,13 @@ from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegist
 from .roles import build_council, plan_rounds
 from .sessions import SessionManager
 from .skills import get_skill
+from . import cancellation
 from .uploads import image_inputs
+
+
+class SessionCancelled(Exception):
+    """The human asked to cancel this session mid-run (cooperative)."""
+
 
 # Actionable draft proposals (writes/exec/stage/promote) — distinct from the
 # read-skill actions (read_file/search_project/list_dir) that also land in
@@ -54,6 +60,10 @@ def _agent_call(
     member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
     images: Optional[list[dict]] = None,
 ) -> Contribution:
+    # Cooperative cancellation: every agent call passes through here, so this is
+    # the one checkpoint that aborts a run the human cancelled mid-flight.
+    if cancellation.is_requested(session.session_id):
+        raise SessionCancelled()
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
     cap = session.budgets.max_agent_calls - max(0, min(reserve, session.budgets.max_agent_calls - 1))

@@ -13,13 +13,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from . import config, intake
+from . import cancellation, config, intake
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
-from .loop import resume_session, resume_with_input, run_session
+from .loop import SessionCancelled, resume_session, resume_with_input, run_session
 from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
 from .paths import extract_established_root
 from .registry import AgentError
@@ -289,6 +289,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         """Background guard: a session must never die silently in a thread."""
         try:
             return fn(session, *args)
+        except SessionCancelled:
+            cancellation.clear(session.session_id)
+            session.stop_reason = "cancelled by user"
+            try:
+                self.manager.transition(session, SessionStatus.cancelled)
+            except ValueError:
+                session.status = SessionStatus.cancelled
+                self.store.save_session(session)
+            self.store.log_event(session.session_id, "session_cancelled", {})
+            return session
         except Exception as e:  # noqa: BLE001 — last-resort containment
             self.store.log_event(session.session_id, "internal_error", {"detail": str(e)})
             try:
@@ -391,6 +401,36 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def delete_session(self, session_id: str) -> bool:
         """Delete a session from the store (DB + JSONL log)."""
         return self.store.delete_session(session_id)
+
+    _TERMINAL = {SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}
+    _PAUSED = {SessionStatus.awaiting_approval, SessionStatus.awaiting_input}
+
+    def cancel_session(self, session_id: str) -> dict:
+        """Cancel a session. If it's paused (awaiting approval/input) no worker is
+        running, so cancel it immediately. If it's mid-run, request cooperative
+        cancellation — the worker stops at the next agent-call checkpoint (an
+        in-flight CLI call finishes first)."""
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(f"session {session_id} not found")
+        if session.status in self._TERMINAL:
+            return {"session_id": session_id, "status": session.status.value, "note": "already finished"}
+        if session.status in self._PAUSED:
+            for a in session.approvals:
+                if a.status == "pending":
+                    a.status = "denied"
+            for r in session.input_requests:
+                if r.status == "pending":
+                    r.status = "declined"
+            session.stop_reason = "cancelled by user"
+            cancellation.clear(session_id)
+            self.manager.transition(session, SessionStatus.cancelled)
+            self.store.log_event(session_id, "session_cancelled", {"from": "paused"})
+            return {"session_id": session_id, "status": "cancelled"}
+        # running — flag it; the worker finalizes to cancelled at the next checkpoint
+        cancellation.request(session_id)
+        self.store.log_event(session_id, "cancel_requested", {})
+        return {"session_id": session_id, "status": "cancelling"}
 
     def list(self) -> list[dict]:
         return self.store.list_sessions()

@@ -54,6 +54,11 @@ class WorkspaceStore:
             raise WorkspaceError(f"workspace root is not a directory: {resolved}")
         resolved.mkdir(parents=True, exist_ok=True)
         data = self._load()
+        # Idempotent: re-registering the same folder returns the existing entry
+        # (no duplicates) so "set the workspace folder" is a stable operation.
+        for w in data["workspaces"]:
+            if Path(w["root"]) == resolved:
+                return Workspace.model_validate(w)
         ws = Workspace(name=name, root=str(resolved))
         data["workspaces"].append(ws.model_dump())
         self._save(data)
