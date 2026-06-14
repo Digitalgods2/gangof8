@@ -16,7 +16,7 @@ ALLOWED_TRANSITIONS: dict[SessionStatus, set[SessionStatus]] = {
     # target gate fires pre-deliberation and re-runs classification on answer.
     SessionStatus.awaiting_input: {SessionStatus.classified, SessionStatus.deliberating, SessionStatus.composing, SessionStatus.cancelled, SessionStatus.failed},
     SessionStatus.deliberating: {SessionStatus.composing, SessionStatus.awaiting_approval, SessionStatus.awaiting_input, SessionStatus.failed, SessionStatus.cancelled},
-    SessionStatus.composing: {SessionStatus.done, SessionStatus.awaiting_input, SessionStatus.failed},
+    SessionStatus.composing: {SessionStatus.done, SessionStatus.awaiting_input, SessionStatus.failed, SessionStatus.cancelled},
     SessionStatus.done: set(),
     SessionStatus.failed: set(),
     SessionStatus.cancelled: set(),

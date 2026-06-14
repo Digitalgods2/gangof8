@@ -271,6 +271,7 @@
     <textarea id="task" rows="1" placeholder="Describe a task for the council…  (Enter to send, Shift+Enter for a new line)"
               oninput="autoGrow(this)" onkeydown="composerKey(event)"></textarea>
     <button class="ghost" onclick="clearComposer()">Clear</button>
+    <button id="cancelBtn" class="deny" style="display:none" onclick="cancelCurrent()">Cancel run</button>
     <button onclick="submitTask()">Send</button>
   </div>
   <input type="file" id="fileInput" style="display:none" onchange="onFilePicked(event)">
@@ -407,6 +408,15 @@ function clearComposer() {
   document.getElementById("submitNote").textContent = "";
 }
 
+async function cancelCurrent() {
+  if (!current) return;
+  if (!confirm("Cancel this run? It stops at the next step — an in-flight agent call finishes first.")) return;
+  const note = document.getElementById("submitNote");
+  const r = await fetch(`/sessions/${current}/cancel`, {method: "POST"});
+  if (r.ok) { const d = await r.json(); note.style.color = ""; note.textContent = d.status === "cancelled" ? "cancelled" : "cancelling…"; pollLoop(); }
+  else { note.style.color = "var(--bad)"; note.textContent = "cancel failed"; }
+}
+
 async function submitTask() {
   const box = document.getElementById("task");
   const text = box.value.trim();
@@ -435,6 +445,10 @@ let _lastListSig = "", _lastDetailSig = "";
 async function refresh() {
   const sessions = await api("/sessions");
   const el = document.getElementById("sessions");
+  // Show "Cancel run" only while the open session is actually running.
+  const curS = sessions.find(s => s.session_id === current);
+  const cancelBtn = document.getElementById("cancelBtn");
+  if (cancelBtn) cancelBtn.style.display = (curS && !TERMINAL_STATES.has(curS.status)) ? "inline-block" : "none";
   // Only rebuild the list when something actually changed AND no selection is
   // active in it — re-rendering identical HTML every poll wiped selections.
   const listSig = JSON.stringify(sessions.map(s =>
@@ -891,6 +905,10 @@ async function saveSettings() {
     note.textContent = "saved ✓";
     settingsCache = await r.json();
     loadHealth();  // header backend label may have changed
+    // also commit a workspace folder typed but not yet added — Save should
+    // persist it too, not silently drop it (idempotent on the backend).
+    const pendingRoot = (document.getElementById("ws_root")?.value || "").trim();
+    if (pendingRoot) await addWorkspace();
   } else {
     note.style.color = "var(--bad)";
     note.textContent = "save failed";
@@ -981,18 +999,29 @@ function useFsFolder() {
   if (!document.getElementById("ws_name").value.trim())
     document.getElementById("ws_name").value = baseName(fsCurrent);
   closeFs();
+  addWorkspace();  // choosing a folder saves it immediately (no separate step)
 }
 
 async function addWorkspace() {
-  const name = document.getElementById("ws_name").value.trim();
   const root = document.getElementById("ws_root").value.trim();
+  const name = document.getElementById("ws_name").value.trim() || baseName(root);
   const note = document.getElementById("savedNote");
-  if (!name || !root) { note.textContent = "name + path required"; return; }
+  if (!root) { note.style.color = ""; note.textContent = "pick a folder first"; return; }
   const r = await fetch("/workspaces", {method: "POST",
     headers: {"Content-Type": "application/json"}, body: JSON.stringify({name, root})});
-  if (r.ok) { wsCache = await api("/workspaces"); _renderWsAfterChange("workspace added ✓"); }
-  else { const d = await r.json().catch(() => ({})); note.style.color = "var(--bad)";
-         note.textContent = "add failed: " + (d.detail || r.status); }
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({})); note.style.color = "var(--bad)";
+    note.textContent = "add failed: " + (d.detail || r.status); return;
+  }
+  // persist AND activate immediately so the folder is the permanent workspace
+  const created = await r.json();
+  const ar = await fetch("/workspaces/active", {method: "PUT",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: created.id})});
+  wsCache = ar.ok ? await ar.json() : await api("/workspaces");
+  document.getElementById("ws_name").value = "";
+  document.getElementById("ws_root").value = "";
+  note.style.color = "";
+  _renderWsAfterChange("workspace saved ✓");
 }
 
 async function deleteWorkspace(id) {

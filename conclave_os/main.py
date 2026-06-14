@@ -164,6 +164,14 @@ def delete_session(session_id: str) -> dict:
     return {"deleted": session_id}
 
 
+@app.post("/sessions/{session_id}/cancel")
+def cancel_session(session_id: str) -> dict:
+    try:
+        return service.cancel_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+
 # ---- Settings / preferences --------------------------------------------------
 
 
