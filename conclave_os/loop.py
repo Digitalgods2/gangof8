@@ -367,10 +367,70 @@ def draft_prompt(session: Session, established_overview: str = "") -> str:
 def review_prompt(session: Session, draft: Contribution) -> str:
     return (
         f"Task: {session.task.text}\n"
-        "Your role: critic. Review the draft below for flaws. If it is good "
-        "enough, say 'acceptable'.\n"
-        f"Draft:\n{draft.content[:1500]}"
+        "Your role: critic. Review the draft below for flaws. Hold a real bar: "
+        "only say the single word 'acceptable' when it genuinely meets the task; "
+        "otherwise give specific, actionable objections (what is wrong and what to "
+        "change) so it can be improved.\n"
+        f"Draft:\n{draft.content[:1800]}"
     )
+
+
+def _review_accepts(review: str) -> bool:
+    """The critic accepts iff 'acceptable' appears AND is not negated — so
+    'not acceptable yet' / 'unacceptable' correctly count as a REJECTION."""
+    t = (review or "").lower()
+    if "not acceptable" in t or "unacceptable" in t or "isn't acceptable" in t \
+            or "not yet acceptable" in t:
+        return False
+    return "acceptable" in t
+
+
+def refine_prompt(session: Session, established_overview: str, prior_review: str) -> str:
+    """A redraft that must resolve the critic's objections — the engine of
+    convergence. Falls back to a plain draft when there's nothing to address."""
+    base = draft_prompt(session, established_overview)
+    pr = (prior_review or "").strip()
+    if not pr or pr.lower().startswith("acceptable"):
+        return base
+    return (
+        base
+        + "\n\nYour previous draft was NOT accepted. The critic's objections:\n"
+        + pr[:1800]
+        + "\nProduce a REVISED version that fully resolves these objections — keep "
+        "what worked, fix what was flawed, and output the COMPLETE result again in "
+        "the required format (do not describe the changes)."
+    )
+
+
+def _converge(
+    session: Session, council: Council, call: AgentCall,
+    established_overview: str, store: LogStore, start: float,
+) -> tuple[str, str]:
+    """Refine the draft until the critic ACCEPTS it — the real terminator for an
+    output task. Repeats draft→critique, feeding each critique back, and stops on
+    acceptance OR a backstop (refine-iteration cap, wall-time; the agent-call
+    budget raises BudgetExceeded on its own). Returns (verdict, stop_reason)."""
+    implementer = council.get(Role.implementer)
+    critic = council.get(Role.critic)
+    sid = session.session_id
+    if not (implementer and implementer.active and critic and critic.active):
+        return "revise", "max rounds reached"  # nothing to converge with
+    last_review = next(
+        (c.content for c in reversed(session.contributions) if c.role == Role.critic), "")
+    for i in range(config.MAX_REFINE_ITERATIONS):
+        if time.monotonic() - start > session.budgets.max_wall_seconds:
+            session.unresolved.append("stopped refining: wall-time limit")
+            return "revise", "refinement time limit"
+        store.log_event(sid, "refine_round", {"iteration": i + 1})
+        draft = call(implementer, refine_prompt(session, established_overview, last_review))
+        review = call(critic, review_prompt(session, draft))
+        if _review_accepts(review.content):
+            store.log_event(sid, "converged", {"iterations": i + 1})
+            return "accept", f"answer accepted (after {i + 1} refinement round(s))"
+        last_review = review.content
+    session.unresolved.append(
+        f"stopped refining after {config.MAX_REFINE_ITERATIONS} rounds without critic acceptance")
+    return "revise", "refinement cap reached without acceptance"
 
 
 # Marker for an explicit conflict: optional bullet/numbering, then
@@ -656,7 +716,7 @@ def _deliberate(
                 draft = call(implementer, draft_prompt(session, established_overview))
                 if critic and critic.active:
                     review = call(critic, review_prompt(session, draft))
-                    verdict = "accept" if "acceptable" in review.content.lower() else "revise"
+                    verdict = "accept" if _review_accepts(review.content) else "revise"
                 else:
                     verdict = "accept"
 
@@ -665,6 +725,14 @@ def _deliberate(
             if stop:
                 session.stop_reason = reason
                 break
+
+        # 9b. Convergence: if the planned phases ended with the draft NOT accepted
+        # by the critic, keep refining (draft↔critique) until it IS accepted, or a
+        # backstop trips (refine cap / agent-call budget / wall-time). The round
+        # count is a safety ceiling now, no longer the normal terminator.
+        if session.stop_reason == "max rounds reached" and verdict == "revise":
+            verdict, session.stop_reason = _converge(
+                session, council, call, established_overview, store, start)
 
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
@@ -681,9 +749,6 @@ def _deliberate(
         store.log_event(sid, "paused_for_approval", e.approval.model_dump())
         manager.transition(session, SessionStatus.awaiting_approval)
         return session
-
-    if session.stop_reason == "max rounds reached" and verdict == "revise":
-        session.unresolved.append("round cap reached with an unaccepted draft")
 
     # 7b. Governed action execution: collect the implementer's artifact
     # proposals, gate every action on a human approval, execute approved ones.

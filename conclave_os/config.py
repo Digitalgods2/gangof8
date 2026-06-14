@@ -27,9 +27,17 @@ SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_r
 
 BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
     Complexity.trivial: Budgets(max_rounds=1, max_turns_per_round=1, max_agent_calls=4, max_wall_seconds=180),
-    Complexity.standard: Budgets(max_rounds=3, max_turns_per_round=2, max_agent_calls=12, max_wall_seconds=600),
-    Complexity.complex: Budgets(max_rounds=4, max_turns_per_round=2, max_agent_calls=16, max_wall_seconds=900),
+    # Headroom raised so convergence (refine-until-accepted) has room to iterate;
+    # easy tasks still finish fast via early acceptance.
+    Complexity.standard: Budgets(max_rounds=3, max_turns_per_round=2, max_agent_calls=24, max_wall_seconds=1200),
+    Complexity.complex: Budgets(max_rounds=4, max_turns_per_round=2, max_agent_calls=40, max_wall_seconds=1800),
 }
+
+# Convergence-driven deliberation: after the planned phases, the implementer
+# revises against the critic's objections and is re-reviewed, repeating UNTIL the
+# critic accepts. This is the safety backstop on that loop (alongside the
+# agent-call budget and wall-time) — NOT the normal terminator.
+MAX_REFINE_ITERATIONS = 6
 
 
 def budgets_for(complexity: Complexity) -> Budgets:
