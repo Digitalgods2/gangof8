@@ -136,6 +136,41 @@ def test_composer_falls_back_after_two_failures(tmp_path):
     assert session.final.answer.startswith("Partial result")
 
 
+def test_composer_recomposes_with_a_working_agent_when_summarizer_errors(tmp_path):
+    """A flaky summarizer (e.g. gemini timeout) must NOT collapse the answer to a
+    partial — recompose with an agent that already worked this run."""
+    from conclave_os.registry import AgentError
+
+    class GoodAgent:
+        name = "good"
+
+        def __init__(self):
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s):
+            return self._inner.call(role, prompt, timeout_s)
+
+    class FlakyAgent:
+        name = "flaky"
+
+        def call(self, role, prompt, timeout_s):
+            raise AgentError("flaky CLI timed out after 150s")
+
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.registry.register(GoodAgent())
+    svc.registry.register(FlakyAgent())
+    # researcher/critic run on 'good'; only the summarizer is the flaky agent
+    svc.role_agents = {
+        Role.researcher: "good", Role.architect: "good", Role.critic: "good",
+        Role.implementer: "good", Role.summarizer: "flaky",
+    }
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert session.final.confidence == "high", "fell back to a working agent, not a partial"
+    assert not session.final.answer.startswith("Partial result")
+    assert any("recomposed with 'good'" in u for u in session.unresolved)
+
+
 def test_substantial_prose_is_accepted_at_medium_confidence(tmp_path):
     """Protocol-wrapped agents often answer in plain prose; that IS the answer."""
     PROSE = (
