@@ -109,6 +109,33 @@ def test_answer_workspace_keeps_in_council_space(tmp_path):
     assert session.status == SessionStatus.done  # no promote, free writes → completes
 
 
+def test_established_overview_injected_into_prompts(tmp_path):
+    """The council must START with the established folder's real content, not
+    depend on an agent remembering to request a SKILL (the gemini-refusal bug)."""
+    from conclave_os import loop
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import RoundSpec
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "app"
+    (est / "src").mkdir(parents=True)
+    (est / "README.md").write_text("# CoolApp\nDoes neat things.", encoding="utf-8")
+    (est / "src" / "main.py").write_text("print('hi')", encoding="utf-8")
+    store = LogStore(tmp_path / "data")
+    s = SessionManager(store).create("examine it", source="test")
+    s.established_root = str(est)
+
+    overview = loop._established_overview(s, store.data_dir)
+    assert "README.md" in overview and "CoolApp" in overview      # key file content read
+    assert "src/main.py" in overview                              # directory tree present
+
+    spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
+    p = loop.build_prompt(s, spec, Role.researcher, [], overview)
+    assert "CoolApp" in p                                         # injected into the prompt
+    # and the governance context forbids the "can't access" refusal
+    assert "NEVER say you 'cannot access'" in p
+
+
 class _PromoteAdapter:
     """Implementer writes a file to scratch AND asks to promote it."""
 
