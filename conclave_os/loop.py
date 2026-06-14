@@ -34,11 +34,8 @@ from .roles import build_council, plan_rounds
 from .sessions import SessionManager
 from .skills import get_skill
 from . import cancellation
+from .cancellation import SessionCancelled  # re-exported for callers (service)
 from .uploads import image_inputs
-
-
-class SessionCancelled(Exception):
-    """The human asked to cancel this session mid-run (cooperative)."""
 
 
 # Actionable draft proposals (writes/exec/stage/promote) — distinct from the
@@ -75,12 +72,17 @@ def _agent_call(
     # Per-agent timeout: the gemini CLI needs more headroom than claude/codex.
     if timeout_s is None:
         timeout_s = config.agent_timeout(member.agent)
+    # Tag this worker thread with the session so the CLI adapter can register its
+    # subprocess for hard cancellation (kill on request).
+    cancellation.set_current_session(session.session_id)
     try:
         result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
         raise
+    finally:
+        cancellation.set_current_session(None)
     session.agent_calls += 1
     contribution = Contribution(
         round=session.current_round,

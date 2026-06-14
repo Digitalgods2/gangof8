@@ -19,8 +19,20 @@ from conclave_os.service import ConclaveService
 
 
 class _Proc:
+    """Fake subprocess.Popen — _exec now uses Popen().communicate()."""
+
     def __init__(self, returncode=0, stdout="", stderr=""):
-        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+        self.returncode, self._stdout, self._stderr = returncode, stdout, stderr
+        self._calls = None
+
+    def communicate(self, input=None, timeout=None):
+        if self._calls is not None:
+            self._calls["input"] = input
+        return self._stdout, self._stderr
+
+    def kill(self):
+        if self._calls is not None:
+            self._calls["killed"] = True
 
 
 @pytest.fixture()
@@ -28,11 +40,12 @@ def stub_run(monkeypatch):
     calls = {}
 
     def _set(proc):
-        def fake_run(cmd, **kwargs):
+        proc._calls = calls
+
+        def fake_popen(cmd, **kwargs):
             calls["cmd"] = cmd
-            calls["input"] = kwargs.get("input")
             return proc
-        monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(cli_mod.subprocess, "Popen", fake_popen)
         # resolve any CLI name to a fake path so tests don't need a real install
         monkeypatch.setattr(cli_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
         return calls
@@ -103,14 +116,14 @@ def test_codex_vision_attaches_image_flag(monkeypatch, tmp_path):
     img.write_bytes(b"\x89PNG fake")
     captured = {}
 
-    def fake_run(cmd, **kwargs):
+    def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
         # codex writes its final message to the --output-last-message path
         outfile = cmd[cmd.index("--output-last-message") + 1]
         Path(outfile).write_text("CODE-READ", encoding="utf-8")
         return _Proc(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(cli_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
     out = CliAdapter("codex").call(
         Role.critic, "read it", timeout_s=60,
@@ -169,6 +182,24 @@ def test_gemini_without_images_uses_cli(stub_run):
 def test_unknown_agent_raises():
     with pytest.raises(AgentError, match="unknown CLI agent"):
         CliAdapter("llama").call(Role.researcher, "x", timeout_s=30)
+
+
+def test_killed_subprocess_surfaces_as_cancellation(stub_run):
+    """When a cancel kills the CLI process, _exec raises SessionCancelled (not a
+    generic AgentError), so the loop treats it as a cancel, not a seat failure."""
+    from conclave_os import cancellation
+    from conclave_os.cancellation import SessionCancelled
+
+    cancellation.set_current_session("s_test")
+    cancellation.request("s_test")  # simulate the cancel having fired
+    try:
+        # process returns nonzero (as a killed process would)
+        stub_run(_Proc(returncode=1, stdout="", stderr=""))
+        with pytest.raises(SessionCancelled):
+            CliAdapter("claude").call(Role.researcher, "x", timeout_s=30)
+    finally:
+        cancellation.clear("s_test")
+        cancellation.set_current_session(None)
 
 
 def test_cli_backend_registers_cli_adapters(tmp_path):

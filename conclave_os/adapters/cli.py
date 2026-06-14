@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .. import cancellation
+from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentError
 
@@ -59,27 +61,42 @@ class CliAdapter:
         return AdapterResult(content=content, duration_ms=int((time.monotonic() - t0) * 1000))
 
     def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
-        """Run a CLI command with the prompt on stdin; return stdout. The
-        executable is resolved via PATH (shutil.which) so Windows .cmd/.exe
-        shims for npm-installed CLIs are found and run directly."""
+        """Run a CLI command with the prompt on stdin; return stdout. Uses Popen
+        (not subprocess.run) and registers the process for the current session so
+        a cancel can KILL it mid-flight — a killed call surfaces as SessionCancelled
+        instead of a generic error. The executable is resolved via PATH
+        (shutil.which) so Windows .cmd/.exe shims are found and run directly."""
         exe = shutil.which(cmd[0])
         if not exe:
             raise AgentError(f"{self.agent} CLI not found on PATH ({cmd[0]!r})")
-        cmd = [exe, *cmd[1:]]
+        sid = cancellation.current_session()
         try:
-            proc = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=max(30, timeout_s),
+            proc = subprocess.Popen(
+                [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             )
-        except subprocess.TimeoutExpired as e:
-            raise AgentError(f"{self.agent} CLI timed out after {timeout_s}s") from e
         except (OSError, FileNotFoundError) as e:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e
+        cancellation.register_proc(sid, proc)
+        try:
+            out, err = proc.communicate(input=prompt, timeout=max(30, timeout_s))
+        except subprocess.TimeoutExpired as e:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            raise AgentError(f"{self.agent} CLI timed out after {timeout_s}s") from e
+        finally:
+            cancellation.unregister_proc(sid, proc)
+        # If a cancel killed the process, report it as cancellation (not an error).
+        if sid and cancellation.is_requested(sid):
+            raise SessionCancelled()
         if proc.returncode != 0:
             raise AgentError(
-                f"{self.agent} CLI exited {proc.returncode}: {(proc.stderr or '').strip()[:300]}"
+                f"{self.agent} CLI exited {proc.returncode}: {(err or '').strip()[:300]}"
             )
-        return proc.stdout or ""
+        return out or ""
 
     def _run_claude(self, prompt: str, timeout_s: int) -> str:
         cmd = ["claude", "-p", "--output-format", "json", "--tools", ""]
