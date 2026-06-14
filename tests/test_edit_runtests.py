@@ -1,9 +1,10 @@
-"""edit_file (surgical replace) and run_tests (governed code execution).
+"""edit_file (surgical replace) and run_tests (council-space code execution).
 
-Both are approval-gated. edit_file replaces a unique OLD snippet in an existing
-file; run_tests executes a command in the workspace/sandbox only after approval
-and returns its output. The implementer proposes them via EDIT / RUNTESTS blocks
-in its draft, parsed alongside ARTIFACT.
+Both are now FREE (no approval) — they act only in the council's own spaces
+(sandbox/workspace). edit_file replaces a unique OLD snippet in an existing
+file; run_tests executes a command in the workspace/sandbox and returns its
+output. The implementer proposes them via EDIT / RUNTESTS blocks in its draft,
+parsed alongside ARTIFACT.
 """
 
 from pathlib import Path
@@ -37,14 +38,15 @@ def session(tmp_path):
 
 def test_edit_file_metadata():
     s = get_skill("edit_file")
-    assert s.category == "file_edit" and s.requires_approval is True
-    assert s.risk == Risk.medium and s.allowed_roles == [Role.implementer]
+    assert s.category == "file_edit" and s.requires_approval is False  # now free
+    assert s.risk == Risk.low and s.allowed_roles == [Role.implementer]
 
 
 def test_run_tests_metadata():
     s = get_skill("run_tests")
-    assert s.category == "code_exec" and s.requires_approval is True
-    assert s.risk == Risk.high and Role.implementer in s.allowed_roles
+    assert s.category == "code_exec" and s.requires_approval is False  # now free
+    assert s.risk == Risk.medium and Role.implementer in s.allowed_roles
+    assert Role.critic in s.allowed_roles
 
 
 # ---- edit_file handler -------------------------------------------------------
@@ -57,11 +59,11 @@ def test_edit_file_replaces_unique_snippet(governance, session, tmp_path):
     session.workspace_root = str(root)
     action = ProposedAction(
         session_id=session.session_id, kind="edit_file", role=Role.implementer,
-        args={"filename": "app.py", "old": "x = 1", "new": "x = 42"},
+        args={"filename": "app.py", "old": "x = 1", "new": "x = 42", "target": "workspace"},
     )
-    approval = governance.authorize_action(session, action)
-    assert approval is not None and approval.category == "file_edit"  # gated
-    governance.resolve(session, approval.approval_id, approved=True)
+    # edit_file is now FREE — no approval, runs straight through
+    assert governance.authorize_action(session, action) is None
+    assert session.approvals == []
     execute(session, action, tmp_path)  # data_dir unused (workspace bound)
     assert (root / "app.py").read_text(encoding="utf-8") == "x = 42\nprint(x)\n"
 
@@ -72,11 +74,11 @@ def test_edit_file_rejects_missing_and_ambiguous(session, tmp_path):
     (root / "a.py").write_text("dup\ndup\n", encoding="utf-8")
     session.workspace_root = str(root)
     missing = ProposedAction(session_id=session.session_id, kind="edit_file",
-                             args={"filename": "a.py", "old": "nope", "new": "z"})
+                             args={"filename": "a.py", "old": "nope", "new": "z", "target": "workspace"})
     with pytest.raises(ExecutionError, match="not found"):
         execute(session, missing, tmp_path)
     ambiguous = ProposedAction(session_id=session.session_id, kind="edit_file",
-                               args={"filename": "a.py", "old": "dup", "new": "z"})
+                               args={"filename": "a.py", "old": "dup", "new": "z", "target": "workspace"})
     with pytest.raises(ExecutionError, match="not unique"):
         execute(session, ambiguous, tmp_path)
 
@@ -144,26 +146,29 @@ class EditAdapter:
 
     def call(self, role, prompt, timeout_s, images=None):
         if role == Role.implementer:
+            # Write note.txt into the (free) sandbox, then surgically edit it —
+            # both blocks execute freely and land in the session sandbox.
             return AdapterResult(
-                content="EDIT: note.txt\n<<<<<<< OLD\nhello\n=======\ngoodbye\n>>>>>>> NEW\n",
+                content=(
+                    "ARTIFACT: note.txt\nhello world\n"
+                    "EDIT: note.txt\n<<<<<<< OLD\nhello\n=======\ngoodbye\n>>>>>>> NEW\n"
+                ),
                 duration_ms=1)
         if role == Role.critic:
             return AdapterResult(content="acceptable", duration_ms=1)
         return self._inner.call(role, prompt, timeout_s)
 
 
-def test_edit_end_to_end_after_approval(tmp_path):
+def test_edit_end_to_end_free(tmp_path):
     svc = ConclaveService(data_dir=tmp_path / "data")
     svc.registry.register(EditAdapter())
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    (proj / "note.txt").write_text("hello world", encoding="utf-8")
-    ws = svc.create_workspace("p", str(proj))
-    svc.set_active_workspace(ws.id)
 
+    # write + edit are free now: no approval gate — the session completes directly
     session = svc.run("Change the greeting in note.txt", source="test")
-    assert session.status == SessionStatus.awaiting_approval
-    assert session.proposed_actions[0].kind == "edit_file"
-    done = svc.approve(session.session_id, session.approvals[0].approval_id, approved=True)
-    assert done.status == SessionStatus.done
-    assert (proj / "note.txt").read_text(encoding="utf-8") == "goodbye world"
+    assert session.status == SessionStatus.done
+    kinds = [a.kind for a in session.proposed_actions]
+    assert kinds == ["write_file", "edit_file"]  # document order
+    assert all(a.status == "executed" for a in session.proposed_actions)
+    assert not [a for a in session.approvals if a.status == "pending"]
+    sandbox = tmp_path / "data" / "artifacts" / session.session_id
+    assert (sandbox / "note.txt").read_text(encoding="utf-8") == "goodbye world"

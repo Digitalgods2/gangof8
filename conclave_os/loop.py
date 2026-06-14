@@ -34,11 +34,12 @@ from .sessions import SessionManager
 from .skills import get_skill
 from .uploads import image_inputs
 
-# Approval-gated draft proposals (the artifact/exec gate) — distinct from the
-# read-skill actions (read_file/search_project) that also land in
+# Actionable draft proposals (writes/exec/stage/promote) — distinct from the
+# read-skill actions (read_file/search_project/list_dir) that also land in
 # proposed_actions for audit. The "did we collect / are we past deliberation"
-# guards must count only these, not read requests.
-_PROPOSAL_KINDS = {"write_file", "edit_file", "run_tests"}
+# guards must count only these, not read requests. (Most now execute freely;
+# only `promote` pauses for approval — but all are "the council produced work".)
+_PROPOSAL_KINDS = {"write_file", "edit_file", "run_tests", "stage", "promote"}
 
 
 def _has_proposals(session: Session) -> bool:
@@ -49,7 +50,7 @@ AgentCall = Callable[[CouncilMember, str], Contribution]
 
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
-    member: CouncilMember, prompt: str, timeout_s: int = 120, reserve: int = 0,
+    member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
     images: Optional[list[dict]] = None,
 ) -> Contribution:
     # `reserve` calls are held back for the composer; never reserve the
@@ -60,6 +61,9 @@ def _agent_call(
             f"max_agent_calls={session.budgets.max_agent_calls} reached"
             + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
         )
+    # Per-agent timeout: the gemini CLI needs more headroom than claude/codex.
+    if timeout_s is None:
+        timeout_s = config.agent_timeout(member.agent)
     try:
         result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
     except AgentInputRequired as e:
@@ -118,16 +122,24 @@ _GOVERNANCE_CONTEXT = (
 def build_prompt(
     session: Session, spec: RoundSpec, role: Role, readable: list[str] = ()
 ) -> str:
-    # Advertise the no-approval skills this role may pull mid-round, but only
-    # when they'd be useful (a workspace to search, or files to read).
+    # Advertise the no-approval discovery skills this role may pull mid-round,
+    # but only when there's something to look at: an established folder being
+    # examined, a workspace, or files already produced.
+    has_dir = bool(session.established_root or session.workspace_root)
+    where = "established folder" if session.established_root else "project"
     hints: list[str] = []
-    sp = get_skill("search_project")
-    if session.workspace_root and sp and role in sp.allowed_roles:
+    ld = get_skill("list_dir")
+    if has_dir and ld and role in ld.allowed_roles:
         hints.append(
-            "search the project (existing files) with a line 'SKILL: search_project <query>'"
+            f"list the {where}'s files with a line 'SKILL: list_dir .' (use a subfolder to drill in)"
+        )
+    sp = get_skill("search_project")
+    if has_dir and sp and role in sp.allowed_roles:
+        hints.append(
+            f"search the {where} with a line 'SKILL: search_project <query>'"
         )
     rf = get_skill("read_file")
-    if (readable or session.workspace_root) and rf and role in rf.allowed_roles:
+    if (readable or has_dir) and rf and role in rf.allowed_roles:
         avail = f" Available now: {', '.join(readable)}." if readable else ""
         hints.append(f"read a file with a line 'SKILL: read_file <path>'.{avail}")
     cap = (
@@ -176,10 +188,13 @@ def _resolve_skill_requests(
         if skill is None:
             results.append(f"SKILL {name}: unknown skill")
             continue
-        if skill.requires_approval:
+        # Mid-deliberation SKILL: requests are for DISCOVERY only (read/search/
+        # list). Writes/edits/tests/stage/promote carry structured content and
+        # go through the draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE contracts.
+        if skill.category != "read":
             results.append(
-                f"SKILL {name}: not available mid-deliberation (requires approval) — "
-                "produce it as an ARTIFACT instead")
+                f"SKILL {name}: not available mid-deliberation (it changes state) — "
+                "produce it as an ARTIFACT/EDIT/PROMOTE block in your draft instead")
             continue
         # map the single positional arg to the skill's first declared input
         # (read_file→filename, search_project→query)
@@ -221,6 +236,22 @@ def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
 
 
 def draft_prompt(session: Session) -> str:
+    # When an established folder is in play, the implementer drafts freely in the
+    # sandbox and PROMOTES the finished files into the real folder (the one gate).
+    if session.established_root:
+        promote = (
+            f"\nThis task targets the EXISTING folder: {session.established_root}\n"
+            "Your ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
+            "approval) so you can build and test. NOTHING reaches the real folder until "
+            "you PROMOTE it AND the human approves. For each file that should land in "
+            "the real folder, add a line:\n"
+            "PROMOTE: <filename>   (one per file you want delivered)\n"
+        )
+    else:
+        promote = (
+            "\nYour ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
+            "approval needed) — you need no filesystem access yourself.\n"
+        )
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
@@ -233,8 +264,8 @@ def draft_prompt(session: Session) -> str:
         "ARTIFACT: <next filename>\n"
         "<full file contents>\n"
         "Use one ARTIFACT block per file and include EVERY file the task asks for. Do "
-        "not describe the files in prose — write them out in full. They are saved for "
-        "you only after human approval, so you need no filesystem access yourself.\n"
+        "not describe the files in prose — write them out in full.\n"
+        f"{promote}"
         "Example of the exact format:\n"
         "ARTIFACT: main.py\n"
         "from fastapi import FastAPI\n"
@@ -253,7 +284,7 @@ def draft_prompt(session: Session) -> str:
         "=======\n"
         "<replacement text>\n"
         ">>>>>>> NEW\n"
-        "To run the test suite (executed only after human approval), add a line:\n"
+        "To run the test suite in your sandbox (free, no approval), add a line:\n"
         "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
         f"\nContext so far:\n{_recent_context(session, limit=5)}"
     )
@@ -391,6 +422,25 @@ def run_session(
         manager.transition(session, SessionStatus.awaiting_approval)
         return session
 
+    # Greenfield gate: a build that creates something NEW, with no established
+    # folder referenced, needs a destination — ASK rather than assume one.
+    if cls.greenfield and not session.established_root and not session.established_asked:
+        req = InputRequest(
+            session_id=sid, agent="system", role=Role.coordinator,
+            purpose="establish_target", resume_token="",
+            question=(
+                "This is a greenfield build, but you didn't reference a target folder. "
+                "Where should the finished files go? Reply with a folder path to deliver "
+                "there (you'll approve each file), or reply 'workspace' to keep them in "
+                "the council's workspace/sandbox without delivering anywhere."
+            ),
+        )
+        session.input_requests.append(req)
+        session.stop_reason = "needs a build target"
+        store.log_event(sid, "input_requested", req.model_dump())
+        manager.transition(session, SessionStatus.awaiting_input)
+        return session
+
     return _deliberate(session, manager, registry, governance, store, role_agents)
 
 
@@ -477,8 +527,20 @@ def _deliberate(
                 for _ in range(spec.max_turns):
                     governance.check(session, "generate_text")
                     p = build_prompt(session, spec, role, readable)
-                    c = call(member, p)
-                    c = _resolve_skill_requests(session, member, p, c, call, governance, store)
+                    try:
+                        c = call(member, p)
+                        c = _resolve_skill_requests(session, member, p, c, call, governance, store)
+                    except AgentError as e:
+                        # One flaky seat (e.g. the gemini CLI stalling) must not
+                        # abort the whole council. Drop it for the rest of the run
+                        # and continue with the others — graceful degradation.
+                        store.log_event(sid, "seat_dropped",
+                                        {"round": spec.round, "role": role.value,
+                                         "agent": member.agent, "error": str(e)})
+                        session.unresolved.append(
+                            f"{role.value} seat ({member.agent}) dropped: {e}")
+                        member.active = False
+                        break
                     if c.content.strip():  # output requirement met (Phase 0: non-empty)
                         break
 
@@ -585,16 +647,23 @@ _EDIT_MARKER = re.compile(
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
-# 'RUNTESTS: <command>' proposes a (human-approved) test run; command optional.
+# 'RUNTESTS: <command>' proposes a (free) test run; command optional.
 _RUNTESTS_MARKER = re.compile(
     r"^[ \t]*(?:\*\*)?RUN_?TESTS(?:\*\*)?[ \t]*:[ \t]*(?P<cmd>.*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# any block start — bounds ARTIFACT content so a following EDIT/RUNTESTS isn't
-# swallowed into the file body.
+# 'PROMOTE: <filename>' proposes copying a council file into the established
+# folder — the ONE approval-gated boundary that touches real user code.
+_PROMOTE_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?PROMOTE(?:\*\*)?[ \t]*:[ \t]*(?:\*\*)?\s*(?P<file>.+?)\s*(?:\*\*)?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# any block start — bounds ARTIFACT content so a following EDIT/RUNTESTS/PROMOTE
+# isn't swallowed into the file body.
 _BLOCK_START = re.compile(
-    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS)\b", re.IGNORECASE | re.MULTILINE
+    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)\b", re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -634,6 +703,13 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="run_tests", role=Role.implementer,
             filename=cmd or "pytest -q", args={"command": cmd})))
+    # PROMOTE only means anything with an established folder to deliver into.
+    if session.established_root:
+        for m in _PROMOTE_MARKER.finditer(text):
+            fn = m.group("file").strip()
+            found.append((m.start(), ProposedAction(
+                session_id=sid, kind="promote", role=Role.implementer,
+                filename=fn, args={"filename": fn})))
 
     for _, action in sorted(found, key=lambda t: t[0]):
         session.proposed_actions.append(action)
@@ -769,7 +845,7 @@ def _execute_actions(
             elif approval is not None and approval.status == "denied":
                 action.status = "denied"
                 session.unresolved.append(
-                    f"artifact '{action.filename}' not written: approval denied"
+                    f"'{action.filename}' not delivered ({action.kind}): approval denied"
                 )
                 store.log_event(sid, "action_denied", {"action_id": action.action_id})
                 continue
@@ -780,8 +856,8 @@ def _execute_actions(
             try:
                 result = executor.execute(session, action, store.data_dir)
                 action.status = "executed"
-                action.result_path = result  # path for writes/edits; output for run_tests
-                if action.kind in ("write_file", "edit_file"):
+                action.result_path = result  # path for writes/edits/promote; output for run_tests
+                if action.kind in ("write_file", "edit_file", "promote", "stage"):
                     session.files_changed.append(result)
                 else:  # run_tests (or other non-file actions) — keep the output visible
                     session.unresolved.append(f"{action.kind} '{action.filename}':\n{result}")

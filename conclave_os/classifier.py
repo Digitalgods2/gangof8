@@ -25,6 +25,12 @@ _FILE_ARTIFACT = re.compile(
     r"json|ya?ml|toml|ini|cfg|csv|html|css|scss|sh|bat|ps1|sql)\b",
     re.IGNORECASE,
 )
+# Building something NEW (vs. examining/improving an existing folder). A
+# greenfield build needs a destination — the loop ASKS if none was referenced.
+GREENFIELD_WORDS = [
+    "build", "create", "make", "scaffold", "generate", "bootstrap",
+    "new app", "new project", "from scratch", "starter", "greenfield",
+]
 EXEC_WORDS = ["execute", "run", "install", "launch"]
 DESIGN_WORDS = ["design", "architecture", "architect", "blueprint", "schema", "structure"]
 RESEARCH_WORDS = ["research", "investigate", "survey", "look up", "find out"]
@@ -112,6 +118,9 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     produces_output = task_type in (TaskType.code, TaskType.content, TaskType.design, TaskType.action)
     quality_matters = complexity != Complexity.trivial or risk != Risk.none
     needs_governance = action or risk_gt(risk, Risk.low) or _any(GOVERNANCE_WORDS, lower)
+    greenfield = task_type == TaskType.code and _any(GREENFIELD_WORDS, lower)
+    if greenfield:
+        notes.append("greenfield build (creates something new) — needs a target if none referenced")
 
     skills = []
     if needs_facts:
@@ -137,4 +146,5 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         produces_output=produces_output,
         quality_matters=quality_matters,
         needs_governance=needs_governance,
+        greenfield=greenfield,
     )

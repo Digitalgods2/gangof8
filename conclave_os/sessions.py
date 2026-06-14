@@ -10,9 +10,11 @@ from .models import Budgets, Session, SessionStatus, Task, short_id
 
 ALLOWED_TRANSITIONS: dict[SessionStatus, set[SessionStatus]] = {
     SessionStatus.received: {SessionStatus.classified, SessionStatus.failed, SessionStatus.cancelled},
-    SessionStatus.classified: {SessionStatus.awaiting_approval, SessionStatus.deliberating, SessionStatus.failed, SessionStatus.cancelled},
+    SessionStatus.classified: {SessionStatus.awaiting_approval, SessionStatus.awaiting_input, SessionStatus.deliberating, SessionStatus.failed, SessionStatus.cancelled},
     SessionStatus.awaiting_approval: {SessionStatus.deliberating, SessionStatus.composing, SessionStatus.cancelled, SessionStatus.failed},
-    SessionStatus.awaiting_input: {SessionStatus.deliberating, SessionStatus.composing, SessionStatus.cancelled, SessionStatus.failed},
+    # awaiting_input may resolve straight back to classified — the greenfield
+    # target gate fires pre-deliberation and re-runs classification on answer.
+    SessionStatus.awaiting_input: {SessionStatus.classified, SessionStatus.deliberating, SessionStatus.composing, SessionStatus.cancelled, SessionStatus.failed},
     SessionStatus.deliberating: {SessionStatus.composing, SessionStatus.awaiting_approval, SessionStatus.awaiting_input, SessionStatus.failed, SessionStatus.cancelled},
     SessionStatus.composing: {SessionStatus.done, SessionStatus.awaiting_input, SessionStatus.failed},
     SessionStatus.done: set(),

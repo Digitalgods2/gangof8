@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ws_use = ws_sub.add_parser("use", help="activate a workspace by id")
     p_ws_use.add_argument("workspace_id")
     ws_sub.add_parser("none", help="clear the active workspace (use the per-session sandbox)")
+    ws_sub.add_parser("empty", help="delete the CONTENTS of the active workspace (start fresh)")
 
     args = parser.parse_args(argv)
 
@@ -186,6 +187,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.ws_command == "none":
             service.set_active_workspace(None)
             print("active workspace cleared (per-session sandbox)")
+            return 0
+        if args.ws_command == "empty":
+            out = service.empty_workspace()
+            print(f"emptied workspace {out['emptied']} ({out['removed']} item(s) removed)")
             return 0
         data = service.list_workspaces()  # list
         if not data["workspaces"]:

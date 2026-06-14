@@ -1,10 +1,10 @@
 """Workspace state — the allowed work area (Type-2 module).
 
-A workspace is a real project directory the council may read and (with
-approval) write into, instead of the throwaway per-session sandbox. File skills
-resolve inside the workspace root with a hard containment boundary; sessions
-capture the active workspace at submit time. No workspace ⇒ unchanged sandbox
-behaviour.
+A workspace is the council's permanent work area the council may read and write
+into (target="workspace"), alongside the throwaway per-session sandbox. File
+skills resolve inside the workspace root with a hard containment boundary;
+sessions capture the active workspace at submit time. No workspace ⇒ unchanged
+sandbox behaviour.
 """
 
 from pathlib import Path
@@ -86,7 +86,7 @@ def test_write_file_into_workspace_subdir(tmp_path, session):
     (tmp_path / "proj").mkdir()
     action = ProposedAction(
         session_id=session.session_id, kind="write_file", role=Role.implementer,
-        args={"filename": "src/main.py", "content": "print('hi')"},
+        args={"filename": "src/main.py", "content": "print('hi')", "target": "workspace"},
     )
     result = execute(session, action, tmp_path / "data")
     assert Path(result) == (tmp_path / "proj" / "src" / "main.py").resolve()
@@ -117,7 +117,7 @@ def test_write_rejects_escape_in_workspace(tmp_path, session):
 
 
 def test_no_workspace_uses_flat_sandbox(tmp_path, session):
-    # workspace_root None ⇒ legacy artifacts sandbox; subdir parts are dropped
+    # workspace_root None ⇒ write lands in the session's artifacts sandbox
     action = ProposedAction(
         session_id=session.session_id, kind="write_file", role=Role.implementer,
         args={"filename": "report.md", "content": "x"},
@@ -143,23 +143,23 @@ class WsArtifactAdapter:
         return self._inner.call(role, prompt, timeout_s)
 
 
-def test_session_binds_active_workspace_and_writes_there(tmp_path):
+def test_session_binds_active_workspace_and_writes_free_into_sandbox(tmp_path):
     svc = ConclaveService(data_dir=tmp_path / "data")
     svc.registry.register(WsArtifactAdapter())
     proj = tmp_path / "proj"
     ws = svc.create_workspace("proj", str(proj))
     svc.set_active_workspace(ws.id)
 
-    session = svc.run("Build an app: src/main.py", source="test")
+    # The active workspace is still bound on the session, but ARTIFACT blocks now
+    # write FREELY into the per-session sandbox (no approval gate) and the session
+    # completes directly. Reaching the real folder requires a (gated) PROMOTE.
+    session = svc.run("Produce an app: src/main.py", source="test")
     assert session.workspace_root == str(proj.resolve())
-    assert session.status == SessionStatus.awaiting_approval
+    assert session.status == SessionStatus.done
+    assert not [a for a in session.approvals if a.status == "pending"]
     action = session.proposed_actions[0]
-    # the approval names the workspace, not the sandbox
-    assert any("workspace" in a.action for a in session.approvals)
-
-    done = svc.approve(session.session_id, session.approvals[0].approval_id, approved=True)
-    assert done.status == SessionStatus.done
-    written = proj / "src" / "main.py"
+    assert action.kind == "write_file" and action.status == "executed"
+    written = tmp_path / "data" / "artifacts" / session.session_id / "src" / "main.py"
     assert written.read_text(encoding="utf-8") == "print('built')"
 
 
@@ -235,7 +235,9 @@ def test_fs_mkdir(tmp_path):
 
 
 def test_workspace_endpoints(client, tmp_path):
-    assert client.get("/workspaces").json() == {"workspaces": [], "active": None}
+    initial = client.get("/workspaces").json()
+    assert initial["workspaces"] == [] and initial["active"] is None
+    assert initial["sandbox_root"].endswith("artifacts")
     created = client.post("/workspaces", json={"name": "p", "root": str(tmp_path / "p")}).json()
     wid = created["id"]
     listing = client.get("/workspaces").json()

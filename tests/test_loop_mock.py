@@ -100,3 +100,33 @@ def test_session_persisted_in_sqlite(service, session):
 def test_empty_task_rejected(service):
     with pytest.raises(ValueError):
         service.run("   ", source="test")
+
+
+# --- graceful degradation: a flaky seat must not abort the whole council ------
+
+
+class _BoomAdapter:
+    """A backend that always fails — stands in for the gemini CLI stalling."""
+
+    name = "boom"
+
+    def call(self, role, prompt, timeout_s, images=None):
+        from conclave_os.registry import AgentError
+        raise AgentError("boom CLI timed out after 120s")
+
+
+def test_one_failing_seat_is_dropped_not_fatal(tmp_path):
+    service = ConclaveService(data_dir=tmp_path)
+    service.registry.register(_BoomAdapter())
+    # point the researcher at the failing agent; the rest stay on mock
+    service.role_agents = {**service.role_agents, Role.researcher: "boom"}
+
+    session = service.run(TASK, source="test")
+
+    # the run still completes and produces a final answer (does NOT crash)
+    assert session.status == SessionStatus.done
+    assert session.final is not None and session.final.answer
+    # the flaky seat was dropped gracefully and recorded for the human
+    assert any("researcher seat (boom) dropped" in u for u in session.unresolved)
+    researcher = session.council.get(Role.researcher)
+    assert researcher is not None and researcher.active is False
