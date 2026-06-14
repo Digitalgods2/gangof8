@@ -423,9 +423,28 @@ async function submitTask() {
   pollLoop();  // a new run just started → fast polling
 }
 
+// True when the user currently has text selected inside `el` — we must NOT
+// clobber its innerHTML while they're selecting/copying.
+function _hasSelectionIn(el) {
+  const sel = window.getSelection && window.getSelection();
+  if (!el || !sel || sel.isCollapsed || sel.rangeCount === 0) return false;
+  return el.contains(sel.anchorNode) || el.contains(sel.focusNode);
+}
+let _lastListSig = "", _lastDetailSig = "";
+
 async function refresh() {
   const sessions = await api("/sessions");
   const el = document.getElementById("sessions");
+  // Only rebuild the list when something actually changed AND no selection is
+  // active in it — re-rendering identical HTML every poll wiped selections.
+  const listSig = JSON.stringify(sessions.map(s =>
+    [s.session_id, s.status, s.pending_approvals || 0, s.pending_inputs || 0,
+     s.task_text || "", s.session_id === current]));
+  if (listSig === _lastListSig || _hasSelectionIn(el)) {
+    if (current) await _refreshDetail();
+    return sessions;
+  }
+  _lastListSig = listSig;
   el.innerHTML = sessions.map(s => `
     <div class="session ${s.session_id===current?"active":""}" onclick="select('${s.session_id}')">
       <button class="trash" title="Delete this session" onclick="deleteSession('${s.session_id}', event)">🗑</button>
@@ -437,8 +456,19 @@ async function refresh() {
         <span>${esc(s.session_id)}</span>
       </div>
     </div>`).join("");
-  if (current) renderDetail(await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null));
+  if (current) await _refreshDetail();
   return sessions;
+}
+
+// Re-render the open session's detail ONLY when its data changed and the user
+// isn't selecting text in it — so a static (done) session never gets clobbered.
+async function _refreshDetail() {
+  const detail = await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null);
+  const right = document.getElementById("right");
+  const sig = JSON.stringify(detail);
+  if (sig === _lastDetailSig || _hasSelectionIn(right)) return;
+  _lastDetailSig = sig;
+  renderDetail(detail);
 }
 
 // Adaptive polling: only "heartbeat" the server while something is actually
@@ -470,7 +500,7 @@ async function deleteSession(id, ev) {
   }
 }
 
-function select(id) { current = id; refresh(); }
+function select(id) { current = id; _lastDetailSig = ""; _lastListSig = ""; refresh(); }
 
 function renderDetail(s) {
   if (!s) return;
