@@ -599,9 +599,14 @@ function renderDetail(s) {
         ${final.next_action ? `<h3>Next action</h3><div>${esc(final.next_action)}</div>` : ""}
       </div>` : ""}
 
-    ${(s.files_changed||[]).length ? `
+    ${(s.files_changed||[]).length ? (() => {
+        const est = s.established_root || "";
+        const inEst = f => est && f.toLowerCase().startsWith(est.toLowerCase());
+        return `
       <div class="card"><h3>Files written</h3>
-        <ul>${s.files_changed.map(f=>`<li class="mono">${esc(f)}</li>`).join("")}</ul></div>` : ""}
+        <div class="sub" style="margin-bottom:6px">Scratch files live in the council's sandbox/workspace. Your established folder is only touched by an approved <b>promote</b>.</div>
+        <ul>${s.files_changed.map(f=>`<li class="mono">${esc(f)} <span class="badge" style="font-size:10px">${inEst(f) ? "→ your folder (promoted)" : "sandbox (scratch)"}</span></li>`).join("")}</ul></div>`;
+      })() : ""}
 
     ${disagreements.length ? collapsible("sec_disagreements",
         `Disagreements (${disagreements.length})${rulingSummary ? ` — ${rulingSummary}` : ""}`,
