@@ -239,7 +239,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return {
             "workspaces": [w.model_dump() for w in self.workspaces.list()],
             "active": active.id if active else None,
-            "sandbox_root": str((self._data_dir / "artifacts").resolve()),
+            # neutral, isolated scratch location — never under a project folder
+            "sandbox_root": str(config.SANDBOX_ROOT.resolve()),
         }
 
     def create_workspace(self, name: str, root: str):

@@ -11,7 +11,7 @@ import re
 
 import pytest
 
-from conclave_os import loop
+from conclave_os import executor, loop
 from conclave_os.adapters.mock import MockAdapter
 from conclave_os.models import Role, SessionStatus
 from conclave_os.registry import AdapterResult
@@ -101,7 +101,7 @@ def test_materialized_files_written_after_approval(service, tmp_path):
     for approval in [a for a in session.approvals if a.status == "pending"]:
         done = service.approve(sid, approval.approval_id, approved=True)
     assert done.status == SessionStatus.done
-    sandbox = tmp_path / "artifacts" / sid
+    sandbox = executor.artifacts_dir(tmp_path, sid)
     assert {p.name for p in sandbox.iterdir()} == {"main.py", "README.md", "requirements.txt"}
     assert (sandbox / "main.py").read_text(encoding="utf-8") == "print('hello world')"
     assert len(done.files_changed) == 3

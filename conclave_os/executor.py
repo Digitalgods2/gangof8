@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import config
 from .models import ProposedAction, Session
 
 # Conservative filename whitelist: word chars, dot, dash, space. No path
@@ -33,7 +34,11 @@ def _safe_filename(raw: str) -> str:
 
 
 def artifacts_dir(data_dir: Path, session_id: str) -> Path:
-    return Path(data_dir) / "artifacts" / session_id
+    """The ephemeral per-session sandbox. Lives under the NEUTRAL config.SANDBOX_ROOT
+    (an isolated OS location), NEVER under data_dir or any project/source folder —
+    so scratch writes can never touch source material. `data_dir` is accepted for
+    call-site compatibility but intentionally not used for the location."""
+    return Path(config.SANDBOX_ROOT) / session_id
 
 
 def resolve_in_workspace(root: Path, relpath: str) -> Path:

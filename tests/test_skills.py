@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from conclave_os import executor
 from conclave_os.executor import ExecutionError, execute
 from conclave_os.governance import Governance
 from conclave_os.logstore import LogStore
@@ -191,7 +192,7 @@ def test_write_file_is_free_and_sandboxes(governance, session, tmp_path):
     assert session.approvals == [], "a free write creates no approval"
     result = execute(session, action, tmp_path)
     path = Path(result)
-    assert path.parent == (tmp_path / "artifacts" / session.session_id).resolve()
+    assert path.parent == executor.artifacts_dir(tmp_path, session.session_id).resolve()
     assert path.read_text(encoding="utf-8") == "hello"
 
 
@@ -215,7 +216,7 @@ def test_write_file_bad_charset_resolves_in_sandbox(session, tmp_path):
     )
     result = execute(session, action, tmp_path)
     assert Path(result).name == "###"
-    assert Path(result).parent == (tmp_path / "artifacts" / session.session_id).resolve()
+    assert Path(result).parent == executor.artifacts_dir(tmp_path, session.session_id).resolve()
     assert Path(result).read_text(encoding="utf-8") == "x"
 
 
@@ -234,7 +235,7 @@ def test_write_file_falls_back_to_legacy_fields(session, tmp_path):
 
 def test_read_file_requires_no_approval_and_reads(governance, session, tmp_path):
     # seed a file via write_file
-    out_dir = tmp_path / "artifacts" / session.session_id
+    out_dir = executor.artifacts_dir(tmp_path, session.session_id)
     out_dir.mkdir(parents=True)
     (out_dir / "data.txt").write_text("contents here", encoding="utf-8")
 
@@ -276,7 +277,7 @@ def test_stage_moves_sandbox_file_into_workspace(governance, session, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     session.workspace_root = str(ws)
-    sandbox = tmp_path / "artifacts" / session.session_id
+    sandbox = executor.artifacts_dir(tmp_path, session.session_id)
     sandbox.mkdir(parents=True)
     (sandbox / "keep.py").write_text("print('keep')", encoding="utf-8")
 
@@ -336,7 +337,7 @@ def test_promote_falls_back_to_sandbox_source(governance, session, tmp_path):
     est = tmp_path / "established"
     est.mkdir()
     session.established_root = str(est)
-    sandbox = tmp_path / "artifacts" / session.session_id
+    sandbox = executor.artifacts_dir(tmp_path, session.session_id)
     sandbox.mkdir(parents=True)
     (sandbox / "y.py").write_text("scratch body\n", encoding="utf-8")
 
@@ -376,7 +377,7 @@ def test_unknown_skill_is_rejected_cleanly(governance, session):
 
 
 def test_no_approval_skill_executes_without_gate(governance, session, tmp_path):
-    out_dir = tmp_path / "artifacts" / session.session_id
+    out_dir = executor.artifacts_dir(tmp_path, session.session_id)
     out_dir.mkdir(parents=True)
     (out_dir / "f.txt").write_text("ok", encoding="utf-8")
     action = ProposedAction(

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from conclave_os import executor
 from conclave_os.executor import ExecutionError
 from conclave_os.models import Role, SessionStatus
 from conclave_os.registry import AdapterResult
@@ -68,7 +69,7 @@ def test_artifact_writes_freely_into_sandbox(service, tmp_path):
 
     path = Path(action.result_path)
     assert path.exists()
-    assert path.parent == (tmp_path / "artifacts" / session.session_id).resolve()
+    assert path.parent == executor.artifacts_dir(tmp_path, session.session_id).resolve()
     assert "Use SQLite for session logs" in path.read_text(encoding="utf-8")
     assert "ARTIFACT:" not in path.read_text(encoding="utf-8"), "marker line is stripped"
     assert session.files_changed == [str(path)]
@@ -292,7 +293,7 @@ def test_multi_artifact_writes_all_into_sandbox(multi_service, tmp_path):
     session = multi_service.run("Produce a tiny app with main.py and a readme.", source="test")
     assert session.status == SessionStatus.done
     sid = session.session_id
-    sandbox = tmp_path / "artifacts" / sid
+    sandbox = executor.artifacts_dir(tmp_path, sid)
     assert {p.name for p in sandbox.iterdir()} == {"main.py", "README.md", "requirements.txt"}
     assert (sandbox / "main.py").read_text(encoding="utf-8") == "print('hello world')"
     assert all(a.status == "executed" for a in session.proposed_actions)
