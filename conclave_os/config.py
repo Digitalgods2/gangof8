@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 from .models import Budgets, Complexity, Risk, Role
 
 DATA_DIR = Path(os.environ.get("CONCLAVE_OS_DATA", str(Path(__file__).resolve().parent.parent / "data")))
+
+
+def _default_sandbox_root() -> Path:
+    """A NEUTRAL scratch location, deliberately OUTSIDE any project/source folder
+    so the ephemeral sandbox can never sit inside (or corrupt) source material.
+    Windows → %LOCALAPPDATA%\\ConclaveOS\\sandbox; else a temp-dir subfolder.
+    Override with CONCLAVE_OS_SANDBOX."""
+    base = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
+    root = Path(base) / "ConclaveOS" if base else Path(tempfile.gettempdir()) / "conclave_os"
+    return root / "sandbox"
+
+
+# The ephemeral per-session sandbox lives here — NEVER under DATA_DIR or any
+# project folder. Each session gets its own subdir (executor.artifacts_dir).
+SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_root())))
 
 BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
     Complexity.trivial: Budgets(max_rounds=1, max_turns_per_round=1, max_agent_calls=4, max_wall_seconds=180),

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import loop
+from conclave_os import executor, loop
 from conclave_os.adapters.mock import MockAdapter
 from conclave_os.executor import ExecutionError, execute
 from conclave_os.governance import Governance
@@ -170,5 +170,5 @@ def test_edit_end_to_end_free(tmp_path):
     assert kinds == ["write_file", "edit_file"]  # document order
     assert all(a.status == "executed" for a in session.proposed_actions)
     assert not [a for a in session.approvals if a.status == "pending"]
-    sandbox = tmp_path / "data" / "artifacts" / session.session_id
+    sandbox = executor.artifacts_dir(tmp_path / "data", session.session_id)
     assert (sandbox / "note.txt").read_text(encoding="utf-8") == "goodbye world"

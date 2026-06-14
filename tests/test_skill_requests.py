@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import config, loop
+from conclave_os import config, executor, loop
 from conclave_os.governance import Governance
 from conclave_os.logstore import LogStore
 from conclave_os.models import Contribution, CouncilMember, Role, Session
@@ -55,7 +55,7 @@ def _recording_call(answer: str = "informed answer"):
 
 
 def _seed(tmp_path, session: Session, name: str, body: str) -> None:
-    d = tmp_path / "artifacts" / session.session_id
+    d = executor.artifacts_dir(tmp_path, session.session_id)
     d.mkdir(parents=True, exist_ok=True)
     (d / name).write_text(body, encoding="utf-8")
 

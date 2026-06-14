@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from conclave_os import executor
 from conclave_os.adapters.mock import MockAdapter
 from conclave_os.executor import ExecutionError, execute, resolve_in_workspace
 from conclave_os.governance import Governance
@@ -123,7 +124,7 @@ def test_no_workspace_uses_flat_sandbox(tmp_path, session):
         args={"filename": "report.md", "content": "x"},
     )
     result = execute(session, action, tmp_path / "data")
-    assert Path(result).parent == (tmp_path / "data" / "artifacts" / session.session_id).resolve()
+    assert Path(result).parent == executor.artifacts_dir(tmp_path / "data", session.session_id).resolve()
 
 
 # ---- service binds the active workspace + end to end -------------------------
@@ -159,7 +160,7 @@ def test_session_binds_active_workspace_and_writes_free_into_sandbox(tmp_path):
     assert not [a for a in session.approvals if a.status == "pending"]
     action = session.proposed_actions[0]
     assert action.kind == "write_file" and action.status == "executed"
-    written = tmp_path / "data" / "artifacts" / session.session_id / "src" / "main.py"
+    written = executor.artifacts_dir(tmp_path / "data", session.session_id) / "src" / "main.py"
     assert written.read_text(encoding="utf-8") == "print('built')"
 
 
@@ -234,10 +235,13 @@ def test_fs_mkdir(tmp_path):
     assert "error" in svc.make_dir(str(tmp_path), "bad/name")
 
 
-def test_workspace_endpoints(client, tmp_path):
+def test_workspace_endpoints(client, tmp_path, _isolated_sandbox):
     initial = client.get("/workspaces").json()
     assert initial["workspaces"] == [] and initial["active"] is None
-    assert initial["sandbox_root"].endswith("artifacts")
+    # sandbox_root is the NEUTRAL config.SANDBOX_ROOT (a temp "sandbox" dir),
+    # never the data dir — the conftest fixture patches it per test.
+    assert Path(initial["sandbox_root"]) == Path(_isolated_sandbox).resolve()
+    assert _isolated_sandbox.name.startswith("sandbox")
     created = client.post("/workspaces", json={"name": "p", "root": str(tmp_path / "p")}).json()
     wid = created["id"]
     listing = client.get("/workspaces").json()
