@@ -45,12 +45,13 @@ class CliAdapter:
         elif self.agent == "codex":
             content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
-            # The gemini CLI has no clean headless image input, so for image
-            # calls use the google-genai SDK inline-image route (a pure inference
-            # call — no tools, governed). Text calls stay on the CLI (its
-            # existing auth). No key ⇒ fall back to text-only CLI + the note.
-            if images and (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-                content = self._run_gemini_sdk(prompt, images)
+            # Prefer the google-genai SDK for ALL gemini calls (text AND images)
+            # when an API key is present: a clean inference call that sidesteps the
+            # gemini CLI's headless problems — its long prompts overflow the
+            # Windows command line ('-p <prompt>' as argv), and plan-mode hangs.
+            # No key ⇒ fall back to the CLI (which still has those limitations).
+            if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+                content = self._run_gemini_sdk(prompt, images or [])
             else:
                 content = self._run_gemini(prompt, timeout_s)
         else:

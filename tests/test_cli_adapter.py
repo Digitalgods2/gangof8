@@ -171,12 +171,44 @@ def test_gemini_vision_uses_genai_sdk(monkeypatch, tmp_path):
     assert captured["contents"][-1] == "read it"   # prompt is the last content
 
 
-def test_gemini_without_images_uses_cli(stub_run):
+def test_gemini_text_without_key_falls_back_to_cli(stub_run, monkeypatch):
+    # no API key → gemini text uses the CLI
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     calls = stub_run(_Proc(stdout="cli answer"))
     out = CliAdapter("gemini").call(Role.researcher, "x", timeout_s=30)  # no images
     assert out.content == "cli answer"
     assert calls["cmd"][0].endswith("gemini")
     assert "-p" in calls["cmd"]
+
+
+def test_gemini_text_uses_sdk_when_key_present(monkeypatch):
+    # with a key, gemini text goes through the SDK (NOT the flaky CLI) — no
+    # subprocess, no command-line-length limit, no headless hang.
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    from google import genai as genai_mod
+
+    captured = {}
+
+    class FakeResp:
+        text = "SDK-TEXT"
+
+    class FakeModels:
+        def generate_content(self, model, contents):
+            captured["contents"] = contents
+            return FakeResp()
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.models = FakeModels()
+
+    monkeypatch.setattr(genai_mod, "Client", FakeClient)
+    # Popen must NOT be called — if it is, the test fails loudly
+    monkeypatch.setattr(cli_mod.subprocess, "Popen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("CLI used despite key")))
+    out = CliAdapter("gemini").call(Role.researcher, "summarize this", timeout_s=30)
+    assert out.content == "SDK-TEXT"
+    assert captured["contents"] == ["summarize this"]  # text-only: just the prompt
 
 
 def test_unknown_agent_raises():
