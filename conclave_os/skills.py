@@ -92,13 +92,30 @@ def _default_read_space(session: Session) -> str:
     return SANDBOX
 
 
+def _assert_outside_established(session: Session, path: Path) -> None:
+    """Hard guard: refuse any free (council-space) write that would resolve INSIDE
+    the established folder OR ANY SUBFOLDER of it (e.g. a workspace mistakenly set
+    under it). A subfolder of the source IS the source — it can only be reached by
+    an APPROVED promote, never by a free write."""
+    if not session.established_root:
+        return
+    est = Path(session.established_root).resolve()
+    p = Path(path).resolve()
+    if p == est or est in p.parents:
+        raise ExecutionError(
+            f"refusing to write inside the established folder ({est}); a subfolder "
+            "of the source is still the source — it is reachable only via an "
+            "approved promote, never a free write")
+
+
 def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Write content into a council space (sandbox default, or workspace). Free —
-    no approval; the established folder is never a write target."""
+    no approval; the established folder (and any subfolder) is never a write target."""
     raw_name = _arg(action, "filename")
     content = _arg(action, "content")
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
     path = resolve_space(session, data_dir, target, raw_name)
+    _assert_outside_established(session, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return str(path)
@@ -126,6 +143,7 @@ def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
         raise ExecutionError("edit_file requires non-empty OLD text")
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
     path = resolve_space(session, data_dir, target, raw_name)
+    _assert_outside_established(session, path)
     if not path.is_file():
         raise ExecutionError(f"file not found to edit: {raw_name!r}")
     text = path.read_text(encoding="utf-8")
@@ -147,6 +165,7 @@ def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
     cmd = (_arg(action, "command") or "").strip() or "pytest -q"
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
     cwd = space_root(session, data_dir, target)
+    _assert_outside_established(session, cwd)  # never execute/write inside the source tree
     cwd.mkdir(parents=True, exist_ok=True)
     if not cwd.is_dir():
         raise ExecutionError("no directory to run tests in")
@@ -175,6 +194,7 @@ def _stage(session: Session, action: ProposedAction, data_dir: Path) -> str:
     if not src.is_file():
         raise ExecutionError(f"nothing to stage (not in sandbox): {raw_name!r}")
     dst = resolve_space(session, data_dir, WORKSPACE, raw_name)
+    _assert_outside_established(session, dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
     return str(dst)
