@@ -18,7 +18,15 @@ from typing import Callable, Optional
 from pydantic import BaseModel
 
 from . import config
-from .executor import ExecutionError, _safe_filename, artifacts_dir, resolve_in_workspace
+from .executor import (
+    ESTABLISHED,
+    SANDBOX,
+    WORKSPACE,
+    ExecutionError,
+    artifacts_dir,
+    resolve_space,
+    space_root,
+)
 from .models import ProposedAction, Risk, Role, Session
 
 # Directories never worth searching (vendored / generated / VCS noise).
@@ -57,55 +65,67 @@ def _arg(action: ProposedAction, key: str, legacy: str = "") -> str:
     return getattr(action, legacy or key, "")
 
 
-def _sandboxed_path(session: Session, data_dir: Path, raw_name: str) -> Path:
-    """Resolve raw_name inside the session's artifacts sandbox, rejecting any
-    path that escapes it (flat — directory components are dropped)."""
-    name = _safe_filename(raw_name)
-    out_dir = artifacts_dir(data_dir, session.session_id)
-    path = (out_dir / name).resolve()
-    if path.parent != out_dir.resolve():
-        raise ExecutionError(f"path escapes the artifacts sandbox: {name!r}")
-    return path
+# --- space targeting (sandbox | workspace | established) ----------------------
+# write/edit/run_tests act ONLY in the council's own spaces (sandbox|workspace);
+# established is read-only and reached for real only via the gated `promote`.
+_WRITE_SPACES = {SANDBOX, WORKSPACE}
+_READ_SPACES = {SANDBOX, WORKSPACE, ESTABLISHED}
 
 
-def _target_path(session: Session, data_dir: Path, raw_name: str) -> Path:
-    """Where a file skill operates: inside the session's workspace root (real
-    project, subdirs allowed) when one is bound, else the flat per-session
-    artifacts sandbox."""
+def _space_arg(action: ProposedAction, default: str, allowed: set[str]) -> str:
+    raw = action.args.get("target") or action.args.get("space") or default
+    s = str(raw).strip().lower()
+    if s not in allowed:
+        raise ExecutionError(
+            f"invalid target {s!r} (allowed: {', '.join(sorted(allowed))})")
+    return s
+
+
+def _default_read_space(session: Session) -> str:
+    """Where a bare read/search/list lands when no target is given: the richest
+    bound space — the established folder being examined, else the workspace,
+    else the ephemeral sandbox."""
+    if session.established_root:
+        return ESTABLISHED
     if session.workspace_root:
-        return resolve_in_workspace(Path(session.workspace_root), raw_name)
-    return _sandboxed_path(session, data_dir, raw_name)
+        return WORKSPACE
+    return SANDBOX
 
 
 def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Write content to the session's workspace (if bound) or artifacts sandbox."""
+    """Write content into a council space (sandbox default, or workspace). Free —
+    no approval; the established folder is never a write target."""
     raw_name = _arg(action, "filename")
     content = _arg(action, "content")
-    path = _target_path(session, data_dir, raw_name)
+    target = _space_arg(action, SANDBOX, _WRITE_SPACES)
+    path = resolve_space(session, data_dir, target, raw_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return str(path)
 
 
 def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Read a file from the session's workspace (if bound) or artifacts sandbox."""
+    """Read a file from any space (default: the richest bound one)."""
     raw_name = _arg(action, "filename")
-    path = _target_path(session, data_dir, raw_name)
+    target = _space_arg(action, _default_read_space(session), _READ_SPACES)
+    path = resolve_space(session, data_dir, target, raw_name)
     if not path.is_file():
         raise ExecutionError(f"file not found: {raw_name!r}")
     return path.read_text(encoding="utf-8")
 
 
 def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Surgically replace a unique OLD snippet with NEW in an existing file
-    (workspace or sandbox). Fails if the file is missing or OLD is absent /
-    not unique — never a blind overwrite."""
+    """Surgically replace a unique OLD snippet with NEW in an existing file in a
+    council space (sandbox default, or workspace). Fails if the file is missing
+    or OLD is absent / not unique — never a blind overwrite. The established
+    folder is never edited directly (changes land there only via `promote`)."""
     raw_name = _arg(action, "filename")
     old = _arg(action, "old")
     new = _arg(action, "new")
     if not old:
         raise ExecutionError("edit_file requires non-empty OLD text")
-    path = _target_path(session, data_dir, raw_name)
+    target = _space_arg(action, SANDBOX, _WRITE_SPACES)
+    path = resolve_space(session, data_dir, target, raw_name)
     if not path.is_file():
         raise ExecutionError(f"file not found to edit: {raw_name!r}")
     text = path.read_text(encoding="utf-8")
@@ -119,14 +139,15 @@ def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
 
 
 def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Run a (human-approved) test command in the workspace/sandbox and return
-    its output. The first code-execution capability — bounded by timeout and
-    output cap; only ever runs after explicit approval (requires_approval)."""
+    """Run a test command in a council space (sandbox default, or workspace) and
+    return its output. Free — no approval (the council's own scratch); still
+    bounded by timeout and output cap."""
     import subprocess
 
     cmd = (_arg(action, "command") or "").strip() or "pytest -q"
-    cwd = Path(session.workspace_root) if session.workspace_root \
-        else artifacts_dir(data_dir, session.session_id)
+    target = _space_arg(action, SANDBOX, _WRITE_SPACES)
+    cwd = space_root(session, data_dir, target)
+    cwd.mkdir(parents=True, exist_ok=True)
     if not cwd.is_dir():
         raise ExecutionError("no directory to run tests in")
     try:
@@ -145,10 +166,130 @@ def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
     return f"$ {cmd}  (cwd: {cwd})\n[{status}]\n{body}"[: config.RUN_TESTS_OUTPUT_MAX_CHARS]
 
 
-def _search_root(session: Session, data_dir: Path) -> Path:
+def _stage(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Move a file UP from the ephemeral sandbox into the permanent workspace —
+    the council keeping work worth carrying across sessions. Free (no approval);
+    both are the council's own spaces."""
+    raw_name = _arg(action, "filename")
+    src = resolve_space(session, data_dir, SANDBOX, raw_name)
+    if not src.is_file():
+        raise ExecutionError(f"nothing to stage (not in sandbox): {raw_name!r}")
+    dst = resolve_space(session, data_dir, WORKSPACE, raw_name)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+    return str(dst)
+
+
+def _promote_source(session: Session, data_dir: Path, raw_name: str) -> Optional[Path]:
+    """The council file `promote` would deliver: prefer the permanent workspace,
+    fall back to the sandbox (so an ARTIFACT written to scratch can promote
+    without an explicit stage)."""
     if session.workspace_root:
-        return Path(session.workspace_root)
-    return artifacts_dir(data_dir, session.session_id)
+        ws = resolve_space(session, data_dir, WORKSPACE, raw_name)
+        if ws.is_file():
+            return ws
+    sb = resolve_space(session, data_dir, SANDBOX, raw_name)
+    return sb if sb.is_file() else None
+
+
+def promote_diff(session: Session, data_dir: Path, raw_name: str) -> str:
+    """Unified diff of what `promote` would change in the established folder: the
+    existing established file (if any) → the council version. Shown in the
+    approval so the human sees exactly what lands in their real code."""
+    import difflib
+
+    src = _promote_source(session, data_dir, raw_name)
+    new = src.read_text(encoding="utf-8", errors="replace") if src else ""
+    dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
+    old = dst.read_text(encoding="utf-8", errors="replace") if dst.is_file() else ""
+    label = "new file" if not old else "modified"
+    diff = "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"established/{raw_name} ({label})", tofile=f"council/{raw_name}",
+    ))
+    return (diff or "(no textual difference)")[: config.PROMOTE_DIFF_MAX_CHARS]
+
+
+def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Copy a council file (workspace, else sandbox) INTO the external established
+    folder. The ONLY skill that writes real, user-owned code — approval-gated."""
+    raw_name = _arg(action, "filename")
+    src = _promote_source(session, data_dir, raw_name)
+    if src is None:
+        raise ExecutionError(f"nothing to promote (not in workspace/sandbox): {raw_name!r}")
+    dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(src.read_bytes())
+    return str(dst)
+
+
+def _search_root(session: Session, data_dir: Path, action: ProposedAction | None = None) -> Path:
+    target = _space_arg(action, _default_read_space(session), _READ_SPACES) \
+        if action is not None else _default_read_space(session)
+    return space_root(session, data_dir, target)
+
+
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def _list_dir(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """List the workspace (or session sandbox) directory tree so agents can
+    DISCOVER what files exist before reading or writing — the missing first step
+    for open-ended 'examine this app' tasks. Read-only, no approval; bounded by
+    entry count and depth. The positional arg is a subdirectory ('.' or empty =
+    the workspace root)."""
+    space = _space_arg(action, _default_read_space(session), _READ_SPACES)
+    base = space_root(session, data_dir, space).resolve()
+    if not base.is_dir():
+        return "No directory to list."
+    raw = (_arg(action, "path") or "").strip().strip("/").replace("\\", "/")
+    if raw in ("", "."):
+        target = base
+    else:
+        target = resolve_space(session, data_dir, space, raw)
+    if not target.is_dir():
+        raise ExecutionError(f"not a directory: {raw or '.'!r}")
+
+    # Breadth-first (shallow entries first) so the top-level layout — the most
+    # useful view for "what is this app" — survives the entry cap instead of
+    # being crowded out by deeply-nested files.
+    entries: list[str] = []
+    truncated = False
+    everything = sorted(
+        target.rglob("*"),
+        key=lambda p: (len(p.relative_to(target).parts),
+                       p.relative_to(target).as_posix().lower()),
+    )
+    for p in everything:
+        rel_parts = p.relative_to(target).parts
+        if any(part in _SEARCH_SKIP_DIRS for part in rel_parts):
+            continue
+        if len(rel_parts) > config.LIST_DIR_MAX_DEPTH:
+            continue
+        if len(entries) >= config.LIST_DIR_MAX_ENTRIES:
+            truncated = True
+            break
+        rel = p.relative_to(target).as_posix()
+        if p.is_dir():
+            entries.append(f"  {rel}/")
+        else:
+            try:
+                size = _fmt_size(p.stat().st_size)
+            except OSError:
+                size = "?"
+            entries.append(f"  {rel}  ({size})")
+
+    label = target.name or "project"
+    if not entries:
+        return f"{label}/ is empty."
+    head = (f"{label}/ — {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+            + (" (truncated)" if truncated else "") + ":\n")
+    return (head + "\n".join(entries))[: config.LIST_DIR_RESULT_MAX_CHARS]
 
 
 def _search_project(session: Session, action: ProposedAction, data_dir: Path) -> str:
@@ -158,7 +299,7 @@ def _search_project(session: Session, action: ProposedAction, data_dir: Path) ->
     query = _arg(action, "query").strip()
     if not query:
         raise ExecutionError("search_project requires a non-empty query")
-    root = _search_root(session, data_dir).resolve()
+    root = _search_root(session, data_dir, action).resolve()
     if not root.is_dir():
         return f"No project directory to search for {query!r}."
 
@@ -204,48 +345,76 @@ def _search_project(session: Session, action: ProposedAction, data_dir: Path) ->
 SKILLS: dict[str, Skill] = {
     "write_file": Skill(
         name="write_file",
-        description="Write content to a file in the session's artifacts sandbox.",
+        description="Write a file into a council space (sandbox default, or workspace). Free, no approval.",
         category="file_write",
-        risk=Risk.medium,
-        requires_approval=True,
+        risk=Risk.low,
+        requires_approval=False,
         allowed_roles=[Role.implementer],
-        inputs=["filename", "content"],
+        inputs=["filename", "content", "target"],
     ),
     "read_file": Skill(
         name="read_file",
-        description="Read a file from the workspace (or the session's sandbox).",
-        category="read",
-        risk=Risk.low,
-        requires_approval=False,
-        allowed_roles=[Role.researcher, Role.implementer],
-        inputs=["filename"],
-    ),
-    "search_project": Skill(
-        name="search_project",
-        description="Search the workspace for a string in file names and contents.",
+        description="Read a file from any space (sandbox/workspace/established).",
         category="read",
         risk=Risk.low,
         requires_approval=False,
         allowed_roles=[Role.researcher, Role.architect, Role.implementer],
-        inputs=["query"],
+        inputs=["filename", "target"],
+    ),
+    "search_project": Skill(
+        name="search_project",
+        description="Search a space for a string in file names and contents.",
+        category="read",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        inputs=["query", "target"],
+    ),
+    "list_dir": Skill(
+        name="list_dir",
+        description="List the files/folders in a space (sandbox/workspace/established) "
+                    "so you can see what exists before reading or writing.",
+        category="read",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        inputs=["path", "target"],
     ),
     "edit_file": Skill(
         name="edit_file",
-        description="Replace a unique snippet in an existing file (surgical edit).",
+        description="Surgically replace a unique snippet in a council-space file (sandbox/workspace). Free, no approval.",
         category="file_edit",
-        risk=Risk.medium,
-        requires_approval=True,
+        risk=Risk.low,
+        requires_approval=False,
         allowed_roles=[Role.implementer],
-        inputs=["filename", "old", "new"],
+        inputs=["filename", "old", "new", "target"],
     ),
     "run_tests": Skill(
         name="run_tests",
-        description="Run a test command in the workspace and return its output.",
+        description="Run a test command in a council space (sandbox/workspace). Free, no approval.",
         category="code_exec",
-        risk=Risk.high,
-        requires_approval=True,
+        risk=Risk.medium,
+        requires_approval=False,
         allowed_roles=[Role.implementer, Role.critic],
-        inputs=["command"],
+        inputs=["command", "target"],
+    ),
+    "stage": Skill(
+        name="stage",
+        description="Keep a sandbox file by moving it up into the permanent workspace. Free, no approval.",
+        category="stage",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.implementer],
+        inputs=["filename"],
+    ),
+    "promote": Skill(
+        name="promote",
+        description="Copy a workspace file INTO the external established folder (real code). Requires human approval.",
+        category="promote",
+        risk=Risk.medium,
+        requires_approval=True,
+        allowed_roles=[Role.implementer],
+        inputs=["filename"],
     ),
 }
 
@@ -253,8 +422,11 @@ HANDLERS: dict[str, Handler] = {
     "write_file": _write_file,
     "read_file": _read_file,
     "search_project": _search_project,
+    "list_dir": _list_dir,
     "edit_file": _edit_file,
     "run_tests": _run_tests,
+    "stage": _stage,
+    "promote": _promote,
 }
 
 

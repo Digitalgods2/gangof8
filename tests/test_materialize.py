@@ -79,20 +79,22 @@ def test_intended_filenames_from_task(tmp_path):
 
 def test_materializes_each_described_file(service):
     session = service.run(
-        "Build a tiny app with main.py, README.md, and requirements.txt.", source="test"
+        "Produce a tiny app with main.py, README.md, and requirements.txt.", source="test"
     )
-    assert session.status == SessionStatus.awaiting_approval
+    # materialized write_files are FREE now — they execute and the session completes
+    assert session.status == SessionStatus.done
     proposed = {a.filename: a for a in session.proposed_actions}
     assert set(proposed) == {"main.py", "README.md", "requirements.txt"}
     # the fenced body was stripped to the raw file content
     assert proposed["main.py"].content == "print('hello world')"
     assert "Hello App" in proposed["README.md"].content
-    assert len([a for a in session.approvals if a.status == "pending"]) == 3
+    assert all(a.status == "executed" for a in session.proposed_actions)
+    assert not [a for a in session.approvals if a.status == "pending"]
 
 
 def test_materialized_files_written_after_approval(service, tmp_path):
     session = service.run(
-        "Build a tiny app with main.py, README.md, and requirements.txt.", source="test"
+        "Produce a tiny app with main.py, README.md, and requirements.txt.", source="test"
     )
     sid = session.session_id
     done = session
@@ -123,6 +125,6 @@ def test_no_materialization_when_artifacts_emitted(tmp_path):
 
     service = ConclaveService(data_dir=tmp_path)
     service.registry.register(DirectAdapter())
-    session = service.run("Build an app: only.py", source="test")
+    session = service.run("Produce an app: only.py", source="test")
     assert {a.filename for a in session.proposed_actions} == {"only.py"}
     assert session.proposed_actions[0].content == "print('direct')"

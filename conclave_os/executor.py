@@ -37,20 +37,49 @@ def artifacts_dir(data_dir: Path, session_id: str) -> Path:
 
 
 def resolve_in_workspace(root: Path, relpath: str) -> Path:
-    """Resolve a relative path inside a workspace root, allowing subdirectories
+    """Resolve a relative path inside a root directory, allowing subdirectories
     (src/main.py) but rejecting anything that escapes the root — `..` traversal,
     absolute paths, or drive-qualified paths. The containment check on the
-    resolved path is the real security boundary."""
+    resolved path is the real security boundary. Used for every space (sandbox,
+    workspace, established) so all three share one escape-proof boundary."""
     raw = (relpath or "").strip().replace("\\", "/")
     if not raw or raw.startswith("/") or ":" in raw.split("/", 1)[0]:
-        raise ExecutionError(f"workspace path must be relative: {relpath!r}")
+        raise ExecutionError(f"path must be relative: {relpath!r}")
     root = Path(root).resolve()
     target = (root / raw).resolve()
     if target == root:
-        raise ExecutionError(f"path resolves to the workspace root itself: {relpath!r}")
+        raise ExecutionError(f"path resolves to the root itself: {relpath!r}")
     if root not in target.parents:
-        raise ExecutionError(f"path escapes the workspace root: {relpath!r}")
+        raise ExecutionError(f"path escapes the root: {relpath!r}")
     return target
+
+
+# The three spaces a skill may address. sandbox + workspace are the council's
+# OWN areas (free read/write); established is the external real folder (read +
+# approval-gated promote target). See the spaces-model design.
+SANDBOX, WORKSPACE, ESTABLISHED = "sandbox", "workspace", "established"
+SPACES = (SANDBOX, WORKSPACE, ESTABLISHED)
+
+
+def space_root(session: Session, data_dir: Path, space: str) -> Path:
+    """Map a space name to its root directory for this session. Raises if the
+    requested space isn't bound (no workspace / no established folder)."""
+    if space == WORKSPACE:
+        if not session.workspace_root:
+            raise ExecutionError("no workspace bound for this session")
+        return Path(session.workspace_root)
+    if space == ESTABLISHED:
+        if not session.established_root:
+            raise ExecutionError("no established folder referenced for this task")
+        return Path(session.established_root)
+    if space == SANDBOX:
+        return artifacts_dir(data_dir, session.session_id)
+    raise ExecutionError(f"unknown space: {space!r}")
+
+
+def resolve_space(session: Session, data_dir: Path, space: str, relpath: str) -> Path:
+    """Resolve a relative path inside the named space, escape-checked."""
+    return resolve_in_workspace(space_root(session, data_dir, space), relpath)
 
 
 def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:

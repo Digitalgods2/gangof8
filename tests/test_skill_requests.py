@@ -136,13 +136,16 @@ def test_role_not_allowed_is_denied_and_fed_back(tmp_path, store, governance, se
     assert session.approvals == [], "a denial creates no approval"
 
 
-def test_approval_gated_skill_is_refused_midround(tmp_path, store, governance, session):
+def test_non_read_skill_is_refused_midround(tmp_path, store, governance, session):
+    """write_file is refused mid-round because it changes state (category != read),
+    NOT because it requires approval — only read skills run mid-deliberation."""
     member = _member(Role.implementer)
     contribution = _contribution(Role.implementer, "SKILL: write_file out.md")
     call, prompts = _recording_call()
 
     loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
-    assert "requires approval" in prompts[0]
+    assert "it changes state" in prompts[0]
+    assert "ARTIFACT/EDIT/PROMOTE" in prompts[0]
     assert session.approvals == [], "write_file is not gated mid-round; it is just refused"
     assert not any(a.status == "executed" for a in session.proposed_actions)
 
@@ -174,3 +177,14 @@ def test_build_prompt_advertises_read_only_with_files_and_allowed_role(session):
     assert "read_file" in p and "notes.md" in p
     # files but a role not allowed to read → no mention
     assert "read_file" not in loop.build_prompt(session, spec, Role.critic, ["notes.md"])
+
+
+def test_build_prompt_advertises_list_dir_when_workspace_bound(session, tmp_path):
+    from conclave_os.models import RoundSpec
+
+    spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
+    # no workspace → no list_dir mention (nothing to enumerate)
+    assert "list_dir" not in loop.build_prompt(session, spec, Role.researcher, [])
+    # workspace bound + allowed role → advertised so the council can DISCOVER files
+    session.workspace_root = str(tmp_path)
+    assert "list_dir" in loop.build_prompt(session, spec, Role.researcher, [])

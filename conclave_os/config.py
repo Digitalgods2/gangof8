@@ -67,12 +67,31 @@ APPROVAL_CATEGORIES = [
     "settings",
     "external",
     "read",
+    "stage",
+    "promote",
 ]
+
+# promote (workspace → established folder) is the ONE approval-gated boundary
+# that touches real user code; cap the diff shown in its approval card.
+PROMOTE_DIFF_MAX_CHARS = 6000
 
 # run_tests (code execution) bounds — the command runs in the workspace only
 # after explicit human approval; keep it time- and output-bounded.
 RUN_TESTS_TIMEOUT = 300
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
+
+# Per-agent CLI timeouts (seconds). The gemini CLI in headless plan mode is
+# markedly slower than claude/codex and prone to stalling, so give it more room
+# before timing out. A seat that still times out is dropped gracefully (the
+# round continues without it) rather than aborting the whole deliberation.
+AGENT_TIMEOUT_DEFAULT = 120
+AGENT_TIMEOUTS: dict[str, int] = {
+    "gemini": 300,
+}
+
+
+def agent_timeout(agent: str) -> int:
+    return AGENT_TIMEOUTS.get(agent, AGENT_TIMEOUT_DEFAULT)
 
 # The ONLY capability that never needs approval (default-deny everything else).
 ALWAYS_ALLOWED_CAPABILITIES = {"generate_text"}
@@ -116,3 +135,9 @@ SEARCH_MAX_FILES = 400          # files whose contents are scanned
 SEARCH_MAX_MATCHES = 60         # content-match lines returned
 SEARCH_MAX_FILE_BYTES = 500_000  # skip files larger than this
 SEARCH_RESULT_MAX_CHARS = 4000  # cap the formatted result fed back to the agent
+
+# list_dir skill bounds: a bounded directory listing so agents can DISCOVER what
+# exists in the workspace before reading/writing. Kept cheap and small.
+LIST_DIR_MAX_ENTRIES = 300      # files/folders listed before truncating
+LIST_DIR_MAX_DEPTH = 6          # nesting depth walked
+LIST_DIR_RESULT_MAX_CHARS = 4000  # cap the formatted listing fed back to the agent

@@ -64,6 +64,7 @@ def _summary(session) -> dict:
         ],
         "files_changed": session.files_changed,
         "workspace_root": session.workspace_root,
+        "established_root": session.established_root,
         "attachments": session.attachments,
     }
 
@@ -267,5 +268,15 @@ def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
 def delete_workspace(workspace_id: str) -> dict:
     service.remove_workspace(workspace_id)
     return service.list_workspaces()
+
+
+@app.post("/workspaces/empty")
+def empty_workspace() -> dict:
+    """Delete the contents of the ACTIVE workspace (the council's own area).
+    Does not touch any established folder."""
+    try:
+        return service.empty_workspace()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e))
 
 

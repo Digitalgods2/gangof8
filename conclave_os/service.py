@@ -21,12 +21,13 @@ from .governance import Governance
 from .logstore import LogStore
 from .loop import resume_session, resume_with_input, run_session
 from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
+from .paths import extract_established_root
 from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
 from .settings import Settings, budgets_overrides, load_settings, save_settings
 from .uploads import UploadStore, attachment_context
-from .workspaces import WorkspaceStore
+from .workspaces import WorkspaceError, WorkspaceStore
 
 
 class ConclaveService:
@@ -119,6 +120,9 @@ class ConclaveService:
         session.backend = self.backend
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
+        # Established folder is PER TASK: interpret a path the user referenced in
+        # the prompt (a file → its parent). None ⇒ the greenfield gate may ask.
+        session.established_root = extract_established_root(text or "")
         for uid in attachments or []:
             rec = self.uploads.get(uid)
             if rec:
@@ -235,6 +239,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return {
             "workspaces": [w.model_dump() for w in self.workspaces.list()],
             "active": active.id if active else None,
+            "sandbox_root": str((self._data_dir / "artifacts").resolve()),
         }
 
     def create_workspace(self, name: str, root: str):
@@ -245,6 +250,27 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     def remove_workspace(self, workspace_id: str) -> None:
         self.workspaces.remove(workspace_id)
+
+    def empty_workspace(self, workspace_id: Optional[str] = None) -> dict:
+        """Delete the CONTENTS of a workspace dir (default: the active one). The
+        workspace is the council's own accumulation area — emptying it starts a
+        fresh project in the same folder. Does NOT touch any established folder."""
+        import shutil
+
+        ws = self.workspaces.get(workspace_id) if workspace_id else self.workspaces.active()
+        if ws is None:
+            raise WorkspaceError("no workspace to empty")
+        root = Path(ws.root)
+        removed = 0
+        if root.is_dir():
+            for child in root.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+                removed += 1
+        self.store.log_event("-", "workspace_emptied", {"id": ws.id, "removed": removed})
+        return {"emptied": ws.id, "removed": removed}
 
     def _run_full(self, session: Session) -> Session:
         return run_session(
@@ -439,7 +465,26 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return session
         return self._answer_continue(session, req)
 
+    # answers that keep the build in the council's own spaces (no delivery target)
+    _WORKSPACE_ANSWERS = {"workspace", "sandbox", "none", "skip", "no", "keep", "here"}
+
     def _answer_continue(self, session: Session, req) -> Session:
+        # System greenfield-target question: not a paused agent call — interpret
+        # the answer, set the established folder (or keep it in-workspace), then
+        # start deliberation.
+        if req.agent == "system" and req.purpose == "establish_target":
+            session.established_asked = True
+            ans = (req.answer or "").strip()
+            if ans.lower() not in self._WORKSPACE_ANSWERS:
+                picked = extract_established_root(ans)
+                if picked is None and ("/" in ans or "\\" in ans):
+                    picked = str(Path(ans).expanduser().resolve())
+                session.established_root = picked
+            self.store.save_session(session)
+            return run_session(
+                session, self.manager, self.registry, self.governance,
+                self.store, role_agents=self.role_agents,
+            )
         try:
             result = self.registry.resume(req.agent, req.resume_token, req.answer)
         except AgentError as e:

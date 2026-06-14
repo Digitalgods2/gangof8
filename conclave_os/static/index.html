@@ -184,13 +184,20 @@
   .keyrow .kstat { color:var(--dim); flex:1; font-family:Consolas, monospace; }
   .keyrow .kstat.set { color:var(--ok); }
   #savedNote { color:var(--ok); font-size:12px; margin-left:8px; }
-  .wsrow { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12.5px;
-           padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  .wsrow { display:flex; align-items:center; flex-wrap:wrap; gap:6px 8px; margin-top:6px;
+           font-size:12.5px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
   .wsrow.active { border-color:var(--accent); }
   .wsrow .wsname { color:var(--text); font-weight:600; flex:0 0 auto; }
-  .wsrow .wsroot { color:var(--dim); font-family:Consolas, monospace; flex:1;
-                   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .wsrow .badge { color:var(--accent); font-size:11px; }
+  .wsrow .wsroot { color:var(--dim); font-family:Consolas, monospace; flex:1 1 100%;
+                   word-break:break-all; white-space:normal; user-select:text; cursor:text; }
+  .wsrow .badge { color:var(--accent); font-size:11px; flex:0 0 auto; margin-left:auto; }
+  pre.diff { max-height:320px; overflow:auto; background:#0d1117; border:1px solid var(--line);
+             border-radius:6px; padding:8px 10px; margin:8px 0; font-family:Consolas, monospace;
+             font-size:12px; line-height:1.45; white-space:pre; }
+  pre.diff .d-add { color:#3fb950; display:block; }
+  pre.diff .d-del { color:#f85149; display:block; }
+  pre.diff .d-hunk { color:#58a6ff; display:block; }
+  pre.diff .d-meta { color:var(--dim); display:block; }
 </style>
 </head>
 <body>
@@ -298,6 +305,14 @@ function collapsible(key, summary, body, defaultOpen) {
 
 const esc = s => (s ?? "").toString()
   .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+// Colorize a unified diff (promote preview) line by line.
+const diffHtml = s => esc(s).split("\n").map(l => {
+  const c = l.startsWith("+") && !l.startsWith("+++") ? "add"
+          : l.startsWith("-") && !l.startsWith("---") ? "del"
+          : l.startsWith("@@") ? "hunk"
+          : l.startsWith("+++") || l.startsWith("---") ? "meta" : "";
+  return c ? `<span class="d-${c}">${l}</span>` : l;
+}).join("\n");
 const api = (path, opts) => fetch(path, opts).then(r => r.json());
 
 async function loadHealth() {
@@ -308,8 +323,10 @@ async function loadHealth() {
 async function loadWorkspace() {
   wsCache = await api("/workspaces").catch(() => ({workspaces: [], active: null}));
   const active = (wsCache.workspaces || []).find(w => w.id === wsCache.active);
-  document.getElementById("workspace").textContent =
-    "workspace: " + (active ? active.name : "(sandbox)");
+  const el = document.getElementById("workspace");
+  el.textContent = "workspace: " + (active ? active.name : "(sandbox)");
+  el.title = active ? active.root
+                    : ((wsCache.sandbox_root || "") + "\\<session>  (per-session throwaway folder)");
 }
 
 // ---- composer: text + multi-modal attachments ----
@@ -503,6 +520,7 @@ function renderDetail(s) {
       <h3>Task — <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
           ${s.stop_reason ? `<span class="sub"> · ${esc(s.stop_reason)}</span>` : ""}</h3>
       <div class="mono">${esc(s.task?.text)}</div>
+      ${s.established_root ? `<div class="sub" style="margin-top:6px" title="read-only source; files reach it only via an approved promote">📂 established folder: <span class="mono">${esc(s.established_root)}</span></div>` : ""}
       ${(s.attachments||[]).length ? `<div class="atts" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${
         s.attachments.map(a => `<span class="chip ${esc(a.kind)}">${KIND_ICON[a.kind]||"📎"} ${esc(a.name)}</span>`).join("")
       }</div>` : ""}
@@ -540,6 +558,7 @@ function renderDetail(s) {
       <div class="card needs">
         <h3>Approval needed — ${esc(a.category)} / ${esc(a.risk)}</h3>
         <div>${esc(a.action)}</div>
+        ${a.details ? `<pre class="diff">${diffHtml(a.details)}</pre>` : ""}
         <div class="row">
           <button onclick="resolveApproval('${a.approval_id}', true)">Approve</button>
           <button class="deny" onclick="resolveApproval('${a.approval_id}', false)">Deny</button>
@@ -702,10 +721,11 @@ function renderSettings(s, seats) {
     const on = w.id === wsCache.active;
     return `<div class="wsrow ${on ? "active" : ""}">
       <span class="wsname">${esc(w.name)}</span>
-      <span class="wsroot" title="${esc(w.root)}">${esc(w.root)}</span>
       ${on ? '<span class="badge">active ✓</span>'
            : `<button class="ghost" onclick="activateWorkspace('${esc(w.id)}')">Activate</button>`}
+      ${on ? '<button class="ghost" onclick="emptyWorkspace()" title="Delete the contents (start fresh)">Empty</button>' : ""}
       <button class="deny" onclick="deleteWorkspace('${esc(w.id)}')">✕</button>
+      <span class="wsroot" title="${esc(w.root)}">${esc(w.root)}</span>
     </div>`;
   }).join("");
 
@@ -715,9 +735,9 @@ function renderSettings(s, seats) {
       ${wsRows || '<div class="sub">no workspaces — add one below</div>'}
       <div class="wsrow ${wsCache.active ? "" : "active"}">
         <span class="wsname">(sandbox)</span>
-        <span class="wsroot">per-session throwaway folder</span>
         ${wsCache.active ? '<button class="ghost" onclick="activateWorkspace(null)">Use this</button>'
                          : '<span class="badge">active ✓</span>'}
+        <span class="wsroot" title="per-session throwaway folder">${esc(wsCache.sandbox_root || "")}\\&lt;session&gt;<span class="sub" style="display:block;margin-top:2px">per-session throwaway folder</span></span>
       </div>
       <div class="field" style="margin-top:8px">${lbl("Add workspace", "workspace")}
         <input type="text" id="ws_name" placeholder="name" style="flex:0 0 110px">
@@ -907,6 +927,13 @@ async function addWorkspace() {
 async function deleteWorkspace(id) {
   const r = await fetch("/workspaces/" + encodeURIComponent(id), {method: "DELETE"});
   if (r.ok) { wsCache = await r.json(); _renderWsAfterChange("workspace removed"); }
+}
+
+async function emptyWorkspace() {
+  if (!confirm("Delete ALL contents of the active workspace? This cannot be undone. (Your established folder is not touched.)")) return;
+  const r = await fetch("/workspaces/empty", {method: "POST"});
+  if (r.ok) { const d = await r.json(); _renderWsAfterChange(`workspace emptied (${d.removed} item${d.removed===1?"":"s"})`); }
+  else { _renderWsAfterChange("could not empty workspace"); }
 }
 
 loadHealth();

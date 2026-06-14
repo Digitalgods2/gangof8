@@ -77,16 +77,31 @@ class Governance:
         for a in session.approvals:
             if a.action_ref == action.action_id and a.status == "approved":
                 return None
-        where = (
-            f"workspace {session.workspace_root}" if session.workspace_root
-            else f"data/artifacts/{session.session_id}/"
-        )
+        # promote is the one gate that writes real user code: name the target
+        # and attach the diff so the human approves with full sight of the change.
+        details = None
+        if skill.category == "promote":
+            fname = action.args.get("filename") or action.filename
+            where = f"established folder {session.established_root}"
+            summary = f"promote: {fname} → {where}"
+            try:
+                from .skills import promote_diff
+                details = promote_diff(session, self.store.data_dir, fname)
+            except Exception as e:  # noqa: BLE001 — never let preview failure block the gate
+                details = f"(could not build diff preview: {e})"
+        else:
+            where = (
+                f"workspace {session.workspace_root}" if session.workspace_root
+                else f"data/artifacts/{session.session_id}/"
+            )
+            summary = f"{skill.name}: {action.filename or skill.description} in {where}"
         return self.request_approval(
             session,
-            action=f"{skill.name}: {action.filename or skill.description} in {where}",
+            action=summary,
             category=skill.category,
             risk=skill.risk,
             action_ref=action.action_id,
+            details=details,
         )
 
     def _deny_action(self, session: Session, action: ProposedAction, reason: str) -> None:
@@ -100,10 +115,11 @@ class Governance:
     def request_approval(
         self, session: Session, action: str, category: str,
         risk: Risk = Risk.medium, action_ref: str | None = None,
+        details: str | None = None,
     ) -> ApprovalRequest:
         approval = ApprovalRequest(
             session_id=session.session_id, action=action, category=category,
-            risk=risk, action_ref=action_ref,
+            risk=risk, action_ref=action_ref, details=details,
         )
         session.approvals.append(approval)
         self.store.log_event(session.session_id, "approval_requested", approval.model_dump())

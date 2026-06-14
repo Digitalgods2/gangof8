@@ -92,6 +92,7 @@ class Classification(BaseModel):
     produces_output: bool = False
     quality_matters: bool = True
     needs_governance: bool = False
+    greenfield: bool = False  # builds something NEW — needs a target if none referenced
 
 
 class CouncilMember(BaseModel):
@@ -170,6 +171,7 @@ class ApprovalRequest(BaseModel):
     risk: Risk = Risk.medium
     status: str = "pending"  # pending | approved | denied
     action_ref: Optional[str] = None  # ProposedAction id — denial skips the action, not the session
+    details: Optional[str] = None  # extra review context shown in the approval (e.g. a promote diff)
     requested_at: str = Field(default_factory=utcnow)
     resolved_at: Optional[str] = None
     resolved_by: Optional[str] = None
@@ -229,7 +231,10 @@ class Session(BaseModel):
     session_id: str
     status: SessionStatus = SessionStatus.received
     backend: str = "mock"  # which adapter family this session runs on; resume must match
-    workspace_root: Optional[str] = None  # allowed work area; None ⇒ per-session sandbox
+    workspace_root: Optional[str] = None  # the council's PERMANENT work area; None ⇒ sandbox only
+    established_root: Optional[str] = None  # external real folder (per task): read-only; the
+    #                                         approval-gated promote target. Never written directly.
+    established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
     attachments: list[dict] = []  # [{id, name, kind}] folded into the task text
     budgets: Budgets = Field(default_factory=Budgets)
     budgets_locked: bool = False  # True when caller supplied explicit budgets
