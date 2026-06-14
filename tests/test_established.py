@@ -56,6 +56,22 @@ def test_examine_task_is_not_greenfield():
     assert c.greenfield is False
 
 
+def test_examine_recommend_is_analysis_no_file_output():
+    # the reported bug: "examine ... recommend ... make this app better" must NOT
+    # be a code/file-producing task (it was echoing source files into the sandbox)
+    c = classify("examine the app in this folder and understand it and then "
+                 "recommend 5 things that can be introduced or improved to make "
+                 "this app even better")
+    assert c.task_type == TaskType.research
+    assert c.produces_output is False
+
+
+def test_examine_with_real_modify_verb_stays_code():
+    # an explicit change verb keeps it a file-producing task
+    assert classify("examine the app and refactor the auth module").task_type == TaskType.code
+    assert classify("review X then implement the fix").task_type == TaskType.code
+
+
 # --- the greenfield gate (ask, don't assume) ----------------------------------
 
 

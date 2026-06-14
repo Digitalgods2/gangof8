@@ -31,6 +31,21 @@ GREENFIELD_WORDS = [
     "build", "create", "make", "scaffold", "generate", "bootstrap",
     "new app", "new project", "from scratch", "starter", "greenfield",
 ]
+# Examining/understanding/recommending — the deliverable is prose analysis,
+# not files. Counts only when no create/modify verb is also present.
+ANALYSIS_WORDS = [
+    "examine", "understand", "review", "analyze", "analyse", "assess",
+    "evaluate", "audit", "recommend", "suggest", "critique", "inspect",
+    "explain", "describe",
+]
+# UNAMBIGUOUS "produce/change files now" verbs. Deliberately excludes vague
+# words (make/add/improve/update/build) that show up in analysis phrasing like
+# "make this app better" or "recommend things to add" — those must NOT force a
+# recommendation task to produce files.
+MODIFY_WORDS = [
+    "implement", "refactor", "scaffold", "rewrite", "migrate", "port",
+    "convert", "fix the", "fix a", "patch",
+]
 EXEC_WORDS = ["execute", "run", "install", "launch"]
 DESIGN_WORDS = ["design", "architecture", "architect", "blueprint", "schema", "structure"]
 RESEARCH_WORDS = ["research", "investigate", "survey", "look up", "find out"]
@@ -80,6 +95,19 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     else:
         task_type = TaskType.question
         notes.append("no action/code/design markers; treated as question")
+
+    # Analysis override: "examine/understand/recommend/review this app" is an
+    # ANALYSIS task — its deliverable is the answer (recommendations), NOT files.
+    # The mere mention of an "app" must not route it to code (which would spawn
+    # the implementer and write scratch files). A real create/modify verb keeps
+    # it as code; otherwise downgrade to research so NO files are produced.
+    analysis = _any(ANALYSIS_WORDS, lower)
+    # an explicit file to produce, or a clear create/modify verb, keeps it code
+    wants_files = _any(MODIFY_WORDS, lower) or bool(_FILE_ARTIFACT.search(text))
+    if analysis and not wants_files and task_type in (TaskType.code, TaskType.design):
+        task_type = TaskType.research
+        notes.append("analysis/examination intent (no create/modify verb) — "
+                     "treated as research; produces no files")
 
     words = len(text.split())
     if words <= 8:
