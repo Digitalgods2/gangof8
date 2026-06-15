@@ -158,9 +158,17 @@ def test_put_settings_role_mapping(client):
     assert r.json()["resolved_role_agents"]["researcher"] == "gemini"
 
 
-def test_seats_lists_local_cli_agents(client):
+def test_seats_lists_cli_and_openrouter_agents(client):
     r = client.get("/settings/seats")
     assert r.status_code == 200
-    seats = {s["name"] for s in r.json()["seats"]}
-    assert seats == {"claude", "codex", "gemini"}
-    assert all(s["kind"] == "cli" for s in r.json()["seats"])
+    body = r.json()
+    by_name = {s["name"]: s for s in body["seats"]}
+    # local CLI seats
+    assert {"claude", "codex", "gemini"} <= set(by_name)
+    assert all(by_name[a]["kind"] == "cli" for a in ("claude", "codex", "gemini"))
+    # OpenRouter seats present, disabled by default, unavailable without a key
+    for name in ("deepseek", "glm", "qwen", "kimi"):
+        assert by_name[name]["kind"] == "openrouter"
+        assert by_name[name]["enabled"] is False
+        assert by_name[name]["available"] is False
+    assert body["openrouter_key"] is False

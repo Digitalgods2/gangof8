@@ -16,6 +16,8 @@ from typing import Optional
 from . import cancellation, config, intake
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
+from .adapters.openrouter import OpenRouterAdapter
+from .secrets import SecretStore
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
@@ -48,6 +50,7 @@ class ConclaveService:
         self.governance = Governance(self.store)
         self.workspaces = WorkspaceStore(self._data_dir)
         self.uploads = UploadStore(self._data_dir)
+        self.secrets = SecretStore(self._data_dir)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
@@ -82,16 +85,50 @@ class ConclaveService:
 
         self.registry = AgentRegistry()
         if self.backend == "cli":
+            # OpenRouter seats: enabled ones + any referenced in the role map.
+            enabled = {n for n, on in (self.settings.openrouter_enabled or {}).items() if on}
+            referenced = {a for a in self.role_agents.values() if a in config.OPENROUTER_SEATS}
+            for seat in sorted(enabled | referenced):
+                self._register_openrouter(seat)
+            # CLI adapters for every non-OpenRouter agent in the role map.
             for agent in sorted(set(self.role_agents.values())):
-                self.registry.register(CliAdapter(agent=agent))
+                if agent not in config.OPENROUTER_SEATS:
+                    self.registry.register(CliAdapter(agent=agent))
         else:
             self.registry.register(MockAdapter())
+
+    def _register_openrouter(self, seat: str) -> None:
+        spec = config.OPENROUTER_SEATS.get(seat)
+        if not spec:
+            return
+        self.registry.register(OpenRouterAdapter(
+            name=seat, model_slug=spec["model_slug"],
+            api_key_getter=lambda: self.secrets.get("openrouter"),
+            endpoint=config.OPENROUTER_ENDPOINT,
+            data_collection=config.OPENROUTER_DATA_COLLECTION,
+        ))
 
     # role_agents/budgets are the COMPLETE intended set (the dashboard sends all
     # non-default picks each save), so replace them wholesale — merging would
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
-    _REPLACE_KEYS = {"role_agents", "budgets"}
+    _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled"}
+
+    def set_openrouter_key(self, value: str) -> dict:
+        self.secrets.set("openrouter", value or "")
+        return self.openrouter_key_status()
+
+    def clear_openrouter_key(self) -> dict:
+        self.secrets.clear("openrouter")
+        return self.openrouter_key_status()
+
+    def openrouter_key_status(self) -> dict:
+        """Masked status of the OpenRouter key — never returns the full key."""
+        return {
+            "present": self.secrets.has("openrouter"),
+            "source": self.secrets.source("openrouter"),  # 'env' | 'stored' | None
+            "masked": SecretStore.mask(self.secrets.get("openrouter")),
+        }
 
     def update_settings(self, patch: dict) -> Settings:
         """Apply a partial settings patch, persist it, and re-derive the
@@ -318,20 +355,33 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         for agent in sorted(needed):
             if agent in self.registry.names() or agent in ("mock", "unknown"):
                 continue
-            self.registry.register(CliAdapter(agent=agent))
+            if agent in config.OPENROUTER_SEATS:
+                self._register_openrouter(agent)
+            else:
+                self.registry.register(CliAdapter(agent=agent))
 
     # ---- CLI seats (settings panel) ------------------------------------------
 
     def seats(self) -> dict:
-        """The local CLI agents Conclave OS can drive, with availability from
-        PATH — used to populate the role→agent dropdowns in settings."""
+        """All seats the council can use, with availability — used to populate the
+        role→agent dropdowns. CLI seats are available when on PATH; OpenRouter
+        seats when enabled AND an API key is present."""
         import shutil
 
-        agents = ["claude", "codex", "gemini"]
-        return {"seats": [
-            {"name": a, "available": shutil.which(a) is not None, "kind": "cli"}
-            for a in agents
-        ]}
+        cli = [
+            {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a}
+            for a in ("claude", "codex", "gemini")
+        ]
+        key_present = self.secrets.has("openrouter")
+        enabled = self.settings.openrouter_enabled or {}
+        openrouter = [
+            {"name": name, "kind": "openrouter", "label": spec["label"],
+             "model_slug": spec["model_slug"],
+             "enabled": bool(enabled.get(name)),
+             "available": bool(enabled.get(name)) and key_present}
+            for name, spec in config.OPENROUTER_SEATS.items()
+        ]
+        return {"seats": cli + openrouter, "openrouter_key": key_present}
 
     def list_dir(self, path: Optional[str] = None) -> dict:
         """List sub-directories of `path` for the in-page folder browser. With no

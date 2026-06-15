@@ -73,6 +73,18 @@ ROLE_AGENTS_BY_BACKEND: dict[str, dict[Role, str]] = {
     "cli": ROLE_AGENTS_CLI,
 }
 
+# OpenRouter council seats (pay-per-token API models, no CLI). Each is a friendly
+# seat name → OpenRouter model slug; opt-in per seat in Settings, needs an
+# OPENROUTER_API_KEY. Mixed freely with the local CLI agents in the role map.
+OPENROUTER_ENDPOINT = os.environ.get("CONCLAVE_OS_OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1")
+OPENROUTER_DATA_COLLECTION = os.environ.get("CONCLAVE_OS_OPENROUTER_DATA", "deny")  # deny | allow
+OPENROUTER_SEATS: dict[str, dict[str, str]] = {
+    "deepseek": {"model_slug": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
+    "glm":      {"model_slug": "z-ai/glm-4.6",             "label": "GLM-4.6 (Z.ai)"},
+    "qwen":     {"model_slug": "qwen/qwen3.6-plus",        "label": "Qwen 3.6 Plus (Alibaba)"},
+    "kimi":     {"model_slug": "moonshotai/kimi-k2.6",     "label": "Kimi K2.6 (Moonshot)"},
+}
+
 # Default mapping for the configured backend (modules that need a specific
 # session's mapping receive it explicitly instead of reading this).
 ROLE_AGENTS = ROLE_AGENTS_BY_BACKEND.get(BACKEND, ROLE_AGENTS_MOCK)

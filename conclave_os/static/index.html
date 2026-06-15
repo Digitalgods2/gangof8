@@ -743,6 +743,7 @@ async function declineInput(iid) {
 // Opening overlays the dashboard; closing returns to it untouched.
 const ROLES = ["researcher", "architect", "critic", "implementer", "summarizer"];
 let settingsCache = null, seatsCache = [], wsCache = {workspaces: [], active: null};
+let orKey = {present: false, masked: null, source: null};
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
@@ -768,14 +769,16 @@ async function openSettings() {
   document.getElementById("settingsOverlay").classList.add("open");
   document.getElementById("savedNote").textContent = "";
   document.getElementById("settingsBody").innerHTML = '<div class="empty">Loading…</div>';
-  const [settings, seatsResp, wsResp] = await Promise.all([
+  const [settings, seatsResp, wsResp, keyResp] = await Promise.all([
     api("/settings"),
     api("/settings/seats").catch(() => ({seats: []})),
     api("/workspaces").catch(() => ({workspaces: [], active: null})),
+    api("/settings/api-keys/openrouter").catch(() => ({present: false})),
   ]);
   settingsCache = settings;
   seatsCache = seatsResp.seats || [];
   wsCache = wsResp;
+  orKey = keyResp || {present: false};
   renderSettings(settings, seatsCache);
 }
 
@@ -784,9 +787,15 @@ function closeSettings() {
 }
 
 function seatOptions(selected) {
-  const names = seatsCache.map(s => s.name).filter(Boolean);
+  // CLI seats always selectable; OpenRouter seats only once enabled.
+  const usable = seatsCache.filter(s => s.kind !== "openrouter" || s.enabled);
+  const names = usable.map(s => s.name).filter(Boolean);
+  const labelFor = n => {
+    const s = seatsCache.find(x => x.name === n);
+    return s && s.kind === "openrouter" ? `${n} · OpenRouter` : n;
+  };
   const opts = ['<option value="">(backend default)</option>'].concat(
-    names.map(n => `<option value="${esc(n)}" ${n === selected ? "selected" : ""}>${esc(n)}</option>`)
+    names.map(n => `<option value="${esc(n)}" ${n === selected ? "selected" : ""}>${esc(labelFor(n))}</option>`)
   );
   // include a current value that isn't in the seat list, so it isn't lost
   if (selected && !names.includes(selected)) {
@@ -842,6 +851,31 @@ function renderSettings(s, seats) {
     </div>
 
     <div class="sset">
+      <label>OpenRouter API key</label>
+      <div class="field">
+        <input type="password" id="or_key" autocomplete="off" placeholder="${orKey.present ? "key set (" + esc(orKey.masked || "••••") + ") — type to replace" : "sk-or-… paste your OpenRouter key"}">
+        <button onclick="saveOpenrouterKey()">Save key</button>
+        ${orKey.present ? '<button class="ghost" onclick="clearOpenrouterKey()">Clear</button>' : ""}
+      </div>
+      <div class="sub">${orKey.present
+        ? (orKey.source === "env" ? "Using OPENROUTER_API_KEY from your environment." : "Stored locally in data/secrets.json (gitignored).")
+        : "Needed for the OpenRouter models below — get one at openrouter.ai/keys."}</div>
+    </div>
+
+    <div class="sset">
+      <label>OpenRouter models (pay-per-token)</label>
+      ${(seats || []).filter(s => s.kind === "openrouter").map(s => `
+        <div class="field" style="align-items:center">
+          <label style="flex:1;display:flex;gap:8px;align-items:center;cursor:pointer;margin:0">
+            <input type="checkbox" class="or_enable" data-seat="${esc(s.name)}" ${s.enabled ? "checked" : ""}>
+            <span><b>${esc(s.label || s.name)}</b> &nbsp;<span class="sub mono">${esc(s.model_slug || "")}</span></span>
+          </label>
+          <span class="badge" style="color:${s.available ? "var(--accent)" : "var(--dim)"}">${s.available ? "ready ✓" : (s.enabled ? "needs key" : "off")}</span>
+        </div>`).join("") || '<div class="sub">none configured</div>'}
+      <div class="sub">Enable a model to make it selectable in Role mapping. Billed by OpenRouter; data_collection = "deny".</div>
+    </div>
+
+    <div class="sset">
       <label>Role mapping → agent ${tip("roles")}</label>
       ${ROLES.map(r => `
         <div class="field">${lbl(r, r)}
@@ -885,9 +919,12 @@ async function saveSettings() {
     const v = document.getElementById("role_" + r).value;
     if (v) role_agents[r] = v;  // empty ⇒ backend default
   });
+  const openrouter_enabled = {};
+  document.querySelectorAll(".or_enable").forEach(c => { openrouter_enabled[c.dataset.seat] = c.checked; });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
+    openrouter_enabled,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),
@@ -909,10 +946,40 @@ async function saveSettings() {
     // persist it too, not silently drop it (idempotent on the backend).
     const pendingRoot = (document.getElementById("ws_root")?.value || "").trim();
     if (pendingRoot) await addWorkspace();
+    // refresh seats so newly-enabled OpenRouter models appear in role dropdowns
+    seatsCache = (await api("/settings/seats").catch(() => ({seats: []}))).seats || seatsCache;
+    renderSettings(settingsCache, seatsCache);
+    note.textContent = "saved ✓";
   } else {
     note.style.color = "var(--bad)";
     note.textContent = "save failed";
   }
+}
+
+async function _refreshSeatsKeepChecks() {
+  // preserve unsaved enable-checkbox toggles across a re-render
+  const checked = {};
+  document.querySelectorAll(".or_enable").forEach(c => { checked[c.dataset.seat] = c.checked; });
+  seatsCache = (await api("/settings/seats").catch(() => ({seats: []}))).seats || seatsCache;
+  seatsCache.forEach(s => { if (s.name in checked) s.enabled = checked[s.name]; });
+  renderSettings(settingsCache, seatsCache);
+}
+
+async function saveOpenrouterKey() {
+  const note = document.getElementById("savedNote");
+  const v = (document.getElementById("or_key")?.value || "").trim();
+  if (!v) { note.textContent = "paste an OpenRouter key first"; return; }
+  const r = await fetch("/settings/api-keys/openrouter", {method: "PUT",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({value: v})});
+  if (r.ok) { orKey = await r.json(); note.textContent = "OpenRouter key saved ✓"; await _refreshSeatsKeepChecks(); }
+  else { note.style.color = "var(--bad)"; note.textContent = "could not save key"; }
+}
+
+async function clearOpenrouterKey() {
+  const note = document.getElementById("savedNote");
+  if (!confirm("Remove the stored OpenRouter key?")) return;
+  const r = await fetch("/settings/api-keys/openrouter", {method: "DELETE"});
+  if (r.ok) { orKey = await r.json(); note.textContent = "OpenRouter key cleared"; await _refreshSeatsKeepChecks(); }
 }
 
 function _renderWsAfterChange(msg) {
