@@ -214,6 +214,14 @@
   .tlrow .tllabel { color:var(--text); flex:0 0 auto; }
   .tlrow .tldetail { color:var(--dim); font-family:Consolas, monospace; font-size:11.5px;
                      overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .card.respond { border-color:var(--accent); }
+  .card.respond h3 { color:var(--accent); }
+  .turn { padding:8px 10px; border-top:1px solid var(--line); }
+  .turn:first-child { border-top:0; }
+  .turn .turnwho { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .turn.user .turnwho { color:var(--accent); }
+  .turn.council .turnwho { color:var(--dim); }
+  .turn .turntext { margin-top:3px; white-space:pre-wrap; font-size:13px; }
 </style>
 </head>
 <body>
@@ -433,6 +441,19 @@ function clearComposer() {
   document.getElementById("submitNote").textContent = "";
 }
 
+async function sendFollowup(sid) {
+  const ta = document.getElementById("followupText");
+  const text = (ta?.value || "").trim();
+  if (!text) return;
+  const r = await fetch(`/sessions/${encodeURIComponent(sid)}/followup`, {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
+  if (r.ok) { ta.value = ""; _lastDetailSig = ""; pollLoop(); }
+  else { const d = await r.json().catch(() => ({})); alert("could not continue: " + (d.detail || r.status)); }
+}
+function followupKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFollowup(current); }
+}
+
 async function cancelCurrent() {
   if (!current) return;
   if (!confirm("Cancel this run? It stops at the next step — an in-flight agent call finishes first.")) return;
@@ -633,7 +654,7 @@ function renderDetail(s) {
 
     ${showSummary ? `
       <div class="card summary">
-        <h3>Summary</h3>
+        <h3>${(s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary"}</h3>
         ${final ? `
           <div class="row" style="margin-top:0"><span class="conf-${esc(final.confidence)}">${esc(final.confidence)} confidence</span></div>
           <pre>${esc(final.answer)}</pre>` : ``}
@@ -641,6 +662,22 @@ function renderDetail(s) {
         ${agentBreak ? `<div class="ruling">${agentBreak}</div>` : ``}
         ${rulingSummary ? `<div class="ruling">disagreements — ${rulingSummary}</div>` : ``}
       </div>` : ``}
+
+    ${s.status === "done" ? `
+      <div class="card respond">
+        <h3>💬 Respond to the council</h3>
+        <div class="sub" style="margin-bottom:6px">Agree, push back, or add a new angle — it deliberates again with the whole conversation, no starting over.</div>
+        <textarea id="followupText" rows="2" placeholder="Your response… (Enter to send, Shift+Enter for a new line)" onkeydown="followupKey(event)"></textarea>
+        <div class="row" style="margin-top:6px"><button onclick="sendFollowup('${esc(s.session_id)}')">Send response</button></div>
+      </div>` : ``}
+
+    ${(s.turns && s.turns.length > 2) ? collapsible("sec_conversation",
+        `Conversation (${s.turns.length} turns)`,
+        s.turns.map(t => `
+          <div class="turn ${t.role}">
+            <span class="turnwho">${t.role === "user" ? "You" : "Council"}</span>
+            <div class="turntext">${esc(t.text)}</div>
+          </div>`).join(""), true) : ""}
 
     ${working ? `
       <div class="card live">

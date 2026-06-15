@@ -235,6 +235,8 @@ class Session(BaseModel):
     established_root: Optional[str] = None  # external real folder (per task): read-only; the
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
+    turns: list[dict] = []  # the conversation: [{role:'user'|'council', text}] — grows as the
+    #                         human responds to a conclusion and the council deliberates again.
     attachments: list[dict] = []  # [{id, name, kind}] folded into the task text
     budgets: Budgets = Field(default_factory=Budgets)
     budgets_locked: bool = False  # True when caller supplied explicit budgets
