@@ -239,6 +239,28 @@ def _established_overview(session: Session, data_dir) -> str:
             + "\n\n".join(parts))[:14000] + directive
 
 
+def _web_overview(session: Session) -> str:
+    """Proactively look up current info ONCE up front for fact-needing tasks with
+    no local source — so the council has REAL web data even if the researcher
+    seat fails or no agent thinks to call web_search. (Having internet access
+    available is not the same as using it; this uses it.) Best-effort; bounded."""
+    cls = session.classification
+    if not config.WEB_ENABLED or session.established_root:
+        return ""
+    if not (cls and cls.needs_facts):
+        return ""
+    try:
+        from . import web
+        result = web.web_search(session.task.text)
+    except Exception:  # noqa: BLE001 — web is best-effort context
+        return ""
+    if not result or not result.strip():
+        return ""
+    return ("WEB RESEARCH (current information the coordinator looked up on the live "
+            "web for this task — trust and use it; you may request more with "
+            "'SKILL: web_search <query>' / 'SKILL: web_fetch <url>'):\n" + result)
+
+
 # Every role sees this so non-implementer roles stop treating can_write_files /
 # can_run_commands as a blocker and stop asking the human to "enable" them: file
 # production is governed (implementer emits ARTIFACT, human approves the write).
@@ -713,9 +735,15 @@ def _deliberate(
     images = image_inputs(store.data_dir, session.attachments)
     # Read the established folder ONCE up front so every agent starts with the
     # real code it was asked to examine (no dependence on an agent requesting it).
-    established_overview = _established_overview(session, store.data_dir)
+    # Up-front context the council starts with, so it never depends on a flaky
+    # seat or an agent remembering to request a skill: the established folder's
+    # real source AND/OR live web research for fact-needing questions.
+    established_overview = "\n\n".join(p for p in (
+        _established_overview(session, store.data_dir),
+        _web_overview(session),
+    ) if p)
     if established_overview:
-        store.log_event(sid, "established_overview", {"chars": len(established_overview)})
+        store.log_event(sid, "context_overview", {"chars": len(established_overview)})
 
     def call(member: CouncilMember, prompt: str) -> Contribution:
         return _agent_call(session, registry, store, member, prompt,

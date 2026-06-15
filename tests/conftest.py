@@ -14,4 +14,7 @@ from conclave_os import config
 def _isolated_sandbox(tmp_path_factory, monkeypatch):
     sandbox = tmp_path_factory.mktemp("sandbox")
     monkeypatch.setattr(config, "SANDBOX_ROOT", sandbox)
+    # Default web access OFF in tests so the proactive web overview never makes a
+    # real network call; tests that exercise web access re-enable it explicitly.
+    monkeypatch.setattr(config, "WEB_ENABLED", False)
     return sandbox
