@@ -62,7 +62,7 @@ class MockAdapter:
         if role == Role.summarizer:
             content = FINAL_JSON
         elif role == Role.critic:
-            if "test both sides" in lower:
+            if "rule this disagreement" in lower or "test both sides" in lower:
                 content = VERDICT
             elif "review" in lower:
                 content = REVIEW

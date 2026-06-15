@@ -145,6 +145,10 @@ COMPOSER_RESERVED_CALLS = 2
 # critic and rule the rest on constraints, instead of burning the budget.
 MAX_CRITIC_TESTS_PER_ROUND = 3
 
+# A disagreement ruling is a verdict + a sentence or two — cap it so a verbose
+# model can't bloat the record (and the UI) with a full essay per conflict.
+CRITIC_TEST_MAX_CHARS = 600
+
 # Agents often return the final answer as plain prose, not the labeled format.
 # Substantial prose (>= this many chars) is accepted as the answer at medium
 # confidence; shorter unparseable output gets one retry.
