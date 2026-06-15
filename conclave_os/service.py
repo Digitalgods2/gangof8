@@ -97,12 +97,21 @@ class ConclaveService:
         else:
             self.registry.register(MockAdapter())
 
-    def _register_openrouter(self, seat: str) -> None:
+    def _openrouter_slug(self, seat: str) -> Optional[str]:
+        """Effective model slug for a seat: a user override (settings) wins over
+        the built-in default in config.OPENROUTER_SEATS."""
+        override = (self.settings.openrouter_models or {}).get(seat)
+        if override and override.strip():
+            return override.strip()
         spec = config.OPENROUTER_SEATS.get(seat)
-        if not spec:
+        return spec["model_slug"] if spec else None
+
+    def _register_openrouter(self, seat: str) -> None:
+        slug = self._openrouter_slug(seat)
+        if not slug:
             return
         self.registry.register(OpenRouterAdapter(
-            name=seat, model_slug=spec["model_slug"],
+            name=seat, model_slug=slug,
             api_key_getter=lambda: self.secrets.get("openrouter"),
             endpoint=config.OPENROUTER_ENDPOINT,
             data_collection=config.OPENROUTER_DATA_COLLECTION,
@@ -112,7 +121,7 @@ class ConclaveService:
     # non-default picks each save), so replace them wholesale — merging would
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
-    _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled"}
+    _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models"}
 
     def set_openrouter_key(self, value: str) -> dict:
         self.secrets.set("openrouter", value or "")
@@ -376,7 +385,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         enabled = self.settings.openrouter_enabled or {}
         openrouter = [
             {"name": name, "kind": "openrouter", "label": spec["label"],
-             "model_slug": spec["model_slug"],
+             "model_slug": self._openrouter_slug(name),
+             "default_slug": spec["model_slug"],
              "enabled": bool(enabled.get(name)),
              "available": bool(enabled.get(name)) and key_present}
             for name, spec in config.OPENROUTER_SEATS.items()

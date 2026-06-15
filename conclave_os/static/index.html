@@ -865,14 +865,17 @@ function renderSettings(s, seats) {
     <div class="sset">
       <label>OpenRouter models (pay-per-token)</label>
       ${(seats || []).filter(s => s.kind === "openrouter").map(s => `
-        <div class="field" style="align-items:center">
-          <label style="flex:1;display:flex;gap:8px;align-items:center;cursor:pointer;margin:0">
+        <div class="field" style="align-items:center;flex-wrap:wrap">
+          <label style="display:flex;gap:8px;align-items:center;cursor:pointer;margin:0;flex:0 0 auto" title="${esc(s.name)}">
             <input type="checkbox" class="or_enable" data-seat="${esc(s.name)}" ${s.enabled ? "checked" : ""}>
-            <span><b>${esc(s.label || s.name)}</b> &nbsp;<span class="sub mono">${esc(s.model_slug || "")}</span></span>
+            <b>${esc(s.label || s.name)}</b>
           </label>
+          <input type="text" class="or_slug mono" data-seat="${esc(s.name)}" spellcheck="false"
+                 value="${escAttr(s.model_slug || "")}" placeholder="${escAttr(s.default_slug || "provider/model")}"
+                 title="OpenRouter model slug (default: ${escAttr(s.default_slug || "")})" style="flex:1;min-width:200px">
           <span class="badge" style="color:${s.available ? "var(--accent)" : "var(--dim)"}">${s.available ? "ready ✓" : (s.enabled ? "needs key" : "off")}</span>
         </div>`).join("") || '<div class="sub">none configured</div>'}
-      <div class="sub">Enable a model to make it selectable in Role mapping. Billed by OpenRouter; data_collection = "deny".</div>
+      <div class="sub">Enable a model and edit its slug (verify at openrouter.ai/models). Selectable in Role mapping once enabled. Billed by OpenRouter; data_collection = "deny".</div>
     </div>
 
     <div class="sset">
@@ -921,10 +924,13 @@ async function saveSettings() {
   });
   const openrouter_enabled = {};
   document.querySelectorAll(".or_enable").forEach(c => { openrouter_enabled[c.dataset.seat] = c.checked; });
+  const openrouter_models = {};
+  document.querySelectorAll(".or_slug").forEach(i => { const v = i.value.trim(); if (v) openrouter_models[i.dataset.seat] = v; });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
     openrouter_enabled,
+    openrouter_models,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),
@@ -957,11 +963,15 @@ async function saveSettings() {
 }
 
 async function _refreshSeatsKeepChecks() {
-  // preserve unsaved enable-checkbox toggles across a re-render
-  const checked = {};
+  // preserve unsaved enable-checkbox toggles AND slug edits across a re-render
+  const checked = {}, slugs = {};
   document.querySelectorAll(".or_enable").forEach(c => { checked[c.dataset.seat] = c.checked; });
+  document.querySelectorAll(".or_slug").forEach(i => { slugs[i.dataset.seat] = i.value; });
   seatsCache = (await api("/settings/seats").catch(() => ({seats: []}))).seats || seatsCache;
-  seatsCache.forEach(s => { if (s.name in checked) s.enabled = checked[s.name]; });
+  seatsCache.forEach(s => {
+    if (s.name in checked) s.enabled = checked[s.name];
+    if (s.name in slugs && slugs[s.name].trim()) s.model_slug = slugs[s.name];
+  });
   renderSettings(settingsCache, seatsCache);
 }
 

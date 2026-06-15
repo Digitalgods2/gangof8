@@ -130,6 +130,24 @@ def test_enabling_seat_registers_openrouter_adapter(tmp_path, monkeypatch):
     assert isinstance(svc.registry._adapters["glm"], OpenRouterAdapter)
 
 
+def test_model_slug_override_is_used(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.set_openrouter_key("sk-or-key")
+    svc.update_settings({
+        "backend": "cli",
+        "openrouter_enabled": {"deepseek": True},
+        "openrouter_models": {"deepseek": "deepseek/deepseek-v5-ultra"},
+    })
+    assert svc.registry._adapters["deepseek"].model_slug == "deepseek/deepseek-v5-ultra"
+    seat = next(s for s in svc.seats()["seats"] if s["name"] == "deepseek")
+    assert seat["model_slug"] == "deepseek/deepseek-v5-ultra"
+    assert seat["default_slug"] == "deepseek/deepseek-v4-pro"
+    # clearing the override falls back to the built-in default
+    svc.update_settings({"openrouter_models": {}})
+    assert svc._openrouter_slug("deepseek") == "deepseek/deepseek-v4-pro"
+
+
 def test_seat_unavailable_without_key(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     svc = ConclaveService(data_dir=tmp_path)

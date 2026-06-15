@@ -184,6 +184,7 @@ class SettingsPatch(BaseModel):
     composer: dict | None = None
     ui: dict | None = None
     openrouter_enabled: dict[str, bool] | None = None
+    openrouter_models: dict[str, str] | None = None
 
 
 class ApiKeyIn(BaseModel):

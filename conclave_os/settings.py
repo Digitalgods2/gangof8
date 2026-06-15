@@ -49,6 +49,10 @@ class Settings(BaseModel):
     # Which OpenRouter seats are enabled (seat name → bool). Absent/false ⇒ the
     # seat is not registered. Opt-in: they cost per-token and need an API key.
     openrouter_enabled: dict[str, bool] = {}
+    # Per-seat OpenRouter model-slug overrides (seat name → slug). Empty/absent ⇒
+    # the built-in default from config.OPENROUTER_SEATS. Edit when the catalog
+    # changes a slug.
+    openrouter_models: dict[str, str] = {}
 
 
 def _settings_path(data_dir: Optional[Path] = None) -> Path:
