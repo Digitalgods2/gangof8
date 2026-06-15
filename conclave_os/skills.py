@@ -243,6 +243,36 @@ def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
     return str(dst)
 
 
+def _web_search(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Answer a query with live web grounding (the coordinator does the search)."""
+    from . import web
+
+    if not config.WEB_ENABLED:
+        raise ExecutionError("web access is disabled (CONCLAVE_OS_WEB=0)")
+    query = _arg(action, "query").strip()
+    if not query:
+        raise ExecutionError("web_search requires a non-empty query")
+    try:
+        return web.web_search(query)
+    except web.WebError as e:
+        raise ExecutionError(str(e)) from e
+
+
+def _web_fetch(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Fetch a public http(s) URL and return its readable text."""
+    from . import web
+
+    if not config.WEB_ENABLED:
+        raise ExecutionError("web access is disabled (CONCLAVE_OS_WEB=0)")
+    url = _arg(action, "url").strip()
+    if not url:
+        raise ExecutionError("web_fetch requires a URL")
+    try:
+        return web.web_fetch(url)
+    except web.WebError as e:
+        raise ExecutionError(str(e)) from e
+
+
 def _search_root(session: Session, data_dir: Path, action: ProposedAction | None = None) -> Path:
     target = _space_arg(action, _default_read_space(session), _READ_SPACES) \
         if action is not None else _default_read_space(session)
@@ -400,6 +430,25 @@ SKILLS: dict[str, Skill] = {
         allowed_roles=[Role.researcher, Role.architect, Role.implementer],
         inputs=["path", "target"],
     ),
+    "web_search": Skill(
+        name="web_search",
+        description="Search the live web and get a cited answer (use for current "
+                    "facts, docs, libraries, prior art).",
+        category="web",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.researcher, Role.architect, Role.critic, Role.implementer],
+        inputs=["query"],
+    ),
+    "web_fetch": Skill(
+        name="web_fetch",
+        description="Fetch a specific public URL and read its text.",
+        category="web",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=[Role.researcher, Role.architect, Role.critic, Role.implementer],
+        inputs=["url"],
+    ),
     "edit_file": Skill(
         name="edit_file",
         description="Surgically replace a unique snippet in a council-space file (sandbox/workspace). Free, no approval.",
@@ -443,6 +492,8 @@ HANDLERS: dict[str, Handler] = {
     "read_file": _read_file,
     "search_project": _search_project,
     "list_dir": _list_dir,
+    "web_search": _web_search,
+    "web_fetch": _web_fetch,
     "edit_file": _edit_file,
     "run_tests": _run_tests,
     "stage": _stage,

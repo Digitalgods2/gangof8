@@ -284,6 +284,10 @@ def build_prompt(
     if (readable or has_dir) and rf and role in rf.allowed_roles:
         avail = f" Available now: {', '.join(readable)}." if readable else ""
         hints.append(f"read a file with a line 'SKILL: read_file <path>'.{avail}")
+    ws = get_skill("web_search")
+    if config.WEB_ENABLED and ws and role in ws.allowed_roles:
+        hints.append("search the live web with 'SKILL: web_search <query>' "
+                     "(and read a page with 'SKILL: web_fetch <url>')")
     cap = (
         "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
         if hints else ""
@@ -332,10 +336,10 @@ def _resolve_skill_requests(
         if skill is None:
             results.append(f"SKILL {name}: unknown skill")
             continue
-        # Mid-deliberation SKILL: requests are for DISCOVERY only (read/search/
-        # list). Writes/edits/tests/stage/promote carry structured content and
+        # Mid-deliberation SKILL: requests are for DISCOVERY only — reads and web
+        # lookups. Writes/edits/tests/stage/promote carry structured content and
         # go through the draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE contracts.
-        if skill.category != "read":
+        if skill.category not in ("read", "web"):
             results.append(
                 f"SKILL {name}: not available mid-deliberation (it changes state) — "
                 "produce it as an ARTIFACT/EDIT/PROMOTE block in your draft instead")
