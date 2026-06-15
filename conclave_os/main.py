@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import __version__
+from . import __version__, reporting
 from .service import ConclaveService
 
 app = FastAPI(title="Conclave OS — Coordinator", version=__version__)
@@ -66,6 +66,7 @@ def _summary(session) -> dict:
         "workspace_root": session.workspace_root,
         "established_root": session.established_root,
         "attachments": session.attachments,
+        "council_health": reporting.council_health(session.unresolved),
     }
 
 
@@ -154,7 +155,16 @@ def get_session(session_id: str) -> dict:
     data = service.get(session_id)
     if data is None:
         raise HTTPException(status_code=404, detail="session not found")
+    data["council_health"] = reporting.council_health(data.get("unresolved", []))
     return data
+
+
+@app.get("/sessions/{session_id}/timeline")
+def session_timeline(session_id: str) -> dict:
+    """A readable run timeline from the session's event log."""
+    if service.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return service.timeline(session_id)
 
 
 @app.delete("/sessions/{session_id}")
