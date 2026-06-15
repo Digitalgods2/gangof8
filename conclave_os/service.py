@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
-from . import cancellation, config, intake
+from . import cancellation, config, intake, reporting
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
 from .adapters.openrouter import OpenRouterAdapter
@@ -461,6 +461,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def delete_session(self, session_id: str) -> bool:
         """Delete a session from the store (DB + JSONL log)."""
         return self.store.delete_session(session_id)
+
+    def timeline(self, session_id: str) -> dict:
+        """A readable run timeline built from the session's JSONL event log."""
+        import json as _json
+
+        path = self.store.session_log_path(session_id)
+        events: list[dict] = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    events.append(_json.loads(line))
+                except _json.JSONDecodeError:
+                    continue
+        return {"session_id": session_id, "events": reporting.format_timeline(events)}
 
     _TERMINAL = {SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}
     _PAUSED = {SessionStatus.awaiting_approval, SessionStatus.awaiting_input}

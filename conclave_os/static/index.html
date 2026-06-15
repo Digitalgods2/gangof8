@@ -203,6 +203,17 @@
   pre.diff .d-del { color:#f85149; display:block; }
   pre.diff .d-hunk { color:#58a6ff; display:block; }
   pre.diff .d-meta { color:var(--dim); display:block; }
+  .card.health { border-color:var(--warn); background:#2a2414; }
+  .card.health h3 { color:var(--warn); }
+  .card.health .hrow { font-size:12.5px; color:var(--text); margin-top:5px; }
+  .tlrow { display:flex; align-items:baseline; gap:8px; padding:3px 10px; font-size:12.5px;
+           border-top:1px solid var(--line); }
+  .tlrow:first-child { border-top:0; }
+  .tlrow .tlts { color:var(--dim); font-family:Consolas, monospace; font-size:11px; flex:0 0 56px; }
+  .tlrow .tlic { flex:0 0 auto; }
+  .tlrow .tllabel { color:var(--text); flex:0 0 auto; }
+  .tlrow .tldetail { color:var(--dim); font-family:Consolas, monospace; font-size:11.5px;
+                     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -291,6 +302,20 @@ function toggleSection(key) {
   openSections[key] = !openSections[key];
   const el = document.querySelector(`.collapse[data-sec="${key}"]`);
   if (el) el.classList.toggle("open", openSections[key]);
+  if (key === "sec_timeline" && openSections[key] && current) loadTimeline(current);
+}
+
+async function loadTimeline(sid) {
+  const wrap = document.getElementById("tlBody");
+  if (!wrap) return;
+  const d = await api("/sessions/" + encodeURIComponent(sid) + "/timeline").catch(() => ({events: []}));
+  wrap.innerHTML = (d.events || []).map(e => `
+    <div class="tlrow">
+      <span class="tlts">${esc((e.ts || "").slice(11, 19))}</span>
+      <span class="tlic">${e.icon || "•"}</span>
+      <span class="tllabel">${esc(e.label)}</span>
+      ${e.detail ? `<span class="tldetail">${esc(e.detail)}</span>` : ""}
+    </div>`).join("") || '<div class="sub" style="padding:10px">no events</div>';
 }
 
 // Render a collapsible block. `key` is the persistent section id, `summary`
@@ -634,6 +659,14 @@ function renderDetail(s) {
         </div>
       </div>` : ""}
 
+    ${(s.council_health && s.council_health.degraded) ? `
+      <div class="card health">
+        <h3>⚠ Council health — ran degraded</h3>
+        ${s.council_health.dropped.map(d => `<div class="hrow"><b>${esc(d.role)}</b> seat (${esc(d.agent)}) dropped — ${esc(d.error)}</div>`).join("")}
+        ${s.council_health.substitutions.map(x => `<div class="hrow">summarizer <b>${esc(x.failed)}</b> failed → recomposed with <b>${esc(x.replaced_by)}</b></div>`).join("")}
+        ${s.council_health.notes.map(n => `<div class="hrow">${esc(n)}</div>`).join("")}
+      </div>` : ""}
+
     ${approvals.map(a => `
       <div class="card needs">
         <h3>Approval needed — ${esc(a.category)} / ${esc(a.risk)}</h3>
@@ -695,7 +728,11 @@ function renderDetail(s) {
             <pre>${esc(c.content)}</pre>
           </div>`).join(""),
         collapseDefault) : ""}
+
+    ${(final || contribs.length) ? collapsible("sec_timeline", "Timeline",
+        '<div id="tlBody"><div class="sub" style="padding:10px">loading…</div></div>', false) : ""}
   `;
+  if (openSections["sec_timeline"] && current) loadTimeline(current);
 
   // Restore answer-in-progress + scroll position that survived this re-render.
   for (const [id, d] of Object.entries(draft)) {
