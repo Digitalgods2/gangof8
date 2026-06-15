@@ -46,6 +46,9 @@ class Settings(BaseModel):
     risk_boundary: str = Field(default_factory=lambda: config.RISK_BOUNDARY.value)
     composer: ComposerSettings = Field(default_factory=ComposerSettings)
     ui: UISettings = Field(default_factory=UISettings)
+    # Which OpenRouter seats are enabled (seat name → bool). Absent/false ⇒ the
+    # seat is not registered. Opt-in: they cost per-token and need an API key.
+    openrouter_enabled: dict[str, bool] = {}
 
 
 def _settings_path(data_dir: Optional[Path] = None) -> Path:

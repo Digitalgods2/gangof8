@@ -183,6 +183,11 @@ class SettingsPatch(BaseModel):
     risk_boundary: str | None = None
     composer: dict | None = None
     ui: dict | None = None
+    openrouter_enabled: dict[str, bool] | None = None
+
+
+class ApiKeyIn(BaseModel):
+    value: str = ""
 
 
 @app.get("/settings")
@@ -213,9 +218,24 @@ def put_settings(body: SettingsPatch) -> dict:
 
 @app.get("/settings/seats")
 def get_seats() -> dict:
-    """The local CLI agents (claude/codex/gemini) with PATH availability, for
-    the role→agent dropdowns in settings."""
+    """All seats (CLI + OpenRouter) with availability, for the role dropdowns."""
     return service.seats()
+
+
+@app.get("/settings/api-keys/openrouter")
+def get_openrouter_key() -> dict:
+    """Masked status of the OpenRouter API key (never the full key)."""
+    return service.openrouter_key_status()
+
+
+@app.put("/settings/api-keys/openrouter")
+def put_openrouter_key(body: ApiKeyIn) -> dict:
+    return service.set_openrouter_key(body.value)
+
+
+@app.delete("/settings/api-keys/openrouter")
+def delete_openrouter_key() -> dict:
+    return service.clear_openrouter_key()
 
 
 # ---- Workspaces --------------------------------------------------------------
