@@ -4,7 +4,12 @@ governed as no-approval 'web' skills usable mid-deliberation. SSRF-guarded.
 
 import pytest
 
-from conclave_os import web
+from conclave_os import config, web
+
+
+@pytest.fixture(autouse=True)
+def _web_on(monkeypatch):
+    monkeypatch.setattr(config, "WEB_ENABLED", True)
 from conclave_os.executor import ExecutionError, execute
 from conclave_os.governance import Governance
 from conclave_os.logstore import LogStore
@@ -82,6 +87,25 @@ def test_html_to_text_strips_tags_and_scripts():
 
 
 # --- governed mid-deliberation (web is allowed alongside read) ----------------
+
+
+def test_web_overview_proactively_researches_factual_questions(tmp_path, monkeypatch):
+    """Internet access being AVAILABLE isn't enough — the coordinator proactively
+    web-searches a fact-needing question so the council has real data even if the
+    researcher seat fails. Skipped when a local source (established folder) exists."""
+    from conclave_os import loop
+    from conclave_os.models import Classification, Complexity, Risk, TaskType
+
+    monkeypatch.setattr(web, "web_search",
+                        lambda q: "Current: M51 is well placed tonight.\nSources:\n- ex: http://e")
+    s = SessionManager(LogStore(tmp_path)).create("what galaxies are visible tonight?", source="test")
+    s.classification = Classification(
+        task_type=TaskType.question, complexity=Complexity.standard, risk=Risk.none, needs_facts=True)
+    ov = loop._web_overview(s)
+    assert "WEB RESEARCH" in ov and "M51 is well placed" in ov
+    # a local source to examine ⇒ no web overview (the file overview applies instead)
+    s.established_root = str(tmp_path)
+    assert loop._web_overview(s) == ""
 
 
 def test_web_search_runs_mid_deliberation(session, tmp_path, monkeypatch):
