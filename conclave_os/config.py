@@ -91,6 +91,7 @@ APPROVAL_CATEGORIES = [
     "settings",
     "external",
     "read",
+    "web",
     "stage",
     "promote",
 ]
@@ -168,3 +169,13 @@ SEARCH_RESULT_MAX_CHARS = 4000  # cap the formatted result fed back to the agent
 LIST_DIR_MAX_ENTRIES = 300      # files/folders listed before truncating
 LIST_DIR_MAX_DEPTH = 6          # nesting depth walked
 LIST_DIR_RESULT_MAX_CHARS = 4000  # cap the formatted listing fed back to the agent
+
+# Web access: the coordinator reaches the internet for the council (web_search /
+# web_fetch skills). Read-only, no side effects on the host. NOTE: queries/URLs
+# leave the machine. Disable by setting CONCLAVE_OS_WEB=0.
+WEB_ENABLED = os.environ.get("CONCLAVE_OS_WEB", "1") != "0"
+WEB_SEARCH_MODEL = os.environ.get("CONCLAVE_OS_WEB_MODEL", "gemini-2.5-flash")
+WEB_SEARCH_MAX_CHARS = 4000     # cap a search result fed back to the agent
+WEB_FETCH_TIMEOUT = 20          # seconds
+WEB_FETCH_MAX_BYTES = 2_000_000  # cap the download
+WEB_FETCH_MAX_CHARS = 6000      # cap the extracted text fed back to the agent
