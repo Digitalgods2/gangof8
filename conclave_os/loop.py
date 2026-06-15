@@ -274,6 +274,29 @@ def _established_overview(session: Session, data_dir) -> str:
             + "\n\n".join(parts))[:14000] + directive
 
 
+def _conversation_overview(session: Session) -> str:
+    """For a CONTINUED conversation: the prior turns plus the human's latest
+    response, so the council builds on the discussion and engages with what the
+    human said instead of re-stating its earlier conclusion. Empty on turn one."""
+    turns = session.turns or []
+    if not turns:
+        return ""
+    prior = turns[:-1]
+    latest = turns[-1]
+    parts: list[str] = []
+    if prior:
+        hist = "\n\n".join(
+            f"{'YOU (human)' if t.get('role') == 'user' else 'COUNCIL'}: {str(t.get('text',''))[:1400]}"
+            for t in prior)
+        parts.append("CONVERSATION SO FAR:\n" + hist)
+    if latest.get("role") == "user":
+        parts.append(
+            "THE HUMAN'S LATEST RESPONSE — address THIS directly. Engage with their "
+            "point (agree, push back with evidence, or refine); do NOT just repeat your "
+            f"previous conclusion:\n{latest.get('text','')}")
+    return "\n\n".join(parts)
+
+
 def _web_overview(session: Session) -> str:
     """Proactively look up current info ONCE up front for fact-needing tasks with
     no local source — so the council has REAL web data even if the researcher
@@ -775,6 +798,7 @@ def _deliberate(
     # seat or an agent remembering to request a skill: the established folder's
     # real source AND/OR live web research for fact-needing questions.
     established_overview = "\n\n".join(p for p in (
+        _conversation_overview(session),
         _established_overview(session, store.data_dir),
         _web_overview(session),
     ) if p)
@@ -908,6 +932,12 @@ def _deliberate(
         session.final = compose(session, council, compose_call)
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="compose")
+    # Record this turn in the conversation: the human's message (the original task
+    # on turn one; on a follow-up it was appended by continue_session) and the
+    # council's conclusion. The human can now respond and keep the thread going.
+    if not session.turns:
+        session.turns.append({"role": "user", "text": session.task.text})
+    session.turns.append({"role": "council", "text": session.final.answer})
     manager.transition(session, SessionStatus.done)
     store.log_event(sid, "final_composed", session.final.model_dump())
     store.save_session(session)

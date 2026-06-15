@@ -182,6 +182,23 @@ def cancel_session(session_id: str) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
 
 
+class FollowUpIn(BaseModel):
+    text: str
+
+
+@app.post("/sessions/{session_id}/followup")
+def followup_session(session_id: str, body: FollowUpIn) -> dict:
+    """Continue the conversation: respond to the council's conclusion; it
+    deliberates again with the full thread as context."""
+    try:
+        session = service.continue_session(session_id, body.text, background=True)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"session_id": session.session_id, "status": session.status.value}
+
+
 # ---- Settings / preferences --------------------------------------------------
 
 

@@ -76,6 +76,7 @@ _TIMELINE = {
     "budget_exhausted": ("⛔", "Budget exhausted"),
     "agent_error": ("❌", "Agent error"),
     "final_composed": ("🏁", "Final answer composed"),
+    "conversation_continued": ("💬", "You responded — continuing"),
     "session_resumed": ("▶️", "Resumed"),
     "status_change": ("•", "Status"),
     "workspace_emptied": ("🗑️", "Workspace emptied"),

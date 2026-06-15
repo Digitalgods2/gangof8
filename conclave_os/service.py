@@ -462,6 +462,49 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         """Delete a session from the store (DB + JSONL log)."""
         return self.store.delete_session(session_id)
 
+    def continue_session(self, session_id: str, text: str, background: bool = True) -> Session:
+        """Continue the conversation: the human responds to the council's
+        conclusion and the council deliberates AGAIN with the full thread as
+        context — no starting over. Re-opens a settled (done) session."""
+        if not (text or "").strip():
+            raise ValueError("response text required")
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(f"session {session_id} not found")
+        if session.status != SessionStatus.done:
+            raise ValueError(f"cannot continue a session in status '{session.status.value}'")
+        self._ensure_adapters(session)
+        # seed turn-one history for sessions created before the conversation feature
+        if not session.turns:
+            session.turns.append({"role": "user", "text": session.task.text})
+            if session.final:
+                session.turns.append({"role": "council", "text": session.final.answer})
+        session.turns.append({"role": "user", "text": text.strip()})
+        # reset per-turn deliberation state (keep turns, backend, roots, files)
+        session.rounds = []
+        session.contributions = []
+        session.disagreements = []
+        session.proposed_actions = []
+        session.approvals = []
+        session.input_requests = []
+        session.unresolved = []
+        session.tools_called = []
+        session.agent_calls = 0
+        session.final = None
+        session.stop_reason = None
+        session.current_round = 0
+        session.classification = None
+        session.risk_exceeds_boundary = False
+        session.blocked_on_missing_info = False
+        session.status = SessionStatus.received  # re-open (bypass terminal transition)
+        cancellation.clear(session_id)
+        self.store.log_event(session_id, "conversation_continued", {"turn": len(session.turns)})
+        self.store.save_session(session)
+        if background:
+            self._pool.submit(self._safely, session, self._run_full)
+            return session
+        return self._safely(session, self._run_full)
+
     def timeline(self, session_id: str) -> dict:
         """A readable run timeline built from the session's JSONL event log."""
         import json as _json
