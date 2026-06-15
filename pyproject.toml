@@ -7,10 +7,13 @@ dependencies = [
     "pydantic>=2.7",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "httpx>=0.27",          # OpenRouter adapter (runtime HTTP client)
+    "google-genai>=1.0",    # gemini SDK: vision/text calls + Google Search grounding (web_search)
+    "pypdf>=4",             # PDF attachment text extraction (uploads)
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = ["pytest>=8"]         # httpx is a runtime dep above; TestClient uses it transitively
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

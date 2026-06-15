@@ -139,6 +139,17 @@ _OVERVIEW_SKIP_DIRS = {
     ".mypy_cache", ".pytest_cache", "dist", "build", ".idea", ".vscode", ".next",
     "target", "vendor", "third_party", "testdata", "tests", "test", "__tests__",
 }
+# Files that define a CONTRACT/interface — usually small, so the largest-file
+# heuristic misses them (missing registry.py is why the council "recommended" a
+# Protocol that already exists). Always pulled in.
+_OVERVIEW_CONTRACT_HINTS = (
+    "registry", "protocol", "interface", "factory", "abc", "schema",
+)
+# Other architecturally CENTRAL files worth surfacing.
+_OVERVIEW_CORE_HINTS = (
+    "config", "settings", "models", "types", "router", "service", "app", "main",
+    "core", "engine", "client", "api", "store", "database",
+)
 
 
 def _read_established(session: Session, data_dir, name: str) -> str:
@@ -187,8 +198,11 @@ def _established_overview(session: Session, data_dir) -> str:
             parts.append(f"--- {name} ---\n{body[:1100]}")
             docs += 1
 
-    # 3. ACTUAL SOURCE — entry points first, then the largest code files (core
-    # logic), excluding tests/vendored/generated. Shows HOW the app works.
+    # 3. ACTUAL SOURCE — entry points + architecturally CENTRAL files (registry/
+    # protocol/config/models/…) + the largest code files, excluding tests/vendored.
+    # Central files are often small (an interface/Protocol) so the largest-file
+    # heuristic alone misses them — which made the council "recommend" things that
+    # already exist. Shows HOW the app works.
     picked: list[Path] = []
     for name in _OVERVIEW_ENTRY_FILES:
         p = (root / name)
@@ -211,13 +225,25 @@ def _established_overview(session: Session, data_dir) -> str:
         if size > 250_000:  # skip generated/bundled
             continue
         candidates.append((size, p))
-    candidates.sort(key=lambda t: t[0], reverse=True)  # largest = core logic
-    for _, p in candidates:
-        if len(picked) >= 6:
+    cap = 8
+    # First, CONTRACT/interface files (registry/protocol/factory/…) — usually
+    # small, so the largest-file heuristic misses them; missing them is exactly
+    # why the council "recommended" a Protocol that already exists. Then a couple
+    # of central-by-name files, then FILL THE REST with the largest (core logic).
+    by_size = sorted(candidates, key=lambda t: t[0], reverse=True)
+    contracts = [p for _, p in by_size
+                 if any(h in p.stem.lower() for h in _OVERVIEW_CONTRACT_HINTS)]
+    central = [p for _, p in by_size
+               if any(h in p.stem.lower() for h in _OVERVIEW_CORE_HINTS)]
+    for p in contracts[:2] + central[:2]:
+        if p not in picked:
+            picked.append(p)
+    for _, p in by_size:
+        if len(picked) >= cap:
             break
         if p not in picked:
             picked.append(p)
-    for p in picked[:6]:
+    for p in picked[:cap]:
         try:
             body = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -228,11 +254,20 @@ def _established_overview(session: Session, data_dir) -> str:
     if not parts:
         return ""
     directive = (
-        "\n\nWhen recommending improvements, GROUND each one in the specific code "
-        "above — name the file/function/feature it concerns. Do NOT give generic "
-        "advice ('add documentation', 'add tests', 'improve observability', 'do a "
-        "privacy audit') unless the code visibly lacks it AND you point to where. "
-        "Prefer concrete, app-specific improvements a developer could start today."
+        "\n\nHOW TO RECOMMEND:\n"
+        "1. FIRST infer WHAT THIS APP IS and its constraints from its README/docs "
+        "and code — e.g. a LOCAL single-user tool vs a production multi-user "
+        "service. Recommendations MUST fit that. Do NOT propose production/scale/"
+        "multi-user hardening (auth/JWT, rate-limiting, async ORM + connection "
+        "pooling, Docker, OpenTelemetry/Prometheus, field encryption, 'concurrency "
+        "under load') for a LOCAL single-user app — that is wrong-altitude advice.\n"
+        "2. Do NOT recommend adding something that ALREADY EXISTS in the code shown "
+        "(e.g. an adapter Protocol, a backend, tests) — check first; if it exists, "
+        "suggest improving it, not introducing it.\n"
+        "3. GROUND each recommendation in specific code — name the file/function/"
+        "feature. Avoid generic best-practice filler ('add docs/tests/observability') "
+        "unless the code visibly lacks it and you point to where.\n"
+        "4. Prefer concrete, app-specific improvements a developer could start today."
     )
     return ("ESTABLISHED FOLDER (real content the coordinator read for you from "
             f"{session.established_root} — analyze THIS, not assumptions):\n"
@@ -396,12 +431,13 @@ def _resolve_skill_requests(
 def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
     positions = "\n".join(f"- {p['role']}: {p['claim']}" for p in d.positions)
     return (
-        f"Task: {session.task.text}\n"
-        f"A disagreement was raised on: {d.topic}\n"
+        f"Disagreement on: {d.topic}\n"
         f"Positions:\n{positions}\n"
-        "Your role: critic. Test both sides against evidence, constraints, and "
-        "the user's goal. Start your verdict with 'VERDICT: uphold' or "
-        "'VERDICT: overturn'."
+        "Your role: critic — RULE this disagreement only. Reply in AT MOST 3 "
+        "lines: line 1 is exactly 'VERDICT: uphold' or 'VERDICT: overturn'; then "
+        "1–2 sentences naming the decisive evidence. Do NOT restate the task, do "
+        "NOT list recommendations, do NOT write an essay — just the verdict and "
+        "the reason."
     )
 
 
@@ -791,7 +827,7 @@ def _deliberate(
             new_disagreements = detect_disagreements(session, spec)
             for i, d in enumerate(new_disagreements):
                 if critic and critic.active and i < config.MAX_CRITIC_TESTS_PER_ROUND:
-                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content
+                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content[: config.CRITIC_TEST_MAX_CHARS]
                 elif i >= config.MAX_CRITIC_TESTS_PER_ROUND:
                     store.log_event(sid, "critic_test_skipped",
                                     {"round": spec.round, "topic": d.topic,
@@ -1208,7 +1244,7 @@ def resume_with_input(
         try:
             for i, d in enumerate(detect_disagreements(session, spec)):
                 if critic and critic.active and i < config.MAX_CRITIC_TESTS_PER_ROUND:
-                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content
+                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content[: config.CRITIC_TEST_MAX_CHARS]
                 d.ruling, d.ruling_basis, d.rationale = coordinator_decide(d)
                 session.disagreements.append(d)
                 store.log_event(sid, "disagreement_ruled", d.model_dump())
