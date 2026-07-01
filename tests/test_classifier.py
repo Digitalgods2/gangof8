@@ -36,15 +36,14 @@ def test_code_tasks_are_led_with_specialists_on_standby():
 
 
 def test_greenfield_build_is_led_directly():
-    from conclave_os.config import budgets_for
-    from conclave_os.roles import build_council, plan_rounds
-    from conclave_os.models import Complexity, Role
+    from conclave_os.roles import build_council
+    from conclave_os.models import Role
 
     cls = classify("create an app that shows a calendar selectable by year and month")
     assert cls.task_type == TaskType.code
     assert cls.greenfield is True
 
-    council = build_council(cls)
+    council = build_council(cls, panel=["claude", "codex"])
     active = {m.role for m in council.members if m.active}
     assert Role.lead in active
     assert Role.summarizer in active
@@ -52,10 +51,10 @@ def test_greenfield_build_is_led_directly():
     assert Role.critic not in active
     assert Role.red_team not in active
     assert Role.fact_validator not in active
-
-    plan = plan_rounds(cls, council, budgets_for(Complexity.standard))
-    assert len(plan) == 1
-    assert plan[0].agents == [Role.lead]
+    # the panel seats are convened as first-class, always-active members
+    panelists = [m for m in council.members if m.role == Role.panelist]
+    assert [m.agent for m in panelists] == ["claude", "codex"]
+    assert all(m.active for m in panelists)
 
 
 def test_fastapi_app_with_filenames_is_code():

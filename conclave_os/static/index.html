@@ -112,6 +112,7 @@
   .seat.spoke { color:#fff; background:linear-gradient(180deg, var(--seat-bg), rgba(255,255,255,.035)); }
   .seat.spoke::after { content:"✓"; color:var(--seat); font-weight:800; margin-left:1px; }
   .seat.role-lead { --seat:#ffd166; --seat-bg:rgba(255,209,102,.18); }
+  .seat.role-panelist { --seat:#fb923c; --seat-bg:rgba(251,146,60,.16); }
   .seat.role-knowledge_retriever { --seat:#58a6ff; --seat-bg:rgba(88,166,255,.16); }
   .seat.role-researcher { --seat:#2dd4bf; --seat-bg:rgba(45,212,191,.15); }
   .seat.role-architect { --seat:#a78bfa; --seat-bg:rgba(167,139,250,.15); }
@@ -631,7 +632,8 @@ function renderDetail(s) {
     new Set(contribs.map(c => c.round)).size;
   const calls = s.agent_calls ?? contribs.length;
   // talents the lead pulled in = contributions from non-driver roles
-  const DRIVE_ROLES = new Set(["lead", "summarizer", "coordinator"]);
+  // (panelists contribute every round by design — they are not delegations)
+  const DRIVE_ROLES = new Set(["lead", "panelist", "summarizer", "coordinator"]);
   const delegations = contribs.filter(c => c.role && !DRIVE_ROLES.has(c.role)).length;
   // "7 agent calls · 3 agents · 2 delegations"
   const statBits = [];

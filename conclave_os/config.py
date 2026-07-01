@@ -25,12 +25,14 @@ def _default_sandbox_root() -> Path:
 # project folder. Each session gets its own subdir (executor.artifacts_dir).
 SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_root())))
 
+# A panel round costs len(panel)+1 calls (every seat + the lead synthesis), so
+# the call budgets carry real multi-round headroom. max_rounds/max_turns_per_round
+# remain as fields for back-compat but no longer terminate deliberation — the
+# terminators are ROUND: DONE, a declined consent, max_agent_calls, and wall time.
 BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
-    Complexity.trivial: Budgets(max_rounds=1, max_turns_per_round=1, max_agent_calls=4, max_wall_seconds=180),
-    # Headroom raised so convergence (refine-until-accepted) has room to iterate;
-    # easy tasks still finish fast via early acceptance.
-    Complexity.standard: Budgets(max_rounds=3, max_turns_per_round=2, max_agent_calls=24, max_wall_seconds=1200),
-    Complexity.complex: Budgets(max_rounds=4, max_turns_per_round=2, max_agent_calls=40, max_wall_seconds=1800),
+    Complexity.trivial: Budgets(max_rounds=1, max_turns_per_round=1, max_agent_calls=10, max_wall_seconds=420),
+    Complexity.standard: Budgets(max_rounds=3, max_turns_per_round=2, max_agent_calls=48, max_wall_seconds=1800),
+    Complexity.complex: Budgets(max_rounds=4, max_turns_per_round=2, max_agent_calls=80, max_wall_seconds=2700),
 }
 
 # Convergence-driven deliberation: after the planned phases, the implementer
@@ -144,8 +146,25 @@ OPENROUTER_SEATS: dict[str, dict[str, str]] = {
 # session's mapping receive it explicitly instead of reading this).
 ROLE_AGENTS = ROLE_AGENTS_BY_BACKEND.get(BACKEND, ROLE_AGENTS_MOCK)
 
-# Any classified risk ABOVE this boundary forces a human approval gate
-# before round 1 (loop step 7 / DESIGN hard rules).
+# The PANEL: seats that contribute EVERY round in parallel before the lead
+# synthesizes — diversity of intelligence is the point. Enabled OpenRouter
+# seats are appended at runtime (service._effective_panel) when a key exists.
+PANEL_SEATS_BY_BACKEND: dict[str, list[str]] = {
+    "mock": ["mock"],
+    "cli": ["claude", "codex", "gemini"],
+}
+# Rounds proceed automatically; after this many without ROUND: DONE the run
+# pauses and asks the human whether to go another block of rounds.
+ROUNDS_PER_CONSENT = 3
+PANEL_TO_LEAD_CHARS = 2500       # per-seat text folded into the lead synthesis prompt
+PANEL_CARRYOVER_CHARS = 900      # a seat's own prior-round text carried into its next prompt
+PEER_CARRYOVER_CHARS = 500       # a peer seat's prior-round text carried into others' prompts
+SYNTHESIS_CARRYOVER_CHARS = 2000  # last round's lead synthesis carried forward
+ROUND_SUMMARY_CHARS = 300        # per-round digest shown in the consent question
+
+# Retained for settings back-compat; classification still reports risk but it
+# is informational — the loop no longer pauses on it. The one hard gate is the
+# promote approval (workspace → established folder).
 RISK_BOUNDARY = Risk.low
 
 APPROVAL_CATEGORIES = [

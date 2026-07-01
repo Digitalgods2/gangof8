@@ -13,7 +13,6 @@ from typing import Callable, Optional
 from . import config
 from .governance import BudgetExceeded
 from .models import Contribution, Council, CouncilMember, FinalAnswer, Role, Session
-from .truth import ledger_prompt
 from .registry import AgentError
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
@@ -79,11 +78,7 @@ def compose_prompt(session: Session) -> str:
         f"[{c.role.value} r{c.round}] {_condense_for_compose(c.content)}"
         for c in session.contributions[-config.COMPOSER_CONTEXT_CONTRIBUTIONS:]
     )
-    rulings = "\n".join(
-        f"- {d.topic}: ruled '{d.ruling}' ({d.ruling_basis})" for d in session.disagreements
-    ) or "(none)"
     actions = _actions_summary(session)
-    ledger = ledger_prompt(session)
     # Plain-text labeled sections, NOT JSON: asking an agent for a JSON object
     # whose keys overlap a wrapping protocol can contaminate its output
     # (learned from real runs). Text labels survive — like DISAGREEMENT:/VERDICT:.
@@ -119,11 +114,8 @@ def compose_prompt(session: Session) -> str:
         "RISKS:\n- <unresolved risks, one per line, or '- none'>\n"
         "NEXT_ACTION: <one line, or 'none'>\n"
         f"Actions performed (authoritative):\n{actions or '(none)'}\n"
-        "Truth ledger (authoritative for established facts vs assumptions):\n"
-        f"{ledger}\n"
         "In ANSWER, separate established facts from proposals when the distinction "
         "matters. Do not promote an assumption to fact.\n"
-        f"Disagreement rulings:\n{rulings}\n"
         f"Deliberation:\n{recent}"
     )
 

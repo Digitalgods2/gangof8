@@ -21,8 +21,8 @@ def test_lead_runs_a_single_round(service):
     budgets = Budgets(max_rounds=2, max_turns_per_round=1, max_agent_calls=12, max_wall_seconds=60)
     session = service.run(TASK, source="test", budgets=budgets)
     assert session.status == SessionStatus.done
-    assert len(session.rounds) == 1  # the lead drives in one round, regardless of budget
-    assert session.stop_reason == "lead produced a result"
+    assert len(session.rounds) == 1  # no ROUND: marker defaults to DONE after round 1
+    assert session.stop_reason == "council produced a result"
     assert session.agent_calls <= budgets.max_agent_calls
 
 

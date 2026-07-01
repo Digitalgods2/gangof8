@@ -27,7 +27,7 @@ def session(service):
 def test_session_completes_state_machine(session):
     assert session.session_id.startswith("s_")
     assert session.status == SessionStatus.done
-    assert session.stop_reason == "lead produced a result"
+    assert session.stop_reason == "council produced a result"
 
 
 def test_classification(session):
@@ -39,23 +39,28 @@ def test_classification(session):
     assert cls.tools_allowed is False
 
 
-def test_lead_council_is_minimal(session):
-    """The lead model activates only coordinator + lead + summarizer; the
-    specialist talents are listed but inactive (available for delegation)."""
+def test_council_is_lead_plus_panel(session):
+    """The council activates coordinator + lead + the panel seats + summarizer;
+    the specialist talents are listed but inactive (available for delegation)."""
     active = session.council.active_roles()
-    assert {Role.coordinator, Role.lead, Role.summarizer} <= active
+    assert {Role.coordinator, Role.lead, Role.panelist, Role.summarizer} <= active
     # specialists are present but inactive until the lead pulls one in
     assert session.council.get(Role.critic).active is False
     assert session.council.get(Role.researcher).active is False
     assert Role.researcher not in active and Role.red_team not in active
-    # all roles are still listed, so the UI roster shows what's reachable
-    assert len(session.council.members) == 13
+    # all roles are still listed, so the UI roster shows what's reachable;
+    # the mock backend convenes a one-seat panel
+    assert session.panel == ["mock"]
+    assert len(session.council.members) == 13 + len(session.panel)
 
 
-def test_single_lead_round(session):
+def test_single_round_when_lead_declares_done(session):
+    # the mock lead emits no ROUND: marker, which defaults to DONE — one round
     assert len(session.rounds) == 1
-    assert "lead" in session.rounds[0].goal
-    assert session.rounds[0].agents == [Role.lead]
+    assert "panel round 1" in session.rounds[0].goal
+    assert session.rounds[0].agents == [Role.panelist, Role.lead]
+    # the panel seat contributed before the lead synthesized
+    assert any(c.role == Role.panelist for c in session.contributions)
     assert session.agent_calls <= session.budgets.max_agent_calls
 
 

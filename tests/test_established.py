@@ -1,8 +1,9 @@
-"""Phase 3: established-folder path extraction + the greenfield "ask" gate.
+"""Phase 3: established-folder path extraction + the promote-time target ask.
 
 A path the user references in the prompt becomes the session's established folder
-(read source + approval-gated promote target). A greenfield build that references
-NO path pauses and ASKS for a target instead of assuming one.
+(read source + approval-gated promote target). A build that references NO path
+runs freely in the sandbox; only when it wants to DELIVER (PROMOTE) does the
+coordinator ask WHERE — at delivery time, never up front.
 """
 
 import pytest
@@ -72,7 +73,7 @@ def test_examine_with_real_modify_verb_stays_code():
     assert classify("review X then implement the fix").task_type == TaskType.code
 
 
-# --- the greenfield gate (ask, don't assume) ----------------------------------
+# --- the promote-time target ask (ask at delivery, don't assume) ---------------
 
 
 class _ImplAdapter:
@@ -95,34 +96,80 @@ def _svc(tmp_path):
     return svc
 
 
-def test_greenfield_without_target_pauses_and_asks(tmp_path):
+def test_greenfield_without_promote_runs_free(tmp_path):
+    """No up-front target question: a greenfield build that never asks to
+    deliver completes with zero pauses (sandbox writes are free)."""
     svc = _svc(tmp_path)
+    session = svc.run("build me a brand new tic-tac-toe app from scratch", source="test")
+    assert session.status == SessionStatus.done
+    assert session.input_requests == []
+    assert session.approvals == []
+
+
+class _PromotingImplAdapter:
+    """Lead writes a file AND asks to deliver it — with no target referenced."""
+
+    name = "mock"
+
+    def __init__(self):
+        self._inner = MockAdapter()
+
+    def call(self, role, prompt, timeout_s, images=None):
+        if role == Role.lead:
+            return AdapterResult(
+                content="ARTIFACT: game.py\nprint('tic tac toe')\nPROMOTE: game.py\n",
+                duration_ms=1)
+        return self._inner.call(role, prompt, timeout_s)
+
+
+def _promote_svc(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc.registry.register(_PromotingImplAdapter())
+    return svc
+
+
+def test_promote_without_target_asks_at_delivery_time(tmp_path):
+    svc = _promote_svc(tmp_path)
     session = svc.run("build me a brand new tic-tac-toe app from scratch", source="test")
     assert session.status == SessionStatus.awaiting_input
     req = session.input_requests[-1]
-    assert req.agent == "system" and req.purpose == "establish_target"
-    assert "target" in req.question.lower()
+    assert req.agent == "system" and req.purpose == "promote_target"
+    assert "game.py" in req.question
+    assert "where" in req.question.lower()
 
 
-def test_answer_with_path_sets_established_then_runs(tmp_path):
-    svc = _svc(tmp_path)
+def test_answer_with_path_routes_promote_through_the_gate(tmp_path):
+    svc = _promote_svc(tmp_path)
     target = tmp_path / "delivery"
+    target.mkdir()
     session = svc.run("build me a brand new tic-tac-toe app from scratch", source="test")
     req = session.input_requests[-1]
     session = svc.answer(session.session_id, req.input_id, str(target))
     assert session.established_asked is True
     assert session.established_root == str(target.resolve())
-    assert session.status in (SessionStatus.done, SessionStatus.awaiting_approval)
+    # the promote now pauses on the ONE hard gate, with a diff to review
+    assert session.status == SessionStatus.awaiting_approval
+    approval = next(a for a in session.approvals if a.status == "pending")
+    assert approval.category == "promote"
+    assert not (target / "game.py").exists(), "nothing lands before approval"
+    done = svc.approve(session.session_id, approval.approval_id, approved=True)
+    assert done.status == SessionStatus.done
+    assert (target / "game.py").read_text(encoding="utf-8").startswith("print(")
 
 
 def test_answer_workspace_keeps_in_council_space(tmp_path):
-    svc = _svc(tmp_path)
+    svc = _promote_svc(tmp_path)
     session = svc.run("create a new app from scratch", source="test")
     req = session.input_requests[-1]
+    assert req.purpose == "promote_target"
     session = svc.answer(session.session_id, req.input_id, "workspace")
     assert session.established_asked is True
     assert session.established_root is None
-    assert session.status == SessionStatus.done  # no promote, free writes → completes
+    assert session.status == SessionStatus.done
+    promote = next(a for a in session.proposed_actions if a.kind == "promote")
+    assert promote.status == "denied", "delivery skipped; file stays in the sandbox"
+    write = next(a for a in session.proposed_actions if a.kind == "write_file")
+    assert write.status == "executed"
 
 
 def test_free_write_into_established_subfolder_is_refused(tmp_path):

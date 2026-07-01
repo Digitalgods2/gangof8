@@ -134,11 +134,13 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         risk = Risk.none
     notes.append(f"risk: {risk.value}")
 
-    # Any output-producing task may propose artifacts (still approval-gated).
+    # Any output-producing task may propose artifacts (promote stays gated).
     tools_allowed = task_type in (TaskType.action, TaskType.code, TaskType.content, TaskType.design)
+    # Informational only: shown in the UI, but the loop no longer pauses on it —
+    # the one hard gate is the promote approval at delivery time.
     human_approval_required = risk_gt(risk, config.RISK_BOUNDARY)
     if human_approval_required:
-        notes.append(f"risk above boundary ({config.RISK_BOUNDARY.value}) — human approval required")
+        notes.append(f"risk above boundary ({config.RISK_BOUNDARY.value}) — flagged for visibility")
 
     # code included: a coding task benefits from a context-gathering round first
     # (read/search the existing code, surface constraints) — and it's the role

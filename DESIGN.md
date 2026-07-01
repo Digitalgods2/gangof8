@@ -1,11 +1,39 @@
 # Conclave OS — Type 1: Coordinator OS
 
-**Design document v0.1 — 2026-06-12**
+**Design document v0.1 — 2026-06-12** *(see "Current model" below for the
+2026-07-01 panel-round revision; sections further down describe the original
+court flow and are kept for historical reference)*
 
 Type 1 is not a full autonomous AI operating system. It is a coordination layer that
 receives a user task, decides which AI agents or tools should participate, assigns
 roles, manages the discussion, prevents runaway loops, records the reasoning trail,
 and returns a final answer to the user. The human always has final authority.
+
+## Current model (2026-07-01): panel rounds + a single hard gate
+
+Deliberation is an automatic round loop built for **diversity of intelligence**:
+
+- **The panel.** Every enabled seat — the local `claude`/`codex`/`gemini` CLIs
+  plus any enabled, keyed OpenRouter seats (DeepSeek, GLM, Qwen, Kimi) — gives
+  an independent take **in parallel** each round (`Role.panelist`). The **lead**
+  then synthesizes, may still `CONSULT:`/`DELEGATE:` specialist talents
+  mid-round, and ends with `ROUND: DONE` or `ROUND: CONTINUE - <what's open>`
+  (no marker ⇒ DONE, so a marker-ignoring model can never cause a runaway).
+- **Consent-gated rotation.** Rounds proceed automatically; after
+  `ROUNDS_PER_CONSENT` (default 3) rounds without DONE the run pauses and asks
+  the human: *continue another block, a specific number of rounds, or compose
+  now?* Budgets (`max_agent_calls`, `max_wall_seconds`) remain the hard backstop.
+- **One hard gate.** The pre-run risk gate and the up-front greenfield
+  "where should this go?" pause are gone. Sandbox/workspace writes, staging,
+  test runs, and web access are free. The **only approval** is `promote`
+  (workspace → established folder — the only write that touches real user
+  code), with a diff on the approval card. A `PROMOTE:` with no known target
+  asks for the destination **at delivery time** (never up front, and never
+  assumed — the no-assumptions-on-greenfield-targets rule is preserved).
+  Risk classification is still computed and shown, but it is informational.
+- The side-effect surface is unchanged: agents still have no filesystem or
+  network access of their own; everything routes through governed skills.
+  Note `run_tests` in the sandbox/workspace now runs without any pre-run pause.
 
 ## Agent backend (self-contained)
 

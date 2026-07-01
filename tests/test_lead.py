@@ -312,7 +312,9 @@ class PreambleArtifactLead:
 
 
 def test_build_uses_deterministic_summary_and_one_call(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    # panel=[] → solo mode: the lead is the only model called, so a build spends
+    # exactly one agent call and the summary stays deterministic.
+    svc = ConclaveService(data_dir=tmp_path, panel=[])
     svc.registry.register(PreambleArtifactLead())
 
     s = svc.run("Produce index.html with a calendar", source="test")

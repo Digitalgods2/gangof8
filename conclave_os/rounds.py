@@ -7,7 +7,9 @@ reverse), so the prompt layer stays cycle-free and independently testable.
 
 from __future__ import annotations
 
-from .models import Council, Role, Session
+import re
+
+from .models import Contribution, Council, CouncilMember, Role, Session
 from . import config
 from .skills import get_skill
 
@@ -90,17 +92,16 @@ _ROLE_INSTRUCTIONS: dict[Role, str] = {
     ),
     Role.critic: (
         "Seat charter: Critic. Challenge the strongest claim or implementation "
-        "risk. Use DISAGREEMENT lines only for material conflicts."
+        "risk, concretely and with evidence."
     ),
     Role.red_team: (
         "Seat charter: Red Team. Try to break the proposal with adversarial "
         "cases, bad assumptions, security/privacy failure modes, and model "
-        "hallucination risk. End with VERDICT: BLOCK or VERDICT: PASS."
+        "hallucination risk."
     ),
     Role.fact_validator: (
         "Seat charter: Fact Validator. Independently verify the claims made so "
-        "far. Output CONFIRMED, REFUTED, or UNVERIFIABLE for each important "
-        "claim, with the checked source or reason."
+        "far, naming the checked source or the reason a claim can't be verified."
     ),
     Role.implementer: (
         "Seat charter: Implementer. Produce concrete deliverables and complete "
@@ -160,6 +161,11 @@ def _output_contract(session: Session) -> str:
         promote = (
             "\nYour ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
             "approval needed) — you need no filesystem access yourself.\n"
+            "If the finished files should be DELIVERED to a real folder of the user's, "
+            "add a line per file:\n"
+            "PROMOTE: <filename>\n"
+            "The coordinator will ask the user for the destination and get their "
+            "approval before anything lands.\n"
         )
     return (
         "If the task needs files (code, docs, config), emit each file literally in "
@@ -209,3 +215,148 @@ def lead_prompt(
         f"{overview}"
         f"Context so far:\n{_recent_context(session, limit=5)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Panel rounds: every enabled seat contributes in parallel, then the lead
+# synthesizes and declares the round DONE or CONTINUE.
+# ---------------------------------------------------------------------------
+
+# Panel seats are pure generate_text voices — no SKILL/ARTIFACT machinery is
+# resolved for them (only the lead's), so their context note must not advertise
+# capabilities they don't have.
+_PANEL_CONTEXT = (
+    "You operate inside a governed coordinator with no filesystem or network "
+    "access of your own; the coordinator has already gathered any project "
+    "content shown below. Do not refuse for lack of access — reason from what "
+    "is provided and state assumptions where something is missing.\n"
+)
+
+_ROUND_CONTRACT = (
+    "\nEnd your reply with exactly one line:\n"
+    "ROUND: DONE                        (the task is complete — your reply above IS the result)\n"
+    "ROUND: CONTINUE - <what is still open for the next round>\n"
+    "Declare CONTINUE only when another round of panel input would materially "
+    "improve the result. If you emit neither line, DONE is assumed.\n"
+)
+
+# 'ROUND: DONE' / 'ROUND: CONTINUE - why' in the same envelope-surviving style
+# as ARTIFACT:/CONSULT: (bullets, bold, and :—–- separators tolerated).
+_ROUND_MARKER = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?ROUND(?:\*\*)?\s*[:—–-]\s*"
+    r"(?:\*\*)?(?P<decision>DONE|CONTINUE)\b"
+    r"(?:\s*[-–—:]\s*(?P<why>.*?))?\s*(?:\*\*)?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_round_decision(text: str) -> tuple[str, str]:
+    """The lead's round verdict. No marker ⇒ DONE, so a marker-ignoring model
+    degrades to a single-pass run — never a runaway loop. The LAST marker wins
+    (the contract says to end with it)."""
+    matches = list(_ROUND_MARKER.finditer(text or ""))
+    if not matches:
+        return "DONE", ""
+    m = matches[-1]
+    return m.group("decision").upper(), (m.group("why") or "").strip()
+
+
+def round_context(session: Session, seat_agent: str, round_idx: int) -> str:
+    """What a panel seat carries into round N: the lead's prior synthesis, its
+    own prior take, and the peers' — all capped. Derived purely from
+    session.contributions so a resumed session rebuilds it exactly."""
+    if round_idx <= 0:
+        return ""
+    prev = [c for c in session.contributions if c.round == round_idx - 1]
+    parts: list[str] = []
+    synth = next((c for c in reversed(prev) if c.role == Role.lead), None)
+    if synth:
+        parts.append("LEAD SYNTHESIS of the previous round:\n"
+                     + synth.content[:config.SYNTHESIS_CARRYOVER_CHARS])
+    own = next((c for c in reversed(prev)
+                if c.role == Role.panelist and c.agent == seat_agent), None)
+    if own:
+        parts.append("YOUR OWN prior take (build on it, don't repeat it):\n"
+                     + own.content[:config.PANEL_CARRYOVER_CHARS])
+    peers = [c for c in prev if c.role == Role.panelist and c.agent != seat_agent]
+    if peers:
+        parts.append("PEER SEATS' prior takes:\n" + "\n".join(
+            f"[{c.agent}] {c.content[:config.PEER_CARRYOVER_CHARS]}" for c in peers))
+    return "\n\n".join(parts)
+
+
+def panel_prompt(
+    session: Session, member: CouncilMember, round_idx: int,
+    established_overview: str = "", readable: list[str] = (),
+) -> str:
+    """One seat's independent take. Panel seats never write files or pull
+    skills — they contribute intelligence; the lead materializes."""
+    overview = f"{established_overview}\n\n" if established_overview else ""
+    ctx = round_context(session, member.agent, round_idx)
+    ctx_block = f"{ctx}\n\n" if ctx else ""
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_PANEL_CONTEXT}"
+        f"You are one seat on a multi-model council (round {round_idx + 1}; your "
+        f"origin model: {member.agent}). Give YOUR best independent take on the "
+        "task: the answer or design as you see it, the strongest objections, and "
+        "anything the other seats appear to have missed. Be concrete and commit "
+        "to positions; where you disagree with the synthesis below, say so and "
+        "give evidence. Do NOT emit ARTIFACT/PROMOTE file blocks — the lead "
+        "materializes files; describe what should change instead. Do not ask the "
+        "human questions; state assumptions and proceed.\n"
+        f"{overview}"
+        f"{ctx_block}"
+    )
+
+
+def synthesis_prompt(
+    session: Session, council: "Council", role_agents: dict[Role, str] | None,
+    round_idx: int, panel_results: list[Contribution],
+    established_overview: str = "", readable: list[str] = (),
+) -> str:
+    """The lead's per-round prompt: the task, the panel's independent views, the
+    file-output contract, the delegation menu, and the ROUND: DONE/CONTINUE
+    termination contract. With no panel this is the plain lead prompt plus the
+    round contract."""
+    produces = bool(session.classification and session.classification.produces_output)
+    overview = f"{established_overview}\n\n" if established_overview else ""
+    contract = _output_contract(session) if produces else (
+        "Produce the actual answer the task asks for — complete, concrete, and "
+        "ready to use. Do not ask the human questions; state assumptions and answer.\n"
+    )
+    panel_block = ""
+    if panel_results:
+        views = "\n\n".join(
+            f"--- {c.agent} ---\n{c.content[:config.PANEL_TO_LEAD_CHARS]}"
+            for c in panel_results)
+        panel_block = (
+            f"PANEL VIEWS (round {round_idx + 1} — independent takes from the "
+            "other council models; weigh them on evidence, adopt what is right, "
+            "and name real disagreements rather than papering over them):\n"
+            f"{views}\n\n")
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"Your role: lead (round {round_idx + 1}). You own this task end to end. "
+        "Produce the real, working result — not a plan or a description of it.\n"
+        f"{delegation_contract(council, role_agents)}"
+        f"{contract}"
+        f"{_skill_hints(session, Role.lead, readable)}"
+        f"{overview}"
+        f"{panel_block}"
+        f"Context so far:\n{_recent_context(session, limit=5)}\n"
+        f"{_ROUND_CONTRACT}"
+    )
+
+
+def round_summaries(session: Session) -> str:
+    """One capped line per completed round (from the lead syntheses) so the
+    human can decide whether more rounds are worth it."""
+    lines: list[str] = []
+    for spec in session.rounds:
+        synth = next((c for c in reversed(session.contributions)
+                      if c.round == spec.round and c.role == Role.lead), None)
+        gist = " ".join((synth.content if synth else "").split())[:config.ROUND_SUMMARY_CHARS]
+        lines.append(f"round {spec.round + 1}: {gist or '(no synthesis recorded)'}")
+    return "\n".join(lines)

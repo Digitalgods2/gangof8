@@ -21,7 +21,13 @@ from .secrets import SecretStore
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
-from .loop import SessionCancelled, resume_session, resume_with_input, run_session
+from .loop import (
+    SessionCancelled,
+    resume_deliberation,
+    resume_session,
+    resume_with_input,
+    run_session,
+)
 from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
 from .paths import extract_established_root
 from .registry import AgentError
@@ -38,12 +44,16 @@ class ConclaveService:
         data_dir: Optional[Path] = None,
         backend: Optional[str] = None,
         role_agents: Optional[dict[Role, str]] = None,
+        panel: Optional[list[str]] = None,
     ):
         self._data_dir = Path(data_dir) if data_dir else config.DATA_DIR
         # Persisted settings layer over config/env. With no settings.json this
         # returns the pure config/env defaults, so behaviour is unchanged.
         self.settings = load_settings(self._data_dir)
         self._explicit_role_agents = role_agents  # explicit arg always wins
+        # Explicit panel roster: None ⇒ derive per backend; [] ⇒ no panel
+        # (lead-only solo mode — fast runs and focused tests).
+        self._explicit_panel = panel
 
         self.store = LogStore(self._data_dir)
         self.manager = SessionManager(self.store)
@@ -83,6 +93,7 @@ class ConclaveService:
         config.COMPOSER_PROSE_MIN_CHARS = self.settings.composer.prose_min_chars
         config.COMPOSER_RESERVED_CALLS = self.settings.composer.reserved_calls
         config.MAX_CRITIC_TESTS_PER_ROUND = self.settings.composer.max_critic_tests
+        config.ROUNDS_PER_CONSENT = self.settings.rounds_per_consent
         config.BUDGETS_BY_COMPLEXITY = budgets_overrides(self.settings)
 
         self.registry = AgentRegistry()
@@ -98,6 +109,30 @@ class ConclaveService:
                     self.registry.register(CliAdapter(agent=agent))
         else:
             self.registry.register(MockAdapter())
+        self.panel = self._effective_panel()
+
+    def _effective_panel(self) -> list[str]:
+        """The seats that contribute every round. Explicit ctor arg › settings
+        roster › backend default (installed CLI agents + enabled, keyed
+        OpenRouter seats). Degrades gracefully: no OpenRouter key ⇒ CLI-only;
+        a seat with no registered adapter is dropped."""
+        import shutil
+
+        if self._explicit_panel is not None:
+            # trusted as-is: the caller (tests, embedders) registers its own
+            # adapters, possibly after construction
+            return list(self._explicit_panel)
+        if self.settings.panel_seats:
+            return [s for s in self.settings.panel_seats if s in self.registry.names()]
+        seats = list(config.PANEL_SEATS_BY_BACKEND.get(self.backend, ["mock"]))
+        if self.backend == "cli":
+            seats = [s for s in seats if shutil.which(s)]
+            if self.secrets.has("openrouter"):
+                seats += sorted(
+                    n for n, on in (self.settings.openrouter_enabled or {}).items()
+                    if on and self._openrouter_slug(n)
+                )
+        return [s for s in seats if s in self.registry.names()]
 
     def _openrouter_slug(self, seat: str) -> Optional[str]:
         """Effective model slug for a seat: a user override (settings) wins over
@@ -166,6 +201,7 @@ class ConclaveService:
         full_text = (text or "") + attachment_context(self.uploads, attachments or [])
         session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
+        session.panel = list(self.panel)
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
         # Established folder is PER TASK: interpret a path the user referenced in
@@ -632,11 +668,56 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     # answers that keep the build in the council's own spaces (no delivery target)
     _WORKSPACE_ANSWERS = {"workspace", "sandbox", "none", "skip", "no", "keep", "here"}
+    # answers that end the rotation and compose from the work done so far
+    _STOP_ANSWERS = {"no", "n", "stop", "finish", "done", "compose", "wrap up", "enough"}
 
     def _answer_continue(self, session: Session, req) -> Session:
-        # System greenfield-target question: not a paused agent call — interpret
-        # the answer, set the established folder (or keep it in-workspace), then
-        # start deliberation.
+        # Round-consent question: 'yes' (or anything unrecognized) grants another
+        # block of rounds, a number grants exactly that many, 'no'/'stop' composes
+        # the final answer from the work so far.
+        if req.agent == "system" and req.purpose == "continue_rounds":
+            import re as _re
+
+            ans = (req.answer or "").strip().lower()
+            m = _re.match(r"^\s*(\d+)", ans)
+            if ans in self._STOP_ANSWERS:
+                session.compose_now = True
+            elif m:
+                session.consent_extra_rounds += int(m.group(1))
+            else:
+                session.consent_extra_rounds += config.ROUNDS_PER_CONSENT
+            self.store.save_session(session)
+            return resume_deliberation(
+                session, self.manager, self.registry, self.governance,
+                self.store, role_agents=self.role_agents,
+            )
+
+        # Delivery-target question, asked at promote time: 'workspace' keeps the
+        # files in the council's spaces (promotes skipped); a path becomes the
+        # established root and each promote then flows through the ONE hard gate
+        # (the diff-carrying promote approval).
+        if req.agent == "system" and req.purpose == "promote_target":
+            session.established_asked = True
+            ans = (req.answer or "").strip()
+            if ans.lower() in self._WORKSPACE_ANSWERS:
+                for a in session.proposed_actions:
+                    if a.kind == "promote" and a.status == "proposed":
+                        a.status = "denied"
+                        a.error = "user kept the files in the council workspace"
+            else:
+                picked = extract_established_root(ans)
+                if picked is None and ("/" in ans or "\\" in ans):
+                    picked = str(Path(ans).expanduser().resolve())
+                session.established_root = picked
+            self.store.save_session(session)
+            return resume_deliberation(
+                session, self.manager, self.registry, self.governance,
+                self.store, role_agents=self.role_agents,
+            )
+
+        # System greenfield-target question (legacy — sessions paused on disk
+        # before the promote-time ask replaced the up-front gate): interpret the
+        # answer, set the established folder, then start deliberation.
         if req.agent == "system" and req.purpose == "establish_target":
             session.established_asked = True
             ans = (req.answer or "").strip()

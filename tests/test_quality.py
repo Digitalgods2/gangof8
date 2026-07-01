@@ -36,7 +36,9 @@ def test_compose_prompt_includes_authoritative_action_outcomes():
     assert "authoritative" in prompt.lower()
 
 
-def test_compose_prompt_includes_truth_ledger():
+def test_compose_prompt_omits_ledger_and_rulings_ceremony():
+    """The verdict/ruling/ledger ceremony is gone from composition — the prompt
+    stays lean even when legacy sessions still carry truth claims."""
     from conclave_os.composer import compose_prompt
     from conclave_os.models import TruthClaim
 
@@ -51,8 +53,8 @@ def test_compose_prompt_includes_truth_ledger():
 
     prompt = compose_prompt(session)
 
-    assert "Truth ledger" in prompt
-    assert "[established] SQLite supports atomic transactions" in prompt
+    assert "Truth ledger" not in prompt
+    assert "Disagreement rulings" not in prompt
     assert "Do not promote an assumption to fact" in prompt
 
 
@@ -125,7 +127,7 @@ def test_composer_recomposes_with_a_working_agent_when_summarizer_errors(tmp_pat
     assert session.status == SessionStatus.done
     assert session.final.confidence == "high", "fell back to a working agent, not a partial"
     assert not session.final.answer.startswith("Partial result")
-    assert any("recomposed with 'good'" in u for u in session.unresolved)
+    assert any("recomposed with '" in u for u in session.unresolved)
 
 
 def test_substantial_prose_is_accepted_at_medium_confidence(tmp_path):

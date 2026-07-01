@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor, skills, truth
+from . import config, executor, rounds, skills
 from .classifier import classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
@@ -26,14 +26,14 @@ from .models import (
     FinalAnswer,
     InputRequest,
     ProposedAction,
+    RoundSpec,
     Session,
     SessionStatus,
     Role,
     TaskType,
-    risk_gt,
 )
 from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegistry
-from .roles import build_council, plan_rounds
+from .roles import build_council
 from .rounds import (
     _GOVERNANCE_CONTEXT,
     _output_contract,
@@ -576,6 +576,145 @@ def _resolve_skill_requests(
     return call(member, followup)
 
 
+def _panel_one(
+    session: Session, member: CouncilMember, prompt: str,
+    call: AgentCall, store: LogStore,
+) -> Optional[Contribution]:
+    """One panel seat's contribution, fan-out-safe: a failing seat is dropped
+    for the round (logged, noted), never fatal. A panel seat asking the human a
+    question is also treated as a drop — pausing mid-fan-out with sibling
+    threads in flight is not sound; only the lead's calls may pause the run."""
+    try:
+        return call(member, prompt)
+    except AgentInputRequired:
+        reason = "asked for user input"
+    except (AgentError, BudgetExceeded) as e:
+        reason = str(e)
+    with _SESSION_LOCK:
+        session.unresolved.append(f"panel seat '{member.agent}' dropped this round: {reason}")
+        store.log_event(session.session_id, "panel_seat_dropped",
+                        {"agent": member.agent, "round": session.current_round,
+                         "error": reason[:300]})
+    return None
+
+
+def _pause_for_consent(session: Session, manager: SessionManager, store: LogStore) -> None:
+    """The automatic rotation's one checkpoint: after a block of rounds without
+    DONE, ask the human whether the council should keep going."""
+    n = len(session.rounds)
+    block = config.ROUNDS_PER_CONSENT
+    req = InputRequest(
+        session_id=session.session_id, agent="system", role=Role.coordinator,
+        round=session.current_round, purpose="continue_rounds", resume_token="",
+        question=(
+            f"The council has deliberated {n} rounds without declaring the task done.\n"
+            f"Round summaries:\n{rounds.round_summaries(session)}\n"
+            f"Continue for another {block} rounds? Reply 'yes', a number of extra "
+            "rounds, or 'no' to compose the final answer from the work so far."
+        ),
+    )
+    session.input_requests.append(req)
+    session.stop_reason = "waiting for go-ahead on more rounds"
+    store.log_event(session.session_id, "input_requested", req.model_dump())
+    manager.transition(session, SessionStatus.awaiting_input)
+
+
+def _run_panel_rounds(
+    session: Session,
+    manager: SessionManager,
+    council: Council,
+    lead: CouncilMember,
+    call: AgentCall,
+    lead_call: AgentCall,
+    governance: Governance,
+    store: LogStore,
+    role_agents: Optional[dict[Role, str]],
+    established_overview: str,
+    start: float,
+) -> bool:
+    """Drive panel rounds until the lead declares DONE, the human declines more
+    rounds, or budget/wall-time headroom runs out. Returns True when the session
+    paused for round consent (the caller returns immediately). Round count and
+    all carried context derive from persisted state (session.rounds /
+    contributions), so a resumed session continues exactly where it paused."""
+    sid = session.session_id
+    panel = [m for m in council.members if m.role == Role.panelist and m.active]
+    while not session.compose_now:
+        r = len(session.rounds)
+        if r > 0 and r >= config.ROUNDS_PER_CONSENT + session.consent_extra_rounds:
+            _pause_for_consent(session, manager, store)
+            return True
+        remaining = (session.budgets.max_agent_calls - session.agent_calls
+                     - config.COMPOSER_RESERVED_CALLS)
+        if r > 0 and remaining < 2:
+            session.unresolved.append("rounds stopped: agent-call budget headroom exhausted")
+            break
+        if r > 0 and time.monotonic() - start > session.budgets.max_wall_seconds:
+            session.unresolved.append("rounds stopped: wall-time budget reached")
+            break
+        session.current_round = r
+        spec = RoundSpec(
+            round=r,
+            goal=f"panel round {r + 1}: every seat contributes; lead synthesizes",
+            agents=[Role.panelist, Role.lead] if panel else [Role.lead],
+            stop_condition="lead declares ROUND: DONE",
+            output_requirement="synthesis (and ARTIFACT/PROMOTE files when ready)",
+        )
+        session.rounds.append(spec)
+        store.log_event(sid, "round_start", spec.model_dump())
+        readable = _readable_files(session, store.data_dir)
+        # the big up-front context is only worth its tokens once — round 1
+        ov = established_overview if r == 0 else ""
+
+        # (a) FAN-OUT — every panel seat answers in parallel (bounded by the
+        # machine-wide semaphore inside _agent_call); a failing seat is dropped.
+        results: list[Contribution] = []
+        if panel:
+            with ThreadPoolExecutor(
+                max_workers=min(len(panel), config.MAX_PARALLEL_AGENTS),
+                thread_name_prefix="panel",
+            ) as ex:
+                futures = [
+                    ex.submit(_panel_one, session, m,
+                              rounds.panel_prompt(session, m, r, ov, readable),
+                              call, store)
+                    for m in panel
+                ]
+                results = [f.result() for f in futures]
+            results = [c for c in results if c]
+
+        # (b) SYNTHESIS — the lead does the real work; CONSULT/DELEGATE and
+        # SKILL requests remain available inside every round.
+        governance.check(session, "generate_text")
+        p = rounds.synthesis_prompt(session, council, role_agents, r, results, ov, readable)
+        c = lead_call(lead, p)
+        c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
+        c = _resolve_delegations(session, council, lead, p, c, call, store)
+        decision, why = rounds.parse_round_decision(c.content)
+        store.log_event(sid, "round_synthesized",
+                        {"round": r, "decision": decision, "why": why[:200]})
+        if decision == "DONE":
+            break
+    session.stop_reason = "council produced a result"
+    return False
+
+
+def resume_deliberation(
+    session: Session,
+    manager: SessionManager,
+    registry: AgentRegistry,
+    governance: Governance,
+    store: LogStore,
+    role_agents: Optional[dict[Role, str]] = None,
+) -> Session:
+    """Re-enter deliberation after a system InputRequest (round consent /
+    promote target) was answered. _deliberate is re-entrant: completed rounds,
+    contributions, and executed actions are all persisted state it skips."""
+    session.stop_reason = None
+    store.log_event(session.session_id, "session_resumed", {"from": "input"})
+    return _deliberate(session, manager, registry, governance, store, role_agents)
+
+
 def run_session(
     session: Session,
     manager: SessionManager,
@@ -586,45 +725,17 @@ def run_session(
 ) -> Session:
     sid = session.session_id
 
-    # 2. Classify
+    # 2. Classify. Classification still reports risk/greenfield (informational,
+    # shown in the UI) but no longer gates the run: work happens freely in the
+    # sandbox/workspace, and the ONE hard gate is the promote approval at
+    # delivery time (where a missing target is also asked for — see
+    # _execute_actions). No pre-run pauses.
     cls = classify(session.task.text, role_agents)
     session.classification = cls
     if not session.budgets_locked:
         session.budgets = config.budgets_for(cls.complexity)
     store.log_event(sid, "classified", cls.model_dump())
     manager.transition(session, SessionStatus.classified)
-
-    # 7 (pre-round gate): high-risk tasks pause for the human before anything runs
-    if cls.human_approval_required:
-        governance.request_approval(
-            session,
-            action=f"begin execution of task: {session.task.text[:120]}",
-            category="external",
-            risk=cls.risk,
-        )
-        session.risk_exceeds_boundary = risk_gt(cls.risk, config.RISK_BOUNDARY)
-        session.stop_reason = "human approval needed"
-        manager.transition(session, SessionStatus.awaiting_approval)
-        return session
-
-    # Greenfield gate: a build that creates something NEW, with no established
-    # folder referenced, needs a destination — ASK rather than assume one.
-    if cls.greenfield and not session.established_root and not session.established_asked:
-        req = InputRequest(
-            session_id=sid, agent="system", role=Role.coordinator,
-            purpose="establish_target", resume_token="",
-            question=(
-                "This is a greenfield build, but you didn't reference a target folder. "
-                "Where should the finished files go? Reply with a folder path to deliver "
-                "there (you'll approve each file), or reply 'workspace' to keep them in "
-                "the council's workspace/sandbox without delivering anywhere."
-            ),
-        )
-        session.input_requests.append(req)
-        session.stop_reason = "needs a build target"
-        store.log_event(sid, "input_requested", req.model_dump())
-        manager.transition(session, SessionStatus.awaiting_input)
-        return session
 
     return _deliberate(session, manager, registry, governance, store, role_agents)
 
@@ -667,13 +778,10 @@ def _deliberate(
     if session.council.members:
         council = session.council
     else:
-        council = build_council(cls, role_agents)
+        council = build_council(cls, role_agents, panel=session.panel)
         session.council = council
         store.log_event(sid, "council_formed", council.model_dump())
 
-    # 4. A single nominal round: the lead drives. Kept so timeline/budgets have an
-    # anchor. On resume (proposals already collected) we skip straight to execution.
-    plan = plan_rounds(cls, council, session.budgets)
     manager.transition(session, SessionStatus.deliberating)
 
     start = time.monotonic()
@@ -705,20 +813,15 @@ def _deliberate(
 
     lead = council.get(Role.lead)
     try:
-        # 5. The lead drives the task directly; it pulls in talents only on demand.
-        if not _has_proposals(session) and lead and lead.active:
-            spec = plan[0]
-            session.current_round = spec.round
-            if not session.rounds:
-                session.rounds.append(spec)
-                store.log_event(sid, "round_start", spec.model_dump())
-            readable = _readable_files(session, store.data_dir)
-            governance.check(session, "generate_text")
-            p = lead_prompt(session, council, role_agents, established_overview, readable)
-            c = lead_call(lead, p)
-            c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
-            c = _resolve_delegations(session, council, lead, p, c, call, store)
-            session.stop_reason = "lead produced a result"
+        # 5. Panel rounds: every enabled seat contributes in parallel, the lead
+        # synthesizes (pulling in talents on demand) and declares the round DONE
+        # or CONTINUE. After ROUNDS_PER_CONSENT rounds the human is asked before
+        # the council runs another block.
+        if not _has_proposals(session) and lead and lead.active and not session.compose_now:
+            if _run_panel_rounds(session, manager, council, lead, call, lead_call,
+                                 governance, store, role_agents, established_overview,
+                                 start):
+                return session  # paused for round consent
 
             # 7. Mid-flight approval gate (only trips if governance flagged something).
             if session.has_pending_approval:
@@ -788,17 +891,6 @@ def _deliberate(
 
     # 10. Final response
     manager.transition(session, SessionStatus.composing)
-    truth.build_truth_ledger(session)
-    if session.truth_claims:
-        store.log_event(
-            sid,
-            "truth_ledger_built",
-            {
-                "claims": len(session.truth_claims),
-                "established": sum(1 for c in session.truth_claims if c.status == "established"),
-                "disputed": sum(1 for c in session.truth_claims if c.status == "disputed"),
-            },
-        )
     # A task that produced verified file artifacts gets a FAST, deterministic
     # summary built from the lead's own rationale + a real file manifest — no
     # second model call. This both halves latency for builds AND removes a whole
@@ -910,13 +1002,14 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="run_tests", role=Role.implementer,
             filename=cmd or "pytest -q", args={"command": cmd})))
-    # PROMOTE only means anything with an established folder to deliver into.
-    if session.established_root:
-        for m in _PROMOTE_MARKER.finditer(text):
-            fn = m.group("file").strip()
-            found.append((m.start(), ProposedAction(
-                session_id=sid, kind="promote", role=Role.implementer,
-                filename=fn, args={"filename": fn})))
+    # PROMOTE is collected even without an established folder: the missing
+    # delivery target is asked for at execution time (_execute_actions), not
+    # assumed — and never asked up front when there may be nothing to deliver.
+    for m in _PROMOTE_MARKER.finditer(text):
+        fn = m.group("file").strip()
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="promote", role=Role.implementer,
+            filename=fn, args={"filename": fn})))
 
     for _, action in sorted(found, key=lambda t: t[0]):
         session.proposed_actions.append(action)
@@ -1160,6 +1253,35 @@ def _execute_actions(
     approved ones. Returns True when the session must pause for the human.
     Deterministic and resume-safe — re-entered after each approval decision."""
     sid = session.session_id
+    # A promote with no delivery target: ask the human WHERE at delivery time
+    # (never up front — there may have been nothing to deliver). One question,
+    # once; if the human already answered 'workspace', the promotes are skipped.
+    needs_target = [a for a in session.proposed_actions
+                    if a.kind == "promote" and a.status == "proposed"]
+    if needs_target and not session.established_root:
+        if session.established_asked:
+            for a in needs_target:
+                a.status = "denied"
+                a.error = "no delivery target (files kept in the council workspace)"
+                session.unresolved.append(
+                    f"'{a.filename}' not delivered: kept in the council workspace")
+        else:
+            req = InputRequest(
+                session_id=sid, agent="system", role=Role.coordinator,
+                round=session.current_round, purpose="promote_target", resume_token="",
+                question=(
+                    "The council wants to deliver: "
+                    + ", ".join(a.filename for a in needs_target)
+                    + ". Where should these files go? Reply with a folder path "
+                      "(you'll approve each file with a diff), or 'workspace' to "
+                      "keep them in the council's workspace/sandbox."
+                ),
+            )
+            session.input_requests.append(req)
+            session.stop_reason = "needs a delivery target"
+            store.log_event(sid, "input_requested", req.model_dump())
+            manager.transition(session, SessionStatus.awaiting_input)
+            return True
     pending = False
     for action in session.proposed_actions:
         if action.status == "proposed":
