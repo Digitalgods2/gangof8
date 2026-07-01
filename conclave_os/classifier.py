@@ -36,11 +36,16 @@ GREENFIELD_WORDS = [
     "new app", "new project", "from scratch", "starter", "greenfield",
 ]
 # Examining/understanding/recommending — the deliverable is prose analysis,
-# not files. Counts only when no create/modify verb is also present.
+# not files. Counts only when no create/modify verb is also present. Noun and
+# derived forms matter: "give a firm recommendation" must count the same as
+# "recommend" (word-boundary matching won't find 'recommend' inside it).
 ANALYSIS_WORDS = [
     "examine", "understand", "review", "analyze", "analyse", "assess",
     "evaluate", "audit", "recommend", "suggest", "critique", "inspect",
     "explain", "describe",
+    "recommendation", "recommendations", "suggestion", "suggestions",
+    "compare", "comparison", "advice", "opinion", "pros and cons",
+    "trade-offs", "tradeoffs", "evaluation", "assessment",
 ]
 # UNAMBIGUOUS "produce/change files now" verbs. Deliberately excludes vague
 # words (make/add/improve/update/build) that show up in analysis phrasing like

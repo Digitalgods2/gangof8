@@ -294,15 +294,23 @@ def panel_prompt(
     overview = f"{established_overview}\n\n" if established_overview else ""
     ctx = round_context(session, member.agent, round_idx)
     ctx_block = f"{ctx}\n\n" if ctx else ""
+    # only later rounds have a synthesis/peer takes to push back on
+    disagree = (
+        "anything the other seats appear to have missed. Be concrete and commit "
+        "to positions; where you disagree with the synthesis or the peer takes "
+        "below, say so and give evidence. "
+        if ctx else
+        "the pitfalls a first answer typically misses. Be concrete and commit "
+        "to positions. "
+    )
     return (
         f"Task: {session.task.text}\n"
         f"{_PANEL_CONTEXT}"
         f"You are one seat on a multi-model council (round {round_idx + 1}; your "
         f"origin model: {member.agent}). Give YOUR best independent take on the "
         "task: the answer or design as you see it, the strongest objections, and "
-        "anything the other seats appear to have missed. Be concrete and commit "
-        "to positions; where you disagree with the synthesis below, say so and "
-        "give evidence. Do NOT emit ARTIFACT/PROMOTE file blocks — the lead "
+        f"{disagree}"
+        "Do NOT emit ARTIFACT/PROMOTE file blocks — the lead "
         "materializes files; describe what should change instead. Do not ask the "
         "human questions; state assumptions and proceed.\n"
         f"{overview}"

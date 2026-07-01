@@ -57,6 +57,18 @@ def test_greenfield_build_is_led_directly():
     assert all(m.active for m in panelists)
 
 
+def test_recommendation_question_about_an_app_is_not_code():
+    # live-smoke regression: mentioning "FastAPI app" must not turn a pure
+    # recommendation question into a file-producing code task (which then
+    # fails artifact verification and discards the council's real answer)
+    cls = classify(
+        "For a local single-user FastAPI app that stores session logs, is SQLite "
+        "or JSONL the better default? Give a firm recommendation with your key reasons."
+    )
+    assert cls.task_type == TaskType.research
+    assert cls.produces_output is False
+
+
 def test_fastapi_app_with_filenames_is_code():
     cls = classify(
         "Create a simple FastAPI hello-world app with main.py, README.md, "
