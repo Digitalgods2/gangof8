@@ -7,7 +7,9 @@ budgets; exceeding any cap force-stops with a partial answer.
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -52,6 +54,13 @@ def _has_proposals(session: Session) -> bool:
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
+# Guards mutable session state (budget counter, contributions, unresolved,
+# council roster, log writes) so parallel sibling consults can't race. Held only
+# for tiny bookkeeping critical sections — NEVER across an agent call.
+_SESSION_LOCK = threading.Lock()
+# Bounds concurrent agent subprocesses machine-wide (see config.MAX_PARALLEL_AGENTS).
+_AGENT_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_AGENTS)
+
 
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
@@ -65,26 +74,41 @@ def _agent_call(
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
     cap = session.budgets.max_agent_calls - max(0, min(reserve, session.budgets.max_agent_calls - 1))
-    if session.agent_calls >= cap:
-        raise BudgetExceeded(
-            f"max_agent_calls={session.budgets.max_agent_calls} reached"
-            + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
-        )
+    # Reserve a budget slot UP FRONT (under lock) so concurrent fan-out calls can't
+    # slip past a check-then-increment gap and oversubscribe max_agent_calls. The
+    # slot is rolled back if the call fails or pauses, preserving the sequential
+    # semantics ("only a completed call counts").
+    with _SESSION_LOCK:
+        if session.agent_calls >= cap:
+            raise BudgetExceeded(
+                f"max_agent_calls={session.budgets.max_agent_calls} reached"
+                + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
+            )
+        session.agent_calls += 1
     # Per-agent timeout: the gemini CLI needs more headroom than claude/codex.
     if timeout_s is None:
         timeout_s = config.agent_timeout(member.agent)
     # Tag this worker thread with the session so the CLI adapter can register its
-    # subprocess for hard cancellation (kill on request).
+    # subprocess for hard cancellation (kill on request). current_session is
+    # thread-local, so each parallel worker tags itself independently.
     cancellation.set_current_session(session.session_id)
     try:
-        result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
+        # The semaphore bounds how many CLI subprocesses run at once (never held
+        # across the budget lock, so bookkeeping never blocks on a slow call).
+        with _AGENT_SEMAPHORE:
+            result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
+        with _SESSION_LOCK:
+            session.agent_calls -= 1  # paused, not completed — resume re-counts it
+        raise
+    except Exception:
+        with _SESSION_LOCK:
+            session.agent_calls -= 1  # failed — release the reserved slot
         raise
     finally:
         cancellation.set_current_session(None)
-    session.agent_calls += 1
     contribution = Contribution(
         round=session.current_round,
         role=member.role,
@@ -93,13 +117,14 @@ def _agent_call(
         tokens=result.tokens,
         duration_ms=result.duration_ms,
     )
-    session.contributions.append(contribution)
-    store.log_event(
-        session.session_id,
-        "contribution",
-        {"round": contribution.round, "role": member.role.value,
-         "agent": member.agent, "chars": len(result.content)},
-    )
+    with _SESSION_LOCK:
+        session.contributions.append(contribution)
+        store.log_event(
+            session.session_id,
+            "contribution",
+            {"round": contribution.round, "role": member.role.value,
+             "agent": member.agent, "chars": len(result.content)},
+        )
     return contribution
 
 
@@ -551,60 +576,132 @@ def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
     return True, "granted"
 
 
-def delegate_prompt(session: Session, role: Role, kind: str, reason: str) -> str:
-    return (
-        f"Task: {session.task.text}\n"
-        f"The lead has asked you ({role.value}) to {kind} on a focused point.\n"
-        f"Request: {reason}\n"
-        f"{role_instruction(role)}\n"
+def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
+                    *, by: str = "lead", may_subconsult: bool = False) -> str:
+    lines = [
+        f"Task: {session.task.text}",
+        f"The {by} has asked you ({role.value}) to {kind} on a focused point.",
+        f"Request: {reason}",
+        role_instruction(role),
         "Answer ONLY that request — concise, concrete, task-relevant. Do not produce "
-        "final deliverables or restate the whole task.\n"
-        f"Context so far:\n{_recent_context(session, limit=5)}"
-    )
+        "final deliverables or restate the whole task.",
+    ]
+    if may_subconsult:
+        others = ", ".join(r.value for r in config.TALENTS if r != role)
+        lines.append(
+            "If — and ONLY if — exactly one other specialist would materially sharpen "
+            "your answer, you MAY pull in ONE with a single line "
+            "'CONSULT: <talent> - <specific question>' (do not convene a panel; "
+            f"usually just answer). Talents: {others}.")
+    lines.append(f"Context so far:\n{_recent_context(session, limit=5)}")
+    return "\n".join(lines)
+
+
+def _resolve_one_delegation(
+    session: Session, council: Council, requester: CouncilMember, m: "re.Match",
+    call: AgentCall, store: LogStore, depth: int, can_subconsult: bool,
+) -> str:
+    """Resolve ONE CONSULT:/DELEGATE: grant and return its folded result string.
+    Runs on a worker thread when siblings fan out, so every mutation of shared
+    session state is done under _SESSION_LOCK; the agent call and any deeper
+    recursion happen OUTSIDE the lock so real work overlaps."""
+    sid = session.session_id
+    kind = m.group("kind").lower()
+    role = _parse_role(m.group("talent"))
+    reason = " ".join(m.group("reason").strip().split())
+    with _SESSION_LOCK:
+        store.log_event(sid, "delegation_requested",
+                        {"kind": kind, "to": role.value if role else m.group("talent"),
+                         "reason": reason, "depth": depth, "by": requester.role.value})
+    ok, why = _delegation_decision(role)
+    if ok and role == requester.role:
+        ok, why = False, "a seat cannot consult itself"  # no trivial self-loop
+    if not ok or role is None:
+        with _SESSION_LOCK:
+            store.log_event(sid, "delegation_denied",
+                            {"to": m.group("talent"), "reason": reason,
+                             "decision": why, "depth": depth})
+        return f"{kind.upper()} {m.group('talent')}: unavailable - {why}"
+    with _SESSION_LOCK:
+        helper = council.get(role)
+        if helper is None:
+            helper = CouncilMember(role=role, agent=(config.ROLE_AGENTS.get(role) or requester.agent))
+            council.members.append(helper)
+        helper.active = True
+        store.log_event(sid, "delegation_granted",
+                        {"to": role.value, "agent": helper.agent, "kind": kind,
+                         "reason": reason, "depth": depth})
+    try:
+        answer = call(helper, delegate_prompt(
+            session, role, kind, reason,
+            by=requester.role.value, may_subconsult=can_subconsult))
+        piece = answer.content[: config.DELEGATION_RESULT_MAX_CHARS]
+        # The sub-agent tier: let the consulted specialist itself consult one level
+        # deeper. Its (already-capped) sub-results are folded in below the
+        # specialist's own answer, so the requester sees the whole chain.
+        if can_subconsult:
+            sub = _run_delegations(
+                session, council, helper, answer.content, call, store, depth + 1)
+            if sub:
+                piece += "\n\nSub-consultations this seat pulled in:\n" + "\n\n".join(sub)
+        with _SESSION_LOCK:
+            store.log_event(sid, "delegation_resolved",
+                            {"to": role.value, "chars": len(piece), "depth": depth})
+        return f"{kind.upper()} {role.value}@{helper.agent}:\n{piece}"
+    except (AgentError, BudgetExceeded) as e:
+        with _SESSION_LOCK:
+            session.unresolved.append(f"delegation to {role.value} failed: {e}")
+            store.log_event(sid, "delegation_failed",
+                            {"to": role.value, "error": str(e), "depth": depth})
+        return f"{kind.upper()} {role.value}: failed - {e}"
+
+
+def _run_delegations(
+    session: Session, council: Council, requester: CouncilMember, content: str,
+    call: AgentCall, store: LogStore, depth: int,
+) -> list[str]:
+    """Resolve the CONSULT:/DELEGATE: lines in `content` (authored by `requester`),
+    returning one folded result string per grant, in request order.
+
+    Independent siblings (a seat emitting several CONSULT: lines at once) run
+    CONCURRENTLY — each is a blocking CLI call, so this is the real wall-clock win.
+    A single consult (the common case) skips the pool. Every consulted specialist's
+    OWN answer is re-scanned one level deeper (up to config.MAX_DELEGATION_DEPTH) —
+    the primary lead → specialist → sub-agent hierarchy. Concurrency is bounded by
+    _AGENT_SEMAPHORE (subprocess count) and the session agent-call budget; depth by
+    MAX_DELEGATION_DEPTH. Per-level pools keep parents from waiting on children in
+    the same pool, so nested fan-out can't deadlock."""
+    reqs = list(_DELEGATION_MARKER.finditer(content))
+    if not reqs:
+        return []
+    can_subconsult = depth < config.MAX_DELEGATION_DEPTH
+    batch = reqs[: config.MAX_DELEGATIONS]
+
+    def resolve(m: "re.Match") -> str:
+        return _resolve_one_delegation(
+            session, council, requester, m, call, store, depth, can_subconsult)
+
+    if len(batch) == 1:
+        return [resolve(batch[0])]
+    workers = min(len(batch), config.MAX_PARALLEL_AGENTS)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="consult") as ex:
+        futures = [ex.submit(resolve, m) for m in batch]
+        return [f.result() for f in futures]  # order preserved → stable folded output
 
 
 def _resolve_delegations(
     session: Session, council: Council, lead: CouncilMember, prompt: str,
     contribution: Contribution, call: AgentCall, store: LogStore,
 ) -> Contribution:
-    """Handle the lead's CONSULT:/DELEGATE: lines: call each requested talent once
-    (with its own origin model), feed the results back, and re-call the lead ONCE.
-    Bounded by MAX_DELEGATIONS; no recursion in this pass (the re-called lead's
-    output isn't re-scanned for further delegations)."""
-    reqs = list(_DELEGATION_MARKER.finditer(contribution.content))
-    if not reqs:
+    """Handle the lead's CONSULT:/DELEGATE: lines (level 1), letting each consulted
+    specialist itself consult ONE bounded level deeper (the sub-agent tier — see
+    _run_delegations), then re-call the lead ONCE with the folded results. Bounded
+    by MAX_DELEGATIONS per scan, MAX_DELEGATION_DEPTH levels, and the agent-call
+    budget."""
+    results = _run_delegations(session, council, lead, contribution.content,
+                               call, store, depth=1)
+    if not results:
         return contribution
-    sid = session.session_id
-    results: list[str] = []
-    for m in reqs[: config.MAX_DELEGATIONS]:
-        kind = m.group("kind").lower()
-        role = _parse_role(m.group("talent"))
-        reason = " ".join(m.group("reason").strip().split())
-        store.log_event(sid, "delegation_requested",
-                        {"kind": kind, "to": role.value if role else m.group("talent"), "reason": reason})
-        ok, why = _delegation_decision(role)
-        if not ok or role is None:
-            store.log_event(sid, "delegation_denied",
-                            {"to": m.group("talent"), "reason": reason, "decision": why})
-            results.append(f"{kind.upper()} {m.group('talent')}: unavailable - {why}")
-            continue
-        helper = council.get(role)
-        if helper is None:
-            helper = CouncilMember(role=role, agent=(config.ROLE_AGENTS.get(role) or lead.agent))
-            council.members.append(helper)
-        helper.active = True
-        store.log_event(sid, "delegation_granted",
-                        {"to": role.value, "agent": helper.agent, "kind": kind, "reason": reason})
-        try:
-            answer = call(helper, delegate_prompt(session, role, kind, reason))
-            results.append(
-                f"{kind.upper()} {role.value}@{helper.agent}:\n"
-                f"{answer.content[: config.DELEGATION_RESULT_MAX_CHARS]}")
-            store.log_event(sid, "delegation_resolved", {"to": role.value, "chars": len(answer.content)})
-        except (AgentError, BudgetExceeded) as e:
-            session.unresolved.append(f"delegation to {role.value} failed: {e}")
-            store.log_event(sid, "delegation_failed", {"to": role.value, "error": str(e)})
-            results.append(f"{kind.upper()} {role.value}: failed - {e}")
     followup = (
         f"{prompt}\n\nResults from the talents you pulled in (use these; finish the "
         "task now — do not request the same help again):\n" + "\n\n".join(results)

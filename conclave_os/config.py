@@ -46,6 +46,18 @@ MAX_REFINE_ITERATIONS = 6
 # big-file generation — there is no fixed round plan or critic-acceptance loop.
 MAX_DELEGATIONS = 4               # how many specialists the lead may pull in per run
 DELEGATION_RESULT_MAX_CHARS = 2500  # how much of a specialist's reply is fed back
+# How deep delegation may recurse: 1 = lead → specialist only; 2 = a consulted
+# specialist may itself CONSULT ONE sub-agent (the "primary LLM → agents →
+# sub-agents" hierarchy). Kept tiny on purpose — the real hierarchy is two levels,
+# not an org chart. Depth is a hard stop against runaway recursion; the session
+# agent-call budget (max_agent_calls, composer reserve) is the second backstop.
+MAX_DELEGATION_DEPTH = 2
+# Independent sibling consults (a seat emitting several CONSULT: lines at once) run
+# concurrently — each is a blocking CLI call, so this is the real wall-clock win.
+# This caps how many agent subprocesses run at once MACHINE-WIDE (the CLIs are
+# heavy local processes; unbounded fan-out would thrash the host). The budget lock
+# keeps max_agent_calls exact under this concurrency.
+MAX_PARALLEL_AGENTS = int(os.environ.get("CONCLAVE_OS_MAX_PARALLEL_AGENTS", "4"))
 # A large single-file artifact can exceed one model response. When a written file
 # looks cut off (e.g. HTML missing </html>), the lead is asked to CONTINUE it from
 # where it stopped — appending, never re-drafting. Bound how many continuations.
@@ -168,8 +180,13 @@ AGENT_TIMEOUT_DEFAULT = 120
 # gemini headless either answers reasonably fast or hangs; a long timeout just
 # makes a hang painful (you wait the whole time for nothing). Keep it short so a
 # stall surfaces quickly and the seat-drop / composer fallback can take over.
+# codex, by contrast, does genuine work per call (e.g. live web research in the
+# researcher seat, deep review as critic/fact_validator) that legitimately runs
+# past the 120s default — its invocation is non-interactive and doesn't hang, so
+# the extra time is real reasoning, not a stall. Give it real headroom.
 AGENT_TIMEOUTS: dict[str, int] = {
     "gemini": 150,
+    "codex": 300,
 }
 
 

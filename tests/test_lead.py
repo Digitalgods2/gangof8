@@ -166,6 +166,67 @@ def test_lead_delegates_then_finishes(tmp_path):
                for a in session.proposed_actions)
 
 
+# --- sub-agent tier: a consulted specialist consults one level deeper ---------
+
+
+class NestedDelegatingLead:
+    """lead → architect (L1) → code_generator (L2). code_generator ALSO emits a
+    CONSULT to red_team, which MUST be ignored (depth cap = 2)."""
+
+    name = "mock"
+
+    def __init__(self):
+        self._inner = MockAdapter()
+        self.lead_calls = 0
+        self.architect_calls = 0
+        self.codegen_calls = 0
+        self.redteam_calls = 0
+
+    def call(self, role, prompt, timeout_s, images=None):
+        if role == Role.lead:
+            self.lead_calls += 1
+            if "Results from the talents" in prompt:
+                return AdapterResult(content="ARTIFACT: out.txt\nfinal answer\n", duration_ms=1)
+            return AdapterResult(
+                content="CONSULT: architect - design the storage module", duration_ms=1)
+        if role == Role.architect:
+            self.architect_calls += 1
+            return AdapterResult(
+                content="Design: layered.\nCONSULT: code_generator - implement the core fn",
+                duration_ms=1)
+        if role == Role.code_generator:
+            self.codegen_calls += 1
+            # This deeper CONSULT must NOT be honored — we are at the depth cap.
+            return AdapterResult(
+                content="Impl done in Python.\nCONSULT: red_team - probe for abuse",
+                duration_ms=1)
+        if role == Role.red_team:
+            self.redteam_calls += 1
+            return AdapterResult(content="should never run", duration_ms=1)
+        return self._inner.call(role, prompt, timeout_s)
+
+
+def test_specialist_consults_subagent_bounded_by_depth(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path)
+    adapter = NestedDelegatingLead()
+    svc.registry.register(adapter)
+
+    session = svc.run(
+        "Write a short report comparing two storage options and recommend the "
+        "best approach for our small team.",
+        source="test",
+    )
+
+    assert session.status == SessionStatus.done
+    assert adapter.lead_calls == 2, "lead re-called once after its consult resolves"
+    assert adapter.architect_calls == 1, "level-1 specialist pulled in once"
+    assert adapter.codegen_calls == 1, "the sub-agent tier fired (architect → code_generator)"
+    assert adapter.redteam_calls == 0, "depth cap blocks a third level (code_generator → red_team)"
+    # the sub-agent's answer is folded up so the lead can use it
+    assert any(c.role == Role.code_generator and "Impl done" in c.content
+               for c in session.contributions)
+
+
 # --- truncation: finish a cut-off file, don't re-draft -----------------------
 
 
