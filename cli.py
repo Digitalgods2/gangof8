@@ -39,6 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     p_approve.add_argument("session_id")
     p_approve.add_argument("approval_id")
     p_approve.add_argument("--by", default="user")
+    p_approve.add_argument(
+        "--all", action="store_true", dest="approve_all",
+        help="also grant a session-wide standing approval for this category "
+             "(e.g. every promote in this session)")
 
     p_deny = sub.add_parser("deny", help="deny a pending approval (cancels the session)")
     p_deny.add_argument("session_id")
@@ -145,7 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("approve", "deny"):
         approved = args.command == "approve"
         try:
-            session = service.approve(args.session_id, args.approval_id, approved, by=args.by)
+            session = service.approve(
+                args.session_id, args.approval_id, approved, by=args.by,
+                approve_all=getattr(args, "approve_all", False))
         except (KeyError, ValueError) as e:
             print(str(e), file=sys.stderr)
             return 1

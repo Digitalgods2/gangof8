@@ -265,6 +265,51 @@ def test_risky_task_still_gates_on_promote(tmp_path):
     assert (est / "report.md").exists()
 
 
+MULTI_PROMOTE_DRAFT = (
+    "ARTIFACT: a.md\nbody A\n"
+    "ARTIFACT: b.md\nbody B\n"
+    "ARTIFACT: c.md\nbody C\n"
+    "PROMOTE: a.md\nPROMOTE: b.md\nPROMOTE: c.md\n"
+)
+
+
+@pytest.fixture()
+def multi_promote_service(tmp_path):
+    est = tmp_path / "established"
+    est.mkdir()
+    svc = _EstablishedService(data_dir=tmp_path / "data")
+    svc.established_root = str(est)
+    svc.registry.register(ArtifactAdapter(draft=MULTI_PROMOTE_DRAFT))
+    return svc, est
+
+
+def test_approve_all_clears_every_promote_with_one_decision(multi_promote_service):
+    svc, est = multi_promote_service
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.awaiting_approval
+    pending = [a for a in session.approvals if a.status == "pending"]
+    assert len(pending) == 3, "one gate per file today"
+    done = svc.approve(session.session_id, pending[0].approval_id,
+                       approved=True, approve_all=True)
+    assert done.status == SessionStatus.done
+    assert "promote" in done.standing_approvals
+    promotes = [a for a in done.proposed_actions if a.kind == "promote"]
+    assert all(a.status == "executed" for a in promotes)
+    for name in ("a.md", "b.md", "c.md"):
+        assert (est / name).exists()
+    assert not [a for a in done.approvals if a.status == "pending"]
+
+
+def test_without_approve_all_each_promote_still_gates(multi_promote_service):
+    svc, est = multi_promote_service
+    session = svc.run(TASK, source="test")
+    pending = [a for a in session.approvals if a.status == "pending"]
+    still = svc.approve(session.session_id, pending[0].approval_id, approved=True)
+    assert still.status == SessionStatus.awaiting_approval, "two gates remain"
+    assert still.standing_approvals == []
+    assert len([a for a in still.approvals if a.status == "pending"]) == 2
+
+
 # --- multi-file artifacts: all free, no approval ------------------------------
 
 MULTI_DRAFT = (

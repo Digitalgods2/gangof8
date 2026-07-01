@@ -235,7 +235,7 @@ def test_budget_exact_under_panel_contention(tmp_path):
     svc = ConclaveService(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
     for name in ("alpha", "beta", "gamma"):
         svc.registry.register(ProbeSeat(name, shared))
-    budgets = Budgets(max_rounds=4, max_turns_per_round=1, max_agent_calls=2, max_wall_seconds=60)
+    budgets = Budgets(max_agent_calls=2, max_wall_seconds=60)
     session = svc.run(TASK, source="test", budgets=budgets)
     assert session.status == SessionStatus.done, "budget exhaustion degrades, never crashes"
     assert session.agent_calls <= budgets.max_agent_calls
@@ -596,6 +596,65 @@ def test_cli_panel_appends_enabled_keyed_openrouter_seats(tmp_path, monkeypatch)
     svc.settings.openrouter_enabled = {"deepseek": True, "glm": False}
     svc._apply_settings(backend="cli")
     assert svc.panel == ["claude", "codex", "deepseek"]
+
+
+# --- delegated RESULT block survives folding ----------------------------------------
+
+
+def test_split_result_block():
+    pre, block = rounds.split_result_block("long analysis...\nRESULT:\nfinding: X\nconfidence: high")
+    assert pre == "long analysis...\n"
+    assert block.startswith("RESULT:")
+    assert rounds.split_result_block("no block here") == ("no block here", "")
+
+
+def test_delegated_result_block_survives_truncation(tmp_path):
+    """The conclusion used to be exactly what end-truncation cut off. A reply
+    whose preamble alone exceeds the cap keeps its RESULT: block whole."""
+    long_reply = ("preamble waffle. " * 300  # ~5100 chars, well past the 2500 cap
+                  + "\nRESULT:\nfinding: SQLite wins decisively.\n"
+                    "artifacts: none\nconfidence: high")
+
+    class ConsultingLead:
+        name = "mock"
+
+        def __init__(self):
+            self.asked = False
+            self.followup = None
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s, images=None):
+            if role == Role.architect:
+                return AdapterResult(content=long_reply, duration_ms=1)
+            if role == Role.lead:
+                if not self.asked:
+                    self.asked = True
+                    return AdapterResult(content="CONSULT: architect - which store?", duration_ms=1)
+                self.followup = prompt
+                return AdapterResult(content="Done.\nROUND: DONE", duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    lead = ConsultingLead()
+    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc.registry.register(lead)
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert lead.followup is not None
+    assert "finding: SQLite wins decisively." in lead.followup, "conclusion survived"
+    assert "confidence: high" in lead.followup
+    # and the delegate was told about the contract
+    assert config.DELEGATION_RESULT_MAX_CHARS >= len(
+        "RESULT:\nfinding: SQLite wins decisively.\nartifacts: none\nconfidence: high")
+
+
+def test_delegation_shape_scales_with_complexity():
+    from conclave_os.config import budgets_for
+    from conclave_os.models import Complexity
+
+    assert budgets_for(Complexity.trivial).max_delegation_depth == 1
+    assert budgets_for(Complexity.standard).max_delegation_depth == 2
+    assert budgets_for(Complexity.complex).max_delegation_depth == 3
+    assert budgets_for(Complexity.complex).max_delegations == 6
 
 
 # --- disk back-compat --------------------------------------------------------------

@@ -79,6 +79,8 @@ _TIMELINE = {
     "action_failed": ("❌", "Action failed"),
     "approval_requested": ("⏸️", "Approval requested"),
     "approval_resolved": ("👍", "Approval resolved"),
+    "standing_approval_granted": ("🔓", "Standing approval granted"),
+    "standing_approval_used": ("🔓", "Standing approval used"),
     "paused_for_approval": ("⏸️", "Paused for approval"),
     "input_requested": ("❓", "Question to you"),
     "input_answered": ("💡", "You answered"),

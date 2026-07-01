@@ -1,5 +1,8 @@
-"""Quick session inspector: python inspect_session.py <session_id>"""
+"""Quick session inspector: python scripts/inspect_session.py <session_id>"""
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from conclave_os.service import ConclaveService
 

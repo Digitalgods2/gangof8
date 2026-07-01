@@ -269,10 +269,8 @@ files are produced via `ARTIFACT:` + approval.
 
 ## Utilities
 
-- `inspect_session.py <sid>` — round/contribution/disagreement overview
-- `show_contribution.py <sid> <role>` — full text of a role's contributions
-- `demo_phase4.py` — offline propose → approve → execute walkthrough
-- `patch_backend.py <sid> <backend>` — backfill the backend field on old sessions
+- `scripts/inspect_session.py <sid>` — round/contribution overview
+- `scripts/show_contribution.py <sid> <role>` — full text of a role's contributions
 
 ## Status
 

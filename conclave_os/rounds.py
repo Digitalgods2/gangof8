@@ -313,6 +313,32 @@ def parse_round_decision(text: str) -> tuple[str, str]:
     return m.group("decision").upper(), (m.group("why") or "").strip()
 
 
+# A delegated specialist ends its reply with a RESULT: block — the part
+# guaranteed to survive folding. Blind head-truncation used to cut a reply from
+# the END, which is exactly where a well-written answer puts its conclusion.
+_RESULT_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?RESULT(?:\*\*)?[ \t]*:", re.IGNORECASE | re.MULTILINE)
+
+RESULT_CONTRACT = (
+    "Finish your reply with this block — it is the ONLY part guaranteed to "
+    "survive truncation when your answer is folded back to the requester:\n"
+    "RESULT:\n"
+    "finding: <your answer, 3-6 sentences>\n"
+    "artifacts: <sandbox filenames you produced, or none>\n"
+    "confidence: high|medium|low"
+)
+
+
+def split_result_block(text: str) -> tuple[str, str]:
+    """(preamble, result_block): the block runs from the LAST 'RESULT:' line to
+    the end; result_block is '' when the reply didn't use the contract."""
+    matches = list(_RESULT_MARKER.finditer(text or ""))
+    if not matches:
+        return (text or "", "")
+    m = matches[-1]
+    return text[: m.start()], text[m.start():]
+
+
 def strip_round_marker(text: str) -> str:
     """The ROUND: DONE/CONTINUE line is loop control, not content — remove it
     when the synthesis text is used verbatim (e.g. as the final answer)."""

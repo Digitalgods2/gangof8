@@ -403,6 +403,7 @@ def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
             "your answer, you MAY pull in ONE with a single line "
             "'CONSULT: <talent> - <specific question>' (do not convene a panel; "
             f"usually just answer). Talents: {others}.")
+    lines.append(rounds.RESULT_CONTRACT)
     lines.append(f"Context so far:\n{_recent_context(session, limit=5)}")
     return "\n".join(lines)
 
@@ -445,7 +446,17 @@ def _resolve_one_delegation(
         answer = call(helper, delegate_prompt(
             session, role, kind, reason,
             by=requester.role.value, may_subconsult=can_subconsult))
-        piece = answer.content[: config.DELEGATION_RESULT_MAX_CHARS]
+        # Fold the reply back with the CONCLUSION intact: the RESULT: block is
+        # kept whole and the preamble absorbs the truncation. A reply without
+        # the block falls back to plain head-truncation.
+        cap = config.DELEGATION_RESULT_MAX_CHARS
+        preamble, result_block = rounds.split_result_block(answer.content)
+        if result_block:
+            result_block = result_block[:cap]  # a runaway block is still bounded
+            head = preamble.strip()[: max(0, cap - len(result_block))].rstrip()
+            piece = f"{head}\n\n{result_block}" if head else result_block
+        else:
+            piece = answer.content[:cap]
         # The sub-agent tier: let the consulted specialist itself consult one level
         # deeper. Its (already-capped) sub-results are folded in below the
         # specialist's own answer, so the requester sees the whole chain.
@@ -476,16 +487,17 @@ def _run_delegations(
     Independent siblings (a seat emitting several CONSULT: lines at once) run
     CONCURRENTLY — each is a blocking CLI call, so this is the real wall-clock win.
     A single consult (the common case) skips the pool. Every consulted specialist's
-    OWN answer is re-scanned one level deeper (up to config.MAX_DELEGATION_DEPTH) —
-    the primary lead → specialist → sub-agent hierarchy. Concurrency is bounded by
-    _AGENT_SEMAPHORE (subprocess count) and the session agent-call budget; depth by
-    MAX_DELEGATION_DEPTH. Per-level pools keep parents from waiting on children in
-    the same pool, so nested fan-out can't deadlock."""
+    OWN answer is re-scanned one level deeper (up to budgets.max_delegation_depth,
+    scaled by task complexity) — the primary lead → specialist → sub-agent
+    hierarchy. Concurrency is bounded by _AGENT_SEMAPHORE (subprocess count) and
+    the session agent-call budget; fan-out by budgets.max_delegations per scan.
+    Per-level pools keep parents from waiting on children in the same pool, so
+    nested fan-out can't deadlock."""
     reqs = list(_DELEGATION_MARKER.finditer(content))
     if not reqs:
         return []
-    can_subconsult = depth < config.MAX_DELEGATION_DEPTH
-    batch = reqs[: config.MAX_DELEGATIONS]
+    can_subconsult = depth < session.budgets.max_delegation_depth
+    batch = reqs[: session.budgets.max_delegations]
 
     def resolve(m: "re.Match") -> str:
         return _resolve_one_delegation(
@@ -506,8 +518,8 @@ def _resolve_delegations(
     """Handle the lead's CONSULT:/DELEGATE: lines (level 1), letting each consulted
     specialist itself consult ONE bounded level deeper (the sub-agent tier — see
     _run_delegations), then re-call the lead ONCE with the folded results. Bounded
-    by MAX_DELEGATIONS per scan, MAX_DELEGATION_DEPTH levels, and the agent-call
-    budget."""
+    by budgets.max_delegations per scan, budgets.max_delegation_depth levels, and
+    the agent-call budget."""
     results = _run_delegations(session, council, lead, contribution.content,
                                call, store, depth=1)
     if not results:
