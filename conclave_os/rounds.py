@@ -250,6 +250,34 @@ _ROUND_MARKER = re.compile(
 )
 
 
+# First-person future intent — the signature of a reply that defers the work
+# ("I'll read the core source files ... then deliver the recommendation set").
+_DEFERRAL_RE = re.compile(
+    r"\b(?:I(?:'|’| wi)ll|let me|I am going to|I'm going to|going to start)\b",
+    re.IGNORECASE,
+)
+# Any contract marker line — a reply carrying one of these IS doing the work
+# (or legitimately requesting it), regardless of length.
+_ANY_MARKER_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?"
+    r"(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE|CONSULT|DELEGATE|SKILL|ROUND)"
+    r"(?:\*\*)?\s*[:—–-]",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def synthesis_is_stub(content: str) -> bool:
+    """True when a lead reply merely announces future work instead of doing it:
+    short, no contract markers, first-person deferral phrasing. A genuinely
+    short direct answer (no deferral phrasing) is NOT a stub."""
+    text = (content or "").strip()
+    if len(text) >= config.SYNTHESIS_STUB_CHARS:
+        return False
+    if _ANY_MARKER_RE.search(text):
+        return False
+    return bool(_DEFERRAL_RE.search(text))
+
+
 def parse_round_decision(text: str) -> tuple[str, str]:
     """The lead's round verdict. No marker ⇒ DONE, so a marker-ignoring model
     degrades to a single-pass run — never a runaway loop. The LAST marker wins

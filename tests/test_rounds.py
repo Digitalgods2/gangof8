@@ -275,6 +275,131 @@ def test_consult_still_available_inside_a_round(tmp_path):
     assert len(session.rounds) == 1, "delegation happens inside the round, not as a new round"
 
 
+# --- stub synthesis: announcing the work is not doing it --------------------------
+
+
+LIVE_STUB = (
+    "I'll read the core source files directly to ground my analysis, "
+    "then deliver the recommendation set."
+)
+
+
+def test_stub_detection_matches_the_live_failure():
+    assert rounds.synthesis_is_stub(LIVE_STUB) is True
+
+
+def test_short_direct_answer_is_not_a_stub():
+    # the mock lead's legitimate short answer has no deferral phrasing
+    from conclave_os.adapters.mock import LEAD_ANSWER
+
+    assert rounds.synthesis_is_stub(LEAD_ANSWER) is False
+    assert rounds.synthesis_is_stub("SQLite. It is the safer default.") is False
+
+
+def test_marker_lines_are_never_stubs():
+    assert rounds.synthesis_is_stub("I'll consult a specialist first.\nCONSULT: architect - layout?") is False
+    assert rounds.synthesis_is_stub("Let me check the file.\nSKILL: read_file main.py") is False
+    assert rounds.synthesis_is_stub("I'll wrap up here.\nROUND: DONE") is False
+
+
+def test_long_reply_is_not_a_stub():
+    assert rounds.synthesis_is_stub("I'll now explain in detail. " + "Substance. " * 60) is False
+
+
+class StubbingLead:
+    """Lead answers with an announcement first; delivers only when re-asked
+    (nudged) — reproduces the live cli-backend failure."""
+
+    name = "mock"
+
+    def __init__(self, stubs: int = 1):
+        self.stubs = stubs
+        self._inner = MockAdapter()
+
+    def call(self, role, prompt, timeout_s, images=None):
+        if role == Role.lead:
+            if self.stubs > 0:
+                self.stubs -= 1
+                return AdapterResult(content=LIVE_STUB, duration_ms=1)
+            return AdapterResult(
+                content="Full grounded recommendation set: use X, refactor Y, delete Z.\nROUND: DONE",
+                duration_ms=1)
+        return self._inner.call(role, prompt, timeout_s)
+
+
+def test_stub_lead_is_recalled_once_and_delivers(tmp_path):
+    svc = _svc(tmp_path, StubbingLead(stubs=1))
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert "synthesis_stub_retry" in _events(svc, session)
+    leads = [c for c in session.contributions if c.role == Role.lead]
+    assert len(leads) == 2, "the stub triggered exactly one re-call"
+    assert "recommendation set" in leads[-1].content
+    assert len(session.rounds) == 1
+    assert not any("stub twice" in u for u in session.unresolved)
+
+
+def test_double_stub_degrades_to_composer(tmp_path):
+    svc = _svc(tmp_path, StubbingLead(stubs=99))
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert session.final is not None and session.final.answer
+    assert any("stub twice" in u for u in session.unresolved)
+    # only one retry was spent — no runaway re-calling
+    assert _events(svc, session).count("synthesis_stub_retry") == 1
+
+
+# --- task-aware skill-request cap --------------------------------------------------
+
+
+def test_analysis_tasks_get_a_higher_skill_cap(tmp_path):
+    from conclave_os import loop
+    from conclave_os.classifier import classify
+    from conclave_os.logstore import LogStore
+    from conclave_os.sessions import SessionManager
+
+    store = LogStore(tmp_path)
+    s = SessionManager(store).create("t", source="test")
+    s.classification = classify("examine this app and recommend improvements")
+    assert s.classification.task_type.value == "research"
+    assert loop._skill_request_cap(s) == config.MAX_SKILL_REQUESTS_ANALYSIS
+
+    s.classification = classify("implement a parser module in parser.py")
+    assert s.classification.task_type.value == "code"
+    assert loop._skill_request_cap(s) == config.MAX_SKILL_REQUESTS_PER_TURN
+
+
+def test_research_lead_gets_more_than_two_skill_results(tmp_path):
+    """The live starvation: an examine-task lead asked for many reads and got 2.
+    On an analysis task, more than two SKILL: lines now resolve in one turn."""
+
+    class HungryLead:
+        name = "mock"
+
+        def __init__(self):
+            self.followup_prompt = None
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s, images=None):
+            if role == Role.lead:
+                if "Skill results" in prompt:
+                    self.followup_prompt = prompt
+                    return AdapterResult(content="Analysis done.\nROUND: DONE", duration_ms=1)
+                return AdapterResult(
+                    content=("SKILL: bogus_one x\nSKILL: bogus_two y\nSKILL: bogus_three z\n"
+                             "SKILL: bogus_four w\n"),
+                    duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    lead = HungryLead()
+    svc = _svc(tmp_path, lead, panel=[])
+    session = svc.run("examine the project and recommend improvements to its design", source="test")
+    assert session.status == SessionStatus.done
+    assert lead.followup_prompt is not None
+    # all four unknown-skill results were fed back (old cap stopped at two)
+    assert lead.followup_prompt.count("unknown skill") == 4
+
+
 # --- panel derivation & degradation ----------------------------------------------
 
 

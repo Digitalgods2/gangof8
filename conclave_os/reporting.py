@@ -51,6 +51,7 @@ _TIMELINE = {
     "round_start": ("🔄", "Round started"),
     "round_synthesized": ("🧩", "Round synthesized"),
     "panel_seat_dropped": ("⚠️", "Panel seat dropped"),
+    "synthesis_stub_retry": ("✏️", "Lead re-asked (stub reply)"),
     "contribution": ("💬", "Agent contributed"),
     "skill_requested": ("🔧", "Skill requested"),
     "skill_resolved": ("📄", "Skill result"),
