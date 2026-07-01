@@ -168,6 +168,12 @@ ROUND_SUMMARY_CHARS = 300        # per-round digest shown in the consent questio
 # demanding the work now; a second stub degrades to composing from the panel
 # views (the composer rescue path proven in that same run).
 SYNTHESIS_STUB_CHARS = 250
+# For a pure-answer task, a lead synthesis at least this substantial IS the
+# final answer — it already weighed every panel view, and re-compressing it
+# through the summarizer costs a call and loses content (live run: a 5.9KB
+# synthesis shrank to 2.7KB, dropping whole sections). Thin or CONTINUE
+# syntheses still get real composition.
+SYNTHESIS_FINAL_MIN_CHARS = 1500
 
 # Retained for settings back-compat; classification still reports risk but it
 # is informational — the loop no longer pauses on it. The one hard gate is the
@@ -257,6 +263,10 @@ COMPOSER_CONTEXT_CHARS = 1400
 MAX_SKILL_REQUESTS_PER_TURN = 2
 MAX_SKILL_REQUESTS_ANALYSIS = 6
 SKILL_RESULT_MAX_CHARS = 2000
+# Analysis tasks also get DEEPER reads: 2000 chars of a 75KB file is ~3%, and a
+# live run showed the lead reasoning to a wrong conclusion from exactly that
+# truncation (it "read" a test file whose decisive test sat past the cap).
+SKILL_RESULT_ANALYSIS_MAX_CHARS = 8000
 MAX_ESCALATION_REQUESTS_PER_TURN = 2
 ESCALATION_RESULT_MAX_CHARS = 2500
 

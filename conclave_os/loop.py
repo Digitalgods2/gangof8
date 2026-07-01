@@ -519,13 +519,24 @@ def _resolve_delegations(
     return call(lead, followup)
 
 
+def _is_analysis_task(session: Session) -> bool:
+    cls = session.classification
+    return bool(cls and cls.task_type in (TaskType.research, TaskType.question, TaskType.design))
+
+
 def _skill_request_cap(session: Session) -> int:
     """How many SKILL: requests one turn may resolve. Analysis tasks get more —
     reading the material is the job; output tasks keep the tight bound."""
-    cls = session.classification
-    if cls and cls.task_type in (TaskType.research, TaskType.question, TaskType.design):
-        return config.MAX_SKILL_REQUESTS_ANALYSIS
-    return config.MAX_SKILL_REQUESTS_PER_TURN
+    return config.MAX_SKILL_REQUESTS_ANALYSIS if _is_analysis_task(session) \
+        else config.MAX_SKILL_REQUESTS_PER_TURN
+
+
+def _skill_result_cap(session: Session) -> int:
+    """How much of each skill result is fed back. Analysis tasks get deeper
+    reads — a 2000-char window on a large source file is a truncation the
+    agent can't see, and it reasons wrongly from the fragment."""
+    return config.SKILL_RESULT_ANALYSIS_MAX_CHARS if _is_analysis_task(session) \
+        else config.SKILL_RESULT_MAX_CHARS
 
 
 def _resolve_skill_requests(
@@ -572,7 +583,7 @@ def _resolve_skill_requests(
             action.status = "executed"
             session.tools_called.append(name)
             store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
-            results.append(f"SKILL {name} '{arg}' result:\n{out[: config.SKILL_RESULT_MAX_CHARS]}")
+            results.append(f"SKILL {name} '{arg}' result:\n{out[: _skill_result_cap(session)]}")
         except ExecutionError as e:
             action.status = "failed"
             action.error = str(e)
@@ -583,6 +594,30 @@ def _resolve_skill_requests(
         + "\n\n".join(results)
     )
     return call(member, followup)
+
+
+def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
+    """The lead's final synthesis as the FinalAnswer, when it can stand as one:
+    substantial, not a stub, and declared DONE (a CONTINUE synthesis is
+    explicitly unfinished — e.g. the human answered 'no' at the consent gate —
+    so the summarizer aggregates instead). Confidence is high only when panel
+    seats actually contributed to what the lead weighed."""
+    synth = next((c for c in reversed(session.contributions) if c.role == Role.lead), None)
+    if synth is None:
+        return None
+    decision, _ = rounds.parse_round_decision(synth.content)
+    if decision != "DONE":
+        return None
+    text = rounds.strip_round_marker(synth.content)
+    if len(text) < config.SYNTHESIS_FINAL_MIN_CHARS or rounds.reply_is_stub(text):
+        return None
+    had_panel = any(c.role == Role.panelist for c in session.contributions)
+    return FinalAnswer(
+        answer=text,
+        confidence="high" if had_panel else "medium",
+        assumptions=[],
+        risks_unresolved=list(session.unresolved),
+    )
 
 
 def _panel_one(
@@ -955,10 +990,17 @@ def _deliberate(
         session.final = _build_summary_final(session, delivered)
         store.log_event(sid, "build_summary", {"files": [a.filename for a in delivered]})
     else:
-        try:
-            session.final = compose(session, council, compose_call)
-        except AgentInputRequired as e:
-            return _pause_for_input(session, manager, store, e, purpose="compose")
+        # For a pure-answer task, a substantial lead DONE-synthesis IS the
+        # answer — deterministic, one call saved, nothing lost in
+        # re-compression. Thin/CONTINUE/absent syntheses get real composition.
+        session.final = _synthesis_final(session) if not cls.produces_output else None
+        if session.final is not None:
+            store.log_event(sid, "synthesis_final", {"chars": len(session.final.answer)})
+        else:
+            try:
+                session.final = compose(session, council, compose_call)
+            except AgentInputRequired as e:
+                return _pause_for_input(session, manager, store, e, purpose="compose")
     # Record this turn in the conversation: the human's message (the original task
     # on turn one; on a follow-up it was appended by continue_session) and the
     # council's conclusion. The human can now respond and keep the thread going.
