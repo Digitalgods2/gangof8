@@ -313,6 +313,12 @@ def parse_round_decision(text: str) -> tuple[str, str]:
     return m.group("decision").upper(), (m.group("why") or "").strip()
 
 
+def strip_round_marker(text: str) -> str:
+    """The ROUND: DONE/CONTINUE line is loop control, not content — remove it
+    when the synthesis text is used verbatim (e.g. as the final answer)."""
+    return _ROUND_MARKER.sub("", text or "").strip()
+
+
 def round_context(session: Session, seat_agent: str, round_idx: int) -> str:
     """What a panel seat carries into round N: the lead's prior synthesis, its
     own prior take, and the peers' — all capped. Derived purely from

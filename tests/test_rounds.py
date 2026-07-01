@@ -482,6 +482,94 @@ def test_research_lead_gets_more_than_two_skill_results(tmp_path):
     assert lead.followup_prompt.count("unknown skill") == 4
 
 
+def test_analysis_read_results_get_more_room(tmp_path):
+    """The live truncation bug: 'reading' a big file meant seeing its first
+    2000 chars, and the lead reasoned wrongly from the fragment. Analysis
+    tasks now get 8000-char reads."""
+    est = tmp_path / "proj"
+    est.mkdir()
+    (est / "big.txt").write_text("x" * 12000, encoding="utf-8")
+
+    class ReadingLead:
+        name = "mock"
+
+        def __init__(self):
+            self.followup = None
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s, images=None):
+            if role == Role.lead:
+                if "Skill results" in prompt:
+                    self.followup = prompt
+                    return AdapterResult(content="Read it. Analysis done.\nROUND: DONE", duration_ms=1)
+                return AdapterResult(content="SKILL: read_file big.txt", duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    lead = ReadingLead()
+    svc = ConclaveService(data_dir=tmp_path / "data", panel=[])
+    svc.registry.register(lead)
+    session = svc.run(f'examine and evaluate the project in "{est}"', source="test")
+    assert session.status == SessionStatus.done
+    assert session.classification.task_type.value in ("research", "question")  # both analysis
+    assert lead.followup is not None
+    assert "x" * config.SKILL_RESULT_ANALYSIS_MAX_CHARS in lead.followup, "deep read fed back"
+    assert "x" * (config.SKILL_RESULT_ANALYSIS_MAX_CHARS + 1) not in lead.followup, "still capped"
+
+
+# --- lead synthesis as the final answer --------------------------------------------
+
+
+SUBSTANTIAL_SYNTHESIS = (
+    "## Verdict first\n\nThe panel misdiagnosed two of three points; here is the "
+    "grounded reconciliation with evidence and a concrete plan.\n\n"
+    + "Detailed reasoning that weighs each panel view on its merits. " * 40
+    + "\nROUND: DONE"
+)
+
+
+class SubstantialLead:
+    name = "mock"
+
+    def __init__(self):
+        self._inner = MockAdapter()
+
+    def call(self, role, prompt, timeout_s, images=None):
+        if role == Role.lead:
+            return AdapterResult(content=SUBSTANTIAL_SYNTHESIS, duration_ms=1)
+        if role == Role.summarizer:
+            raise AssertionError("the summarizer must not run — the synthesis IS the answer")
+        return self._inner.call(role, prompt, timeout_s)
+
+
+def test_substantial_done_synthesis_is_the_final_answer(tmp_path):
+    svc = _svc(tmp_path, SubstantialLead())
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert "Verdict first" in session.final.answer
+    assert "ROUND" not in session.final.answer, "the control marker is stripped"
+    assert session.final.confidence == "high", "panel seats contributed to what the lead weighed"
+    assert not any(c.role == Role.summarizer for c in session.contributions)
+    assert "synthesis_final" in _events(svc, session)
+
+
+def test_solo_synthesis_final_is_medium_confidence(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc.registry.register(SubstantialLead())
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert "Verdict first" in session.final.answer
+    assert session.final.confidence == "medium", "no panel weighed in — one model's view"
+
+
+def test_thin_synthesis_still_composes_via_summarizer(tmp_path):
+    # the default mock lead's short answer must NOT bypass the summarizer
+    svc = ConclaveService(data_dir=tmp_path)
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert any(c.role == Role.summarizer for c in session.contributions)
+    assert "synthesis_final" not in _events(svc, session)
+
+
 # --- panel derivation & degradation ----------------------------------------------
 
 
