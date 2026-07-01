@@ -95,6 +95,8 @@ def test_service_consumes_settings_file(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     from conclave_os.models import Role
     assert svc.role_agents[Role.critic] == "codex"
+    assert Role.knowledge_retriever in svc.role_agents
+    assert Role.fact_validator in svc.role_agents
 
 
 def test_explicit_backend_arg_wins(tmp_path):
@@ -142,6 +144,9 @@ def test_get_settings(client):
     assert "backend" in data
     assert "resolved_role_agents" in data
     assert "critic" in data["resolved_role_agents"]
+    assert "role_catalog" in data
+    assert "knowledge_retriever" in data["role_catalog"]
+    assert "fact_validator" in data["role_catalog"]
 
 
 def test_put_settings_persists_and_reflects(client):

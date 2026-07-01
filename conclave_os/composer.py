@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from . import config
 from .governance import BudgetExceeded
 from .models import Contribution, Council, CouncilMember, FinalAnswer, Role, Session
+from .truth import ledger_prompt
 from .registry import AgentError
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
@@ -44,15 +45,45 @@ def _actions_summary(session: Session) -> str:
     return "\n".join(lines)
 
 
+# A contribution may BE a file artifact (the lead emits whole files as
+# 'ARTIFACT: <name>\n<body>'). Feeding that raw body into the summarizer makes it
+# CONTINUE the file instead of summarizing it (observed: a 12KB index.html turned
+# the "answer" into a CSS dump). Condense any artifact-bearing contribution to its
+# preamble + the list of files it produced — the bodies are already on disk and
+# reported authoritatively under "Actions performed".
+_ARTIFACT_LINE = re.compile(r"^[ \t]*(?:\*\*)?ARTIFACT(?:\*\*)?[ \t]*:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE)
+# Fenced code block or a raw HTML document — collapse to a placeholder so the
+# summarizer never receives a raw file body to continue (materialize/continuation
+# contributions are pure bodies with no ARTIFACT: line).
+_FENCED = re.compile(r"```.*?```", re.DOTALL)
+_HTML_DOC = re.compile(r"<!doctype html.*?</html>|<html[ >].*?</html>", re.DOTALL | re.IGNORECASE)
+
+
+def _condense_for_compose(content: str) -> str:
+    matches = list(_ARTIFACT_LINE.finditer(content))
+    if matches:
+        names = ", ".join(m.group(1).strip() for m in matches)
+        preamble = content[: matches[0].start()].strip()
+        preamble = (preamble[:400] + " …") if len(preamble) > 400 else preamble
+        note = f"[emitted {len(matches)} file artifact(s): {names} — full contents written to disk, not shown here]"
+        return f"{preamble}\n{note}" if preamble else note
+    # no ARTIFACT line, but the body may still be raw file content (a fenced code
+    # block or a whole HTML document) — collapse those so they can't be continued.
+    collapsed = _HTML_DOC.sub("[file content omitted]", content)
+    collapsed = _FENCED.sub("[code omitted]", collapsed)
+    return collapsed[: config.COMPOSER_CONTEXT_CHARS]
+
+
 def compose_prompt(session: Session) -> str:
     recent = "\n\n".join(
-        f"[{c.role.value} r{c.round}] {c.content[:config.COMPOSER_CONTEXT_CHARS]}"
+        f"[{c.role.value} r{c.round}] {_condense_for_compose(c.content)}"
         for c in session.contributions[-config.COMPOSER_CONTEXT_CONTRIBUTIONS:]
     )
     rulings = "\n".join(
         f"- {d.topic}: ruled '{d.ruling}' ({d.ruling_basis})" for d in session.disagreements
     ) or "(none)"
     actions = _actions_summary(session)
+    ledger = ledger_prompt(session)
     # Plain-text labeled sections, NOT JSON: asking an agent for a JSON object
     # whose keys overlap a wrapping protocol can contaminate its output
     # (learned from real runs). Text labels survive — like DISAGREEMENT:/VERDICT:.
@@ -78,6 +109,9 @@ def compose_prompt(session: Session) -> str:
         "WAS written — report it as done with high confidence. You have NO "
         "filesystem access, so never claim a file is missing/unconfirmed and "
         "never say you ran Glob/find/ls (you cannot) — rely on this record.\n"
+        "Do NOT reproduce, paste, or continue any file contents — the files are "
+        "already written. DESCRIBE what was built and how to use it (e.g. open the "
+        "file in a browser), in a few sentences.\n"
         "Use EXACTLY these labeled plain-text sections (no JSON):\n"
         "ANSWER: <the final answer; may span multiple lines>\n"
         "CONFIDENCE: <high, medium, or low>\n"
@@ -85,6 +119,10 @@ def compose_prompt(session: Session) -> str:
         "RISKS:\n- <unresolved risks, one per line, or '- none'>\n"
         "NEXT_ACTION: <one line, or 'none'>\n"
         f"Actions performed (authoritative):\n{actions or '(none)'}\n"
+        "Truth ledger (authoritative for established facts vs assumptions):\n"
+        f"{ledger}\n"
+        "In ANSWER, separate established facts from proposals when the distinction "
+        "matters. Do not promote an assumption to fact.\n"
         f"Disagreement rulings:\n{rulings}\n"
         f"Deliberation:\n{recent}"
     )

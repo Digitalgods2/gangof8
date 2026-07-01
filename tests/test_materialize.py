@@ -37,7 +37,7 @@ class MaterializeAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             m = _FN_IN_PROMPT.search(prompt)
             if m:  # focused single-file materialization call
                 return AdapterResult(content=BODIES.get(m.group(1), "x"), duration_ms=1)
@@ -117,7 +117,7 @@ def test_no_materialization_when_artifacts_emitted(tmp_path):
             self._inner = MockAdapter()
 
         def call(self, role, prompt, timeout_s):
-            if role == Role.implementer:
+            if role == Role.lead:
                 return AdapterResult(content="ARTIFACT: only.py\nprint('direct')\n", duration_ms=1)
             if role == Role.critic:
                 return AdapterResult(content="acceptable", duration_ms=1)

@@ -100,11 +100,28 @@
   .contrib > .hd .rnd { color:var(--dim); }
   .contrib > .hd .len { color:var(--dim); margin-left:auto; }
   .contrib pre { margin:0; padding:10px; max-height:340px; overflow:auto; }
-  .roster { display:flex; flex-wrap:wrap; gap:6px; }
-  .seat { font-size:11px; padding:2px 9px; border-radius:9px; border:1px solid var(--line);
-          color:var(--dim); }
-  .seat.on { border-color:var(--accent); color:var(--accent); }
-  .seat.spoke { border-color:var(--ok); color:var(--ok); }
+  .roster { display:flex; flex-wrap:wrap; gap:7px; }
+  .seat { --seat:#5b9dd9; --seat-bg:rgba(91,157,217,.10);
+          display:inline-flex; align-items:center; gap:6px; font-size:11px; line-height:1;
+          padding:5px 9px; border-radius:999px; border:1px solid var(--seat);
+          color:#dcecff; background:var(--seat-bg);
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.025); }
+  .seat::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--seat);
+                  box-shadow:0 0 10px var(--seat); flex:none; }
+  .seat.on { opacity:.88; }
+  .seat.spoke { color:#fff; background:linear-gradient(180deg, var(--seat-bg), rgba(255,255,255,.035)); }
+  .seat.spoke::after { content:"✓"; color:var(--seat); font-weight:800; margin-left:1px; }
+  .seat.role-lead { --seat:#ffd166; --seat-bg:rgba(255,209,102,.18); }
+  .seat.role-knowledge_retriever { --seat:#58a6ff; --seat-bg:rgba(88,166,255,.16); }
+  .seat.role-researcher { --seat:#2dd4bf; --seat-bg:rgba(45,212,191,.15); }
+  .seat.role-architect { --seat:#a78bfa; --seat-bg:rgba(167,139,250,.15); }
+  .seat.role-code_generator { --seat:#f472b6; --seat-bg:rgba(244,114,182,.14); }
+  .seat.role-api_integrator { --seat:#38bdf8; --seat-bg:rgba(56,189,248,.14); }
+  .seat.role-critic { --seat:#f59e0b; --seat-bg:rgba(245,158,11,.16); }
+  .seat.role-red_team { --seat:#f87171; --seat-bg:rgba(248,113,113,.15); }
+  .seat.role-fact_validator { --seat:#84cc16; --seat-bg:rgba(132,204,22,.15); }
+  .seat.role-implementer { --seat:#22c55e; --seat-bg:rgba(34,197,94,.16); }
+  .seat.role-summarizer { --seat:#e879f9; --seat-bg:rgba(232,121,249,.14); }
   .card.summary { border-color:var(--accent); background:#15202e; }
   .card.summary pre { margin:0; }
   .stats { display:flex; flex-wrap:wrap; gap:6px 14px; color:var(--dim); font-size:12.5px;
@@ -613,12 +630,16 @@ function renderDetail(s) {
   const roundCount = (s.rounds || []).length ||
     new Set(contribs.map(c => c.round)).size;
   const calls = s.agent_calls ?? contribs.length;
-  // "7 agent calls · 3 agents · 4 disagreements · 2 rounds"
+  // talents the lead pulled in = contributions from non-driver roles
+  const DRIVE_ROLES = new Set(["lead", "summarizer", "coordinator"]);
+  const delegations = contribs.filter(c => c.role && !DRIVE_ROLES.has(c.role)).length;
+  // "7 agent calls · 3 agents · 2 delegations"
   const statBits = [];
   if (calls) statBits.push(`<b>${calls}</b> agent call${calls === 1 ? "" : "s"}`);
   if (agentCount) statBits.push(`<b>${agentCount}</b> agent${agentCount === 1 ? "" : "s"}`);
+  if (delegations) statBits.push(`<b>${delegations}</b> delegation${delegations === 1 ? "" : "s"}`);
+  // legacy sessions may carry court-era disagreements; show them if present
   if (disagreements.length) statBits.push(`<b>${disagreements.length}</b> disagreement${disagreements.length === 1 ? "" : "s"}`);
-  if (roundCount) statBits.push(`<b>${roundCount}</b> round${roundCount === 1 ? "" : "s"}`);
 
   // per-agent breakdown e.g. "gemini ×2, codex ×4"
   const agentBreak = Object.entries(byAgent)
@@ -692,7 +713,7 @@ function renderDetail(s) {
       <div class="card">
         <h3>Council</h3>
         <div class="roster">
-          ${roster.map(m => `<span class="seat ${spokenRoles.has(m.role)?"spoke":"on"}">${esc(m.role)} · ${esc(m.agent)}${spokenRoles.has(m.role)?" ✓":""}</span>`).join("")}
+          ${roster.map(m => `<span class="seat role-${esc(m.role)} ${spokenRoles.has(m.role)?"spoke":"on"}">${esc(m.role)} · ${esc(m.agent)}</span>`).join("")}
         </div>
       </div>` : ""}
 
@@ -815,18 +836,26 @@ async function declineInput(iid) {
 // ============================ Settings panel ============================
 // Self-contained: its own open/close + render, sharing only esc/api helpers.
 // Opening overlays the dashboard; closing returns to it untouched.
-const ROLES = ["researcher", "architect", "critic", "implementer", "summarizer"];
+const ROLES = ["lead", "researcher", "architect", "critic", "implementer", "summarizer"];
+const roleList = s => (s.role_catalog && s.role_catalog.length) ? s.role_catalog : ROLES;
+const roleLabel = r => r.split("_").map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(" ");
 let settingsCache = null, seatsCache = [], wsCache = {workspaces: [], active: null};
 let orKey = {present: false, masked: null, source: null};
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
   backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'cli' runs the local claude/codex/gemini CLIs directly in generation mode, so the implementer emits real file contents — fully self-contained.",
-  roles: "Map each council role to a local CLI agent (claude, codex, gemini). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
-  researcher: "Agent that gathers the relevant facts and constraints in the first round.",
+  roles: "The 'lead' drives every task; the other roles are talents it can pull in on demand. Map each to a model (claude, codex, gemini, or an OpenRouter seat). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
+  lead: "The fixed lead model that drives every task end to end and pulls in the talents below only when a specific strength is needed.",
+  knowledge_retriever: "Talent that gathers cited evidence and marks unsupported claims as assumptions.",
+  researcher: "Agent that interprets gathered evidence for the user's research/development goal.",
   architect: "Agent that proposes design / structure when a task needs design work.",
+  api_integrator: "Agent that maps external API contracts and integration failure modes.",
+  code_generator: "Agent that proposes modular implementation units and integration points.",
   critic: "Agent that challenges the strongest claims and surfaces disagreements.",
-  implementer: "Agent that drafts the working result or artifact — the only role allowed to propose file writes.",
+  red_team: "Agent that tries to break the proposal with adversarial cases and wrong assumptions.",
+  fact_validator: "Agent that independently confirms, refutes, or marks claims as unverifiable.",
+  implementer: "Legacy talent for drafting a working result/artifact; in the lead model the lead authors files directly.",
   summarizer: "Agent that composes the final, reconciled answer.",
   risk: "Tasks classified above this risk level pause for your approval before any deliberation runs.",
   prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried.",
@@ -882,6 +911,10 @@ function renderSettings(s, seats) {
   const c = s.composer || {};
   const ui = s.ui || {};
   const ra = s.role_agents || {};
+  const resolved = s.resolved_role_agents || {};
+  const roles = roleList(s);
+  const roleCatalogWarn = s.role_catalog ? "" :
+    '<div class="sub" style="color:var(--bad);margin-bottom:8px">Backend role catalog is missing. Restart Conclave OS to load the new specialist roles.</div>';
   const seatErr = (seatsCache.length === 0)
     ? '<div class="sub" style="margin-top:4px">no CLI agents found on PATH</div>' : "";
 
@@ -954,9 +987,11 @@ function renderSettings(s, seats) {
 
     <div class="sset">
       <label>Role mapping → agent ${tip("roles")}</label>
-      ${ROLES.map(r => `
-        <div class="field">${lbl(r, r)}
-          <select id="role_${r}">${seatOptions(ra[r] || "")}</select></div>`).join("")}
+      ${roleCatalogWarn}
+      ${roles.map(r => `
+        <div class="field">${lbl(roleLabel(r), r)}
+          <select id="role_${r}">${seatOptions(ra[r] || "")}</select>
+          <span class="sub">current: ${esc(resolved[r] || "backend default")}</span></div>`).join("")}
       ${seatErr}
     </div>
 
@@ -991,8 +1026,10 @@ function _num(id, fallback) {
 
 async function saveSettings() {
   const note = document.getElementById("savedNote");
+  note.style.color = "";
+  note.textContent = "saving...";
   const role_agents = {};
-  ROLES.forEach(r => {
+  roleList(settingsCache || {}).forEach(r => {
     const v = document.getElementById("role_" + r).value;
     if (v) role_agents[r] = v;  // empty ⇒ backend default
   });
@@ -1016,8 +1053,15 @@ async function saveSettings() {
       collapse_finished: document.getElementById("set_collapse").checked,
     },
   };
-  const r = await fetch("/settings", {method: "PUT",
-    headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
+  let r;
+  try {
+    r = await fetch("/settings", {method: "PUT",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(patch)});
+  } catch (e) {
+    note.style.color = "var(--bad)";
+    note.textContent = `save failed: ${e.message || e}`;
+    return;
+  }
   if (r.ok) {
     note.textContent = "saved ✓";
     settingsCache = await r.json();
@@ -1031,8 +1075,15 @@ async function saveSettings() {
     renderSettings(settingsCache, seatsCache);
     note.textContent = "saved ✓";
   } else {
+    let detail = "";
+    try {
+      const body = await r.json();
+      detail = body.detail ? String(body.detail) : JSON.stringify(body);
+    } catch (_) {
+      detail = await r.text().catch(() => "");
+    }
     note.style.color = "var(--bad)";
-    note.textContent = "save failed";
+    note.textContent = `save failed (${r.status})${detail ? ": " + detail.slice(0, 180) : ""}`;
   }
 }
 

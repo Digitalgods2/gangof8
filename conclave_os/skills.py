@@ -113,11 +113,19 @@ def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str
     no approval; the established folder (and any subfolder) is never a write target."""
     raw_name = _arg(action, "filename")
     content = _arg(action, "content")
+    if not content.strip():
+        raise ExecutionError(
+            f"refusing to write empty artifact: {raw_name!r} "
+            "(the agent produced no real file body)"
+        )
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
     path = resolve_space(session, data_dir, target, raw_name)
     _assert_outside_established(session, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # newline="" writes the model's bytes verbatim — no CRLF translation. Windows'
+    # default would rewrite every \n to \r\n (turning emitted CRLF into \r\r\n and
+    # breaking LF-critical files: shebangs, .sh scripts).
+    path.write_text(content, encoding="utf-8", newline="")
     return str(path)
 
 
@@ -137,8 +145,11 @@ def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     or OLD is absent / not unique — never a blind overwrite. The established
     folder is never edited directly (changes land there only via `promote`)."""
     raw_name = _arg(action, "filename")
-    old = _arg(action, "old")
-    new = _arg(action, "new")
+    # Normalize CRLF in the model-supplied snippets to \n; the on-disk file is
+    # read with universal newlines (→ \n), so a CRLF-emitting backend would
+    # otherwise never match an otherwise-correct OLD snippet.
+    old = _arg(action, "old").replace("\r\n", "\n").replace("\r", "\n")
+    new = _arg(action, "new").replace("\r\n", "\n").replace("\r", "\n")
     if not old:
         raise ExecutionError("edit_file requires non-empty OLD text")
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
@@ -152,7 +163,7 @@ def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
         raise ExecutionError(f"OLD text not found in {raw_name!r}")
     if count > 1:
         raise ExecutionError(f"OLD text not unique in {raw_name!r} ({count} matches)")
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="")
     return str(path)
 
 
@@ -205,9 +216,23 @@ def _promote_source(session: Session, data_dir: Path, raw_name: str) -> Optional
     fall back to the sandbox (so an ARTIFACT written to scratch can promote
     without an explicit stage)."""
     if session.workspace_root:
-        ws = resolve_space(session, data_dir, WORKSPACE, raw_name)
-        if ws.is_file():
-            return ws
+        try:
+            ws_root = Path(session.workspace_root).resolve()
+            est_root = Path(session.established_root).resolve() if session.established_root else None
+        except OSError:
+            ws_root = None
+            est_root = None
+        # If the active workspace is the established folder (or inside it), it is
+        # not council-owned source material. Promotion must come from sandbox.
+        workspace_is_established = (
+            ws_root is not None
+            and est_root is not None
+            and (ws_root == est_root or est_root in ws_root.parents)
+        )
+        if not workspace_is_established:
+            ws = resolve_space(session, data_dir, WORKSPACE, raw_name)
+            if ws.is_file():
+                return ws
     sb = resolve_space(session, data_dir, SANDBOX, raw_name)
     return sb if sb.is_file() else None
 
@@ -219,6 +244,8 @@ def promote_diff(session: Session, data_dir: Path, raw_name: str) -> str:
     import difflib
 
     src = _promote_source(session, data_dir, raw_name)
+    if src is not None and src.stat().st_size == 0:
+        return f"REFUSING PROMOTE: council/{raw_name} is empty (0 bytes)"
     new = src.read_text(encoding="utf-8", errors="replace") if src else ""
     dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
     old = dst.read_text(encoding="utf-8", errors="replace") if dst.is_file() else ""
@@ -237,6 +264,8 @@ def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
     src = _promote_source(session, data_dir, raw_name)
     if src is None:
         raise ExecutionError(f"nothing to promote (not in workspace/sandbox): {raw_name!r}")
+    if src.stat().st_size == 0:
+        raise ExecutionError(f"refusing to promote empty artifact: {raw_name!r}")
     dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
@@ -399,7 +428,7 @@ SKILLS: dict[str, Skill] = {
         category="file_write",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.implementer],
+        allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename", "content", "target"],
     ),
     "read_file": Skill(
@@ -408,7 +437,12 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        allowed_roles=[
+            Role.lead,
+            Role.knowledge_retriever, Role.researcher, Role.architect,
+            Role.api_integrator, Role.code_generator,
+            Role.red_team, Role.fact_validator, Role.implementer,
+        ],
         inputs=["filename", "target"],
     ),
     "search_project": Skill(
@@ -417,7 +451,12 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        allowed_roles=[
+            Role.lead,
+            Role.knowledge_retriever, Role.researcher, Role.architect,
+            Role.api_integrator, Role.code_generator,
+            Role.red_team, Role.fact_validator, Role.implementer,
+        ],
         inputs=["query", "target"],
     ),
     "list_dir": Skill(
@@ -427,7 +466,12 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.researcher, Role.architect, Role.implementer],
+        allowed_roles=[
+            Role.lead,
+            Role.knowledge_retriever, Role.researcher, Role.architect,
+            Role.api_integrator, Role.code_generator,
+            Role.red_team, Role.fact_validator, Role.implementer,
+        ],
         inputs=["path", "target"],
     ),
     "web_search": Skill(
@@ -437,7 +481,12 @@ SKILLS: dict[str, Skill] = {
         category="web",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.researcher, Role.architect, Role.critic, Role.implementer],
+        allowed_roles=[
+            Role.lead,
+            Role.knowledge_retriever, Role.researcher, Role.architect,
+            Role.api_integrator, Role.code_generator, Role.critic,
+            Role.red_team, Role.fact_validator, Role.implementer,
+        ],
         inputs=["query"],
     ),
     "web_fetch": Skill(
@@ -446,7 +495,12 @@ SKILLS: dict[str, Skill] = {
         category="web",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.researcher, Role.architect, Role.critic, Role.implementer],
+        allowed_roles=[
+            Role.lead,
+            Role.knowledge_retriever, Role.researcher, Role.architect,
+            Role.api_integrator, Role.code_generator, Role.critic,
+            Role.red_team, Role.fact_validator, Role.implementer,
+        ],
         inputs=["url"],
     ),
     "edit_file": Skill(
@@ -455,7 +509,7 @@ SKILLS: dict[str, Skill] = {
         category="file_edit",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.implementer],
+        allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename", "old", "new", "target"],
     ),
     "run_tests": Skill(
@@ -464,7 +518,7 @@ SKILLS: dict[str, Skill] = {
         category="code_exec",
         risk=Risk.medium,
         requires_approval=False,
-        allowed_roles=[Role.implementer, Role.critic],
+        allowed_roles=[Role.lead, Role.implementer, Role.critic],
         inputs=["command", "target"],
     ),
     "stage": Skill(
@@ -473,7 +527,7 @@ SKILLS: dict[str, Skill] = {
         category="stage",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.implementer],
+        allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename"],
     ),
     "promote": Skill(
@@ -482,7 +536,7 @@ SKILLS: dict[str, Skill] = {
         category="promote",
         risk=Risk.medium,
         requires_approval=True,
-        allowed_roles=[Role.implementer],
+        allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename"],
     ),
 }

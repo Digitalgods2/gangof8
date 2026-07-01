@@ -15,7 +15,7 @@ import pytest
 from conclave_os import config, executor, loop
 from conclave_os.governance import Governance
 from conclave_os.logstore import LogStore
-from conclave_os.models import Contribution, CouncilMember, Role, Session
+from conclave_os.models import Contribution, Council, CouncilMember, Role, Session
 from conclave_os.sessions import SessionManager
 
 
@@ -52,6 +52,16 @@ def _recording_call(answer: str = "informed answer"):
         return _contribution(member.role, answer)
 
     return call, prompts
+
+
+def _role_recording_call(answers: dict[Role, str]):
+    calls: list[tuple[Role, str]] = []
+
+    def call(member: CouncilMember, prompt: str) -> Contribution:
+        calls.append((member.role, prompt))
+        return _contribution(member.role, answers.get(member.role, "ok"))
+
+    return call, calls
 
 
 def _seed(tmp_path, session: Session, name: str, body: str) -> None:
@@ -163,35 +173,70 @@ def test_requests_are_capped_per_turn(tmp_path, store, governance, session):
     assert len(executed) == config.MAX_SKILL_REQUESTS_PER_TURN == 2
 
 
-# --- prompt advertises the skill only when relevant ---------------------------
+# --- on-demand delegation contract ------------------------------------------
 
 
-# The governance context now always explains the read skills, so these check
-# the per-role ADVERTISEMENT phrasing ("read a file with a line", "Available
-# now:") rather than the bare skill name.
+def test_delegation_grants_specific_talent(store, session):
+    lead = _member(Role.lead)
+    researcher = CouncilMember(role=Role.researcher, agent="researcher-model", active=False)
+    council = Council(members=[lead, researcher])
+    contribution = _contribution(
+        Role.lead,
+        "I need a fact.\nCONSULT: researcher - need current documentation for this browser API",
+    )
+    call, calls = _role_recording_call({
+        Role.researcher: "Use the current documented API.",
+        Role.lead: "ARTIFACT: index.html\n<html></html>",
+    })
+
+    out = loop._resolve_delegations(
+        session, council, lead, "ORIGINAL", contribution, call, store
+    )
+
+    assert out.content.startswith("ARTIFACT:")
+    assert researcher.active is True
+    assert [role for role, _ in calls] == [Role.researcher, Role.lead]
+    assert "Use the current documented API" in calls[1][1]
+
+
+def test_delegation_to_unavailable_talent_is_refused(store, session):
+    lead = _member(Role.lead)
+    council = Council(members=[lead])
+    # governance is not an advertised talent → refused, lead still re-called once
+    contribution = _contribution(Role.lead, "DELEGATE: governance - do the whole thing")
+    call, calls = _role_recording_call({Role.lead: "continuing"})
+
+    out = loop._resolve_delegations(
+        session, council, lead, "ORIGINAL", contribution, call, store
+    )
+
+    assert out.content == "continuing"
+    assert [role for role, _ in calls] == [Role.lead]
+    assert "unavailable" in calls[0][1]
+
+
+# --- the lead's skill hints advertise a skill only when relevant --------------
+
+
+# The governance context always explains the read skills, so these check the
+# per-role ADVERTISEMENT phrasing rather than the bare skill name.
 _READ_AD = "read a file with a line"
 _LIST_AD = "with a line 'SKILL: list_dir"
 
 
-def test_build_prompt_advertises_read_only_with_files_and_allowed_role(session):
-    from conclave_os.models import RoundSpec
-
-    spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
+def test_skill_hints_advertise_read_only_with_files_and_allowed_role(session):
     # no files → not advertised (no "Available now")
-    assert "Available now:" not in loop.build_prompt(session, spec, Role.researcher, [])
+    assert "Available now:" not in loop._skill_hints(session, Role.lead, [])
     # files + allowed role → advertised with the filename
-    p = loop.build_prompt(session, spec, Role.researcher, ["notes.md"])
+    p = loop._skill_hints(session, Role.lead, ["notes.md"])
     assert _READ_AD in p and "notes.md" in p
-    # files but a role not allowed to read → not advertised
-    assert _READ_AD not in loop.build_prompt(session, spec, Role.critic, ["notes.md"])
+    # files but a role not allowed to read (critic) → not advertised
+    assert _READ_AD not in loop._skill_hints(session, Role.critic, ["notes.md"])
 
 
-def test_build_prompt_advertises_list_dir_when_workspace_bound(session, tmp_path):
-    from conclave_os.models import RoundSpec
-
-    spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
+def test_skill_hints_advertise_list_dir_when_workspace_bound(session, tmp_path):
     # no workspace/established → list_dir not advertised (nothing to enumerate)
-    assert _LIST_AD not in loop.build_prompt(session, spec, Role.researcher, [])
-    # workspace bound + allowed role → advertised so the council can DISCOVER files
+    assert _LIST_AD not in loop._skill_hints(session, Role.lead, [])
+    # workspace bound + allowed role → advertised so the lead can DISCOVER files
     session.workspace_root = str(tmp_path)
-    assert _LIST_AD in loop.build_prompt(session, spec, Role.researcher, [])
+    assert _LIST_AD in loop._skill_hints(session, Role.lead, [])

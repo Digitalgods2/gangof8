@@ -82,7 +82,7 @@ class _ImplAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             return AdapterResult(content="ARTIFACT: game.py\nprint('tic tac toe')\n", duration_ms=1)
         if role == Role.critic:
             return AdapterResult(content="acceptable", duration_ms=1)
@@ -154,8 +154,9 @@ def test_established_overview_injected_into_prompts(tmp_path):
     """The council must START with the established folder's real content, not
     depend on an agent remembering to request a SKILL (the gemini-refusal bug)."""
     from conclave_os import loop
+    from conclave_os.classifier import classify
     from conclave_os.logstore import LogStore
-    from conclave_os.models import RoundSpec
+    from conclave_os.roles import build_council
     from conclave_os.sessions import SessionManager
 
     est = tmp_path / "app"
@@ -165,14 +166,15 @@ def test_established_overview_injected_into_prompts(tmp_path):
     store = LogStore(tmp_path / "data")
     s = SessionManager(store).create("examine it", source="test")
     s.established_root = str(est)
+    s.classification = classify("examine it")
 
     overview = loop._established_overview(s, store.data_dir)
     assert "README.md" in overview and "CoolApp" in overview      # key file content read
     assert "src/main.py" in overview                              # directory tree present
 
-    spec = RoundSpec(round=0, goal="gather facts", agents=[Role.researcher])
-    p = loop.build_prompt(s, spec, Role.researcher, [], overview)
-    assert "CoolApp" in p                                         # injected into the prompt
+    council = build_council(s.classification)
+    p = loop.lead_prompt(s, council, None, overview)
+    assert "CoolApp" in p                                         # injected into the lead prompt
     # and the governance context forbids the "can't access" refusal
     assert "NEVER say you 'cannot access'" in p
 
@@ -186,7 +188,7 @@ class _PromoteAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             return AdapterResult(
                 content="ARTIFACT: feature.py\nprint('new feature')\n\nPROMOTE: feature.py\n",
                 duration_ms=1)

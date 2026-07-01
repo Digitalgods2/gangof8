@@ -1,5 +1,5 @@
-"""Safest-first test case (DESIGN.md section 6): full pipeline through the
-MockAdapter — no network, no tools, no cost."""
+"""End-to-end pipeline through the MockAdapter for the lead-driven model — no
+network, no tools, no cost."""
 
 import json
 
@@ -27,7 +27,7 @@ def session(service):
 def test_session_completes_state_machine(session):
     assert session.session_id.startswith("s_")
     assert session.status == SessionStatus.done
-    assert session.stop_reason == "max rounds reached"
+    assert session.stop_reason == "lead produced a result"
 
 
 def test_classification(session):
@@ -39,31 +39,29 @@ def test_classification(session):
     assert cls.tools_allowed is False
 
 
-def test_council_roles_explicit(session):
+def test_lead_council_is_minimal(session):
+    """The lead model activates only coordinator + lead + summarizer; the
+    specialist talents are listed but inactive (available for delegation)."""
     active = session.council.active_roles()
-    assert {Role.coordinator, Role.researcher, Role.critic, Role.summarizer} <= active
-    assert Role.architect not in active
-    assert Role.implementer not in active
-    # inactive roles are still listed, so the log shows the choice
-    assert len(session.council.members) == 7
+    assert {Role.coordinator, Role.lead, Role.summarizer} <= active
+    # specialists are present but inactive until the lead pulls one in
+    assert session.council.get(Role.critic).active is False
+    assert session.council.get(Role.researcher).active is False
+    assert Role.researcher not in active and Role.red_team not in active
+    # all roles are still listed, so the UI roster shows what's reachable
+    assert len(session.council.members) == 13
 
 
-def test_exactly_three_bounded_rounds(session):
-    assert len(session.rounds) == 3
-    goals = [r.goal for r in session.rounds]
-    assert "gather" in goals[0] and "challenge" in goals[1] and "reconcile" in goals[2]
+def test_single_lead_round(session):
+    assert len(session.rounds) == 1
+    assert "lead" in session.rounds[0].goal
+    assert session.rounds[0].agents == [Role.lead]
     assert session.agent_calls <= session.budgets.max_agent_calls
 
 
-def test_one_disagreement_with_recorded_ruling(session):
-    assert len(session.disagreements) == 1
-    d = session.disagreements[0]
-    assert d.topic == "storage backend"
-    assert len(d.positions) == 2
-    assert d.critic_test and "VERDICT" in d.critic_test
-    assert d.ruling
-    assert d.ruling_basis == "evidence"
-    assert d.rationale
+def test_no_disagreement_machinery(session):
+    """The court is gone — there are no disagreements to rule."""
+    assert session.disagreements == []
 
 
 def test_final_answer_has_required_fields(session):
@@ -75,15 +73,20 @@ def test_final_answer_has_required_fields(session):
     assert isinstance(final.risks_unresolved, list)
 
 
+def test_truth_ledger_is_a_list(session):
+    # The ledger is vestigial in the default flow (no validator seats run unless
+    # the lead delegates to one), but it must still be a clean list.
+    assert isinstance(session.truth_claims, list)
+
+
 def test_jsonl_log_contains_every_step(service, session):
     path = service.store.session_log_path(session.session_id)
     assert path.exists()
     events = [json.loads(line)["event"] for line in path.read_text(encoding="utf-8").splitlines()]
     assert events.count("task_received") == 1
-    assert events.count("round_start") == 3
+    assert events.count("round_start") == 1
     assert "classified" in events
     assert "council_formed" in events
-    assert "disagreement_ruled" in events
     assert "final_composed" in events
     assert events.index("classified") < events.index("council_formed") < events.index("round_start")
 
@@ -102,11 +105,11 @@ def test_empty_task_rejected(service):
         service.run("   ", source="test")
 
 
-# --- graceful degradation: a flaky seat must not abort the whole council ------
+# --- graceful degradation: a failing lead must not crash the session ----------
 
 
 class _BoomAdapter:
-    """A backend that always fails — stands in for the gemini CLI stalling."""
+    """A backend that always fails — stands in for the lead CLI stalling."""
 
     name = "boom"
 
@@ -115,18 +118,16 @@ class _BoomAdapter:
         raise AgentError("boom CLI timed out after 120s")
 
 
-def test_one_failing_seat_is_dropped_not_fatal(tmp_path):
+def test_failing_lead_is_not_fatal(tmp_path):
     service = ConclaveService(data_dir=tmp_path)
     service.registry.register(_BoomAdapter())
-    # point the researcher at the failing agent; the rest stay on mock
-    service.role_agents = {**service.role_agents, Role.researcher: "boom"}
+    # the lead fails; the summarizer still composes a final answer from the rest
+    service.role_agents = {**service.role_agents, Role.lead: "boom"}
 
     session = service.run(TASK, source="test")
 
     # the run still completes and produces a final answer (does NOT crash)
     assert session.status == SessionStatus.done
     assert session.final is not None and session.final.answer
-    # the flaky seat was dropped gracefully and recorded for the human
-    assert any("researcher seat (boom) dropped" in u for u in session.unresolved)
-    researcher = session.council.get(Role.researcher)
-    assert researcher is not None and researcher.active is False
+    # the failure was recorded for the human rather than swallowed
+    assert any("agent error" in u for u in session.unresolved)

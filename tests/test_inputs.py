@@ -57,7 +57,7 @@ def service(tmp_path):
     return ConclaveService(data_dir=tmp_path)
 
 
-def _pause(service, role=Role.researcher):
+def _pause(service, role=Role.lead):
     service.registry.register(PausingAdapter(role))
     session = service.run(TASK, source="test")
     assert session.status == SessionStatus.awaiting_input
@@ -69,7 +69,7 @@ def test_pause_records_the_question(service):
     session = _pause(service)
     req = session.input_requests[0]
     assert req.question == "What is the expected write volume?"
-    assert req.role == Role.researcher
+    assert req.role == Role.lead
     assert req.purpose == "deliberation"
     assert session.final is None
     assert session.stop_reason == "agent needs user input"
@@ -87,8 +87,8 @@ def test_answer_resumes_to_done(service):
     assert any(
         "incorporating the user's answer" in c.content for c in resumed.contributions
     ), "the resumed call's output must join the deliberation"
-    assert len(resumed.rounds) == 3, "remaining rounds must still run after resume"
-    assert len(resumed.disagreements) == 1, "later rounds still get conflict checks"
+    assert len(resumed.rounds) == 1, "the lead runs a single round"
+    assert resumed.disagreements == [], "the lead model has no disagreement machinery"
     path = service.store.session_log_path(session.session_id)
     events = [json.loads(line)["event"] for line in path.read_text(encoding="utf-8").splitlines()]
     assert "input_requested" in events and "input_answered" in events
@@ -131,7 +131,7 @@ def test_api_input_endpoint(tmp_path):
     from conclave_os import main as main_mod
 
     service = ConclaveService(data_dir=tmp_path)
-    service.registry.register(PausingAdapter(Role.researcher))
+    service.registry.register(PausingAdapter(Role.lead))
     main_mod.service = service
     client = TestClient(main_mod.app)
 

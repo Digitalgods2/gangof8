@@ -61,9 +61,15 @@ class SessionStatus(str, Enum):
 
 class Role(str, Enum):
     coordinator = "coordinator"
+    lead = "lead"  # the single driver of a task; pulls in the talents below on demand
+    knowledge_retriever = "knowledge_retriever"
     researcher = "researcher"
     architect = "architect"
+    code_generator = "code_generator"
+    api_integrator = "api_integrator"
     critic = "critic"
+    red_team = "red_team"
+    fact_validator = "fact_validator"
     implementer = "implementer"
     governance = "governance"
     summarizer = "summarizer"
@@ -142,6 +148,26 @@ class Disagreement(BaseModel):
     ruling: Optional[str] = None
     ruling_basis: Optional[str] = None  # evidence | constraint | user_goal
     rationale: Optional[str] = None
+
+
+class TruthClaim(BaseModel):
+    """One claim in the session's source-of-truth ledger.
+
+    The ledger is deliberately conservative: unsupported claims remain
+    assumptions until a validator or sourced contribution promotes them.
+    """
+
+    claim_id: str = Field(default_factory=lambda: f"tc_{short_id()}")
+    claim: str
+    source: Optional[str] = None
+    confidence: float = 0.5
+    asserted_by: Role
+    asserted_agent: str = ""
+    asserted_round: int = 0
+    verified_by: list[str] = []
+    refuted_by: list[str] = []
+    status: str = "assumption"  # established | assumption | disputed | deprecated
+    checked_at: str = Field(default_factory=utcnow)
 
 
 class InputRequest(BaseModel):
@@ -246,6 +272,7 @@ class Session(BaseModel):
     rounds: list[RoundSpec] = []
     contributions: list[Contribution] = []
     disagreements: list[Disagreement] = []
+    truth_claims: list[TruthClaim] = []
     approvals: list[ApprovalRequest] = []
     input_requests: list[InputRequest] = []
     proposed_actions: list[ProposedAction] = []

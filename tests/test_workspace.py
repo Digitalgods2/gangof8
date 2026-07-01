@@ -137,7 +137,7 @@ class WsArtifactAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             return AdapterResult(content="ARTIFACT: src/main.py\nprint('built')\n", duration_ms=1)
         if role == Role.critic:
             return AdapterResult(content="acceptable", duration_ms=1)

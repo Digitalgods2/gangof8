@@ -37,7 +37,37 @@ BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
 # revises against the critic's objections and is re-reviewed, repeating UNTIL the
 # critic accepts. This is the safety backstop on that loop (alongside the
 # agent-call budget and wall-time) — NOT the normal terminator.
+# Retained for settings/back-compat; the lead-driven flow no longer refines.
 MAX_REFINE_ITERATIONS = 6
+
+# Lead-driven model: a single lead LLM drives every task and may pull in other
+# talents (the specialist roles, each backed by its own origin model) ON DEMAND
+# via CONSULT:/DELEGATE: lines. These bound that delegation and the lead's own
+# big-file generation — there is no fixed round plan or critic-acceptance loop.
+MAX_DELEGATIONS = 4               # how many specialists the lead may pull in per run
+DELEGATION_RESULT_MAX_CHARS = 2500  # how much of a specialist's reply is fed back
+# A large single-file artifact can exceed one model response. When a written file
+# looks cut off (e.g. HTML missing </html>), the lead is asked to CONTINUE it from
+# where it stopped — appending, never re-drafting. Bound how many continuations.
+MAX_ARTIFACT_CONTINUATIONS = 3
+ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead sees to continue
+# The lead authors whole files in one shot, so give it markedly more headroom than
+# a quick specialist call before timing out.
+LEAD_TIMEOUT = 600
+
+# Talent menu advertised to the lead: each specialist role and what it is good
+# for, so the lead knows what it can reach for (its origin model is filled in
+# from the role→agent map at prompt-build time).
+TALENTS: dict[Role, str] = {
+    Role.knowledge_retriever: "gather sourced evidence (file:line / URLs)",
+    Role.researcher: "interpret evidence, current/web research",
+    Role.architect: "system design and structural tradeoffs",
+    Role.code_generator: "focused implementation / algorithm help",
+    Role.api_integrator: "external API contracts (endpoint/auth/errors)",
+    Role.critic: "rigorous review of a risky claim or implementation",
+    Role.red_team: "adversarial/security/abuse failure modes",
+    Role.fact_validator: "independently verify specific claims",
+}
 
 
 def budgets_for(complexity: Complexity) -> Budgets:
@@ -49,9 +79,15 @@ def budgets_for(complexity: Complexity) -> Budgets:
 BACKEND = os.environ.get("CONCLAVE_OS_BACKEND", "mock")
 
 ROLE_AGENTS_MOCK: dict[Role, str] = {
+    Role.lead: "mock",
+    Role.knowledge_retriever: "mock",
     Role.researcher: "mock",
     Role.architect: "mock",
+    Role.code_generator: "mock",
+    Role.api_integrator: "mock",
     Role.critic: "mock",
+    Role.red_team: "mock",
+    Role.fact_validator: "mock",
     Role.implementer: "mock",
     Role.summarizer: "mock",
 }
@@ -61,9 +97,16 @@ ROLE_AGENTS_MOCK: dict[Role, str] = {
 # Multi-model conclave via the local CLIs — gemini researches, codex critiques,
 # claude designs/implements/summarizes. Remap any role in settings.
 ROLE_AGENTS_CLI: dict[Role, str] = {
+    # The fixed lead drives every task and pulls in the talents below on demand.
+    Role.lead: "claude",
+    Role.knowledge_retriever: "gemini",
     Role.researcher: "gemini",
     Role.architect: "claude",
+    Role.code_generator: "claude",
+    Role.api_integrator: "codex",
     Role.critic: "codex",
+    Role.red_team: "gemini",
+    Role.fact_validator: "codex",
     Role.implementer: "claude",
     Role.summarizer: "claude",
 }
@@ -167,6 +210,8 @@ COMPOSER_CONTEXT_CHARS = 1400
 # balloon the prompt or the budget.
 MAX_SKILL_REQUESTS_PER_TURN = 2
 SKILL_RESULT_MAX_CHARS = 2000
+MAX_ESCALATION_REQUESTS_PER_TURN = 2
+ESCALATION_RESULT_MAX_CHARS = 2500
 
 # Per-file artifact materialization: an agent sometimes describes multi-file
 # output in one draft instead of emitting it. When an output task yields no full

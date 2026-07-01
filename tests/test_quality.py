@@ -1,13 +1,10 @@
-"""Phase 3: richer disagreement detection + composer polish."""
+"""Composer polish for the lead-driven model."""
 
 import pytest
 
 from conclave_os.adapters.mock import FINAL_JSON, MockAdapter
-from conclave_os.loop import detect_disagreements
 from conclave_os.models import (
-    Contribution,
     Role,
-    RoundSpec,
     Session,
     SessionStatus,
     Task,
@@ -19,17 +16,6 @@ TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
     "service, and recommend one."
 )
-
-
-def _session_with(contents: list[tuple[Role, str]]) -> tuple[Session, RoundSpec]:
-    task = Task(task_id="t_x", session_id="s_x", text="test task")
-    session = Session(session_id="s_x", task=task)
-    for role, content in contents:
-        session.contributions.append(
-            Contribution(round=0, role=role, agent="mock", content=content)
-        )
-    spec = RoundSpec(round=0, goal="challenge", agents=[Role.critic])
-    return session, spec
 
 
 def test_compose_prompt_includes_authoritative_action_outcomes():
@@ -50,57 +36,24 @@ def test_compose_prompt_includes_authoritative_action_outcomes():
     assert "authoritative" in prompt.lower()
 
 
-def test_detects_bullets_case_and_multiline():
-    session, spec = _session_with([
-        (Role.researcher, "- SQLite has transactions."),
-        (Role.critic,
-         "1. disagreement: topic A — claim line one\n"
-         "   continuation of the claim\n"
-         "\n"
-         "- DISAGREE: topic B — a second conflict"),
-    ])
-    found = detect_disagreements(session, spec)
-    assert [d.topic for d in found] == ["topic A", "topic B"]
-    assert "continuation of the claim" in found[0].positions[1]["claim"]
-    assert found[0].positions[0]["role"] == "researcher"
+def test_compose_prompt_includes_truth_ledger():
+    from conclave_os.composer import compose_prompt
+    from conclave_os.models import TruthClaim
 
+    session = Session(session_id="s_x", task=Task(task_id="t", session_id="s_x", text="research it"))
+    session.truth_claims.append(TruthClaim(
+        claim="SQLite supports atomic transactions",
+        source="sqlite docs",
+        confidence=0.9,
+        asserted_by=Role.knowledge_retriever,
+        status="established",
+    ))
 
-def test_attribution_prefers_claim_making_roles():
-    session, spec = _session_with([
-        (Role.researcher, "Claim: use SQLite."),
-        (Role.summarizer, "Interim note."),
-        (Role.critic, "DISAGREEMENT: storage — JSON is fine."),
-    ])
-    found = detect_disagreements(session, spec)
-    assert found[0].positions[0]["role"] == "researcher", (
-        "the challenged claim should come from a claim-making role, "
-        "not just the most recent speaker"
-    )
+    prompt = compose_prompt(session)
 
-
-def test_pass_yields_no_disagreements():
-    session, spec = _session_with([
-        (Role.researcher, "- facts"),
-        (Role.critic, "PASS"),
-    ])
-    assert detect_disagreements(session, spec) == []
-
-
-def test_prose_mentions_of_disagree_are_not_markers():
-    session, spec = _session_with([
-        (Role.researcher, "Some people disagree: that is normal in research."),
-        (Role.critic, "I would not disagree with the facts presented."),
-    ])
-    assert detect_disagreements(session, spec) == []
-
-
-def test_dedupes_topics_across_rounds():
-    session, spec = _session_with([
-        (Role.critic, "DISAGREEMENT: storage backend — JSON suffices."),
-    ])
-    first = detect_disagreements(session, spec)
-    session.disagreements.extend(first)
-    assert detect_disagreements(session, spec) == []
+    assert "Truth ledger" in prompt
+    assert "[established] SQLite supports atomic transactions" in prompt
+    assert "Do not promote an assumption to fact" in prompt
 
 
 class FlakyComposer:
@@ -159,9 +112,13 @@ def test_composer_recomposes_with_a_working_agent_when_summarizer_errors(tmp_pat
     svc = ConclaveService(data_dir=tmp_path)
     svc.registry.register(GoodAgent())
     svc.registry.register(FlakyAgent())
-    # researcher/critic run on 'good'; only the summarizer is the flaky agent
+    # the lead runs on 'good'; only the summarizer is the flaky agent
     svc.role_agents = {
-        Role.researcher: "good", Role.architect: "good", Role.critic: "good",
+        Role.lead: "good",
+        Role.knowledge_retriever: "good", Role.researcher: "good",
+        Role.architect: "good", Role.api_integrator: "good",
+        Role.code_generator: "good", Role.critic: "good",
+        Role.red_team: "good", Role.fact_validator: "good",
         Role.implementer: "good", Role.summarizer: "flaky",
     }
     session = svc.run(TASK, source="test")

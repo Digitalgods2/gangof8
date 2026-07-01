@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import __version__, reporting
+from .models import Role
 from .service import ConclaveService
 
 app = FastAPI(title="Conclave OS — Coordinator", version=__version__)
@@ -62,6 +63,7 @@ def _summary(session) -> dict:
              "status": p.status, "result_path": p.result_path}
             for p in session.proposed_actions
         ],
+        "truth_claims": [c.model_dump() for c in session.truth_claims],
         "files_changed": session.files_changed,
         "workspace_root": session.workspace_root,
         "established_root": session.established_root,
@@ -72,7 +74,10 @@ def _summary(session) -> dict:
 
 @app.get("/")
 def dashboard() -> FileResponse:
-    return FileResponse(_STATIC / "index.html")
+    return FileResponse(
+        _STATIC / "index.html",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/health")
@@ -223,6 +228,7 @@ def get_settings() -> dict:
     """Current effective settings plus the role→agent mapping actually in use."""
     data = service.settings.model_dump()
     data["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
+    data["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
     data["effective_backend"] = service.backend
     return data
 
@@ -239,6 +245,7 @@ def put_settings(body: SettingsPatch) -> dict:
         raise HTTPException(status_code=422, detail=str(e))
     out = service.settings.model_dump()
     out["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
+    out["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
     out["effective_backend"] = service.backend
     out["note"] = "saved — backend/role changes apply to new sessions"
     return out
@@ -341,5 +348,3 @@ def empty_workspace() -> dict:
         return service.empty_workspace()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(e))
-
-

@@ -67,9 +67,11 @@ class ConclaveService:
         if self._explicit_role_agents:
             self.role_agents = self._explicit_role_agents
         elif self.settings.role_agents:
-            self.role_agents = {
+            base = dict(config.ROLE_AGENTS_BY_BACKEND[self.backend])
+            base.update({
                 Role(role): agent for role, agent in self.settings.role_agents.items()
-            }
+            })
+            self.role_agents = base
         else:
             self.role_agents = config.ROLE_AGENTS_BY_BACKEND[self.backend]
 
@@ -484,6 +486,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.rounds = []
         session.contributions = []
         session.disagreements = []
+        session.truth_claims = []
         session.proposed_actions = []
         session.approvals = []
         session.input_requests = []
