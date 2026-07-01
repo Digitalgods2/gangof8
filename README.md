@@ -1,9 +1,11 @@
 # Conclave OS — Type 1: Coordinator OS
 
-A coordination layer that receives a user task, classifies it, assembles an
-agent council with explicit roles, runs a **bounded** deliberation loop under
-**human authority**, logs everything, and returns a structured final answer.
-Full design in [DESIGN.md](DESIGN.md).
+A coordination layer that receives a user task, convenes a **panel of
+different AI models** that deliberate in parallel rounds under a single lead,
+runs the whole thing **bounded** and under **human authority**, logs
+everything, and returns a structured final answer. See
+[How a deliberation works](#how-a-deliberation-works-the-panel-model) below;
+full design in [DESIGN.md](DESIGN.md).
 
 Conclave OS is **fully self-contained**: it runs the local agent CLIs itself.
 Two backends sit behind one adapter interface — `mock` (offline, deterministic,
@@ -21,13 +23,59 @@ Conclave OS governance remains the only path to side effects.
 ```
 
 Default role mapping (edit `conclave_os/config.py` → `ROLE_AGENTS_CLI`):
-researcher→gemini, critic→codex, architect/implementer/summarizer→claude.
-Any role is remappable in settings (chosen from the local CLIs claude/codex/gemini).
+lead→claude, researcher→gemini, critic→codex, summarizer→claude. Any role is
+remappable in settings. The **panel** roster is derived automatically: the
+installed CLI agents plus every OpenRouter seat you enable in Settings
+(DeepSeek, GLM, Qwen, Kimi — needs an API key).
 
-It ships a **web dashboard** with a chat composer, governs file writes through
-human-approved **skills**, can operate on a real project directory
-(**workspaces**), and **reads attached images** (text, diagrams, screenshots) —
-all detailed below.
+It ships a **web dashboard** with a chat composer, governs real-code delivery
+through the approval-gated **promote** skill, can operate on a real project
+directory (**workspaces**), and **reads attached images** (text, diagrams,
+screenshots) — all detailed below.
+
+## How a deliberation works (the panel model)
+
+When a session starts, the council roster shows one chip per seat — and each
+seat is a **different origin model**. Here is what each is doing:
+
+- **The panelists** (orange chips) are the heart of the design. Every round,
+  ALL of them — the local claude/codex/gemini CLIs plus every enabled
+  OpenRouter seat — get the task (plus the pre-read project context) and write
+  their take **independently and in parallel**. None of them sees the others'
+  answers while writing, deliberately: you get N genuinely different
+  perspectives instead of N models agreeing with whoever spoke first. That is
+  the diversity-of-intelligence bet the whole system is built on.
+- **The lead** (yellow chip) is the synthesizer and decision-maker. After the
+  panel fan-out finishes, it gets all the takes and does the real work: weighs
+  them, adopts what's right, pushes back on what's weak, pulls in specialist
+  talents mid-round when it needs one (`CONSULT:` / `DELEGATE:`), writes any
+  files, and ends with `ROUND: DONE` or `ROUND: CONTINUE`.
+- **Why the lead's model also appears as a panelist:** same model, two
+  different jobs. As a panelist it is one independent voice among many; as
+  the lead it is the judge, not a witness — a separate call with a separate
+  charter, so the synthesis weighs its own panel take like any other input.
+  (Remap the lead in Settings if you'd rather have a different model
+  arbitrate.)
+- **The summarizer** (purple chip) composes the final answer card for
+  question/research tasks. Build tasks usually skip it entirely — they get a
+  fast, deterministic file-manifest summary instead.
+- **The specialist talents** (critic, red_team, fact_validator, …) exist but
+  sit inactive off the roster; one lights up only when the lead actually pulls
+  it in.
+
+**Rotation is automatic but consent-gated.** Rounds proceed on their own; if
+the lead declares CONTINUE three times (`ROUNDS_PER_CONSENT`, settable), the
+run pauses and asks you: *continue another block, a specific number of rounds,
+or compose the final answer from the work so far?* Budgets (agent calls, wall
+time) remain the hard backstop underneath. A round costs `len(panel) + 1`
+model calls (every seat + the lead synthesis) — which is exactly why the
+consent gate exists.
+
+**One hard gate.** Work happens freely in the council's own sandbox/workspace
+(writes, edits, test runs, staging, web lookups — no approvals). The single
+approval in the whole pipeline is **promote**: copying a finished file into
+your real folder, with a diff on the approval card. A promote with no known
+destination asks you *where* at delivery time — never up front, never assumed.
 
 ## Setup
 
@@ -108,15 +156,20 @@ its category, risk, `requires_approval`, allowed roles, and inputs; the kernel
 role-gates every action and decides on that metadata — never on hardcoded
 behaviour.
 
-| Skill | Approval | Roles | What it does |
-|-------|----------|-------|--------------|
-| `write_file` | **required** (human) | implementer | Write a file (workspace or sandbox) |
-| `read_file` | none (read) | researcher, implementer | Read a file |
-| `search_project` | none (read) | researcher, architect, implementer | grep file names + contents in the workspace |
+| Skill | Approval | What it does |
+|-------|----------|--------------|
+| `write_file` / `edit_file` | none | Write/edit files in the council's own sandbox or workspace |
+| `run_tests` | none | Run a test command inside the council's spaces (time/output-bounded) |
+| `read_file` / `search_project` / `list_dir` | none (read) | Read, grep, and list — sandbox, workspace, or the established folder |
+| `web_search` / `web_fetch` | none (read) | Governed live-web lookups via the coordinator |
+| `stage` | none | Move a file up from sandbox into the permanent workspace |
+| `promote` | **required** (human, with diff) | **The ONE gate** — copy a council file into your real (established) folder |
 
-- **Producing files**: the implementer heads a block with `ARTIFACT: <filename>`
-  (one per file) followed by the full contents; each becomes an approval-gated
-  `write_file`. If an output task names files but emits no full blocks, the
+- **Producing files**: the lead heads a block with `ARTIFACT: <filename>`
+  (one per file) followed by the full contents; these write freely into the
+  sandbox. A `PROMOTE: <filename>` line is what proposes real delivery — that
+  is where the approval (and, if unset, the "where should this go?" question)
+  happens. If an output task names files but emits no full blocks, the
   coordinator **materializes** each with a focused single-file call.
 - **Reading mid-deliberation**: any allowed role may emit a plain-text
   `SKILL: read_file <path>` or `SKILL: search_project <query>` line; the kernel
@@ -156,12 +209,15 @@ under `data/uploads/`):
 ## Guarantees (enforced by tests)
 
 - Every loop is bounded — sessions always terminate; budget exhaustion yields
-  a partial low-confidence answer, never a spin (`test_budgets.py`).
-- Default-deny — the only approval-free capability is `generate_text`; risky
-  tasks pause in `awaiting_approval` before any agent runs
-  (`test_governance.py`).
+  a partial low-confidence answer, never a spin (`test_budgets.py`); a lead
+  that declares CONTINUE past the consent block pauses for your go-ahead
+  (`test_rounds.py`).
+- One hard gate — work in the council's own spaces is free; nothing reaches
+  your real folder without an explicit, diff-carrying `promote` approval
+  (`test_actions.py`, `test_established.py`). Risk classification is
+  informational and never blocks a run (`test_governance.py`).
 - Full reasoning trail — every classification, council choice, round,
-  contribution, disagreement ruling, and approval is in
+  panel contribution, synthesis decision, and approval is in
   `data/sessions/<id>.jsonl`, with session state in `data/conclave_os.db`
   (`test_loop_mock.py`).
 
