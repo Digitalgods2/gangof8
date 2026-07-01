@@ -23,10 +23,24 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .. import cancellation
+from .. import cancellation, config
 from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentError
+
+
+def _neutral_cwd() -> str:
+    """CLI subprocesses run from an EMPTY, neutral directory — never the
+    server's own repo/cwd. A CLI agent with latent tool instincts (claude
+    attempting Read calls, codex scanning its workspace) must not perceive —
+    or ungovernedly read — whatever folder the server happens to run in.
+    Project content reaches agents only through the governed overview and
+    SKILL reads. (Live failure: a claude lead running with cwd=the repo said
+    \"I'm running in the actual repo\" and emitted tool-call debris instead of
+    a synthesis.)"""
+    d = config.SANDBOX_ROOT / "cli-neutral"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
 
 
 class CliAdapter:
@@ -75,6 +89,7 @@ class CliAdapter:
             proc = subprocess.Popen(
                 [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                cwd=_neutral_cwd(),
             )
         except (OSError, FileNotFoundError) as e:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e

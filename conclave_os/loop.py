@@ -593,13 +593,27 @@ def _panel_one(
     for the round (logged, noted), never fatal. A panel seat asking the human a
     question is also treated as a drop — pausing mid-fan-out with sibling
     threads in flight is not sound; only the lead's calls may pause the run."""
+    dropped_contribution = None
     try:
-        return call(member, prompt)
+        c = call(member, prompt)
+        # A stub take (tool-call debris / announced-but-not-done work) would
+        # only pollute the synthesis and later context windows — drop the seat
+        # for this round AND remove its debris from the transcript (the
+        # panel_seat_dropped event + unresolved note keep the audit trail). No
+        # retry: panel seats are best-effort voices, and the lead + composer
+        # still have every healthy take.
+        if rounds.reply_is_stub(c.content):
+            reason = "stub reply (announced or attempted the work instead of doing it)"
+            dropped_contribution = c
+        else:
+            return c
     except AgentInputRequired:
         reason = "asked for user input"
     except (AgentError, BudgetExceeded) as e:
         reason = str(e)
     with _SESSION_LOCK:
+        if dropped_contribution is not None and dropped_contribution in session.contributions:
+            session.contributions.remove(dropped_contribution)
         session.unresolved.append(f"panel seat '{member.agent}' dropped this round: {reason}")
         store.log_event(session.session_id, "panel_seat_dropped",
                         {"agent": member.agent, "round": session.current_round,
@@ -699,25 +713,28 @@ def _run_panel_rounds(
         c = lead_call(lead, p)
         c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
         c = _resolve_delegations(session, council, lead, p, c, call, store)
-        # A synthesis that only ANNOUNCES the work ("I'll read the files, then
-        # deliver...") must not be accepted as DONE — re-call once demanding the
-        # result now. A second stub is noted and the composer synthesizes from
-        # the panel views instead (the proven rescue path).
-        if rounds.synthesis_is_stub(c.content):
+        # A synthesis that only ANNOUNCES or ATTEMPTS the work ("I'll read the
+        # files, then deliver..." / blocked tool-call debris) must not be
+        # accepted as DONE — re-call once demanding the result now. A second
+        # stub is noted and the composer synthesizes from the panel views
+        # instead (the proven rescue path).
+        if rounds.reply_is_stub(c.content):
             store.log_event(sid, "synthesis_stub_retry",
                             {"round": r, "stub": c.content.strip()[:200]})
             nudge = (
-                f"{p}\n\nIMPORTANT: your previous reply only ANNOUNCED what you "
-                f"were going to do — it said: \"{c.content.strip()[:300]}\". You "
-                "cannot go off and do anything outside this reply. Deliver the "
-                "complete result NOW, in this reply. If you need file contents "
-                "first, emit 'SKILL: read_file <path>' lines and the results "
-                "will be handed back to you."
+                f"{p}\n\nIMPORTANT: your previous reply only ANNOUNCED or "
+                f"ATTEMPTED what you were going to do — it began: "
+                f"\"{c.content.strip()[:300]}\". You cannot go off and do "
+                "anything outside this reply, and any tool-call syntax you emit "
+                "is ignored — you have NO native tools here. Deliver the "
+                "complete result NOW, in this reply, as plain text. If you need "
+                "file contents first, emit 'SKILL: read_file <path>' lines and "
+                "the results will be handed back to you."
             )
             c = lead_call(lead, nudge)
             c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store)
             c = _resolve_delegations(session, council, lead, nudge, c, call, store)
-            if rounds.synthesis_is_stub(c.content):
+            if rounds.reply_is_stub(c.content):
                 session.unresolved.append(
                     "lead synthesis was a stub twice; final answer composed from "
                     "the panel views instead")

@@ -285,25 +285,64 @@ LIVE_STUB = (
 
 
 def test_stub_detection_matches_the_live_failure():
-    assert rounds.synthesis_is_stub(LIVE_STUB) is True
+    assert rounds.reply_is_stub(LIVE_STUB) is True
 
 
 def test_short_direct_answer_is_not_a_stub():
     # the mock lead's legitimate short answer has no deferral phrasing
     from conclave_os.adapters.mock import LEAD_ANSWER
 
-    assert rounds.synthesis_is_stub(LEAD_ANSWER) is False
-    assert rounds.synthesis_is_stub("SQLite. It is the safer default.") is False
+    assert rounds.reply_is_stub(LEAD_ANSWER) is False
+    assert rounds.reply_is_stub("SQLite. It is the safer default.") is False
 
 
 def test_marker_lines_are_never_stubs():
-    assert rounds.synthesis_is_stub("I'll consult a specialist first.\nCONSULT: architect - layout?") is False
-    assert rounds.synthesis_is_stub("Let me check the file.\nSKILL: read_file main.py") is False
-    assert rounds.synthesis_is_stub("I'll wrap up here.\nROUND: DONE") is False
+    assert rounds.reply_is_stub("I'll consult a specialist first.\nCONSULT: architect - layout?") is False
+    assert rounds.reply_is_stub("Let me check the file.\nSKILL: read_file main.py") is False
+    assert rounds.reply_is_stub("I'll wrap up here.\nROUND: DONE") is False
 
 
 def test_long_reply_is_not_a_stub():
-    assert rounds.synthesis_is_stub("I'll now explain in detail. " + "Substance. " * 60) is False
+    assert rounds.reply_is_stub("I'll now explain in detail. " + "Substance. " * 60) is False
+
+
+# the exact shape a claude lead produced live: blocked native tool calls
+# rendered as text — 968 chars of debris that sailed past the length-only check
+LIVE_TOOL_DEBRIS = (
+    "I'm running in the actual repo, so I'll read the core files directly rather "
+    "than relying on the excerpts — starting with the loop, delegation machinery, "
+    "and the prompt layer.\n\n"
+    "<summary>Read loop.py (deliberation loop core)</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\loop.py"\n}\n\n'
+    "<summary>Read rounds.py (prompt layer)</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\rounds.py"\n}\n\n'
+    "<summary>Read config.py (budgets, seats)</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\config.py"\n}\n\n'
+    "<summary>Read models.py</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\models.py"\n}\n\n'
+    "<summary>Read roles.py (council building)</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\roles.py"\n}\n\n'
+    "<summary>Read governance.py</summary>\n"
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\governance.py"\n}'
+)
+
+
+def test_tool_call_debris_is_a_stub_regardless_of_length():
+    assert len(LIVE_TOOL_DEBRIS) > config.SYNTHESIS_STUB_CHARS
+    assert rounds.reply_is_stub(LIVE_TOOL_DEBRIS) is True
+
+
+def test_debris_plus_real_analysis_is_not_a_stub():
+    # a reply that attempted a tool call but ALSO delivered real substance keeps
+    # the substance
+    real = LIVE_TOOL_DEBRIS + "\n\nDespite that, my analysis: " + "the loop should split. " * 20
+    assert rounds.reply_is_stub(real) is False
+
+
+def test_prose_mentioning_file_path_is_not_debris():
+    prose = ('The config uses a "file_path" argument throughout, which is fine. '
+             + "More detail on why this design holds up. " * 10)
+    assert rounds.reply_is_stub(prose) is False
 
 
 class StubbingLead:
@@ -347,6 +386,49 @@ def test_double_stub_degrades_to_composer(tmp_path):
     assert any("stub twice" in u for u in session.unresolved)
     # only one retry was spent — no runaway re-calling
     assert _events(svc, session).count("synthesis_stub_retry") == 1
+
+
+def test_stubbing_panel_seat_is_dropped_from_synthesis(tmp_path):
+    """A panelist that emits tool-call debris is dropped for the round: its
+    debris must NOT reach the lead's synthesis prompt; healthy seats still do."""
+
+    class HealthySeat:
+        name = "alpha"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="panel take from alpha: use SQLite.", duration_ms=1)
+
+    class DebrisSeat:
+        name = "beta"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content=LIVE_TOOL_DEBRIS, duration_ms=1)
+
+    class CapturingLead:
+        name = "mock"
+
+        def __init__(self):
+            self.synthesis_prompt = None
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s, images=None):
+            if role == Role.lead:
+                self.synthesis_prompt = prompt
+                return AdapterResult(content="Synthesis over the healthy takes.\nROUND: DONE",
+                                     duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    lead = CapturingLead()
+    svc = ConclaveService(data_dir=tmp_path, panel=["alpha", "beta"])
+    svc.registry.register(HealthySeat())
+    svc.registry.register(DebrisSeat())
+    svc.registry.register(lead)
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert "panel take from alpha" in lead.synthesis_prompt
+    assert "file_path" not in lead.synthesis_prompt, "debris kept out of the synthesis"
+    assert "panel_seat_dropped" in _events(svc, session)
+    assert any("beta" in u and "stub" in u for u in session.unresolved)
 
 
 # --- task-aware skill-request cap --------------------------------------------------
