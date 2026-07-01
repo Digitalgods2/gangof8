@@ -199,7 +199,12 @@ class CliAdapter:
         fd, outfile = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
         try:
-            cmd = ["codex", "exec", "--color", "never", "--output-last-message", outfile]
+            # --skip-git-repo-check: codex refuses to run outside a "trusted"
+            # (git) directory, and we deliberately run every CLI from a neutral
+            # EMPTY dir (see _neutral_cwd) — codex has no tools enabled here, so
+            # the trust check protects nothing and only kills the seat.
+            cmd = ["codex", "exec", "--color", "never", "--skip-git-repo-check",
+                   "--output-last-message", outfile]
             if self.model:
                 cmd += ["-m", self.model]
             for img in images or []:
