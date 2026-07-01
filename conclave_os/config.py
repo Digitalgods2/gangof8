@@ -161,6 +161,13 @@ PANEL_CARRYOVER_CHARS = 900      # a seat's own prior-round text carried into it
 PEER_CARRYOVER_CHARS = 500       # a peer seat's prior-round text carried into others' prompts
 SYNTHESIS_CARRYOVER_CHARS = 2000  # last round's lead synthesis carried forward
 ROUND_SUMMARY_CHARS = 300        # per-round digest shown in the consent question
+# A lead synthesis that only ANNOUNCES work ("I'll read the files, then deliver
+# my analysis") is a stub, not a result — seen in a live run where the marker
+# default then accepted 100 chars of intent as DONE. Below this size, with no
+# deliverable/marker lines and deferral phrasing, the lead is re-called once
+# demanding the work now; a second stub degrades to composing from the panel
+# views (the composer rescue path proven in that same run).
+SYNTHESIS_STUB_CHARS = 250
 
 # Retained for settings back-compat; classification still reports risk but it
 # is informational — the loop no longer pauses on it. The one hard gate is the
@@ -243,8 +250,11 @@ COMPOSER_CONTEXT_CHARS = 1400
 # In-deliberation skill requests: an agent may emit 'SKILL: <name> <arg>' to
 # pull a no-approval capability (e.g. read_file) mid-round. Bound how many it
 # can request per turn and how much result text is fed back, so a turn can't
-# balloon the prompt or the budget.
+# balloon the prompt or the budget. Analysis tasks (research/question/design)
+# get more headroom — reading the material IS the job there; the tight cap
+# starved "examine this codebase" runs (a lead asked for 11 reads, got 2).
 MAX_SKILL_REQUESTS_PER_TURN = 2
+MAX_SKILL_REQUESTS_ANALYSIS = 6
 SKILL_RESULT_MAX_CHARS = 2000
 MAX_ESCALATION_REQUESTS_PER_TURN = 2
 ESCALATION_RESULT_MAX_CHARS = 2500

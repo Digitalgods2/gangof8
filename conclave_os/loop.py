@@ -519,6 +519,15 @@ def _resolve_delegations(
     return call(lead, followup)
 
 
+def _skill_request_cap(session: Session) -> int:
+    """How many SKILL: requests one turn may resolve. Analysis tasks get more —
+    reading the material is the job; output tasks keep the tight bound."""
+    cls = session.classification
+    if cls and cls.task_type in (TaskType.research, TaskType.question, TaskType.design):
+        return config.MAX_SKILL_REQUESTS_ANALYSIS
+    return config.MAX_SKILL_REQUESTS_PER_TURN
+
+
 def _resolve_skill_requests(
     session: Session, member: CouncilMember, prompt: str, contribution: Contribution,
     call: AgentCall, governance: Governance, store: LogStore,
@@ -533,7 +542,7 @@ def _resolve_skill_requests(
         return contribution
     sid = session.session_id
     results: list[str] = []
-    for raw_name, arg in reqs[: config.MAX_SKILL_REQUESTS_PER_TURN]:
+    for raw_name, arg in reqs[: _skill_request_cap(session)]:
         name, arg = raw_name.lower(), arg.strip()
         store.log_event(sid, "skill_requested",
                         {"skill": name, "role": member.role.value, "arg": arg})
@@ -690,6 +699,28 @@ def _run_panel_rounds(
         c = lead_call(lead, p)
         c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
         c = _resolve_delegations(session, council, lead, p, c, call, store)
+        # A synthesis that only ANNOUNCES the work ("I'll read the files, then
+        # deliver...") must not be accepted as DONE — re-call once demanding the
+        # result now. A second stub is noted and the composer synthesizes from
+        # the panel views instead (the proven rescue path).
+        if rounds.synthesis_is_stub(c.content):
+            store.log_event(sid, "synthesis_stub_retry",
+                            {"round": r, "stub": c.content.strip()[:200]})
+            nudge = (
+                f"{p}\n\nIMPORTANT: your previous reply only ANNOUNCED what you "
+                f"were going to do — it said: \"{c.content.strip()[:300]}\". You "
+                "cannot go off and do anything outside this reply. Deliver the "
+                "complete result NOW, in this reply. If you need file contents "
+                "first, emit 'SKILL: read_file <path>' lines and the results "
+                "will be handed back to you."
+            )
+            c = lead_call(lead, nudge)
+            c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store)
+            c = _resolve_delegations(session, council, lead, nudge, c, call, store)
+            if rounds.synthesis_is_stub(c.content):
+                session.unresolved.append(
+                    "lead synthesis was a stub twice; final answer composed from "
+                    "the panel views instead")
         decision, why = rounds.parse_round_decision(c.content)
         store.log_event(sid, "round_synthesized",
                         {"round": r, "decision": decision, "why": why[:200]})
