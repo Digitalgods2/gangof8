@@ -44,6 +44,7 @@ def stub_run(monkeypatch):
 
         def fake_popen(cmd, **kwargs):
             calls["cmd"] = cmd
+            calls["cwd"] = kwargs.get("cwd")
             return proc
         monkeypatch.setattr(cli_mod.subprocess, "Popen", fake_popen)
         # resolve any CLI name to a fake path so tests don't need a real install
@@ -62,6 +63,20 @@ def test_claude_returns_result_field(stub_run):
     assert calls["cmd"][1] == "-p"
     assert "--tools" in calls["cmd"]  # tools disabled — no side effects
     assert calls["input"] == "make main.py"  # prompt goes on stdin
+
+
+def test_cli_subprocess_runs_from_a_neutral_cwd(stub_run):
+    """The agent CLI must never inherit the server's cwd (the repo): a model
+    with latent tool instincts would perceive — and could ungovernedly read —
+    whatever folder the server runs in. It runs from an empty sandbox dir."""
+    from conclave_os import config
+
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "ok"})))
+    CliAdapter("claude").call(Role.lead, "hello", timeout_s=60)
+    cwd = Path(calls["cwd"])
+    assert cwd == config.SANDBOX_ROOT / "cli-neutral"
+    assert cwd.is_dir()
+    assert Path.cwd() != cwd, "must not be the server's own cwd"
 
 
 def test_claude_is_error_raises(stub_run):

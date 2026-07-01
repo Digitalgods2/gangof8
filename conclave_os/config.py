@@ -193,8 +193,9 @@ APPROVAL_CATEGORIES = [
 # that touches real user code; cap the diff shown in its approval card.
 PROMOTE_DIFF_MAX_CHARS = 6000
 
-# run_tests (code execution) bounds — the command runs in the workspace only
-# after explicit human approval; keep it time- and output-bounded.
+# run_tests (code execution) bounds — the command runs FREELY in the council's
+# own sandbox/workspace (the spaces model gates only promote); keep it time-
+# and output-bounded.
 RUN_TESTS_TIMEOUT = 300
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 

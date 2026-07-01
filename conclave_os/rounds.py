@@ -40,6 +40,10 @@ _GOVERNANCE_CONTEXT = (
     "'SKILL: read_file <path>'; to search, 'SKILL: search_project <query>'. The "
     "results are handed back to you. Use these instead of refusing, and base your "
     "analysis on what they return — never invent file contents.\n"
+    "You have NO native tools here, whatever your instincts say — tool-call "
+    "syntax (Read/invoke blocks, file-path JSON) is ignored and wastes your "
+    "turn. Plain-text SKILL: lines are the ONLY way to read; your reply text "
+    "IS your entire contribution.\n"
 )
 
 def delegation_contract(council: "Council", role_agents: dict[Role, str] | None) -> str:
@@ -230,6 +234,10 @@ _PANEL_CONTEXT = (
     "access of your own; the coordinator has already gathered any project "
     "content shown below. Do not refuse for lack of access — reason from what "
     "is provided and state assumptions where something is missing.\n"
+    "You have NO tools in this environment, even if your instincts say "
+    "otherwise: do NOT emit tool-use syntax (Read/invoke blocks, file-path "
+    "JSON) — nothing executes it and your seat's contribution would be lost. "
+    "Your reply text IS your entire contribution.\n"
 )
 
 _ROUND_CONTRACT = (
@@ -264,18 +272,34 @@ _ANY_MARKER_RE = re.compile(
     r"(?:\*\*)?\s*[:—–-]",
     re.IGNORECASE | re.MULTILINE,
 )
+# Tool-use ATTEMPTS rendered as text: a CLI agent trying to call its native
+# tools instead of contributing (claude's blocked Read calls appear as
+# '<summary>Read x</summary>' + a bare {"file_path": ...} JSON block; raw
+# invoke/parameter XML is the same instinct). Nothing executes these — they
+# are debris, not content, no matter how many chars they add up to.
+_TOOL_DEBRIS_RE = re.compile(
+    r"<summary>.*?</summary>"
+    r"|<invoke\b.*?(?:</invoke>|\Z)"
+    r"|<parameter\b.*?(?:</parameter>|\Z)"
+    r"|^[ \t]*\{[^{}]*\"(?:file_path|command|pattern|query|path)\"[^{}]*\}[ \t]*$",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
 
 
-def synthesis_is_stub(content: str) -> bool:
-    """True when a lead reply merely announces future work instead of doing it:
-    short, no contract markers, first-person deferral phrasing. A genuinely
-    short direct answer (no deferral phrasing) is NOT a stub."""
+def reply_is_stub(content: str) -> bool:
+    """True when a reply merely announces or ATTEMPTS the work instead of doing
+    it: tool-call debris or first-person deferral phrasing, with too little
+    real prose left over. A contract marker (SKILL:/CONSULT:/ARTIFACT:/ROUND:)
+    always counts as real work; a genuinely short direct answer with no
+    deferral phrasing is NOT a stub."""
     text = (content or "").strip()
-    if len(text) >= config.SYNTHESIS_STUB_CHARS:
-        return False
     if _ANY_MARKER_RE.search(text):
         return False
-    return bool(_DEFERRAL_RE.search(text))
+    prose, debris = _TOOL_DEBRIS_RE.subn("", text)
+    prose = prose.strip()
+    if len(prose) >= config.SYNTHESIS_STUB_CHARS:
+        return False
+    return debris > 0 or bool(_DEFERRAL_RE.search(prose))
 
 
 def parse_round_decision(text: str) -> tuple[str, str]:
