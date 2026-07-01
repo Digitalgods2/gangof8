@@ -231,20 +231,20 @@ def test_promote_denial_skips_but_completes_session(promote_service):
     assert done.final is not None
 
 
-# --- session-level risk gate still cancels / still gates -----------------------
+# --- no pre-run risk gate: promote is the single approval boundary -------------
 
 
-def test_gate_denial_still_cancels(tmp_path):
+def test_risky_task_has_no_pre_run_gate(tmp_path):
+    """Risk classification is informational — a risky-sounding task with only
+    sandbox output runs straight through with zero approvals."""
     service = ConclaveService(data_dir=tmp_path)
     session = service.run("Delete all temp files in C:\\temp and email me the report", source="test")
-    assert session.status == SessionStatus.awaiting_approval
-    assert session.approvals[0].action_ref is None, "session gates carry no action_ref"
-    cancelled = service.approve(session.session_id, session.approvals[0].approval_id, approved=False)
-    assert cancelled.status == SessionStatus.cancelled
+    assert session.status == SessionStatus.done
+    assert session.approvals == []
 
 
-def test_gate_then_promote_double_approval(tmp_path):
-    """Risky task with a promote: gate approval first, then the promote approval."""
+def test_risky_task_still_gates_on_promote(tmp_path):
+    """A risky task that promotes hits exactly ONE approval: the promote."""
     est = tmp_path / "established"
     est.mkdir()
     service = _EstablishedService(data_dir=tmp_path / "data")
@@ -253,12 +253,11 @@ def test_gate_then_promote_double_approval(tmp_path):
     session = service.run(
         "Delete all temp files in C:\\temp and email me the report", source="test"
     )
-    assert session.status == SessionStatus.awaiting_approval  # gate
-    after_gate = service.approve(session.session_id, session.approvals[0].approval_id, approved=True)
-    assert after_gate.status == SessionStatus.awaiting_approval  # now the promote
-    action_approval = next(a for a in after_gate.approvals if a.status == "pending")
+    assert session.status == SessionStatus.awaiting_approval  # the promote, not a pre-run gate
+    action_approval = next(a for a in session.approvals if a.status == "pending")
     assert action_approval.action_ref is not None
     assert action_approval.category == "promote"
+    assert len(session.approvals) == 1, "promote is the only approval boundary"
     done = service.approve(session.session_id, action_approval.approval_id, approved=True)
     assert done.status == SessionStatus.done
     promote = next(a for a in done.proposed_actions if a.kind == "promote")

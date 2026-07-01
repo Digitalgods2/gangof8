@@ -62,6 +62,7 @@ class SessionStatus(str, Enum):
 class Role(str, Enum):
     coordinator = "coordinator"
     lead = "lead"  # the single driver of a task; pulls in the talents below on demand
+    panelist = "panelist"  # a full-council seat that contributes every round
     knowledge_retriever = "knowledge_retriever"
     researcher = "researcher"
     architect = "architect"
@@ -179,7 +180,8 @@ class InputRequest(BaseModel):
     agent: str
     role: Role = Role.coordinator
     round: int = 0
-    purpose: str = "deliberation"  # deliberation | compose
+    # deliberation | compose | continue_rounds | promote_target | establish_target (legacy)
+    purpose: str = "deliberation"
     question: str
     resume_token: str  # backend handle for the paused call
     status: str = "pending"  # pending | answered | declined
@@ -261,6 +263,9 @@ class Session(BaseModel):
     established_root: Optional[str] = None  # external real folder (per task): read-only; the
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
+    panel: list[str] = []  # seat names convened for this session (resume-stable)
+    consent_extra_rounds: int = 0  # rounds the human granted beyond ROUNDS_PER_CONSENT
+    compose_now: bool = False  # human said "finish" — skip further rounds, compose from the work so far
     turns: list[dict] = []  # the conversation: [{role:'user'|'council', text}] — grows as the
     #                         human responds to a conclusion and the council deliberates again.
     attachments: list[dict] = []  # [{id, name, kind}] folded into the task text

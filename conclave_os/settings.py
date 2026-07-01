@@ -53,6 +53,12 @@ class Settings(BaseModel):
     # the built-in default from config.OPENROUTER_SEATS. Edit when the catalog
     # changes a slug.
     openrouter_models: dict[str, str] = {}
+    # Explicit panel roster (seat names that contribute every round). Empty ⇒
+    # derive per backend: the installed CLI agents plus enabled+keyed
+    # OpenRouter seats.
+    panel_seats: list[str] = []
+    # Automatic rounds between "continue another n rounds?" consent checks.
+    rounds_per_consent: int = Field(default_factory=lambda: config.ROUNDS_PER_CONSENT)
 
 
 def _settings_path(data_dir: Optional[Path] = None) -> Path:

@@ -49,6 +49,8 @@ _TIMELINE = {
     "classified": ("🏷️", "Classified"),
     "council_formed": ("👥", "Council formed"),
     "round_start": ("🔄", "Round started"),
+    "round_synthesized": ("🧩", "Round synthesized"),
+    "panel_seat_dropped": ("⚠️", "Panel seat dropped"),
     "contribution": ("💬", "Agent contributed"),
     "skill_requested": ("🔧", "Skill requested"),
     "skill_resolved": ("📄", "Skill result"),
@@ -116,6 +118,11 @@ def _detail(event: str, p: dict) -> str:
         return str(p.get("question", p.get("answer", "")))[:80]
     if event == "seat_dropped":
         return f"{p.get('role','')} · {p.get('agent','')}: {str(p.get('error',''))[:60]}"
+    if event == "round_synthesized":
+        return f"round {p.get('round','')}: {p.get('decision','')}" + (
+            f" — {str(p.get('why',''))[:60]}" if p.get("why") else "")
+    if event == "panel_seat_dropped":
+        return f"{p.get('agent','')}: {str(p.get('error',''))[:60]}"
     if event == "refine_round":
         return f"iteration {p.get('iteration','')}"
     if event == "converged":

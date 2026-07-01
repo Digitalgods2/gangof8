@@ -67,17 +67,19 @@ def test_denied_action_still_blocks(governance, session):
         governance.check(session, "spend", action="buy credits", category="spend")
 
 
-def test_risky_task_pauses_before_round_one(service):
+def test_risky_task_runs_without_a_pre_run_gate(service):
+    """Risk is classified for visibility but no longer pauses the run — the one
+    hard gate is the promote approval at delivery time. Sandbox-only work on a
+    risky-sounding task flows straight through."""
     session = service.run(
         "Delete all temp files in C:\\temp and email me the report", source="test"
     )
-    assert session.status == SessionStatus.awaiting_approval
+    assert session.status == SessionStatus.done
     assert session.classification.risk == Risk.high
-    assert session.classification.human_approval_required is True
-    assert session.final is None
-    assert session.has_pending_approval
-    assert len(session.rounds) == 0, "no deliberation may run before approval"
-    assert session.agent_calls == 0, "no agent may be called before approval"
+    assert session.classification.human_approval_required is True  # informational
+    assert session.approvals == [], "no pre-run approval gate"
+    assert len(session.rounds) >= 1, "deliberation ran immediately"
+    assert session.final is not None
 
 
 def test_safe_task_never_pauses(service):

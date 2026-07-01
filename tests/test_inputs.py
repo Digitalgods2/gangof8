@@ -87,7 +87,8 @@ def test_answer_resumes_to_done(service):
     assert any(
         "incorporating the user's answer" in c.content for c in resumed.contributions
     ), "the resumed call's output must join the deliberation"
-    assert len(resumed.rounds) == 1, "the lead runs a single round"
+    # the pre-pause round plus the finishing round after the answer landed
+    assert len(resumed.rounds) == 2
     assert resumed.disagreements == [], "the lead model has no disagreement machinery"
     path = service.store.session_log_path(session.session_id)
     events = [json.loads(line)["event"] for line in path.read_text(encoding="utf-8").splitlines()]

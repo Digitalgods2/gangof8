@@ -93,13 +93,23 @@ FINAL_JSON = (
 )
 
 
+PANEL_VIEW = (
+    "Panel view: SQLite is the safer default for session logs; watch the "
+    "low-write-volume assumption and pair every DB write with its JSONL mirror line."
+)
+
+
 class MockAdapter:
-    name = "mock"
+    def __init__(self, name: str = "mock"):
+        # A name per instance lets tests register several mock seats as a panel.
+        self.name = name
 
     def call(self, role: Role, prompt: str, timeout_s: int,
              images: list[dict] | None = None) -> AdapterResult:
         lower = prompt.lower()
-        if role == Role.lead:
+        if role == Role.panelist:
+            content = PANEL_VIEW
+        elif role == Role.lead:
             # A continuation request (truncated artifact) gets just the tail; any
             # other lead call gets a plain answer. The default mock lead does NOT
             # fabricate files — tests that exercise the artifact path register
