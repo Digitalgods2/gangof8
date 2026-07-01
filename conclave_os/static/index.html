@@ -734,6 +734,7 @@ function renderDetail(s) {
         ${a.details ? `<pre class="diff">${diffHtml(a.details)}</pre>` : ""}
         <div class="row">
           <button onclick="resolveApproval('${a.approval_id}', true)">Approve</button>
+          <button onclick="resolveApproval('${a.approval_id}', true, true)" title="Approve this and every other ${esc(a.category)} in this session — one decision instead of N identical clicks">Approve all ${esc(a.category)}s</button>
           <button class="deny" onclick="resolveApproval('${a.approval_id}', false)">Deny</button>
         </div>
       </div>`).join("")}
@@ -812,10 +813,10 @@ function tickElapsed() {
   el.textContent = Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
 }
 
-async function resolveApproval(aid, approved) {
+async function resolveApproval(aid, approved, approve_all = false) {
   await api(`/sessions/${current}/approvals/${aid}`, {method:"POST",
     headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({approved, background:true})});
+    body: JSON.stringify({approved, approve_all, background:true})});
   pollLoop();  // work may resume → return to fast polling
 }
 

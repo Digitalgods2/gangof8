@@ -241,10 +241,16 @@ class Workspace(BaseModel):
 
 
 class Budgets(BaseModel):
-    max_rounds: int = 4
-    max_turns_per_round: int = 2
+    """The hard bounds on a run. Deliberation terminates on ROUND: DONE, a
+    declined consent, the call budget, or wall time — there is no round cap."""
+
     max_agent_calls: int = 12
     max_wall_seconds: int = 600
+    # How deep the delegation tree may go (1 = lead → specialist only) and how
+    # many CONSULT:/DELEGATE: grants one reply may fan out. Scaled by task
+    # complexity in config.BUDGETS_BY_COMPLEXITY.
+    max_delegation_depth: int = 2
+    max_delegations: int = 4
 
 
 class FinalAnswer(BaseModel):
@@ -264,6 +270,10 @@ class Session(BaseModel):
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
     panel: list[str] = []  # seat names convened for this session (resume-stable)
+    # Approval categories the human granted a session-wide standing approval for
+    # (e.g. "promote" via 'Approve all'): one deliberate grant instead of N
+    # identical clicks. Session-scoped — a new task starts clean.
+    standing_approvals: list[str] = []
     consent_extra_rounds: int = 0  # rounds the human granted beyond ROUNDS_PER_CONSENT
     compose_now: bool = False  # human said "finish" — skip further rounds, compose from the work so far
     turns: list[dict] = []  # the conversation: [{role:'user'|'council', text}] — grows as the

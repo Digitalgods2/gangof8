@@ -1,6 +1,9 @@
 """Show full content of a session's contributions for a role:
-python show_contribution.py <session_id> <role>"""
+python scripts/show_contribution.py <session_id> <role>"""
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from conclave_os.service import ConclaveService
 

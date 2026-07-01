@@ -26,34 +26,25 @@ def _default_sandbox_root() -> Path:
 SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_root())))
 
 # A panel round costs len(panel)+1 calls (every seat + the lead synthesis), so
-# the call budgets carry real multi-round headroom. max_rounds/max_turns_per_round
-# remain as fields for back-compat but no longer terminate deliberation — the
-# terminators are ROUND: DONE, a declined consent, max_agent_calls, and wall time.
+# the call budgets carry real multi-round headroom. The terminators are
+# ROUND: DONE, a declined consent, max_agent_calls, and wall time. Delegation
+# depth/fan-out scale with complexity: a trivial question stays flat and fast;
+# a complex build earns a lead → specialist → sub-agent tree.
 BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
-    Complexity.trivial: Budgets(max_rounds=1, max_turns_per_round=1, max_agent_calls=10, max_wall_seconds=420),
-    Complexity.standard: Budgets(max_rounds=3, max_turns_per_round=2, max_agent_calls=48, max_wall_seconds=1800),
-    Complexity.complex: Budgets(max_rounds=4, max_turns_per_round=2, max_agent_calls=80, max_wall_seconds=2700),
+    Complexity.trivial: Budgets(max_agent_calls=10, max_wall_seconds=420,
+                                max_delegation_depth=1, max_delegations=2),
+    Complexity.standard: Budgets(max_agent_calls=48, max_wall_seconds=1800,
+                                 max_delegation_depth=2, max_delegations=4),
+    Complexity.complex: Budgets(max_agent_calls=80, max_wall_seconds=2700,
+                                max_delegation_depth=3, max_delegations=6),
 }
 
-# Convergence-driven deliberation: after the planned phases, the implementer
-# revises against the critic's objections and is re-reviewed, repeating UNTIL the
-# critic accepts. This is the safety backstop on that loop (alongside the
-# agent-call budget and wall-time) — NOT the normal terminator.
-# Retained for settings/back-compat; the lead-driven flow no longer refines.
-MAX_REFINE_ITERATIONS = 6
-
-# Lead-driven model: a single lead LLM drives every task and may pull in other
-# talents (the specialist roles, each backed by its own origin model) ON DEMAND
-# via CONSULT:/DELEGATE: lines. These bound that delegation and the lead's own
-# big-file generation — there is no fixed round plan or critic-acceptance loop.
-MAX_DELEGATIONS = 4               # how many specialists the lead may pull in per run
-DELEGATION_RESULT_MAX_CHARS = 2500  # how much of a specialist's reply is fed back
-# How deep delegation may recurse: 1 = lead → specialist only; 2 = a consulted
-# specialist may itself CONSULT ONE sub-agent (the "primary LLM → agents →
-# sub-agents" hierarchy). Kept tiny on purpose — the real hierarchy is two levels,
-# not an org chart. Depth is a hard stop against runaway recursion; the session
-# agent-call budget (max_agent_calls, composer reserve) is the second backstop.
-MAX_DELEGATION_DEPTH = 2
+# The lead (and, one level down, consulted specialists) pull in other talents ON
+# DEMAND via CONSULT:/DELEGATE: lines. Depth and per-scan fan-out live on
+# Budgets (scaled by complexity, above); this bounds how much of a specialist's
+# reply is fed back — the RESULT: block survives whole, the preamble is what
+# gets truncated (see rounds.split_result_block).
+DELEGATION_RESULT_MAX_CHARS = 2500
 # Independent sibling consults (a seat emitting several CONSULT: lines at once) run
 # concurrently — each is a blocking CLI call, so this is the real wall-clock win.
 # This caps how many agent subprocesses run at once MACHINE-WIDE (the CLIs are

@@ -41,6 +41,9 @@ class ApprovalIn(BaseModel):
     approved: bool
     by: str = "user"
     background: bool = False
+    # grant a session-wide standing approval for this approval's category
+    # (e.g. every promote in this session) with one deliberate decision
+    approve_all: bool = False
 
 
 class InputAnswerIn(BaseModel):
@@ -113,7 +116,8 @@ def upload_file(body: UploadIn) -> dict:
 def resolve_approval(session_id: str, approval_id: str, body: ApprovalIn) -> dict:
     try:
         session = service.approve(
-            session_id, approval_id, body.approved, by=body.by, background=body.background
+            session_id, approval_id, body.approved, by=body.by,
+            background=body.background, approve_all=body.approve_all,
         )
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))

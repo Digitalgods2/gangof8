@@ -592,16 +592,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return self.store.list_sessions()
 
     def approve(self, session_id: str, approval_id: str, approved: bool,
-                by: str = "user", background: bool = False) -> Session:
+                by: str = "user", background: bool = False,
+                approve_all: bool = False) -> Session:
         """Resolve an approval. Approving the last pending approval on a paused
         session resumes it. Denying a session gate cancels the session; denying
         an action approval (action_ref set) skips just that action — the
-        session resumes and completes without the artifact."""
+        session resumes and completes without the artifact. `approve_all`
+        grants a session-wide standing approval for the category (and clears
+        its pending siblings) so N identical gates need one decision."""
         session = self.manager.load(session_id)
         if session is None:
             raise KeyError(f"session {session_id} not found")
         self._ensure_adapters(session)
-        approval = self.governance.resolve(session, approval_id, approved, by=by)
+        approval = self.governance.resolve(session, approval_id, approved, by=by,
+                                           approve_all=approve_all)
         if session.status != SessionStatus.awaiting_approval:
             return session  # nothing to resume — approval was informational
         if not approved and approval.action_ref is None:

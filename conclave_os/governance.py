@@ -77,6 +77,16 @@ class Governance:
         for a in session.approvals:
             if a.action_ref == action.action_id and a.status == "approved":
                 return None
+        # A standing grant ("approve all <category>" on an earlier approval in
+        # THIS session) clears the action without another pause — one deliberate
+        # human decision instead of N identical clicks.
+        if skill.category in session.standing_approvals:
+            self.store.log_event(
+                session.session_id, "standing_approval_used",
+                {"action_id": action.action_id, "kind": action.kind,
+                 "category": skill.category, "filename": action.filename},
+            )
+            return None
         # promote is the one gate that writes real user code: name the target
         # and attach the diff so the human approves with full sight of the change.
         details = None
@@ -126,8 +136,13 @@ class Governance:
         return approval
 
     def resolve(
-        self, session: Session, approval_id: str, approved: bool, by: str = "user"
+        self, session: Session, approval_id: str, approved: bool, by: str = "user",
+        approve_all: bool = False,
     ) -> ApprovalRequest:
+        """Resolve one approval. `approve_all` (with approved=True) additionally
+        grants a session-wide standing approval for the approval's category and
+        clears its sibling pending approvals of the same category — so promoting
+        six files is one deliberate decision, not six identical clicks."""
         approval = next((a for a in session.approvals if a.approval_id == approval_id), None)
         if approval is None:
             raise KeyError(f"no approval {approval_id} on session {session.session_id}")
@@ -135,5 +150,18 @@ class Governance:
         approval.resolved_at = utcnow()
         approval.resolved_by = by
         self.store.log_event(session.session_id, "approval_resolved", approval.model_dump())
+        if approved and approve_all and approval.category:
+            if approval.category not in session.standing_approvals:
+                session.standing_approvals.append(approval.category)
+            self.store.log_event(
+                session.session_id, "standing_approval_granted",
+                {"category": approval.category, "by": by},
+            )
+            for a in session.approvals:
+                if a.status == "pending" and a.category == approval.category:
+                    a.status = "approved"
+                    a.resolved_at = utcnow()
+                    a.resolved_by = by
+                    self.store.log_event(session.session_id, "approval_resolved", a.model_dump())
         self.store.save_session(session)
         return approval
