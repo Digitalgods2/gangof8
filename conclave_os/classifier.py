@@ -17,6 +17,10 @@ CODE_WORDS = [
     "program", "bug", "fix", "build", "app", "application", "api",
     "module", "package", "library", "cli", "endpoint", "backend",
     "frontend", "class",
+    # web/UI build requests: a "calendar webpage" / "landing page website" is a
+    # file-producing task, not a question — without these it misclassified as a
+    # plain question and the lead was never asked to emit a file.
+    "webpage", "web page", "website", "web app", "html", "css",
 ]
 # A filename with a known code/text extension (main.py, requirements.txt) is a
 # strong signal the task produces files even when no code verb is present.

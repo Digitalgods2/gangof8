@@ -60,6 +60,15 @@ _TIMELINE = {
     "critic_test_skipped": ("⏭️", "Critic test skipped"),
     "refine_round": ("✏️", "Refinement round"),
     "converged": ("🎯", "Critic accepted"),
+    # lead-driven model: on-demand delegation + artifact continuation
+    "delegation_requested": ("🤝", "Talent requested"),
+    "delegation_granted": ("🤝", "Talent pulled in"),
+    "delegation_resolved": ("📥", "Talent answered"),
+    "delegation_denied": ("🚫", "Talent unavailable"),
+    "delegation_failed": ("⚠️", "Delegation failed"),
+    "artifact_continuation": ("✂️", "Finishing cut-off file"),
+    "artifact_continued": ("➕", "File continued"),
+    "artifact_continuation_failed": ("⚠️", "Could not finish file"),
     "action_proposed": ("📝", "Action proposed"),
     "action_executed": ("⚙️", "Action executed"),
     "action_denied": ("🚫", "Action denied"),
@@ -111,6 +120,11 @@ def _detail(event: str, p: dict) -> str:
         return f"iteration {p.get('iteration','')}"
     if event == "converged":
         return f"after {p.get('iterations','')} round(s)"
+    if event in ("delegation_requested", "delegation_granted", "delegation_resolved",
+                 "delegation_denied", "delegation_failed"):
+        return " ".join(str(x) for x in (p.get("to", ""), p.get("reason", "")) if x)[:80]
+    if event in ("artifact_continuation", "artifact_continued", "artifact_continuation_failed"):
+        return str(p.get("file", ""))[:60]
     if event == "status_change":
         return f"{p.get('from','')} → {p.get('to','')}".strip(" →")
     if event in ("budget_exhausted", "agent_error"):

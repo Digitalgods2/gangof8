@@ -54,7 +54,7 @@ def test_stage_metadata():
     assert s.category == "stage"
     assert s.risk == Risk.low
     assert s.requires_approval is False
-    assert s.allowed_roles == [Role.implementer]
+    assert s.allowed_roles == [Role.lead, Role.implementer]
     assert s.inputs == ["filename"]
 
 
@@ -63,7 +63,7 @@ def test_promote_metadata():
     assert s.category == "promote"
     assert s.risk == Risk.medium
     assert s.requires_approval is True, "promote is the one approval-gated skill"
-    assert s.allowed_roles == [Role.implementer]
+    assert s.allowed_roles == [Role.lead, Role.implementer]
     assert s.inputs == ["filename"]
 
 
@@ -160,7 +160,7 @@ def test_write_file_metadata():
     assert s.category == "file_write"
     assert s.risk == Risk.low
     assert s.requires_approval is False, "write_file is now free (no approval)"
-    assert s.allowed_roles == [Role.implementer]
+    assert s.allowed_roles == [Role.lead, Role.implementer]
     assert s.inputs == ["filename", "content", "target"]
 
 
@@ -204,6 +204,16 @@ def test_write_file_rejects_path_escape(session, tmp_path):
     # escaping paths are REJECTED by containment, not flattened into the sandbox
     with pytest.raises(ExecutionError):
         execute(session, action, tmp_path)
+
+
+def test_write_file_rejects_empty_artifact(session, tmp_path):
+    action = ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        args={"filename": "empty.html", "content": ""},
+    )
+    with pytest.raises(ExecutionError, match="empty artifact"):
+        execute(session, action, tmp_path)
+    assert not (executor.artifacts_dir(tmp_path, session.session_id) / "empty.html").exists()
 
 
 def test_write_file_bad_charset_resolves_in_sandbox(session, tmp_path):
@@ -350,6 +360,52 @@ def test_promote_falls_back_to_sandbox_source(governance, session, tmp_path):
     governance.resolve(session, approval.approval_id, approved=True)
     result = execute(session, action, tmp_path)
     assert (est / "y.py").read_text(encoding="utf-8") == "scratch body\n"
+
+
+def test_promote_ignores_workspace_when_it_is_established(governance, session, tmp_path):
+    """If the active workspace is also the delivery folder, promote must use the
+    sandbox artifact instead of treating the target file as council-owned source."""
+    est = tmp_path / "established"
+    est.mkdir()
+    session.workspace_root = str(est)
+    session.established_root = str(est)
+    (est / "z.py").write_text("", encoding="utf-8")
+
+    sandbox = executor.artifacts_dir(tmp_path, session.session_id)
+    sandbox.mkdir(parents=True)
+    (sandbox / "z.py").write_text("scratch body\n", encoding="utf-8")
+
+    action = ProposedAction(
+        session_id=session.session_id, kind="promote", role=Role.implementer,
+        args={"filename": "z.py"},
+    )
+    approval = governance.authorize_action(session, action)
+    assert approval is not None and "scratch body" in (approval.details or "")
+    governance.resolve(session, approval.approval_id, approved=True)
+    result = execute(session, action, tmp_path)
+    assert Path(result) == (est / "z.py").resolve()
+    assert (est / "z.py").read_text(encoding="utf-8") == "scratch body\n"
+
+
+def test_promote_refuses_empty_source(governance, session, tmp_path):
+    est = tmp_path / "established"
+    est.mkdir()
+    session.established_root = str(est)
+    sandbox = executor.artifacts_dir(tmp_path, session.session_id)
+    sandbox.mkdir(parents=True)
+    (sandbox / "empty.html").write_text("", encoding="utf-8")
+
+    action = ProposedAction(
+        session_id=session.session_id, kind="promote", role=Role.implementer,
+        args={"filename": "empty.html"},
+    )
+    approval = governance.authorize_action(session, action)
+    assert approval is not None
+    assert "REFUSING PROMOTE" in (approval.details or "")
+    governance.resolve(session, approval.approval_id, approved=True)
+    with pytest.raises(ExecutionError, match="empty artifact"):
+        execute(session, action, tmp_path)
+    assert not (est / "empty.html").exists()
 
 
 # --- permission kernel --------------------------------------------------------

@@ -17,25 +17,25 @@ def service(tmp_path):
     return ConclaveService(data_dir=tmp_path)
 
 
-def test_max_rounds_caps_the_plan(service):
+def test_lead_runs_a_single_round(service):
     budgets = Budgets(max_rounds=2, max_turns_per_round=1, max_agent_calls=12, max_wall_seconds=60)
     session = service.run(TASK, source="test", budgets=budgets)
     assert session.status == SessionStatus.done
-    assert len(session.rounds) == 2
-    assert session.stop_reason == "max rounds reached"
+    assert len(session.rounds) == 1  # the lead drives in one round, regardless of budget
+    assert session.stop_reason == "lead produced a result"
+    assert session.agent_calls <= budgets.max_agent_calls
 
 
 def test_agent_call_budget_forces_partial_answer(service):
     budgets = Budgets(max_rounds=4, max_turns_per_round=1, max_agent_calls=1, max_wall_seconds=60)
     session = service.run(TASK, source="test", budgets=budgets)
-    # the single allowed call is spent in round 0; the critic round and the
-    # composer both hit the cap — session still finishes with a partial answer
+    # the single allowed call is spent by the lead; the composer hits the cap, so
+    # the session still finishes but with a partial, low-confidence answer
     assert session.status == SessionStatus.done
     assert session.agent_calls == 1
     assert any("budget exhausted" in u for u in session.unresolved)
     assert session.final is not None
     assert session.final.confidence == "low"
-    assert "budget exhausted" in (session.stop_reason or "")
 
 
 def test_trivial_task_gets_one_round(service):

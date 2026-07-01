@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor, skills
+from . import config, executor, skills, truth
 from .classifier import classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
@@ -19,14 +19,15 @@ from .governance import ApprovalRequired, BudgetExceeded, Governance
 from .logstore import LogStore
 from .models import (
     Contribution,
+    Council,
     CouncilMember,
-    Disagreement,
+    FinalAnswer,
     InputRequest,
     ProposedAction,
-    RoundSpec,
     Session,
     SessionStatus,
     Role,
+    TaskType,
     risk_gt,
 )
 from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegistry
@@ -307,6 +308,10 @@ def _web_overview(session: Session) -> str:
         return ""
     if not (cls and cls.needs_facts):
         return ""
+    # A from-scratch build (code/greenfield) doesn't need up-front web research —
+    # skip the slow web call; the lead can still request web_search if it needs it.
+    if cls.task_type == TaskType.code:
+        return ""
     try:
         from . import web
         result = web.web_search(session.task.text)
@@ -339,14 +344,86 @@ _GOVERNANCE_CONTEXT = (
     "analysis on what they return — never invent file contents.\n"
 )
 
+def delegation_contract(council: "Council", role_agents: dict[Role, str] | None) -> str:
+    """The on-demand delegation menu shown to the lead: each available specialist
+    talent and its backing origin model. The lead pulls one in ONLY when a
+    specific talent materially improves the result — synergy, not a panel."""
+    mapping = role_agents or config.ROLE_AGENTS
+    lines: list[str] = []
+    for role, talent in config.TALENTS.items():
+        member = council.get(role)
+        origin = (member.agent if member else None) or mapping.get(role) or "?"
+        lines.append(f"- {role.value} ({origin}): {talent}")
+    menu = "\n".join(lines)
+    return (
+        "YOU LEAD this task. Do it yourself directly. You MAY pull in another "
+        "talent (a different-origin model with a specific strength) ONLY when it "
+        "materially improves the result — do not convene a panel by default. To "
+        "do so, emit one line exactly:\n"
+        "CONSULT: <talent> - <specific question>   (get an answer back, you stay in control)\n"
+        "DELEGATE: <talent> - <specific subtask>   (hand off a focused piece)\n"
+        f"Available talents:\n{menu}\n"
+    )
 
-def build_prompt(
-    session: Session, spec: RoundSpec, role: Role, readable: list[str] = (),
-    established_overview: str = "",
-) -> str:
-    # Advertise the no-approval discovery skills this role may pull mid-round,
-    # but only when there's something to look at: an established folder being
-    # examined, a workspace, or files already produced.
+
+_ROLE_INSTRUCTIONS: dict[Role, str] = {
+    Role.knowledge_retriever: (
+        "Seat charter: Knowledge Retriever. Gather evidence, not opinions. "
+        "Every material claim should include a source such as file:line, URL, "
+        "or an explicit 'NO SOURCE FOUND - assumption' marker. Prefer primary "
+        "sources and local code over summaries."
+    ),
+    Role.researcher: (
+        "Seat charter: Researcher. Interpret the gathered evidence for the "
+        "user's R&D goal. Separate established facts from implications and "
+        "assumptions."
+    ),
+    Role.architect: (
+        "Seat charter: Architect. Turn evidence into a coherent system design "
+        "that fits this app's actual constraints and avoids wrong-altitude work."
+    ),
+    Role.code_generator: (
+        "Seat charter: Code Generator. Propose modular implementation units, "
+        "interfaces, and integration points that can be turned into concrete "
+        "artifacts. Match the existing app style."
+    ),
+    Role.api_integrator: (
+        "Seat charter: API Integrator. Define external integration contracts: "
+        "endpoint/auth/request/response/error behavior. Mark unknowns instead "
+        "of inventing API details."
+    ),
+    Role.critic: (
+        "Seat charter: Critic. Challenge the strongest claim or implementation "
+        "risk. Use DISAGREEMENT lines only for material conflicts."
+    ),
+    Role.red_team: (
+        "Seat charter: Red Team. Try to break the proposal with adversarial "
+        "cases, bad assumptions, security/privacy failure modes, and model "
+        "hallucination risk. End with VERDICT: BLOCK or VERDICT: PASS."
+    ),
+    Role.fact_validator: (
+        "Seat charter: Fact Validator. Independently verify the claims made so "
+        "far. Output CONFIRMED, REFUTED, or UNVERIFIABLE for each important "
+        "claim, with the checked source or reason."
+    ),
+    Role.implementer: (
+        "Seat charter: Implementer. Produce concrete deliverables and complete "
+        "file artifacts when the task calls for them."
+    ),
+    Role.summarizer: (
+        "Seat charter: Synthesizer. Resolve conflicts explicitly and separate "
+        "established truth from assumptions and proposals."
+    ),
+}
+
+
+def role_instruction(role: Role) -> str:
+    return _ROLE_INSTRUCTIONS.get(role, f"Seat charter: {role.value}.")
+
+
+def _skill_hints(session: Session, role: Role, readable: list[str] = ()) -> str:
+    """Advertise the no-approval discovery skills this role may pull (read/search/
+    list/web), but only when there's something to look at."""
     has_dir = bool(session.established_root or session.workspace_root)
     where = "established folder" if session.established_root else "project"
     hints: list[str] = []
@@ -357,9 +434,7 @@ def build_prompt(
         )
     sp = get_skill("search_project")
     if has_dir and sp and role in sp.allowed_roles:
-        hints.append(
-            f"search the {where} with a line 'SKILL: search_project <query>'"
-        )
+        hints.append(f"search the {where} with a line 'SKILL: search_project <query>'")
     rf = get_skill("read_file")
     if (readable or has_dir) and rf and role in rf.allowed_roles:
         avail = f" Available now: {', '.join(readable)}." if readable else ""
@@ -368,20 +443,75 @@ def build_prompt(
     if config.WEB_ENABLED and ws and role in ws.allowed_roles:
         hints.append("search the live web with 'SKILL: web_search <query>' "
                      "(and read a page with 'SKILL: web_fetch <url>')")
-    cap = (
-        "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
-        if hints else ""
+    if not hints:
+        return ""
+    return "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
+
+
+# The file-output contract: how the lead writes real files. Lifted from the old
+# implementer draft prompt so the materialize path stays consistent.
+def _output_contract(session: Session) -> str:
+    if session.established_root:
+        promote = (
+            f"\nThis task targets the EXISTING folder: {session.established_root}\n"
+            "Your ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
+            "approval) so you can build and test. NOTHING reaches the real folder until "
+            "you PROMOTE it AND the human approves. For each file that should land in "
+            "the real folder, add a line:\n"
+            "PROMOTE: <filename>   (one per file you want delivered)\n"
+        )
+    else:
+        promote = (
+            "\nYour ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
+            "approval needed) — you need no filesystem access yourself.\n"
+        )
+    return (
+        "If the task needs files (code, docs, config), emit each file literally in "
+        "this format, with its COMPLETE contents — never a summary of what the file "
+        "would contain:\n"
+        "ARTIFACT: <filename>\n"
+        "<full file contents>\n"
+        "Use one ARTIFACT block per file and include EVERY file the task asks for. Do "
+        "not describe the files in prose — write them out in full.\n"
+        "Write each file's RAW bytes immediately after its ARTIFACT line. Do NOT wrap "
+        "file contents in ``` markdown code fences, and do NOT add ANY commentary, "
+        "notes, or explanation AFTER the last file's content — the file must end at "
+        "its real final byte. A short rationale BEFORE the first ARTIFACT line is "
+        "welcome (it is shown to the user); everything after the first ARTIFACT line "
+        "must be only file contents and ARTIFACT/EDIT/PROMOTE/RUNTESTS lines.\n"
+        f"{promote}"
+        "To MODIFY an existing file instead of overwriting it, emit a surgical edit "
+        "(the OLD snippet must be unique in the file):\n"
+        "EDIT: path/to/file.py\n"
+        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
+        "To run the test suite in your sandbox (free, no approval), add a line:\n"
+        "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
     )
+
+
+def lead_prompt(
+    session: Session, council: "Council", role_agents: dict[Role, str] | None,
+    established_overview: str = "", readable: list[str] = (),
+) -> str:
+    """The single prompt that drives a task. The lead does the work directly and
+    may pull in talents on demand. For output tasks it includes the file contract;
+    for pure questions it just asks for the answer."""
+    produces = bool(session.classification and session.classification.produces_output)
     overview = f"{established_overview}\n\n" if established_overview else ""
+    contract = _output_contract(session) if produces else (
+        "Produce the actual answer the task asks for — complete, concrete, and "
+        "ready to use. Do not ask the human questions; state assumptions and answer.\n"
+    )
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
-        f"Round {spec.round} objective: {spec.goal}\n"
-        f"Your role: {role.value}. Answer only from this role.\n"
-        f"Output requirement: {spec.output_requirement}\n"
-        f"{cap}"
+        "Your role: lead. You own this task end to end. Produce the real, working "
+        "result — not a plan or a description of it.\n"
+        f"{delegation_contract(council, role_agents)}"
+        f"{contract}"
+        f"{_skill_hints(session, Role.lead, readable)}"
         f"{overview}"
-        f"Context so far:\n{_recent_context(session)}"
+        f"Context so far:\n{_recent_context(session, limit=5)}"
     )
 
 
@@ -392,6 +522,94 @@ _SKILL_REQUEST_MARKER = re.compile(
     r"^\s*(?:[-*•]\s*)?(?:\*\*)?SKILL(?:\*\*)?\s*[:—–-]\s*(?:\*\*)?\s*(\w+)\s+(.+?)\s*(?:\*\*)?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+# The lead pulls in a talent with a plain-text line 'CONSULT: <talent> - <q>' or
+# 'DELEGATE: <talent> - <subtask>' (bullets/bold tolerated, : - or — separators).
+_DELEGATION_MARKER = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?(?P<kind>CONSULT|DELEGATE)(?:\*\*)?\s*[:—–-]\s*"
+    r"(?:\*\*)?(?P<talent>[a-z_]+)(?:\*\*)?\s*[—–:-]\s*"
+    r"(?P<reason>.+?)\s*(?:\*\*)?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _parse_role(raw: str) -> Optional[Role]:
+    key = (raw or "").strip().lower().replace("-", "_")
+    for role in Role:
+        if role.value == key:
+            return role
+    return None
+
+
+def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
+    """A talent is grantable iff it's one of the advertised specialist roles."""
+    if role is None:
+        return False, "unknown talent"
+    if role not in config.TALENTS:
+        return False, f"'{role.value}' is not an available talent"
+    return True, "granted"
+
+
+def delegate_prompt(session: Session, role: Role, kind: str, reason: str) -> str:
+    return (
+        f"Task: {session.task.text}\n"
+        f"The lead has asked you ({role.value}) to {kind} on a focused point.\n"
+        f"Request: {reason}\n"
+        f"{role_instruction(role)}\n"
+        "Answer ONLY that request — concise, concrete, task-relevant. Do not produce "
+        "final deliverables or restate the whole task.\n"
+        f"Context so far:\n{_recent_context(session, limit=5)}"
+    )
+
+
+def _resolve_delegations(
+    session: Session, council: Council, lead: CouncilMember, prompt: str,
+    contribution: Contribution, call: AgentCall, store: LogStore,
+) -> Contribution:
+    """Handle the lead's CONSULT:/DELEGATE: lines: call each requested talent once
+    (with its own origin model), feed the results back, and re-call the lead ONCE.
+    Bounded by MAX_DELEGATIONS; no recursion in this pass (the re-called lead's
+    output isn't re-scanned for further delegations)."""
+    reqs = list(_DELEGATION_MARKER.finditer(contribution.content))
+    if not reqs:
+        return contribution
+    sid = session.session_id
+    results: list[str] = []
+    for m in reqs[: config.MAX_DELEGATIONS]:
+        kind = m.group("kind").lower()
+        role = _parse_role(m.group("talent"))
+        reason = " ".join(m.group("reason").strip().split())
+        store.log_event(sid, "delegation_requested",
+                        {"kind": kind, "to": role.value if role else m.group("talent"), "reason": reason})
+        ok, why = _delegation_decision(role)
+        if not ok or role is None:
+            store.log_event(sid, "delegation_denied",
+                            {"to": m.group("talent"), "reason": reason, "decision": why})
+            results.append(f"{kind.upper()} {m.group('talent')}: unavailable - {why}")
+            continue
+        helper = council.get(role)
+        if helper is None:
+            helper = CouncilMember(role=role, agent=(config.ROLE_AGENTS.get(role) or lead.agent))
+            council.members.append(helper)
+        helper.active = True
+        store.log_event(sid, "delegation_granted",
+                        {"to": role.value, "agent": helper.agent, "kind": kind, "reason": reason})
+        try:
+            answer = call(helper, delegate_prompt(session, role, kind, reason))
+            results.append(
+                f"{kind.upper()} {role.value}@{helper.agent}:\n"
+                f"{answer.content[: config.DELEGATION_RESULT_MAX_CHARS]}")
+            store.log_event(sid, "delegation_resolved", {"to": role.value, "chars": len(answer.content)})
+        except (AgentError, BudgetExceeded) as e:
+            session.unresolved.append(f"delegation to {role.value} failed: {e}")
+            store.log_event(sid, "delegation_failed", {"to": role.value, "error": str(e)})
+            results.append(f"{kind.upper()} {role.value}: failed - {e}")
+    followup = (
+        f"{prompt}\n\nResults from the talents you pulled in (use these; finish the "
+        "task now — do not request the same help again):\n" + "\n\n".join(results)
+    )
+    return call(lead, followup)
 
 
 def _resolve_skill_requests(
@@ -449,236 +667,6 @@ def _resolve_skill_requests(
         + "\n\n".join(results)
     )
     return call(member, followup)
-
-
-def test_both_sides_prompt(session: Session, d: Disagreement) -> str:
-    positions = "\n".join(f"- {p['role']}: {p['claim']}" for p in d.positions)
-    return (
-        f"Disagreement on: {d.topic}\n"
-        f"Positions:\n{positions}\n"
-        "Your role: critic — RULE this disagreement only. Reply in AT MOST 3 "
-        "lines: line 1 is exactly 'VERDICT: uphold' or 'VERDICT: overturn'; then "
-        "1–2 sentences naming the decisive evidence. Do NOT restate the task, do "
-        "NOT list recommendations, do NOT write an essay — just the verdict and "
-        "the reason."
-    )
-
-
-def draft_prompt(session: Session, established_overview: str = "") -> str:
-    # When an established folder is in play, the implementer drafts freely in the
-    # sandbox and PROMOTES the finished files into the real folder (the one gate).
-    if session.established_root:
-        promote = (
-            f"\nThis task targets the EXISTING folder: {session.established_root}\n"
-            "Your ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
-            "approval) so you can build and test. NOTHING reaches the real folder until "
-            "you PROMOTE it AND the human approves. For each file that should land in "
-            "the real folder, add a line:\n"
-            "PROMOTE: <filename>   (one per file you want delivered)\n"
-        )
-    else:
-        promote = (
-            "\nYour ARTIFACT/EDIT blocks are written into your own sandbox FREELY (no "
-            "approval needed) — you need no filesystem access yourself.\n"
-        )
-    return (
-        f"Task: {session.task.text}\n"
-        f"{_GOVERNANCE_CONTEXT}"
-        "Your role: implementer. Produce the ACTUAL working result, not a description "
-        "of it. If the task calls for files (code, docs, config), emit each file "
-        "literally in this format, with its COMPLETE contents — never a summary of what "
-        "the file would contain:\n"
-        "ARTIFACT: <filename>\n"
-        "<full file contents>\n"
-        "ARTIFACT: <next filename>\n"
-        "<full file contents>\n"
-        "Use one ARTIFACT block per file and include EVERY file the task asks for. Do "
-        "not describe the files in prose — write them out in full.\n"
-        f"{promote}"
-        "Example of the exact format:\n"
-        "ARTIFACT: main.py\n"
-        "from fastapi import FastAPI\n"
-        "app = FastAPI()\n"
-        "@app.get('/')\n"
-        "def root():\n"
-        "    return {'message': 'Hello, World!'}\n"
-        "ARTIFACT: requirements.txt\n"
-        "fastapi\n"
-        "uvicorn\n"
-        "\nTo MODIFY an existing file (instead of overwriting it), emit a surgical "
-        "edit — the OLD snippet must be unique in the file:\n"
-        "EDIT: path/to/file.py\n"
-        "<<<<<<< OLD\n"
-        "<exact existing text to replace>\n"
-        "=======\n"
-        "<replacement text>\n"
-        ">>>>>>> NEW\n"
-        "To run the test suite in your sandbox (free, no approval), add a line:\n"
-        "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
-        f"{chr(10) + established_overview if established_overview else ''}"
-        f"\nContext so far:\n{_recent_context(session, limit=5)}"
-    )
-
-
-def review_prompt(session: Session, draft: Contribution) -> str:
-    return (
-        f"Task: {session.task.text}\n"
-        "Your role: critic. Review the draft below for flaws. Hold a real bar: "
-        "only say the single word 'acceptable' when it genuinely meets the task; "
-        "otherwise give specific, actionable objections (what is wrong and what to "
-        "change) so it can be improved.\n"
-        f"Draft:\n{draft.content[:1800]}"
-    )
-
-
-def _review_accepts(review: str) -> bool:
-    """The critic accepts iff 'acceptable' appears AND is not negated — so
-    'not acceptable yet' / 'unacceptable' correctly count as a REJECTION."""
-    t = (review or "").lower()
-    if "not acceptable" in t or "unacceptable" in t or "isn't acceptable" in t \
-            or "not yet acceptable" in t:
-        return False
-    return "acceptable" in t
-
-
-def refine_prompt(session: Session, established_overview: str, prior_review: str) -> str:
-    """A redraft that must resolve the critic's objections — the engine of
-    convergence. Falls back to a plain draft when there's nothing to address."""
-    base = draft_prompt(session, established_overview)
-    pr = (prior_review or "").strip()
-    if not pr or pr.lower().startswith("acceptable"):
-        return base
-    return (
-        base
-        + "\n\nYour previous draft was NOT accepted. The critic's objections:\n"
-        + pr[:1800]
-        + "\nProduce a REVISED version that fully resolves these objections — keep "
-        "what worked, fix what was flawed, and output the COMPLETE result again in "
-        "the required format (do not describe the changes)."
-    )
-
-
-def _converge(
-    session: Session, council: Council, call: AgentCall,
-    established_overview: str, store: LogStore, start: float,
-) -> tuple[str, str]:
-    """Refine the draft until the critic ACCEPTS it — the real terminator for an
-    output task. Repeats draft→critique, feeding each critique back, and stops on
-    acceptance OR a backstop (refine-iteration cap, wall-time; the agent-call
-    budget raises BudgetExceeded on its own). Returns (verdict, stop_reason)."""
-    implementer = council.get(Role.implementer)
-    critic = council.get(Role.critic)
-    sid = session.session_id
-    if not (implementer and implementer.active and critic and critic.active):
-        return "revise", "max rounds reached"  # nothing to converge with
-    last_review = next(
-        (c.content for c in reversed(session.contributions) if c.role == Role.critic), "")
-    for i in range(config.MAX_REFINE_ITERATIONS):
-        if time.monotonic() - start > session.budgets.max_wall_seconds:
-            session.unresolved.append("stopped refining: wall-time limit")
-            return "revise", "refinement time limit"
-        store.log_event(sid, "refine_round", {"iteration": i + 1})
-        draft = call(implementer, refine_prompt(session, established_overview, last_review))
-        review = call(critic, review_prompt(session, draft))
-        if _review_accepts(review.content):
-            store.log_event(sid, "converged", {"iterations": i + 1})
-            return "accept", f"answer accepted (after {i + 1} refinement round(s))"
-        last_review = review.content
-    session.unresolved.append(
-        f"stopped refining after {config.MAX_REFINE_ITERATIONS} rounds without critic acceptance")
-    return "revise", "refinement cap reached without acceptance"
-
-
-# Marker for an explicit conflict: optional bullet/numbering, then
-# DISAGREEMENT:/DISAGREE: (any case, : — – or - as separator), then the body.
-_DISAGREEMENT_MARKER = re.compile(
-    r"^\s*(?:[-*•]|\d+[.)])?\s*disagree(?:ment)?\s*[:—–-]\s*(.+)$", re.IGNORECASE
-)
-
-_CLAIM_ROLES = (Role.researcher, Role.architect, Role.implementer)
-
-
-def _claim_source(session: Session, spec: RoundSpec, challenger: Contribution) -> Optional[Contribution]:
-    """The contribution whose claim is being challenged: prefer the most
-    recent claim-making role, fall back to any other role."""
-    candidates = [
-        p for p in session.contributions
-        if p.role != challenger.role and p.round <= spec.round
-    ]
-    for p in reversed(candidates):
-        if p.role in _CLAIM_ROLES:
-            return p
-    return candidates[-1] if candidates else None
-
-
-def detect_disagreements(session: Session, spec: RoundSpec) -> list[Disagreement]:
-    """Scan this round's contributions for explicit disagreement markers
-    (loop step 6). Supports bullets/numbering, any case, multiple markers per
-    contribution, and multi-line claims (continuation lines up to a blank)."""
-    found: list[Disagreement] = []
-    seen = {d.topic for d in session.disagreements}
-    for c in (x for x in session.contributions if x.round == spec.round):
-        lines = c.content.splitlines()
-        i = 0
-        while i < len(lines):
-            m = _DISAGREEMENT_MARKER.match(lines[i])
-            i += 1
-            if not m:
-                continue
-            parts = [m.group(1).strip()]
-            while i < len(lines) and lines[i].strip() and not _DISAGREEMENT_MARKER.match(lines[i]):
-                parts.append(lines[i].strip())
-                i += 1
-            body = " ".join(p for p in parts if p)
-            topic = re.split(r"\s*[—–]\s*|\s+-\s+", body)[0].strip()[:80]
-            if not topic or topic in seen:
-                continue
-            prior = _claim_source(session, spec, c)
-            found.append(
-                Disagreement(
-                    topic=topic,
-                    positions=[
-                        {
-                            "role": prior.role.value if prior else "coordinator",
-                            "claim": (prior.content.splitlines()[0] if prior else session.task.text)[:200],
-                        },
-                        {"role": c.role.value, "claim": body[:300]},
-                    ],
-                )
-            )
-            seen.add(topic)
-    return found
-
-
-def coordinator_decide(d: Disagreement) -> tuple[str, str, str]:
-    """Choose based on evidence > constraints > user goal; always record why."""
-    test = (d.critic_test or "").lower()
-    if "uphold" in test:
-        return d.positions[0]["claim"], "evidence", d.critic_test or ""
-    if "overturn" in test or "reject" in test:
-        return d.positions[1]["claim"], "evidence", d.critic_test or ""
-    return (
-        d.positions[0]["claim"],
-        "constraint",
-        "no decisive critic verdict; kept the position consistent with task constraints",
-    )
-
-
-def _stop_check(
-    session: Session, spec: RoundSpec, plan_len: int, verdict: Optional[str]
-) -> tuple[bool, Optional[str]]:
-    """Loop step 9 — stop when ANY condition is true."""
-    if verdict == "accept":
-        return True, "answer accepted"
-    if spec.round + 1 >= min(plan_len, session.budgets.max_rounds):
-        return True, "max rounds reached"
-    if session.has_pending_approval:
-        return True, "human approval needed"
-    if session.blocked_on_missing_info:
-        return True, "blocked on missing information"
-    if session.risk_exceeds_boundary:
-        return True, "risk exceeds allowed boundary"
-    return False, None
 
 
 def run_session(
@@ -776,27 +764,17 @@ def _deliberate(
         session.council = council
         store.log_event(sid, "council_formed", council.model_dump())
 
-    # 4. Round plan (declared before execution, hard-capped); on resume,
-    # skip the rounds that already ran
+    # 4. A single nominal round: the lead drives. Kept so timeline/budgets have an
+    # anchor. On resume (proposals already collected) we skip straight to execution.
     plan = plan_rounds(cls, council, session.budgets)
-    completed_rounds = len(session.rounds)
-    # If draft proposals were already collected, deliberation finished and we
-    # paused in the action gate (step 7b). On resume, do NOT re-run the remaining
-    # planned rounds (deliberation can early-stop on an accepted draft, leaving
-    # rounds unrun) — fall straight through to execution/compose.
-    if _has_proposals(session):
-        completed_rounds = len(plan)
     manager.transition(session, SessionStatus.deliberating)
 
     start = time.monotonic()
-    verdict: Optional[str] = None
     # image attachments are shown to vision-capable agents on every call
     images = image_inputs(store.data_dir, session.attachments)
-    # Read the established folder ONCE up front so every agent starts with the
-    # real code it was asked to examine (no dependence on an agent requesting it).
-    # Up-front context the council starts with, so it never depends on a flaky
-    # seat or an agent remembering to request a skill: the established folder's
-    # real source AND/OR live web research for fact-needing questions.
+    # Up-front context the LEAD starts with, so it never depends on a flaky seat or
+    # remembering to request a skill: prior conversation turns, the established
+    # folder's real source, and/or live web research for fact-needing questions.
     established_overview = "\n\n".join(p for p in (
         _conversation_overview(session),
         _established_overview(session, store.data_dir),
@@ -805,97 +783,41 @@ def _deliberate(
     if established_overview:
         store.log_event(sid, "context_overview", {"chars": len(established_overview)})
 
-    def call(member: CouncilMember, prompt: str) -> Contribution:
+    def call(member: CouncilMember, prompt: str, timeout_s: Optional[int] = None) -> Contribution:
         return _agent_call(session, registry, store, member, prompt,
-                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+                           timeout_s=timeout_s, reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
     def compose_call(member: CouncilMember, prompt: str) -> Contribution:
         return _agent_call(session, registry, store, member, prompt, images=images)
 
+    def lead_call(member: CouncilMember, prompt: str) -> Contribution:
+        # The lead authors whole files in one shot — give it extra headroom.
+        return _agent_call(session, registry, store, member, prompt,
+                           timeout_s=config.LEAD_TIMEOUT,
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+
+    lead = council.get(Role.lead)
     try:
-        for spec in plan[completed_rounds:]:
-            if time.monotonic() - start > session.budgets.max_wall_seconds:
-                raise BudgetExceeded(f"max_wall_seconds={session.budgets.max_wall_seconds} reached")
+        # 5. The lead drives the task directly; it pulls in talents only on demand.
+        if not _has_proposals(session) and lead and lead.active:
+            spec = plan[0]
             session.current_round = spec.round
-            session.rounds.append(spec)
-            store.log_event(sid, "round_start", spec.model_dump())
-
-            # 5. Run agent round
+            if not session.rounds:
+                session.rounds.append(spec)
+                store.log_event(sid, "round_start", spec.model_dump())
             readable = _readable_files(session, store.data_dir)
-            for role in spec.agents:
-                member = council.get(role)
-                if not (member and member.active):
-                    continue
-                for _ in range(spec.max_turns):
-                    governance.check(session, "generate_text")
-                    p = build_prompt(session, spec, role, readable, established_overview)
-                    try:
-                        c = call(member, p)
-                        c = _resolve_skill_requests(session, member, p, c, call, governance, store)
-                    except AgentError as e:
-                        # One flaky seat (e.g. the gemini CLI stalling) must not
-                        # abort the whole council. Drop it for the rest of the run
-                        # and continue with the others — graceful degradation.
-                        store.log_event(sid, "seat_dropped",
-                                        {"round": spec.round, "role": role.value,
-                                         "agent": member.agent, "error": str(e)})
-                        session.unresolved.append(
-                            f"{role.value} seat ({member.agent}) dropped: {e}")
-                        member.active = False
-                        break
-                    if c.content.strip():  # output requirement met (Phase 0: non-empty)
-                        break
+            governance.check(session, "generate_text")
+            p = lead_prompt(session, council, role_agents, established_overview, readable)
+            c = lead_call(lead, p)
+            c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
+            c = _resolve_delegations(session, council, lead, p, c, call, store)
+            session.stop_reason = "lead produced a result"
 
-            # 6. Conflict check: isolate → critic tests → coordinator rules → log
-            critic = council.get(Role.critic)
-            new_disagreements = detect_disagreements(session, spec)
-            for i, d in enumerate(new_disagreements):
-                if critic and critic.active and i < config.MAX_CRITIC_TESTS_PER_ROUND:
-                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content[: config.CRITIC_TEST_MAX_CHARS]
-                elif i >= config.MAX_CRITIC_TESTS_PER_ROUND:
-                    store.log_event(sid, "critic_test_skipped",
-                                    {"round": spec.round, "topic": d.topic,
-                                     "reason": f"per-round test cap ({config.MAX_CRITIC_TESTS_PER_ROUND})"})
-                d.ruling, d.ruling_basis, d.rationale = coordinator_decide(d)
-                session.disagreements.append(d)
-                store.log_event(sid, "disagreement_ruled", d.model_dump())
-            if not new_disagreements and any(
-                x.role == Role.critic and x.round == spec.round
-                and x.content.strip().upper().startswith("PASS")
-                for x in session.contributions
-            ):
-                store.log_event(sid, "no_conflict", {"round": spec.round})
-
-            # 7. Approval gate (Phase 0: agents cannot propose tool actions,
-            # so this only trips if governance flagged something mid-round)
+            # 7. Mid-flight approval gate (only trips if governance flagged something).
             if session.has_pending_approval:
                 session.stop_reason = "human approval needed"
                 manager.transition(session, SessionStatus.awaiting_approval)
                 return session
-
-            # 8. Produce working result: draft -> critique -> coordinator verdict
-            implementer = council.get(Role.implementer)
-            if implementer and implementer.active:
-                draft = call(implementer, draft_prompt(session, established_overview))
-                if critic and critic.active:
-                    review = call(critic, review_prompt(session, draft))
-                    verdict = "accept" if _review_accepts(review.content) else "revise"
-                else:
-                    verdict = "accept"
-
-            # 9. Stop condition
-            stop, reason = _stop_check(session, spec, len(plan), verdict)
-            if stop:
-                session.stop_reason = reason
-                break
-
-        # 9b. Convergence: if the planned phases ended with the draft NOT accepted
-        # by the critic, keep refining (draft↔critique) until it IS accepted, or a
-        # backstop trips (refine cap / agent-call budget / wall-time). The round
-        # count is a safety ceiling now, no longer the normal terminator.
-        if session.stop_reason == "max rounds reached" and verdict == "revise":
-            verdict, session.stop_reason = _converge(
-                session, council, call, established_overview, store, start)
 
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
@@ -913,25 +835,83 @@ def _deliberate(
         manager.transition(session, SessionStatus.awaiting_approval)
         return session
 
-    # 7b. Governed action execution: collect the implementer's artifact
-    # proposals, gate every action on a human approval, execute approved ones.
-    # If the task should produce files but the draft only described them,
-    # materialize each file with a focused single-file call.
+    # 7b. Governed action execution: collect the lead's artifact proposals, gate
+    # every action on a human approval, execute approved ones. If the task should
+    # produce files but the lead only described them, materialize each file with a
+    # focused single-file call.
     _collect_proposals(session, store)
     if not _has_proposals(session) and cls.produces_output:
         _materialize_artifacts(session, compose_call, store)
     if _execute_actions(session, manager, governance, store):
         return session  # paused in awaiting_approval
 
+    # A large single-file artifact can exceed one model response and be cut off.
+    # Finish it from where it stopped (append) instead of re-drafting — the old
+    # failure mode that produced empty/partial HTML over and over.
+    if lead and lead.active:
+        _complete_truncated_artifacts(session, lead_call, lead, store)
+    # Verify whenever the task produced (or was required to produce) files — NOT
+    # just code tasks. A content/design task that emitted an empty or truncated
+    # file must NOT be reported as a confident success. A code task must produce a
+    # real file even if it emitted none.
+    _needs_file = cls.task_type == TaskType.code
+    _has_file_actions = any(a.kind in _FILE_OUTPUT_KINDS for a in session.proposed_actions)
+    if (_needs_file or _has_file_actions) and not _verify_artifact_outputs(
+        session, store, require_file=_needs_file
+    ):
+        manager.transition(session, SessionStatus.composing)
+        session.final = FinalAnswer(
+            answer=(
+                "The run failed artifact verification: the coordinator did not find "
+                "a real, non-empty, complete file artifact on disk, so this result "
+                "is NOT being reported as a success. See the unresolved risks below."
+            ),
+            confidence="low",
+            assumptions=[],
+            risks_unresolved=list(session.unresolved),
+            next_action="Fix artifact generation and rerun the task.",
+        )
+        if not session.turns:
+            session.turns.append({"role": "user", "text": session.task.text})
+        session.turns.append({"role": "council", "text": session.final.answer})
+        manager.transition(session, SessionStatus.done)
+        store.log_event(sid, "final_composed", session.final.model_dump())
+        store.save_session(session)
+        return session
+
     # 10. Final response
     manager.transition(session, SessionStatus.composing)
-    for d in session.disagreements:
-        if not d.ruling:
-            session.unresolved.append(f"unruled disagreement: {d.topic}")
-    try:
-        session.final = compose(session, council, compose_call)
-    except AgentInputRequired as e:
-        return _pause_for_input(session, manager, store, e, purpose="compose")
+    truth.build_truth_ledger(session)
+    if session.truth_claims:
+        store.log_event(
+            sid,
+            "truth_ledger_built",
+            {
+                "claims": len(session.truth_claims),
+                "established": sum(1 for c in session.truth_claims if c.status == "established"),
+                "disputed": sum(1 for c in session.truth_claims if c.status == "disputed"),
+            },
+        )
+    # A task that produced verified file artifacts gets a FAST, deterministic
+    # summary built from the lead's own rationale + a real file manifest — no
+    # second model call. This both halves latency for builds AND removes a whole
+    # class of bugs (a summarizer fed a 12KB file would echo/continue it). The LLM
+    # summarizer is reserved for pure-answer tasks (questions/research) where
+    # synthesis genuinely adds value.
+    delivered = [a for a in session.proposed_actions
+                 if a.kind in _FILE_OUTPUT_KINDS and a.status == "executed" and a.result_path]
+    # Deterministic manifest ONLY for genuine output/build tasks. A question or
+    # research task that incidentally saved a file still gets real LLM synthesis
+    # (its analysis would otherwise be lost — it lives in the deliberation, not in
+    # a file manifest).
+    if delivered and cls.produces_output:
+        session.final = _build_summary_final(session, delivered)
+        store.log_event(sid, "build_summary", {"files": [a.filename for a in delivered]})
+    else:
+        try:
+            session.final = compose(session, council, compose_call)
+        except AgentInputRequired as e:
+            return _pause_for_input(session, manager, store, e, purpose="compose")
     # Record this turn in the conversation: the human's message (the original task
     # on turn one; on a follow-up it was appended by continue_session) and the
     # council's conclusion. The human can now respond and keep the thread going.
@@ -953,10 +933,13 @@ _ARTIFACT_MARKER = re.compile(
 )
 
 # 'EDIT: <filename>' + a git-conflict-style OLD/NEW block proposes a surgical
-# replace in an existing file. Self-delimited (>>>>>>> ends it).
+# replace in an existing file. Self-delimited (>>>>>>> ends it). The conflict
+# markers require 7+ chars (the emitted contract uses exactly 7) so ordinary
+# content — a Python doctest '>>> f()', an RST '======' heading rule — inside
+# OLD/NEW does NOT prematurely terminate the capture.
 _EDIT_MARKER = re.compile(
     r"^[ \t]*(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
-    r"[ \t]*<{3,}[^\n]*\n(?P<old>.*?)\n[ \t]*={3,}[^\n]*\n(?P<new>.*?)\n[ \t]*>{3,}[^\n]*",
+    r"[ \t]*<{7,}[^\n]*\n(?P<old>.*?)\n[ \t]*={7,}[^\n]*\n(?P<new>.*?)\n[ \t]*>{7,}[^\n]*",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
@@ -974,9 +957,12 @@ _PROMOTE_MARKER = re.compile(
 )
 
 # any block start — bounds ARTIFACT content so a following EDIT/RUNTESTS/PROMOTE
-# isn't swallowed into the file body.
+# isn't swallowed into the file body. A COLON is required so ordinary prose inside
+# a file body ("Edit the .env file", "Run tests before shipping") is NOT mistaken
+# for a block boundary (which silently truncated the file at that line).
 _BLOCK_START = re.compile(
-    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)\b", re.IGNORECASE | re.MULTILINE
+    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -988,7 +974,8 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     if _has_proposals(session):
         return
     draft = next(
-        (c for c in reversed(session.contributions) if c.role == Role.implementer), None
+        (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
+        None,
     )
     if draft is None:
         return
@@ -1002,7 +989,7 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     found: list[tuple[int, ProposedAction]] = []
     for m in _ARTIFACT_MARKER.finditer(text):
         fn = m.group(1).strip()
-        body = _strip_code_fence(text[m.end():_content_end(m.start())].strip())
+        body = _clean_artifact_body(text[m.end():_content_end(m.end())], fn)
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="write_file", role=Role.implementer,
             filename=fn, content=body, args={"filename": fn, "content": body})))
@@ -1065,11 +1052,60 @@ def _strip_code_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _html_doc_end(low: str) -> int:
+    """Index just past the STRUCTURAL </html> in a lowercased HTML string, or -1.
+    The structural close is the FIRST </html> that sits after </body>, so:
+      - a </html> appearing earlier inside a <script> string isn't mistaken for it
+        (that one precedes </body> → fall back to the last </html>), and
+      - a </html> in TRAILING PROSE after the real document is NOT picked up
+        (we take the first structural one and drop everything after it)."""
+    first = low.find("</html>")
+    if first == -1:
+        return -1
+    body_close = low.rfind("</body>")
+    idx = low.rfind("</html>") if (body_close != -1 and first < body_close) else first
+    return idx + len("</html>")
+
+
+def _clean_artifact_body(raw: str, filename: str = "") -> str:
+    """Extract the real file body from an agent's ARTIFACT content. Agents often
+    (a) wrap the file in a ```fence and (b) append an explanation; a naive strip
+    leaves the closing ``` + prose IN the file (it renders as junk after the
+    document — the bug the owner hit). Strategy:
+      - HTML/SVG: slice exactly the document by its own opening/closing tags
+        (structural close, not a mention in trailing prose or a JS string).
+      - A whole-file ``` wrap (EXACTLY one opening fence at the top + one closing
+        fence, nothing more) is stripped. A body with MORE fences is its own
+        content (e.g. a README documenting code blocks) — left untouched so it is
+        never mangled.
+      - Else: returned as-is (the prompt forbids fences/trailing prose at source)."""
+    t = raw.strip()
+    name = filename.lower()
+    low = t.lower()
+    if name.endswith((".html", ".htm")):
+        starts = [i for i in (low.find("<!doctype"), low.find("<html")) if i != -1]
+        e = _html_doc_end(low)
+        if starts and e != -1 and e > min(starts):
+            return t[min(starts):e].strip()
+    elif name.endswith(".svg"):
+        s = low.find("<svg")
+        e = low.rfind("</svg>")
+        if s != -1 and e != -1 and e + len("</svg>") > s:
+            return t[s:e + len("</svg>")].strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
+        if len(fences) == 2 and fences[0] == 0:  # a clean whole-file wrapper
+            return "\n".join(lines[1:fences[1]]).strip()
+    return t
+
+
 def _intended_filenames(session: Session) -> list[str]:
     """The files this task means to produce: explicit ARTIFACT names first, then
-    any filename-like tokens in the implementer's draft and the task text."""
+    any filename-like tokens in the lead's draft and the task text."""
     draft = next(
-        (c for c in reversed(session.contributions) if c.role == Role.implementer), None
+        (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
+        None,
     )
     text = f"{draft.content if draft else ''}\n{session.task.text}"
     seen: set[str] = set()
@@ -1089,8 +1125,8 @@ def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -
     degrades gracefully on budget/agent errors."""
     if _has_proposals(session):
         return
-    implementer = session.council.get(Role.implementer)
-    if not (implementer and implementer.active):
+    lead = session.council.get(Role.lead)
+    if not (lead and lead.active):
         return
     filenames = _intended_filenames(session)
     if not filenames:
@@ -1099,7 +1135,7 @@ def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -
     store.log_event(sid, "materialize_start", {"files": filenames})
     for fn in filenames:
         try:
-            result = call(implementer, materialize_prompt(session, fn))
+            result = call(lead, materialize_prompt(session, fn))
         except (BudgetExceeded, AgentError) as e:
             session.unresolved.append(f"could not materialize '{fn}': {e}")
             store.log_event(sid, "materialize_skipped", {"file": fn, "error": str(e)})
@@ -1108,7 +1144,7 @@ def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -
             session.unresolved.append(f"materialization of '{fn}' needed input; skipped")
             store.log_event(sid, "materialize_skipped", {"file": fn, "reason": "input_required"})
             continue
-        content = _strip_code_fence(result.content)
+        content = _clean_artifact_body(result.content, fn)
         if not content:
             session.unresolved.append(f"materialized '{fn}' was empty; skipped")
             continue
@@ -1122,6 +1158,92 @@ def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -
             {"action_id": action.action_id, "kind": action.kind,
              "filename": fn, "chars": len(content)},
         )
+
+
+def _looks_truncated(path: Path) -> bool:
+    """Heuristic: was this written file cut off mid-generation? HTML must close
+    its </html>; any other sizeable file that ends abruptly (no trailing newline)
+    is treated as likely-cut. Conservative so complete files aren't touched."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not text.strip():
+        return False
+    low = text.lower()
+    suf = path.suffix.lower()
+    # Only flag a file that OPENED a full HTML/SVG document but never closed it —
+    # a reliable truncation signal. Do NOT guess for code/data files (js/css/json/
+    # py): the old '>2KB without a trailing newline' heuristic false-fired on
+    # essentially every correct such file and appended junk via a bogus
+    # continuation. A fragment/partial HTML (no <html> opening) is intentional.
+    if suf in (".html", ".htm"):
+        return ("<!doctype" in low or "<html" in low) and "</html>" not in low
+    if suf == ".svg":
+        return "<svg" in low and "</svg>" not in low
+    return False
+
+
+def continuation_prompt(session: Session, filename: str, tail: str) -> str:
+    return (
+        f"Task: {session.task.text}\n"
+        f"You were writing the file '{filename}' but your output was CUT OFF before "
+        "the file was complete. Here are the LAST characters you produced:\n"
+        f"-----\n{tail}\n-----\n"
+        "Output ONLY the remaining bytes of the file, continuing from EXACTLY where "
+        "that left off to the true end of the file. Do not repeat any of the text "
+        "above, do not add explanation or commentary, do not wrap it in code "
+        "fences — just the raw continuation, ready to append verbatim."
+    )
+
+
+def _complete_truncated_artifacts(
+    session: Session, call: AgentCall, lead: CouncilMember, store: LogStore
+) -> None:
+    """Finish any cut-off file by asking the lead to CONTINUE from where it
+    stopped (appending), instead of re-drafting it from scratch. Bounded by
+    MAX_ARTIFACT_CONTINUATIONS; degrades gracefully on budget/agent errors."""
+    sid = session.session_id
+    for action in session.proposed_actions:
+        if action.kind not in ("write_file", "promote") or action.status != "executed":
+            continue
+        if not action.result_path:
+            continue
+        path = Path(action.result_path)
+        for attempt in range(config.MAX_ARTIFACT_CONTINUATIONS):
+            if not _looks_truncated(path):
+                break
+            try:
+                tail = path.read_text(encoding="utf-8", errors="replace")[
+                    -config.ARTIFACT_CONTINUATION_TAIL_CHARS:
+                ]
+            except OSError:
+                break
+            store.log_event(sid, "artifact_continuation",
+                            {"file": action.filename, "attempt": attempt + 1})
+            try:
+                result = call(lead, continuation_prompt(session, action.filename, tail))
+            except (BudgetExceeded, AgentError, AgentInputRequired) as e:
+                session.unresolved.append(f"could not finish '{action.filename}': {e}")
+                store.log_event(sid, "artifact_continuation_failed",
+                                {"file": action.filename, "error": str(e)})
+                break
+            addition = _strip_code_fence(result.content)
+            # If the continuation closed the document and then rambled, keep only
+            # up to </html> so commentary never lands in the file.
+            low_add = addition.lower()
+            if "</html>" in low_add:
+                addition = addition[:low_add.rfind("</html>") + len("</html>")] + "\n"
+            if not addition.strip():
+                break
+            try:
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(addition)
+            except OSError as e:
+                session.unresolved.append(f"could not append to '{action.filename}': {e}")
+                break
+            store.log_event(sid, "artifact_continued",
+                            {"file": action.filename, "added": len(addition)})
 
 
 def _execute_actions(
@@ -1193,6 +1315,123 @@ def _execute_actions(
     return pending
 
 
+_FILE_OUTPUT_KINDS = {"write_file", "edit_file", "promote", "stage"}
+
+
+def _lead_preamble(session: Session) -> str:
+    """The lead's rationale text BEFORE its first ARTIFACT block — the 'what/why'
+    of the build. Used for a fast deterministic summary without a second model
+    call. Empty when the lead jumped straight into the file."""
+    draft = next(
+        (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
+        None,
+    )
+    if draft is None:
+        return ""
+    m = _ARTIFACT_MARKER.search(draft.content)
+    pre = (draft.content[:m.start()] if m else draft.content).strip()
+    # guard against the lead pasting file-ish content into the preamble
+    return _clean_artifact_body(pre) if pre.startswith("```") else pre
+
+
+def _human_size(path: Path) -> str:
+    try:
+        n = path.stat().st_size
+    except OSError:
+        return "?"
+    return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
+
+
+_KIND_VERB = {"write_file": "written to", "edit_file": "edited at",
+              "promote": "delivered to", "stage": "staged to"}
+_KIND_RANK = {"promote": 3, "stage": 2, "edit_file": 1, "write_file": 0}
+
+
+def _build_summary_final(session: Session, delivered: list[ProposedAction]) -> FinalAnswer:
+    """A deterministic, corruption-proof final answer for a build: the lead's own
+    rationale plus a real manifest of the files written. High confidence is
+    EARNED — this runs only after artifact verification has already passed."""
+    # one entry per filename, preferring its final destination (a file written to
+    # the sandbox and then promoted should read as 'delivered', not listed twice)
+    best: dict[str, ProposedAction] = {}
+    for a in delivered:
+        cur = best.get(a.filename)
+        if cur is None or _KIND_RANK[a.kind] > _KIND_RANK[cur.kind]:
+            best[a.filename] = a
+    lines = [
+        f"- {a.filename} ({_human_size(Path(a.result_path))}) — {_KIND_VERB[a.kind]} {a.result_path}"
+        for a in best.values()
+    ]
+    manifest = "Files written:\n" + "\n".join(lines)
+    html = next((a for a in best.values() if a.filename.lower().endswith((".html", ".htm"))), None)
+    hint = f"\n\nOpen {html.filename} in a web browser to use it." if html else ""
+    preamble = _lead_preamble(session)
+    if len(preamble) > 1400:
+        preamble = preamble[:1400].rstrip() + " …"
+    answer = (f"{preamble}\n\n{manifest}{hint}" if preamble else f"{manifest}{hint}").strip()
+    # don't surface the (passed) verification chatter as a risk
+    risks = [u for u in session.unresolved if "verification" not in u.lower()]
+    return FinalAnswer(answer=answer, confidence="high", assumptions=[], risks_unresolved=risks)
+
+
+def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bool = False) -> bool:
+    """Deterministic guardrail run whenever a task produced (or had to produce)
+    file artifacts. Every executed file must exist and be real — non-empty after
+    stripping whitespace, and (for HTML) a complete document. A task that
+    attempted file output but landed nothing, or a task that was REQUIRED to
+    produce a file (require_file) but produced none, fails. A pure-answer task
+    with no file actions and no requirement has nothing to verify and passes."""
+    file_actions = [a for a in session.proposed_actions if a.kind in _FILE_OUTPUT_KINDS]
+    executed = [a for a in file_actions if a.status == "executed" and a.result_path]
+    failures: list[str] = []
+
+    if not executed:
+        if file_actions or require_file:
+            # files were attempted (and all failed) or were mandatory — not a success
+            failures.append("no file artifact was successfully written to disk")
+        else:
+            return True  # nothing was meant to be produced; nothing to verify
+
+    for action in executed:
+        path = Path(action.result_path)
+        try:
+            if not path.is_file():
+                failures.append(f"{action.filename}: result path does not exist ({path})")
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not text.strip():
+                failures.append(f"{action.filename}: file is empty/blank")
+                continue
+            if path.suffix.lower() in {".html", ".htm"}:
+                low = text.lower()
+                has_open = "<!doctype" in low or "<html" in low
+                if has_open and "</html>" not in low:
+                    failures.append(f"{action.filename}: HTML document is incomplete (no closing </html>)")
+                elif has_open:
+                    tail = text[_html_doc_end(low):].strip()
+                    if len(tail) > 40:  # commentary/fence leaked in after the document
+                        failures.append(
+                            f"{action.filename}: {len(tail)} chars of stray content after </html> "
+                            "(not a clean single file)")
+                # a fragment/partial (no <html> opening) is valid — only the
+                # non-empty check above applies to it
+        except OSError as e:
+            failures.append(f"{action.filename}: verification error: {e}")
+
+    if failures:
+        message = "artifact verification failed: " + "; ".join(failures)
+        session.unresolved.append(message)
+        store.log_event(session.session_id, "artifact_verification_failed", {"failures": failures})
+        return False
+
+    store.log_event(
+        session.session_id,
+        "artifact_verification_passed",
+        {"files": [a.result_path for a in executed]},
+    )
+    return True
+
+
 def _pause_for_input(
     session: Session, manager: SessionManager, store: LogStore,
     exc: AgentInputRequired, purpose: str,
@@ -1258,29 +1497,10 @@ def resume_with_input(
         store.save_session(session)
         return session
 
-    # Deliberation pause: run the conflict check the paused round never got,
-    # then let _deliberate continue with the remaining rounds and compose.
-    # (Step 8 of the paused round is skipped — a known, logged simplification.)
+    # Deliberation pause: the human answered an agent's question mid-run; the
+    # answer (and the resumed call's output) are now in the session context.
+    # Collect any files the resumed answer produced, then re-enter the lead flow
+    # to finish — execution, verification, continuation, and composition.
     session.current_round = req.round
-    council = session.council
-    critic = council.get(Role.critic)
-
-    def call(member: CouncilMember, prompt: str) -> Contribution:
-        return _agent_call(session, registry, store, member, prompt,
-                           reserve=config.COMPOSER_RESERVED_CALLS)
-
-    spec = next((r for r in session.rounds if r.round == req.round), None)
-    if spec is not None:
-        try:
-            for i, d in enumerate(detect_disagreements(session, spec)):
-                if critic and critic.active and i < config.MAX_CRITIC_TESTS_PER_ROUND:
-                    d.critic_test = call(critic, test_both_sides_prompt(session, d)).content[: config.CRITIC_TEST_MAX_CHARS]
-                d.ruling, d.ruling_basis, d.rationale = coordinator_decide(d)
-                session.disagreements.append(d)
-                store.log_event(sid, "disagreement_ruled", d.model_dump())
-        except AgentInputRequired as e:
-            return _pause_for_input(session, manager, store, e, purpose="deliberation")
-        except (BudgetExceeded, AgentError) as e:
-            session.unresolved.append(f"conflict check skipped after input: {e}")
-
+    _collect_proposals(session, store)
     return _deliberate(session, manager, registry, governance, store, role_agents)

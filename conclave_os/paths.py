@@ -18,7 +18,7 @@ from typing import Optional
 # (e.g. "C:\Users\me\proj").
 _QUOTED = re.compile(r"""["'`]([^"'`\n]*[\\/][^"'`\n]*)["'`]""")
 # A bare Windows drive path (C:\... or C:/...).
-_WIN = re.compile(r"([A-Za-z]:[\\/][^\s\"'`<>|]+)")
+_WIN = re.compile(r"([A-Za-z]:[\\/][^\n\"'`<>|]+)")
 # A UNC path (\\server\share\...).
 _UNC = re.compile(r"(\\\\[^\s\"'`<>|]+)")
 # A posix-rooted path (/abs/... or ~/...). Lower confidence — only accepted when
@@ -39,6 +39,7 @@ def extract_established_root(text: str) -> Optional[str]:
     posix path must exist to count."""
     for rx, cand in _candidates(text or ""):
         cand = cand.strip().strip("\"'`").rstrip(".,:;) ")
+        cand = re.sub(r"\s+(?:please|thanks?|now)$", "", cand, flags=re.IGNORECASE)
         if not cand:
             continue
         try:

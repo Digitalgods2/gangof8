@@ -39,7 +39,7 @@ def session(tmp_path):
 def test_edit_file_metadata():
     s = get_skill("edit_file")
     assert s.category == "file_edit" and s.requires_approval is False  # now free
-    assert s.risk == Risk.low and s.allowed_roles == [Role.implementer]
+    assert s.risk == Risk.low and s.allowed_roles == [Role.lead, Role.implementer]
 
 
 def test_run_tests_metadata():
@@ -145,7 +145,7 @@ class EditAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s, images=None):
-        if role == Role.implementer:
+        if role == Role.lead:
             # Write note.txt into the (free) sandbox, then surgically edit it —
             # both blocks execute freely and land in the session sandbox.
             return AdapterResult(

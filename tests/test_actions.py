@@ -15,10 +15,13 @@ import pytest
 
 from conclave_os import executor
 from conclave_os.executor import ExecutionError
-from conclave_os.models import Role, SessionStatus
+from conclave_os.logstore import LogStore
+from conclave_os.loop import _collect_proposals
+from conclave_os.models import Contribution, Role, SessionStatus
 from conclave_os.registry import AdapterResult
 from conclave_os.service import ConclaveService
 from conclave_os.adapters.mock import MockAdapter
+from conclave_os.sessions import SessionManager
 
 # 'write' + 'report' → content task → implementer active, no risk gate
 TASK = "Write a short report recommending SQLite or plain JSON for session logs."
@@ -40,7 +43,7 @@ class ArtifactAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             return AdapterResult(content=self.draft, duration_ms=1)
         return self._inner.call(role, prompt, timeout_s)
 
@@ -118,6 +121,30 @@ def test_artifact_content_strips_code_fence(tmp_path):
     )
     session = service.run(TASK, source="test")
     assert session.proposed_actions[0].content == "print('x')", "wrapping fence is stripped"
+
+
+def test_collects_multifile_artifacts_after_blank_lines(tmp_path):
+    store = LogStore(tmp_path)
+    session = SessionManager(store).create("write two files", source="test")
+    session.contributions.append(Contribution(
+        round=0,
+        role=Role.implementer,
+        agent="mock",
+        content=(
+            "ARTIFACT: first.txt\n"
+            "first body\n\n"
+            "ARTIFACT: second.txt\n"
+            "second body\n\n"
+            "RUNTESTS: echo ok\n"
+        ),
+    ))
+
+    _collect_proposals(session, store)
+
+    writes = [a for a in session.proposed_actions if a.kind == "write_file"]
+    assert [a.filename for a in writes] == ["first.txt", "second.txt"]
+    assert writes[0].content == "first body"
+    assert writes[1].content == "second body"
 
 
 def test_draft_without_marker_proposes_nothing(tmp_path):
@@ -262,7 +289,7 @@ class MultiArtifactAdapter:
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s):
-        if role == Role.implementer:
+        if role == Role.lead:
             return AdapterResult(content=MULTI_DRAFT, duration_ms=1)
         if role == Role.critic:
             return AdapterResult(content="acceptable", duration_ms=1)
@@ -298,3 +325,30 @@ def test_multi_artifact_writes_all_into_sandbox(multi_service, tmp_path):
     assert (sandbox / "main.py").read_text(encoding="utf-8") == "print('hello world')"
     assert all(a.status == "executed" for a in session.proposed_actions)
     assert len(session.files_changed) == 3
+
+
+def test_code_task_with_no_artifact_fails_verification(tmp_path):
+    class NoArtifactAdapter:
+        name = "mock"
+
+        def __init__(self):
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s):
+            if role == Role.lead:
+                return AdapterResult(content="I would create an app here.", duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    service = ConclaveService(data_dir=tmp_path)
+    service.registry.register(NoArtifactAdapter())
+
+    session = service.run("Create a simple app from scratch", source="test")
+    if session.status == SessionStatus.awaiting_input:
+        req = session.input_requests[-1]
+        session = service.answer(session.session_id, req.input_id, "workspace")
+
+    assert session.status == SessionStatus.done
+    assert session.final is not None
+    assert session.final.confidence == "low"
+    assert "failed artifact verification" in session.final.answer
+    assert any("no file artifact" in r for r in session.final.risks_unresolved)
