@@ -177,3 +177,50 @@ def test_seats_lists_cli_and_openrouter_agents(client):
         assert by_name[name]["enabled"] is False
         assert by_name[name]["available"] is False
     assert body["openrouter_key"] is False
+
+
+# ---- API keys: gemini is a first-class stored key (env optional) --------------
+
+
+def _no_gemini_env(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+
+def test_gemini_key_stored_in_settings_no_env_needed(tmp_path, monkeypatch):
+    _no_gemini_env(monkeypatch)
+    svc = ConclaveService(data_dir=tmp_path)
+    assert svc.api_key_status("gemini")["present"] is False
+    status = svc.set_api_key("gemini", "AIza-test-key-1234")
+    assert status["present"] is True and status["source"] == "stored"
+    assert "AIza-test-key-1234" not in json.dumps(status), "never returns the full key"
+    assert svc.secrets.get("gemini") == "AIza-test-key-1234"
+    assert svc.clear_api_key("gemini")["present"] is False
+
+
+def test_google_api_key_env_also_counts(tmp_path, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "g-env-key")
+    svc = ConclaveService(data_dir=tmp_path)
+    st = svc.api_key_status("gemini")
+    assert st["present"] is True and st["source"] == "env"
+
+
+def test_unknown_api_key_name_rejected(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path)
+    with pytest.raises(KeyError):
+        svc.api_key_status("stripe")
+
+
+def test_gemini_key_endpoints(tmp_path, monkeypatch):
+    from conclave_os import main as main_mod
+
+    _no_gemini_env(monkeypatch)
+    main_mod.service = ConclaveService(data_dir=tmp_path)
+    client = TestClient(main_mod.app)
+    assert client.get("/settings/api-keys/gemini").json()["present"] is False
+    r = client.put("/settings/api-keys/gemini", json={"value": "AIza-abc-9999"})
+    assert r.status_code == 200 and r.json()["present"] is True
+    assert "9999" in (r.json()["masked"] or ""), "masked hint, not the key"
+    assert client.delete("/settings/api-keys/gemini").json()["present"] is False
+    assert client.get("/settings/api-keys/stripe").status_code == 404

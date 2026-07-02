@@ -88,6 +88,34 @@ def test_unpinned_claude_without_usage_reports_no_model(stub_run):
     assert out.model is None
 
 
+def test_stored_gemini_key_routes_the_sdk_path_without_env(monkeypatch):
+    """A key pasted in Settings (no env var anywhere) must still unlock the
+    gemini SDK path — env vars are not the only way in."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    seen = {}
+
+    def fake_sdk(self, prompt, images, api_key=None):
+        seen["key"] = api_key
+        return "sdk answer"
+
+    monkeypatch.setattr(CliAdapter, "_run_gemini_sdk", fake_sdk)
+    adapter = CliAdapter("gemini", api_key_getter=lambda: "stored-key-1")
+    out = adapter.call(Role.researcher, "q", timeout_s=60)
+    assert out.content == "sdk answer"
+    assert seen["key"] == "stored-key-1", "the stored key reaches the SDK client"
+    assert out.model == "gemini-2.5-flash", "SDK default is attributed explicitly"
+
+
+def test_no_gemini_key_anywhere_falls_back_to_the_cli(stub_run, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    calls = stub_run(_Proc(stdout="cli answer"))
+    out = CliAdapter("gemini").call(Role.researcher, "q", timeout_s=60)
+    assert out.content == "cli answer"
+    assert calls["cmd"][0].endswith("gemini"), "went through the CLI, not the SDK"
+
+
 def test_cli_subprocess_runs_from_a_neutral_cwd(stub_run):
     """The agent CLI must never inherit the server's cwd (the repo): a model
     with latent tool instincts would perceive — and could ungovernedly read —

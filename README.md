@@ -126,9 +126,28 @@ Get-Command claude, codex, gemini -ErrorAction SilentlyContinue
 
 Each CLI manages its own login (`claude`, `codex`, and `gemini` all have their
 own auth flows) — Conclave OS never sees or stores those credentials. Which
-underlying *model* each CLI runs is a separate question: pin it per seat in
+underlying *model* each CLI runs is a separate question: pick it per seat in
 Settings → Local CLI models, or leave it empty to inherit that CLI's own
 default (every contribution displays the model that actually produced it).
+
+### Which API keys do you need?
+
+Short answer: **none, to start.** The CLIs authenticate themselves, and the
+Settings model dropdowns are fed by a **public, no-key model catalog**
+(refreshed live, newest models first) — so the dynamic model list works out of
+the box. Keys only *add* capability, and both can be pasted in
+**Settings → API keys** (stored locally in gitignored `data/secrets.json`;
+an env var of the same name always wins) — no environment variables required:
+
+| Key | Required? | What it unlocks |
+|-----|-----------|-----------------|
+| *(none)* | — | Full core app: CLI seats, deliberation, builds, promote gate, model dropdowns via the public catalog |
+| **Gemini** (`GEMINI_API_KEY` / Settings) | Optional | The gemini seat runs through Google's SDK instead of its flaky headless CLI (faster, reliable on Windows); the gemini dropdown switches to **Google's own authoritative model list**; gemini image vision; `web_search` with Google Search grounding. Free at aistudio.google.com |
+| **OpenRouter** (`OPENROUTER_API_KEY` / Settings) | Optional | The pay-per-token OpenRouter panel seats (DeepSeek, GLM, Qwen, Kimi, …) |
+
+If a key is absent, the related features degrade gracefully rather than error:
+no Gemini key ⇒ gemini uses its CLI and the dropdown uses the public catalog;
+no OpenRouter key ⇒ the panel is simply CLI-only.
 
 ## Use
 

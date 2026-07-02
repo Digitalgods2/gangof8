@@ -83,16 +83,21 @@ def web_fetch(url: str) -> str:
 
 def web_search(query: str) -> str:
     """Answer a query with live web grounding (Gemini + Google Search), returning
-    a synthesized answer plus its source URLs."""
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        raise WebError("web_search needs GEMINI_API_KEY (Google Search grounding)")
+    a synthesized answer plus its source URLs. The key resolves from the env OR
+    the Settings-stored secrets — an env var must not be the only way in."""
+    from .secrets import SecretStore
+
+    api_key = SecretStore(config.DATA_DIR).get("gemini")  # env override wins inside
+    if not api_key:
+        raise WebError("web_search needs a Gemini API key — set GEMINI_API_KEY or "
+                       "add it in Settings → API keys (Google Search grounding)")
     try:
         from google import genai
         from google.genai import types
     except ImportError as e:
         raise WebError(f"google-genai not installed: {e}") from e
     try:
-        client = genai.Client()
+        client = genai.Client(api_key=api_key)
         cfg = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())])
         resp = client.models.generate_content(
