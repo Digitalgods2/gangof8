@@ -362,6 +362,8 @@ function collapsible(key, summary, body, defaultOpen) {
 
 const esc = s => (s ?? "").toString()
   .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+// "deepseek/deepseek-v4-pro" → "deepseek-v4-pro"; full id stays in the tooltip
+const shortModel = m => (m || "").split("/").pop();
 // Colorize a unified diff (promote preview) line by line.
 const diffHtml = s => esc(s).split("\n").map(l => {
   const c = l.startsWith("+") && !l.startsWith("+++") ? "add"
@@ -602,6 +604,9 @@ function renderDetail(s) {
   const members = ((s.council||{}).members||[]);
   const roster = members.filter(m => m.active && m.agent && m.agent !== "system");
   const agentOf = Object.fromEntries(members.map(m => [m.role, m.agent]));
+  // exact model per seat, learned from the contributions that carried it
+  const modelOf = {};
+  (s.contributions||[]).forEach(c => { if (c.model) modelOf[c.agent] = c.model; });
 
   // What is it doing right now? Current round's goal + the seat we're waiting
   // on, so a long single agent call doesn't read as frozen.
@@ -715,7 +720,7 @@ function renderDetail(s) {
       <div class="card">
         <h3>Council</h3>
         <div class="roster">
-          ${roster.map(m => `<span class="seat role-${esc(m.role)} ${spokenRoles.has(m.role)?"spoke":"on"}">${esc(m.role)} · ${esc(m.agent)}</span>`).join("")}
+          ${roster.map(m => `<span class="seat role-${esc(m.role)} ${spokenRoles.has(m.role)?"spoke":"on"}" title="${modelOf[m.agent] ? esc(modelOf[m.agent]) : "model: CLI default"}">${esc(m.role)} · ${esc(m.agent)}${modelOf[m.agent] ? ` · ${esc(shortModel(modelOf[m.agent]))}` : ""}</span>`).join("")}
         </div>
       </div>` : ""}
 
@@ -784,7 +789,7 @@ function renderDetail(s) {
         contribs.map(c => `
           <div class="contrib">
             <div class="hd"><span class="rnd">r${c.round}</span>
-              <span class="who">${esc(c.role)} · ${esc(c.agent)}</span>
+              <span class="who" title="${c.model ? esc(c.model) : "model: CLI default"}">${esc(c.role)} · ${esc(c.agent)}${c.model ? ` · ${esc(shortModel(c.model))}` : ""}</span>
               <span class="len">${(c.content||"").length} chars</span></div>
             <pre>${esc(c.content)}</pre>
           </div>`).join(""),
@@ -961,6 +966,19 @@ function renderSettings(s, seats) {
     </div>
 
     <div class="sset">
+      <label>Local CLI models</label>
+      ${(seats || []).filter(x => x.kind === "cli").map(x => `
+        <div class="field" style="align-items:center">
+          <label style="margin:0;flex:0 0 70px"><b>${esc(x.name)}</b></label>
+          <input type="text" class="cli_model mono" data-seat="${esc(x.name)}" spellcheck="false"
+                 value="${escAttr(x.model || "")}"
+                 placeholder="(CLI default${x.name === "gemini" ? " · SDK: gemini-2.5-flash" : ""})"
+                 title="Pin the exact model this seat runs (passed as --model / -m / SDK model). Empty = the CLI's own configured default." style="flex:1;min-width:200px">
+        </div>`).join("")}
+      <div class="sub">Pin the exact model each local seat runs (e.g. claude → opus, gemini → gemini-2.5-pro). Empty = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+    </div>
+
+    <div class="sset">
       <label>OpenRouter API key</label>
       <div class="field">
         <input type="password" id="or_key" autocomplete="off" placeholder="${orKey.present ? "key set (" + esc(orKey.masked || "••••") + ") — type to replace" : "sk-or-… paste your OpenRouter key"}">
@@ -1040,11 +1058,14 @@ async function saveSettings() {
   document.querySelectorAll(".or_enable").forEach(c => { openrouter_enabled[c.dataset.seat] = c.checked; });
   const openrouter_models = {};
   document.querySelectorAll(".or_slug").forEach(i => { const v = i.value.trim(); if (v) openrouter_models[i.dataset.seat] = v; });
+  const cli_models = {};
+  document.querySelectorAll(".cli_model").forEach(i => { const v = i.value.trim(); if (v) cli_models[i.dataset.seat] = v; });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
     openrouter_enabled,
     openrouter_models,
+    cli_models,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),

@@ -137,6 +137,7 @@ class Contribution(BaseModel):
     role: Role
     agent: str
     content: str
+    model: Optional[str] = None  # the exact model that produced it, when known
     tokens: int = 0
     duration_ms: int = 0
     ts: str = Field(default_factory=utcnow)

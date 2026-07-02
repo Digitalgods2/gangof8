@@ -57,6 +57,10 @@ class Settings(BaseModel):
     # derive per backend: the installed CLI agents plus enabled+keyed
     # OpenRouter seats.
     panel_seats: list[str] = []
+    # Per-CLI-seat model pins (agent name → model id, e.g. claude → "opus",
+    # gemini → "gemini-2.5-pro"). Empty/absent ⇒ each CLI's own default —
+    # note the gemini SDK path defaults to gemini-2.5-flash.
+    cli_models: dict[str, str] = {}
     # Automatic rounds between "continue another n rounds?" consent checks.
     rounds_per_consent: int = Field(default_factory=lambda: config.ROUNDS_PER_CONSENT)
 
