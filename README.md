@@ -76,6 +76,14 @@ consent gate exists.
 approval in the whole pipeline is **promote**: copying a finished file into
 your real folder, with a diff on the approval card. A promote with no known
 destination asks you *where* at delivery time — never up front, never assumed.
+On any approval you can pick **Approve all** to grant that category for the
+whole session — one deliberate decision instead of N identical clicks.
+
+**Builds close their own loop.** When a build's `RUNTESTS:` command fails, the
+lead is shown the real failure output and repairs the code (surgical `EDIT:`
+blocks or file re-writes), and the tests re-run — up to 3 attempts, all
+*before* anything is promoted. A build ships passing its own tests, or the
+final answer says exactly why it couldn't.
 
 ## Setup
 

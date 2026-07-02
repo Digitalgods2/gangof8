@@ -276,6 +276,7 @@ class Session(BaseModel):
     standing_approvals: list[str] = []
     consent_extra_rounds: int = 0  # rounds the human granted beyond ROUNDS_PER_CONSENT
     compose_now: bool = False  # human said "finish" — skip further rounds, compose from the work so far
+    test_fix_attempts: int = 0  # goal-loop repairs spent (persisted: a pause can't reset the clock)
     turns: list[dict] = []  # the conversation: [{role:'user'|'council', text}] — grows as the
     #                         human responds to a conclusion and the council deliberates again.
     attachments: list[dict] = []  # [{id, name, kind}] folded into the task text
