@@ -99,6 +99,37 @@ python -m venv .venv
 The `cli` backend uses your locally-installed agent CLIs (`claude`, `codex`,
 `gemini` on PATH), each with its own auth — there is no external service.
 
+### How Conclave OS detects your CLIs
+
+There is no configuration file listing which AIs you have — detection is the
+same PATH lookup your terminal does when you type `claude` and press Enter:
+`shutil.which("claude")` (and likewise for `codex` and `gemini`). Anything
+installed and on PATH is found; anything absent is simply skipped. That one
+mechanism drives three behaviors:
+
+- **Settings → seats** shows each CLI with a live "ready ✓" / unavailable
+  badge — that's the `which` check, re-run on every load.
+- **The panel roster degrades gracefully**: only installed CLIs are convened,
+  so uninstalling one shrinks the panel instead of breaking runs (OpenRouter
+  seats join only when enabled *and* an API key is present).
+- **Windows gotcha, already handled**: npm installs `codex` and `gemini` as
+  `.cmd`/`.ps1` shims, not `.exe` files, and spawning them by bare name fails
+  with `WinError 2`. Conclave OS resolves the shim's real path via
+  `shutil.which` before launching — if you ever add another npm-installed CLI,
+  that's the pattern to copy.
+
+To see for yourself what would be detected, run the same probe by hand:
+
+```powershell
+Get-Command claude, codex, gemini -ErrorAction SilentlyContinue
+```
+
+Each CLI manages its own login (`claude`, `codex`, and `gemini` all have their
+own auth flows) — Conclave OS never sees or stores those credentials. Which
+underlying *model* each CLI runs is a separate question: pin it per seat in
+Settings → Local CLI models, or leave it empty to inherit that CLI's own
+default (every contribution displays the model that actually produced it).
+
 ## Use
 
 ```powershell
