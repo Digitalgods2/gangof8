@@ -598,6 +598,37 @@ def test_cli_panel_appends_enabled_keyed_openrouter_seats(tmp_path, monkeypatch)
     assert svc.panel == ["claude", "codex", "deepseek"]
 
 
+def test_lead_recall_after_skill_results_keeps_the_lead_timeout(tmp_path):
+    """Live failure: 'modify the existing game' had the lead read index.html,
+    then time out at 120s regenerating it — the skill-resolution re-call ran on
+    the generic specialist timeout instead of LEAD_TIMEOUT. Both lead calls
+    must carry the long timeout."""
+
+    class TimeoutProbe:
+        name = "mock"
+
+        def __init__(self):
+            self.lead_timeouts = []
+            self._inner = MockAdapter()
+
+        def call(self, role, prompt, timeout_s, images=None):
+            if role == Role.lead:
+                self.lead_timeouts.append(timeout_s)
+                if "Skill results" in prompt:
+                    return AdapterResult(content="Done with the file.\nROUND: DONE", duration_ms=1)
+                return AdapterResult(content="SKILL: bogus x", duration_ms=1)
+            return self._inner.call(role, prompt, timeout_s)
+
+    probe = TimeoutProbe()
+    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc.registry.register(probe)
+    session = svc.run(TASK, source="test")
+    assert session.status == SessionStatus.done
+    assert len(probe.lead_timeouts) == 2, "initial call + skill-results re-call"
+    assert all(t == config.LEAD_TIMEOUT for t in probe.lead_timeouts), \
+        f"every lead call gets the lead timeout, got {probe.lead_timeouts}"
+
+
 # --- delegated RESULT block survives folding ----------------------------------------
 
 

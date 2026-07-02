@@ -514,6 +514,7 @@ def _run_delegations(
 def _resolve_delegations(
     session: Session, council: Council, lead: CouncilMember, prompt: str,
     contribution: Contribution, call: AgentCall, store: LogStore,
+    recall: Optional[AgentCall] = None,
 ) -> Contribution:
     """Handle the lead's CONSULT:/DELEGATE: lines (level 1), letting each consulted
     specialist itself consult ONE bounded level deeper (the sub-agent tier — see
@@ -528,7 +529,9 @@ def _resolve_delegations(
         f"{prompt}\n\nResults from the talents you pulled in (use these; finish the "
         "task now — do not request the same help again):\n" + "\n\n".join(results)
     )
-    return call(lead, followup)
+    # the lead authors whole files in this follow-up — it needs ITS timeout,
+    # not the quick-specialist one
+    return (recall or call)(lead, followup)
 
 
 def _is_analysis_task(session: Session) -> bool:
@@ -554,12 +557,19 @@ def _skill_result_cap(session: Session) -> int:
 def _resolve_skill_requests(
     session: Session, member: CouncilMember, prompt: str, contribution: Contribution,
     call: AgentCall, governance: Governance, store: LogStore,
+    recall: Optional[AgentCall] = None,
 ) -> Contribution:
     """If the agent requested no-approval skills (SKILL: <name> <arg>), run each
     through the permission kernel, execute the authorized ones, and re-call the
     agent ONCE with the results appended so it can use them. Approval-gated
     skills (write_file) are NOT honored here — those go through the ARTIFACT
-    proposal path. Returns the (possibly re-called) contribution."""
+    proposal path. Returns the (possibly re-called) contribution.
+
+    `recall` is the call used for that follow-up; the LEAD must pass its own
+    long-timeout call here — a read-then-write task authors whole files in the
+    follow-up, and the generic 120s specialist timeout killed exactly that
+    (live: 'modify the existing game' read index.html, then timed out
+    regenerating it)."""
     reqs = _SKILL_REQUEST_MARKER.findall(contribution.content)
     if not reqs:
         return contribution
@@ -605,7 +615,7 @@ def _resolve_skill_requests(
         f"{prompt}\n\nSkill results (use these; do not request them again):\n"
         + "\n\n".join(results)
     )
-    return call(member, followup)
+    return (recall or call)(member, followup)
 
 
 def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
@@ -758,8 +768,10 @@ def _run_panel_rounds(
         governance.check(session, "generate_text")
         p = rounds.synthesis_prompt(session, council, role_agents, r, results, ov, readable)
         c = lead_call(lead, p)
-        c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
-        c = _resolve_delegations(session, council, lead, p, c, call, store)
+        c = _resolve_skill_requests(session, lead, p, c, call, governance, store,
+                                    recall=lead_call)
+        c = _resolve_delegations(session, council, lead, p, c, call, store,
+                                 recall=lead_call)
         # A synthesis that only ANNOUNCES or ATTEMPTS the work ("I'll read the
         # files, then deliver..." / blocked tool-call debris) must not be
         # accepted as DONE — re-call once demanding the result now. A second
@@ -779,8 +791,10 @@ def _run_panel_rounds(
                 "the results will be handed back to you."
             )
             c = lead_call(lead, nudge)
-            c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store)
-            c = _resolve_delegations(session, council, lead, nudge, c, call, store)
+            c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store,
+                                        recall=lead_call)
+            c = _resolve_delegations(session, council, lead, nudge, c, call, store,
+                                     recall=lead_call)
             if rounds.reply_is_stub(c.content):
                 session.unresolved.append(
                     "lead synthesis was a stub twice; final answer composed from "
@@ -946,7 +960,9 @@ def _deliberate(
     # focused single-file call.
     _collect_proposals(session, store)
     if not _has_proposals(session) and cls.produces_output:
-        _materialize_artifacts(session, compose_call, store)
+        # materialization authors WHOLE files — it needs the lead's long
+        # timeout, not the composer's 120s (which timed out live on a 30KB file)
+        _materialize_artifacts(session, lead_call, store)
     # Free council-space actions first (writes/edits/tests — never pause), so
     # the goal loop can repair failing tests BEFORE anything is delivered.
     _execute_actions(session, manager, governance, store, promotes=False)
@@ -1518,7 +1534,8 @@ def _run_test_fix_loop(
                                    _readable_files(session, store.data_dir))
         try:
             c = lead_call(lead, p)
-            c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
+            c = _resolve_skill_requests(session, lead, p, c, call, governance, store,
+                                        recall=lead_call)
         except (AgentError, BudgetExceeded) as e:
             session.unresolved.append(f"test-fix attempt {attempt} failed: {e}")
             return
