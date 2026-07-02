@@ -1,9 +1,31 @@
 # Conclave OS — Type 1: Coordinator OS
 
-A coordination layer that receives a user task, convenes a **panel of
-different AI models** that deliberate in parallel rounds under a single lead,
-runs the whole thing **bounded** and under **human authority**, logs
-everything, and returns a structured final answer. See
+**One question. Every AI you have. One answer you can trust.**
+
+Ask a single AI something hard and you get one perspective — with that model's
+blind spots baked in. Conclave OS asks **all of them at once**: every AI on
+your machine (the claude, codex, and gemini CLIs) plus any API seats you
+enable (DeepSeek, GLM, Qwen, Kimi) convenes as a *panel*, each writing its
+take **independently and in parallel** — nobody sees anyone else's answer
+while writing, so you get genuinely different perspectives instead of an echo
+chamber. Then a **lead** model reads them all and does what a good chief
+engineer does: verifies claims against the actual evidence before believing
+them, adopts what's right, overrules what's wrong *by name*, pulls in
+specialist sub-agents when it needs one — and every contribution is tagged
+with the exact model that wrote it.
+
+It doesn't just talk — it **builds**. Ask for working software and the
+council designs it, the lead writes complete files, runs their tests, and
+**fixes its own failures** before anything ships. Deliberation rotates
+automatically, pausing to ask *you* only when it wants more rounds; work
+happens freely in a sandboxed scratch space; and exactly **one hard gate**
+stands between the council and your real files — a diff-carrying approval
+that nothing crosses without your click. Everything is bounded (budgets,
+wall-clock, depth caps), everything is logged, and a run that fails says so
+honestly instead of dressing up a failure as an answer.
+
+The result: the diversity of a committee, the decisiveness of a single owner,
+and the receipts of an audit trail — running entirely on your desk. See
 [How a deliberation works](#how-a-deliberation-works-the-panel-model) below;
 full design in [DESIGN.md](DESIGN.md).
 
