@@ -217,6 +217,9 @@ AGENT_TIMEOUT_DEFAULT = 120
 AGENT_TIMEOUTS: dict[str, int] = {
     "gemini": 150,
     "codex": 300,
+    # the claude CLI writes long, careful panel takes — observed >120s on real
+    # runs (two seats dropped at the old default); it works, it's just thorough
+    "claude": 240,
 }
 
 
