@@ -442,6 +442,32 @@ def synthesis_prompt(
     )
 
 
+def test_fix_prompt(
+    session: Session, failure_output: str, files: list[str],
+    attempt: int, max_attempts: int, readable: list[str] = (),
+) -> str:
+    """The goal-loop repair prompt: the lead sees the real test failure and must
+    fix the code in-reply — not explain the failure back to the human."""
+    file_list = ", ".join(files) if files else "(none yet)"
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"Your build's test run FAILED (repair attempt {attempt} of {max_attempts}). "
+        "Fix the code NOW — do not explain the failure to the human; repair it.\n"
+        f"Files you have written so far: {file_list}\n"
+        "Emit ONLY what changes: a surgical edit per fix —\n"
+        "EDIT: <filename>\n"
+        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
+        "— or a full 'ARTIFACT: <filename>' re-write when the change is large. The "
+        "same test command re-runs automatically after your fix; emit a "
+        "'RUNTESTS: <command>' line only to CHANGE the command. If the failure is "
+        "genuinely unfixable here (e.g. a missing system dependency), say why in "
+        "one short paragraph and emit no blocks.\n"
+        f"{_skill_hints(session, Role.lead, readable)}"
+        f"TEST OUTPUT:\n{failure_output}\n"
+    )
+
+
 def round_summaries(session: Session) -> str:
     """One capped line per completed round (from the lead syntheses) so the
     human can decide whether more rounds are worth it."""

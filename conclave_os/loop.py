@@ -947,14 +947,22 @@ def _deliberate(
     _collect_proposals(session, store)
     if not _has_proposals(session) and cls.produces_output:
         _materialize_artifacts(session, compose_call, store)
-    if _execute_actions(session, manager, governance, store):
-        return session  # paused in awaiting_approval
+    # Free council-space actions first (writes/edits/tests — never pause), so
+    # the goal loop can repair failing tests BEFORE anything is delivered.
+    _execute_actions(session, manager, governance, store, promotes=False)
 
     # A large single-file artifact can exceed one model response and be cut off.
     # Finish it from where it stopped (append) instead of re-drafting — the old
     # failure mode that produced empty/partial HTML over and over.
     if lead and lead.active:
         _complete_truncated_artifacts(session, lead_call, lead, store)
+        # The goal loop: failing tests come back to the lead for bounded repair.
+        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_call)
+
+    # Delivery last: promotes (the one approval gate) and, if the destination
+    # is unknown, the delivery-target question.
+    if _execute_actions(session, manager, governance, store):
+        return session  # paused in awaiting_approval / awaiting_input
     # Verify whenever the task produced (or was required to produce) files — NOT
     # just code tasks. A content/design task that emitted an empty or truncated
     # file must NOT be reported as a confident success. A code task must produce a
@@ -1067,21 +1075,9 @@ _BLOCK_START = re.compile(
 )
 
 
-def _collect_proposals(session: Session, store: LogStore) -> None:
-    """Turn the implementer's final draft into ProposedActions (loop step 7b):
-    'ARTIFACT: <file>' → write_file, an 'EDIT: <file>' OLD/NEW block →
-    edit_file, and 'RUNTESTS: <cmd>' → run_tests. Collected in document order so
-    writes/edits precede a test run. Idempotent: not re-collected on resume."""
-    if _has_proposals(session):
-        return
-    draft = next(
-        (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
-        None,
-    )
-    if draft is None:
-        return
-    text = draft.content
-    sid = session.session_id
+def _parse_proposals(sid: str, text: str) -> list[ProposedAction]:
+    """Parse a draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE blocks into ProposedActions,
+    in document order (so writes/edits precede a test run)."""
     starts = sorted(m.start() for m in _BLOCK_START.finditer(text))
 
     def _content_end(after: int) -> int:
@@ -1112,13 +1108,30 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="promote", role=Role.implementer,
             filename=fn, args={"filename": fn})))
+    return [action for _, action in sorted(found, key=lambda t: t[0])]
 
-    for _, action in sorted(found, key=lambda t: t[0]):
+
+def _append_proposals(session: Session, store: LogStore, actions: list[ProposedAction]) -> None:
+    for action in actions:
         session.proposed_actions.append(action)
         store.log_event(
             session.session_id, "action_proposed",
             {"action_id": action.action_id, "kind": action.kind, "filename": action.filename},
         )
+
+
+def _collect_proposals(session: Session, store: LogStore) -> None:
+    """Turn the lead's final draft into ProposedActions (loop step 7b).
+    Idempotent: not re-collected on resume."""
+    if _has_proposals(session):
+        return
+    draft = next(
+        (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
+        None,
+    )
+    if draft is None:
+        return
+    _append_proposals(session, store, _parse_proposals(session.session_id, draft.content))
 
 
 # Filenames mentioned anywhere (main.py, requirements.txt) — used to recover the
@@ -1349,17 +1362,24 @@ def _complete_truncated_artifacts(
 
 
 def _execute_actions(
-    session: Session, manager: SessionManager, governance: Governance, store: LogStore
+    session: Session, manager: SessionManager, governance: Governance, store: LogStore,
+    promotes: bool = True,
 ) -> bool:
     """Drive every proposed action through its approval lifecycle; execute the
     approved ones. Returns True when the session must pause for the human.
-    Deterministic and resume-safe — re-entered after each approval decision."""
+    Deterministic and resume-safe — re-entered after each approval decision.
+    With promotes=False, only the FREE council-space actions run (writes/edits/
+    tests) — the pass the goal loop repairs against before anything is
+    delivered; promotes (and the delivery-target question) wait for the final
+    pass."""
     sid = session.session_id
     # A promote with no delivery target: ask the human WHERE at delivery time
     # (never up front — there may have been nothing to deliver). One question,
     # once; if the human already answered 'workspace', the promotes are skipped.
     needs_target = [a for a in session.proposed_actions
                     if a.kind == "promote" and a.status == "proposed"]
+    if not promotes:
+        needs_target = []
     if needs_target and not session.established_root:
         if session.established_asked:
             for a in needs_target:
@@ -1386,6 +1406,8 @@ def _execute_actions(
             return True
     pending = False
     for action in session.proposed_actions:
+        if action.kind == "promote" and not promotes:
+            continue
         if action.status == "proposed":
             # Permission kernel: skill metadata drives the decision. It may
             # deny the action (unknown skill / role not allowed → status set
@@ -1447,6 +1469,80 @@ def _execute_actions(
 
 
 _FILE_OUTPUT_KINDS = {"write_file", "edit_file", "promote", "stage"}
+
+
+def _tests_failed(action: ProposedAction) -> Optional[str]:
+    """The failure text of a run_tests action, or None when it passed. The
+    handler tags line 2 of its output '[passed]' or '[exit N]'; timeouts and
+    unrunnable commands surface as a failed action with an error."""
+    if action.kind != "run_tests":
+        return None
+    if action.status == "failed":
+        return f"test command could not run: {action.error}"
+    if action.status == "executed" and action.result_path and "[passed]" not in action.result_path:
+        return action.result_path
+    return None
+
+
+def _run_test_fix_loop(
+    session: Session, manager: SessionManager, governance: Governance, store: LogStore,
+    lead: CouncilMember, call: AgentCall, lead_call: AgentCall,
+) -> None:
+    """The goal loop: while the latest test run fails, show the lead the real
+    failure output and apply its EDIT/ARTIFACT repairs, re-running the tests
+    after each attempt — bounded by MAX_TEST_FIX_ATTEMPTS (persisted on the
+    session) and the agent-call budget, and all BEFORE anything is promoted.
+    A build either ships passing its own tests or says exactly why not."""
+    sid = session.session_id
+    while session.test_fix_attempts < config.MAX_TEST_FIX_ATTEMPTS:
+        latest = next((a for a in reversed(session.proposed_actions)
+                       if a.kind == "run_tests"), None)
+        if latest is None:
+            return
+        failure = _tests_failed(latest)
+        if failure is None:
+            return
+        remaining = (session.budgets.max_agent_calls - session.agent_calls
+                     - config.COMPOSER_RESERVED_CALLS)
+        if remaining < 1:
+            session.unresolved.append("test-fix loop stopped: agent-call budget exhausted")
+            return
+        session.test_fix_attempts += 1
+        attempt = session.test_fix_attempts
+        store.log_event(sid, "test_fix_attempt",
+                        {"attempt": attempt, "failure": failure[:300]})
+        files = sorted({a.filename for a in session.proposed_actions
+                        if a.kind in ("write_file", "edit_file") and a.filename})
+        p = rounds.test_fix_prompt(session, failure, files, attempt,
+                                   config.MAX_TEST_FIX_ATTEMPTS,
+                                   _readable_files(session, store.data_dir))
+        try:
+            c = lead_call(lead, p)
+            c = _resolve_skill_requests(session, lead, p, c, call, governance, store)
+        except (AgentError, BudgetExceeded) as e:
+            session.unresolved.append(f"test-fix attempt {attempt} failed: {e}")
+            return
+        new_actions = _parse_proposals(sid, c.content)
+        fixes = [a for a in new_actions if a.kind in ("write_file", "edit_file")]
+        reruns = [a for a in new_actions if a.kind == "run_tests"]
+        if not fixes and not reruns:
+            session.unresolved.append(
+                f"tests still failing; the lead offered no fix on attempt {attempt}: "
+                + " ".join(c.content.split())[:300])
+            return
+        # the same command re-runs unless the lead explicitly changed it
+        if not reruns:
+            reruns = [ProposedAction(session_id=sid, kind="run_tests",
+                                     role=Role.implementer, filename=latest.filename,
+                                     args=dict(latest.args))]
+        _append_proposals(session, store, fixes + reruns)
+        _execute_actions(session, manager, governance, store, promotes=False)
+    latest = next((a for a in reversed(session.proposed_actions)
+                   if a.kind == "run_tests"), None)
+    if latest is not None and _tests_failed(latest) is not None:
+        note = f"tests still failing after {config.MAX_TEST_FIX_ATTEMPTS} fix attempts"
+        if note not in session.unresolved:
+            session.unresolved.append(note)
 
 
 def _lead_preamble(session: Session) -> str:

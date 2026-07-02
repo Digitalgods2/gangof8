@@ -194,6 +194,12 @@ PROMOTE_DIFF_MAX_CHARS = 6000
 # own sandbox/workspace (the spaces model gates only promote); keep it time-
 # and output-bounded.
 RUN_TESTS_TIMEOUT = 300
+# The goal loop: when a build's test run fails, the lead is shown the failure
+# and asked to repair the code (EDIT/ARTIFACT blocks), then the tests re-run —
+# up to this many attempts, all BEFORE anything is promoted. The count persists
+# on the session, so an approval pause can't reset the clock. Exhausted
+# attempts compose honestly: "tests still failing after N fix attempts".
+MAX_TEST_FIX_ATTEMPTS = 3
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 
 # Per-agent CLI timeouts (seconds). The gemini CLI in headless plan mode is
