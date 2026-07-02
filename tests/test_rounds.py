@@ -721,6 +721,99 @@ def test_cli_model_pins_flow_from_settings_to_adapters(tmp_path, monkeypatch):
     seats = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "cli"}
     assert seats["claude"]["model"] == "claude-opus-4-8"
     assert seats["codex"]["model"] is None
+    # each vendor seat carries its dropdown catalog of reasoning models
+    for name in ("claude", "codex", "gemini"):
+        assert seats[name]["models"], f"{name} should offer a model catalog"
+    assert "opus" in seats["claude"]["models"]
+    assert any(m.startswith("gemini-") for m in seats["gemini"]["models"])
+
+
+# --- live model catalog ---------------------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+_PUBLIC_CATALOG = {"data": [
+    {"id": "anthropic/claude-fable-5:free", "created": 400},   # variant → base id
+    {"id": "anthropic/claude-fable-5", "created": 300},        # deduped
+    {"id": "anthropic/claude-opus-4-8", "created": 200},
+    {"id": "openai/gpt-5.1-codex-max", "created": 250},
+    {"id": "openai/whisper-large-v4", "created": 999},         # not a reasoning model
+    {"id": "google/gemini-3-pro", "created": 100},
+    {"id": "mistralai/mistral-large", "created": 500},         # not one of our CLI vendors
+]}
+
+
+def _catalog_service(tmp_path, monkeypatch, get=None):
+    import httpx
+
+    monkeypatch.setattr(config, "WEB_ENABLED", True)
+    calls = {"n": 0}
+
+    def fake_get(url, timeout=None):
+        calls["n"] += 1
+        if get is not None:
+            return get(url)
+        return _FakeResp(_PUBLIC_CATALOG)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setattr(ConclaveService, "_gemini_sdk_models", lambda self: [])
+    return ConclaveService(data_dir=tmp_path), calls
+
+
+def test_live_catalog_groups_by_vendor_newest_first(tmp_path, monkeypatch):
+    svc, _ = _catalog_service(tmp_path, monkeypatch)
+    cat = svc.cli_model_catalog()
+    # tier aliases stay on top (never stale), then live models newest-first
+    assert cat["claude"][:3] == ["opus", "sonnet", "haiku"]
+    live = cat["claude"][3:]
+    assert live.index("claude-fable-5") < live.index("claude-opus-4-8")
+    assert cat["claude"].count("claude-fable-5") == 1, ":free variant deduped to base id"
+    assert "gpt-5.1-codex-max" in cat["codex"]
+    assert not any("whisper" in m for m in cat["codex"]), "non-reasoning families excluded"
+    assert "gemini-3-pro" in cat["gemini"]
+    assert not any("mistral" in m for models in cat.values() for m in models)
+
+
+def test_catalog_failure_falls_back_to_static(tmp_path, monkeypatch):
+    def boom(url):
+        raise OSError("offline")
+
+    svc, _ = _catalog_service(tmp_path, monkeypatch, get=boom)
+    cat = svc.cli_model_catalog()
+    assert cat == config.CLI_MODEL_CATALOG, "Settings never breaks offline"
+    assert "claude-fable-5" in cat["claude"], "fallback still knows the newest family"
+
+
+def test_catalog_cached_until_refresh(tmp_path, monkeypatch):
+    svc, calls = _catalog_service(tmp_path, monkeypatch)
+    svc.cli_model_catalog()
+    svc.cli_model_catalog()
+    assert calls["n"] == 1, "second call served from cache"
+    svc.cli_model_catalog(refresh=True)
+    assert calls["n"] == 2, "?refresh=1 refetches"
+
+
+def test_web_disabled_never_fetches(tmp_path, monkeypatch):
+    import httpx
+
+    calls = {"n": 0}
+
+    def fake_get(url, timeout=None):
+        calls["n"] += 1
+        return _FakeResp(_PUBLIC_CATALOG)
+
+    monkeypatch.setattr(httpx, "get", fake_get)  # WEB stays off via conftest
+    svc = ConclaveService(data_dir=tmp_path)
+    assert svc.cli_model_catalog() == config.CLI_MODEL_CATALOG
+    assert calls["n"] == 0
 
 
 # --- disk back-compat --------------------------------------------------------------
