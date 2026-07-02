@@ -967,15 +967,26 @@ function renderSettings(s, seats) {
 
     <div class="sset">
       <label>Local CLI models</label>
-      ${(seats || []).filter(x => x.kind === "cli").map(x => `
+      ${(seats || []).filter(x => x.kind === "cli").map(x => {
+        const catalog = x.models || [];
+        const isCustom = x.model && !catalog.includes(x.model);
+        return `
         <div class="field" style="align-items:center">
           <label style="margin:0;flex:0 0 70px"><b>${esc(x.name)}</b></label>
-          <input type="text" class="cli_model mono" data-seat="${esc(x.name)}" spellcheck="false"
-                 value="${escAttr(x.model || "")}"
-                 placeholder="(CLI default${x.name === "gemini" ? " · SDK: gemini-2.5-flash" : ""})"
-                 title="Pin the exact model this seat runs (passed as --model / -m / SDK model). Empty = the CLI's own configured default." style="flex:1;min-width:200px">
-        </div>`).join("")}
-      <div class="sub">Pin the exact model each local seat runs (e.g. claude → opus, gemini → gemini-2.5-pro). Empty = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+          <select class="cli_model_sel" data-seat="${esc(x.name)}" style="flex:1;min-width:180px"
+                  title="Pin the exact model this seat runs (passed as --model / -m / SDK model)."
+                  onchange="this.nextElementSibling.style.display = this.value === '__custom__' ? '' : 'none'">
+            <option value="">(CLI default${x.name === "gemini" ? " · SDK: gemini-2.5-flash" : ""})</option>
+            ${catalog.map(m => `<option value="${escAttr(m)}" ${x.model === m ? "selected" : ""}>${esc(m)}</option>`).join("")}
+            ${isCustom ? `<option value="${escAttr(x.model)}" selected>${esc(x.model)} (custom)</option>` : ""}
+            <option value="__custom__">custom…</option>
+          </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
+                 spellcheck="false" placeholder="exact model id" style="flex:1;min-width:160px;display:none">
+        </div>`;}).join("")}
+      <div class="field" style="justify-content:flex-end">
+        <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
+      </div>
+      <div class="sub">Fetched live from the public model catalog (newest first; plus Google's own list when a gemini key is set) — a model released yesterday shows up here. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
     </div>
 
     <div class="sset">
@@ -1059,7 +1070,14 @@ async function saveSettings() {
   const openrouter_models = {};
   document.querySelectorAll(".or_slug").forEach(i => { const v = i.value.trim(); if (v) openrouter_models[i.dataset.seat] = v; });
   const cli_models = {};
-  document.querySelectorAll(".cli_model").forEach(i => { const v = i.value.trim(); if (v) cli_models[i.dataset.seat] = v; });
+  document.querySelectorAll(".cli_model_sel").forEach(sel => {
+    let v = sel.value;
+    if (v === "__custom__") {
+      const custom = sel.parentElement.querySelector(".cli_model_custom");
+      v = custom ? custom.value.trim() : "";
+    }
+    if (v) cli_models[sel.dataset.seat] = v;
+  });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
@@ -1156,6 +1174,16 @@ async function activateWorkspace(id) {
 // ---- in-page folder browser ----
 let fsCurrent = "";  // "" = drive roots
 const escAttr = s => esc(s).replaceAll('"', "&quot;");
+
+async function refreshModelCatalog(btn) {
+  if (btn) btn.textContent = "↻ fetching…";
+  try {
+    seatsCache = (await api("/settings/seats?refresh=1")).seats || seatsCache;
+    renderSettings(settingsCache, seatsCache);
+  } catch (e) {
+    if (btn) btn.textContent = "↻ fetch failed — retry";
+  }
+}
 const baseName = p => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() || p;
 const isDrive = p => /^[a-z]:\\?$/i.test(p);
 

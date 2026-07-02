@@ -121,6 +121,25 @@ ROLE_AGENTS_BY_BACKEND: dict[str, dict[Role, str]] = {
     "cli": ROLE_AGENTS_CLI,
 }
 
+# The Settings dropdown of models per local CLI seat is fetched LIVE (see
+# service.cli_model_catalog): OpenRouter's PUBLIC no-key model catalog grouped
+# by vendor (newest first — a model released yesterday appears without a code
+# change), plus the gemini SDK's own list when a GEMINI_API_KEY is present.
+# This static list is only the OFFLINE FALLBACK, plus the claude tier aliases
+# (sonnet/opus/haiku), which the CLI always resolves to its current best.
+MODEL_CATALOG_URL = os.environ.get(
+    "CONCLAVE_OS_MODEL_CATALOG_URL", "https://openrouter.ai/api/v1/models")
+MODEL_CATALOG_TTL = 900      # seconds the fetched catalog is cached
+MODEL_CATALOG_TIMEOUT = 6    # seconds before the fetch gives up (fallback wins)
+CLI_MODEL_CATALOG: dict[str, list[str]] = {
+    "claude": ["opus", "sonnet", "haiku",
+               "claude-fable-5", "claude-opus-4-8", "claude-sonnet-5"],
+    "codex": ["gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5.1",
+              "gpt-5-codex", "gpt-5"],
+    "gemini": ["gemini-3-pro-preview", "gemini-2.5-pro",
+               "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+}
+
 # OpenRouter council seats (pay-per-token API models, no CLI). Each is a friendly
 # seat name → OpenRouter model slug; opt-in per seat in Settings, needs an
 # OPENROUTER_API_KEY. Mixed freely with the local CLI agents in the role map.

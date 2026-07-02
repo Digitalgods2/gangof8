@@ -256,9 +256,10 @@ def put_settings(body: SettingsPatch) -> dict:
 
 
 @app.get("/settings/seats")
-def get_seats() -> dict:
-    """All seats (CLI + OpenRouter) with availability, for the role dropdowns."""
-    return service.seats()
+def get_seats(refresh: bool = False) -> dict:
+    """All seats (CLI + OpenRouter) with availability, for the role dropdowns.
+    ?refresh=1 refetches the live model catalog instead of the 15-min cache."""
+    return service.seats(refresh=refresh)
 
 
 @app.get("/settings/api-keys/openrouter")

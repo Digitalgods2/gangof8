@@ -64,6 +64,7 @@ class ConclaveService:
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
+        self._model_catalog_cache: Optional[tuple[float, dict]] = None
         self._apply_settings(backend=backend)
 
     def _apply_settings(self, backend: Optional[str] = None) -> None:
@@ -413,15 +414,109 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     # ---- CLI seats (settings panel) ------------------------------------------
 
-    def seats(self) -> dict:
+    # vendor prefix in the public catalog → our CLI seat name
+    _CATALOG_VENDORS = {"anthropic": "claude", "openai": "codex", "google": "gemini"}
+    # non-reasoning model families that don't belong in a council-seat dropdown
+    _CATALOG_EXCLUDE = ("embed", "whisper", "tts", "dall-e", "audio", "image",
+                        "moderation", "realtime", "transcribe", "veo", "imagen",
+                        "aqa", "robotics", "live-translate", "computer-use")
+
+    def cli_model_catalog(self, refresh: bool = False) -> dict[str, list[str]]:
+        """Dropdown choices per local CLI seat, fetched LIVE so a model released
+        yesterday appears without a code change: OpenRouter's public no-key
+        /models catalog grouped by vendor (newest first), plus the gemini SDK's
+        own list when a key is present (authoritative for the SDK path the
+        gemini seat actually uses). Cached MODEL_CATALOG_TTL seconds; any
+        failure or WEB off falls back to the static list, so Settings never
+        breaks offline."""
+        import time as _time
+
+        now = _time.monotonic()
+        if (not refresh and self._model_catalog_cache
+                and now - self._model_catalog_cache[0] < config.MODEL_CATALOG_TTL):
+            return self._model_catalog_cache[1]
+        catalog = {k: list(v) for k, v in config.CLI_MODEL_CATALOG.items()}
+        if config.WEB_ENABLED:
+            fetched = self._fetch_public_catalog()
+            for seat, models in fetched.items():
+                if models:
+                    # keep the tier aliases (opus/sonnet/haiku) on top — the CLI
+                    # resolves them to its current best, so they never go stale
+                    aliases = [m for m in catalog.get(seat, []) if "-" not in m]
+                    catalog[seat] = aliases + [m for m in models if m not in aliases]
+            sdk = self._gemini_sdk_models()
+            if sdk:
+                catalog["gemini"] = sdk
+        self._model_catalog_cache = (now, catalog)
+        return catalog
+
+    def _fetch_public_catalog(self) -> dict[str, list[str]]:
+        """Vendor → model ids from the public catalog, newest release first.
+        ':free'/':extended' routing variants collapse to the base id (that is
+        what the vendor CLIs accept). Best-effort: {} on any failure."""
+        import httpx
+
+        try:
+            resp = httpx.get(config.MODEL_CATALOG_URL, timeout=config.MODEL_CATALOG_TIMEOUT)
+            if resp.status_code != 200:
+                return {}
+            data = (resp.json() or {}).get("data") or []
+        except Exception:  # noqa: BLE001 — offline/misbehaving catalog ⇒ fallback
+            return {}
+        per: dict[str, list[tuple[float, str]]] = {}
+        for m in data:
+            if not isinstance(m, dict):
+                continue
+            vendor, _, tail = str(m.get("id") or "").partition("/")
+            seat = self._CATALOG_VENDORS.get(vendor)
+            tail = tail.split(":")[0]
+            if not seat or not tail or any(x in tail.lower() for x in self._CATALOG_EXCLUDE):
+                continue
+            per.setdefault(seat, []).append((float(m.get("created") or 0), tail))
+        out: dict[str, list[str]] = {}
+        for seat, items in per.items():
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for _, tail in sorted(items, key=lambda t: t[0], reverse=True):
+                if tail not in seen:
+                    seen.add(tail)
+                    ordered.append(tail)
+            out[seat] = ordered[:12]
+        return out
+
+    def _gemini_sdk_models(self) -> list[str]:
+        """Google's own model list via the google-genai SDK — exactly what the
+        gemini seat can run, since its calls go through that SDK when a key is
+        present. Best-effort: [] without a key or on any failure."""
+        import os as _os
+
+        if not (_os.environ.get("GEMINI_API_KEY") or _os.environ.get("GOOGLE_API_KEY")):
+            return []
+        try:
+            from google import genai
+
+            client = genai.Client()
+            names = []
+            for m in client.models.list():
+                tail = str(getattr(m, "name", "")).split("/")[-1]
+                if tail.startswith("gemini") and not any(
+                        x in tail.lower() for x in self._CATALOG_EXCLUDE):
+                    names.append(tail)
+            return sorted(set(names), reverse=True)[:12]
+        except Exception:  # noqa: BLE001 — SDK/network trouble ⇒ public catalog wins
+            return []
+
+    def seats(self, refresh: bool = False) -> dict:
         """All seats the council can use, with availability — used to populate the
         role→agent dropdowns. CLI seats are available when on PATH; OpenRouter
         seats when enabled AND an API key is present."""
         import shutil
 
+        catalog = self.cli_model_catalog(refresh=refresh)
         cli = [
             {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a,
-             "model": (self.settings.cli_models or {}).get(a) or None}
+             "model": (self.settings.cli_models or {}).get(a) or None,
+             "models": catalog.get(a, [])}
             for a in ("claude", "codex", "gemini")
         ]
         key_present = self.secrets.has("openrouter")
