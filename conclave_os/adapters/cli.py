@@ -52,10 +52,14 @@ class CliAdapter:
     def call(self, role: Role, prompt: str, timeout_s: int,
              images: list[dict] | None = None) -> AdapterResult:
         t0 = time.monotonic()
+        model = self.model  # the pinned model; branches refine it when they know more
         if self.agent == "claude":
             # claude sees images as content blocks via stream-json (no tools)
-            content = self._run_claude_vision(prompt, images, timeout_s) if images \
-                else self._run_claude(prompt, timeout_s)
+            if images:
+                content = self._run_claude_vision(prompt, images, timeout_s)
+            else:
+                content, used = self._run_claude(prompt, timeout_s)
+                model = model or used  # the CLI reports what it actually ran
         elif self.agent == "codex":
             content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
@@ -66,6 +70,7 @@ class CliAdapter:
             # No key ⇒ fall back to the CLI (which still has those limitations).
             if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
                 content = self._run_gemini_sdk(prompt, images or [])
+                model = self.model or "gemini-2.5-flash"  # the SDK default is explicit
             else:
                 content = self._run_gemini(prompt, timeout_s)
         else:
@@ -73,7 +78,8 @@ class CliAdapter:
         content = content.strip()
         if not content:
             raise AgentError(f"{self.agent} CLI returned empty output")
-        return AdapterResult(content=content, duration_ms=int((time.monotonic() - t0) * 1000))
+        return AdapterResult(content=content, model=model,
+                             duration_ms=int((time.monotonic() - t0) * 1000))
 
     def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
         """Run a CLI command with the prompt on stdin; return stdout. Uses Popen
@@ -114,7 +120,9 @@ class CliAdapter:
             )
         return out or ""
 
-    def _run_claude(self, prompt: str, timeout_s: int) -> str:
+    def _run_claude(self, prompt: str, timeout_s: int) -> tuple[str, Optional[str]]:
+        """Returns (content, model): the CLI's JSON result names the model that
+        actually ran (modelUsage keys), so an unpinned seat is still attributable."""
         cmd = ["claude", "-p", "--output-format", "json", "--tools", ""]
         if self.model:
             cmd += ["--model", self.model]
@@ -125,7 +133,11 @@ class CliAdapter:
             raise AgentError(f"claude CLI returned non-JSON: {out[:200]!r}") from e
         if data.get("is_error"):
             raise AgentError(f"claude CLI error: {data.get('result') or data.get('subtype')}")
-        return data.get("result") or ""
+        used = None
+        usage = data.get("modelUsage")
+        if isinstance(usage, dict) and usage:
+            used = next(iter(usage))
+        return data.get("result") or "", used
 
     def _run_claude_vision(self, prompt: str, images: list[dict], timeout_s: int) -> str:
         """Send the prompt + image content blocks via stream-json so the model

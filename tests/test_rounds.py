@@ -688,6 +688,41 @@ def test_delegation_shape_scales_with_complexity():
     assert budgets_for(Complexity.complex).max_delegations == 6
 
 
+# --- model attribution ---------------------------------------------------------------
+
+
+def test_contributions_record_the_model_that_produced_them(tmp_path):
+    class NamedModelSeat:
+        name = "alpha"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="my take", model="alpha-9000", duration_ms=1)
+
+    svc = ConclaveService(data_dir=tmp_path, panel=["alpha"])
+    svc.registry.register(NamedModelSeat())
+    session = svc.run(TASK, source="test")
+    panelist = next(c for c in session.contributions if c.role == Role.panelist)
+    assert panelist.model == "alpha-9000"
+    # the mock adapter reports no model — attribution stays honest, not invented
+    lead = next(c for c in session.contributions if c.role == Role.lead)
+    assert lead.model is None
+
+
+def test_cli_model_pins_flow_from_settings_to_adapters(tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda n: f"/bin/{n}")
+    svc = ConclaveService(data_dir=tmp_path, backend="cli")
+    svc.update_settings({"backend": "cli",
+                         "cli_models": {"claude": "claude-opus-4-8", "gemini": "gemini-2.5-pro"}})
+    assert svc.registry._adapters["claude"].model == "claude-opus-4-8"
+    assert svc.registry._adapters["gemini"].model == "gemini-2.5-pro"
+    assert svc.registry._adapters["codex"].model is None, "unpinned seat keeps its CLI default"
+    seats = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "cli"}
+    assert seats["claude"]["model"] == "claude-opus-4-8"
+    assert seats["codex"]["model"] is None
+
+
 # --- disk back-compat --------------------------------------------------------------
 
 

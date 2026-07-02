@@ -103,10 +103,12 @@ class ConclaveService:
             referenced = {a for a in self.role_agents.values() if a in config.OPENROUTER_SEATS}
             for seat in sorted(enabled | referenced):
                 self._register_openrouter(seat)
-            # CLI adapters for every non-OpenRouter agent in the role map.
+            # CLI adapters for every non-OpenRouter agent in the role map,
+            # pinned to the model chosen in Settings (else the CLI's default).
             for agent in sorted(set(self.role_agents.values())):
                 if agent not in config.OPENROUTER_SEATS:
-                    self.registry.register(CliAdapter(agent=agent))
+                    self.registry.register(CliAdapter(
+                        agent=agent, model=(self.settings.cli_models or {}).get(agent)))
         else:
             self.registry.register(MockAdapter())
         self.panel = self._effective_panel()
@@ -158,7 +160,8 @@ class ConclaveService:
     # non-default picks each save), so replace them wholesale — merging would
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
-    _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models"}
+    _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models",
+                     "cli_models"}
 
     def set_openrouter_key(self, value: str) -> dict:
         self.secrets.set("openrouter", value or "")
@@ -405,7 +408,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if agent in config.OPENROUTER_SEATS:
                 self._register_openrouter(agent)
             else:
-                self.registry.register(CliAdapter(agent=agent))
+                self.registry.register(CliAdapter(
+                    agent=agent, model=(self.settings.cli_models or {}).get(agent)))
 
     # ---- CLI seats (settings panel) ------------------------------------------
 
@@ -416,7 +420,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         import shutil
 
         cli = [
-            {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a}
+            {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a,
+             "model": (self.settings.cli_models or {}).get(a) or None}
             for a in ("claude", "codex", "gemini")
         ]
         key_present = self.secrets.has("openrouter")

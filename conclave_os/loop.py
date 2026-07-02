@@ -123,6 +123,7 @@ def _agent_call(
         role=member.role,
         agent=member.agent,
         content=result.content,
+        model=result.model,
         tokens=result.tokens,
         duration_ms=result.duration_ms,
     )
@@ -1722,7 +1723,8 @@ def resume_with_input(
     )
     contribution = Contribution(
         round=req.round, role=req.role, agent=req.agent,
-        content=result.content, tokens=result.tokens, duration_ms=result.duration_ms,
+        content=result.content, model=getattr(result, "model", None),
+        tokens=result.tokens, duration_ms=result.duration_ms,
     )
     session.contributions.append(contribution)
     store.log_event(

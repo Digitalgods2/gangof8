@@ -88,4 +88,5 @@ class OpenRouterAdapter:
         usage = body.get("usage") or {}
         tokens = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
         return AdapterResult(content=content, tokens=tokens,
-                             duration_ms=int((time.monotonic() - t0) * 1000))
+                             duration_ms=int((time.monotonic() - t0) * 1000),
+                             model=body.get("model") or self.model_slug)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Protocol
+from typing import Optional, Protocol
 
 from pydantic import BaseModel
 
@@ -32,6 +32,10 @@ class AdapterResult(BaseModel):
     content: str
     tokens: int = 0
     duration_ms: int = 0
+    # The exact model that produced this reply (slug/id), when the adapter
+    # knows it — every take should be attributable to a model, not just a
+    # vendor seat. None ⇒ the backend's own default, unknown to us.
+    model: Optional[str] = None
 
 
 class Adapter(Protocol):

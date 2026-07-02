@@ -65,6 +65,29 @@ def test_claude_returns_result_field(stub_run):
     assert calls["input"] == "make main.py"  # prompt goes on stdin
 
 
+def test_pinned_model_is_passed_and_reported(stub_run):
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "hi"})))
+    out = CliAdapter("claude", model="claude-opus-4-8").call(Role.lead, "q", timeout_s=60)
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8", "pin reaches the CLI"
+    assert out.model == "claude-opus-4-8", "the result is attributable to the pinned model"
+
+
+def test_unpinned_claude_reports_the_model_the_cli_ran(stub_run):
+    stub_run(_Proc(stdout=json.dumps({
+        "is_error": False, "result": "hi",
+        "modelUsage": {"claude-sonnet-5": {"inputTokens": 10}},
+    })))
+    out = CliAdapter("claude").call(Role.lead, "q", timeout_s=60)
+    assert out.model == "claude-sonnet-5", "modelUsage names what actually ran"
+
+
+def test_unpinned_claude_without_usage_reports_no_model(stub_run):
+    stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "hi"})))
+    out = CliAdapter("claude").call(Role.lead, "q", timeout_s=60)
+    assert out.model is None
+
+
 def test_cli_subprocess_runs_from_a_neutral_cwd(stub_run):
     """The agent CLI must never inherit the server's cwd (the repo): a model
     with latent tool instincts would perceive — and could ungovernedly read —
