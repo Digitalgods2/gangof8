@@ -849,6 +849,7 @@ const roleList = s => (s.role_catalog && s.role_catalog.length) ? s.role_catalog
 const roleLabel = r => r.split("_").map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(" ");
 let settingsCache = null, seatsCache = [], wsCache = {workspaces: [], active: null};
 let orKey = {present: false, masked: null, source: null};
+let gemKey = {present: false, masked: null, source: null};
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
@@ -880,16 +881,18 @@ async function openSettings() {
   document.getElementById("settingsOverlay").classList.add("open");
   document.getElementById("savedNote").textContent = "";
   document.getElementById("settingsBody").innerHTML = '<div class="empty">Loading…</div>';
-  const [settings, seatsResp, wsResp, keyResp] = await Promise.all([
+  const [settings, seatsResp, wsResp, keyResp, gemResp] = await Promise.all([
     api("/settings"),
     api("/settings/seats").catch(() => ({seats: []})),
     api("/workspaces").catch(() => ({workspaces: [], active: null})),
     api("/settings/api-keys/openrouter").catch(() => ({present: false})),
+    api("/settings/api-keys/gemini").catch(() => ({present: false})),
   ]);
   settingsCache = settings;
   seatsCache = seatsResp.seats || [];
   wsCache = wsResp;
   orKey = keyResp || {present: false};
+  gemKey = gemResp || {present: false};
   renderSettings(settings, seatsCache);
 }
 
@@ -986,7 +989,19 @@ function renderSettings(s, seats) {
       <div class="field" style="justify-content:flex-end">
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
-      <div class="sub">Fetched live from the public model catalog (newest first; plus Google's own list when a gemini key is set) — a model released yesterday shows up here. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+      <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+    </div>
+
+    <div class="sset">
+      <label>Gemini API key (optional)</label>
+      <div class="field">
+        <input type="password" id="gem_key" autocomplete="off" placeholder="${gemKey.present ? "key set (" + esc(gemKey.masked || "••••") + ") — type to replace" : "AIza… paste a Google AI Studio key (optional)"}">
+        <button onclick="saveGeminiKey()">Save key</button>
+        ${gemKey.present ? '<button class="ghost" onclick="clearGeminiKey()">Clear</button>' : ""}
+      </div>
+      <div class="sub">${gemKey.present
+        ? (gemKey.source === "env" ? "Using GEMINI_API_KEY/GOOGLE_API_KEY from your environment." : "Stored locally in data/secrets.json (gitignored).")
+        : "NOT required — without it the gemini seat runs via its CLI and the model list uses the public catalog. With it: gemini runs through Google's SDK (faster, more reliable on Windows), the dropdown shows Google's own model list, image vision works, and web_search gains Google Search grounding. Free at aistudio.google.com."}</div>
     </div>
 
     <div class="sset">
@@ -1157,6 +1172,25 @@ async function clearOpenrouterKey() {
   if (!confirm("Remove the stored OpenRouter key?")) return;
   const r = await fetch("/settings/api-keys/openrouter", {method: "DELETE"});
   if (r.ok) { orKey = await r.json(); note.textContent = "OpenRouter key cleared"; await _refreshSeatsKeepChecks(); }
+}
+
+async function saveGeminiKey() {
+  const note = document.getElementById("savedNote");
+  const v = (document.getElementById("gem_key")?.value || "").trim();
+  if (!v) { note.textContent = "paste a Gemini key first"; return; }
+  const r = await fetch("/settings/api-keys/gemini", {method: "PUT",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({value: v})});
+  if (r.ok) {
+    gemKey = await r.json(); note.textContent = "Gemini key saved ✓";
+    await refreshModelCatalog(null);  // the dropdown can now use Google's own list
+  } else { note.style.color = "var(--bad)"; note.textContent = "could not save key"; }
+}
+
+async function clearGeminiKey() {
+  const note = document.getElementById("savedNote");
+  if (!confirm("Remove the stored Gemini key?")) return;
+  const r = await fetch("/settings/api-keys/gemini", {method: "DELETE"});
+  if (r.ok) { gemKey = await r.json(); note.textContent = "Gemini key cleared"; await refreshModelCatalog(null); }
 }
 
 function _renderWsAfterChange(msg) {

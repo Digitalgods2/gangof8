@@ -262,20 +262,29 @@ def get_seats(refresh: bool = False) -> dict:
     return service.seats(refresh=refresh)
 
 
-@app.get("/settings/api-keys/openrouter")
-def get_openrouter_key() -> dict:
-    """Masked status of the OpenRouter API key (never the full key)."""
-    return service.openrouter_key_status()
+@app.get("/settings/api-keys/{name}")
+def get_api_key(name: str) -> dict:
+    """Masked status of a known API key ('openrouter' | 'gemini')."""
+    try:
+        return service.api_key_status(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.put("/settings/api-keys/openrouter")
-def put_openrouter_key(body: ApiKeyIn) -> dict:
-    return service.set_openrouter_key(body.value)
+@app.put("/settings/api-keys/{name}")
+def put_api_key(name: str, body: ApiKeyIn) -> dict:
+    try:
+        return service.set_api_key(name, body.value)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
-@app.delete("/settings/api-keys/openrouter")
-def delete_openrouter_key() -> dict:
-    return service.clear_openrouter_key()
+@app.delete("/settings/api-keys/{name}")
+def delete_api_key(name: str) -> dict:
+    try:
+        return service.clear_api_key(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ---- Workspaces --------------------------------------------------------------

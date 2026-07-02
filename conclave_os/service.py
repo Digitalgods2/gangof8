@@ -106,10 +106,14 @@ class ConclaveService:
                 self._register_openrouter(seat)
             # CLI adapters for every non-OpenRouter agent in the role map,
             # pinned to the model chosen in Settings (else the CLI's default).
+            # gemini also gets the key getter so a Settings-stored key (not
+            # just the env var) unlocks its SDK path.
             for agent in sorted(set(self.role_agents.values())):
                 if agent not in config.OPENROUTER_SEATS:
                     self.registry.register(CliAdapter(
-                        agent=agent, model=(self.settings.cli_models or {}).get(agent)))
+                        agent=agent, model=(self.settings.cli_models or {}).get(agent),
+                        api_key_getter=(lambda: self.secrets.get("gemini"))
+                        if agent == "gemini" else None))
         else:
             self.registry.register(MockAdapter())
         self.panel = self._effective_panel()
@@ -164,21 +168,47 @@ class ConclaveService:
     _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models",
                      "cli_models"}
 
+    # API keys the app knows how to use. "openrouter" unlocks the OpenRouter
+    # seats; "gemini" is OPTIONAL and upgrades the gemini seat (SDK path),
+    # Google's own model list in the Settings dropdown, image vision, and
+    # web_search grounding. Nothing else needs a key — the CLIs auth
+    # themselves and the model dropdown's public catalog is key-free.
+    KNOWN_API_KEYS = ("openrouter", "gemini")
+
+    def api_key_status(self, name: str) -> dict:
+        """Masked status of a stored/env API key — never returns the full key."""
+        if name not in self.KNOWN_API_KEYS:
+            raise KeyError(f"unknown API key {name!r}")
+        return {
+            "name": name,
+            "present": self.secrets.has(name),
+            "source": self.secrets.source(name),  # 'env' | 'stored' | None
+            "masked": SecretStore.mask(self.secrets.get(name)),
+        }
+
+    def set_api_key(self, name: str, value: str) -> dict:
+        if name not in self.KNOWN_API_KEYS:
+            raise KeyError(f"unknown API key {name!r}")
+        self.secrets.set(name, value or "")
+        self._model_catalog_cache = None  # a new key may unlock a better catalog
+        return self.api_key_status(name)
+
+    def clear_api_key(self, name: str) -> dict:
+        if name not in self.KNOWN_API_KEYS:
+            raise KeyError(f"unknown API key {name!r}")
+        self.secrets.clear(name)
+        self._model_catalog_cache = None
+        return self.api_key_status(name)
+
+    # back-compat wrappers (older callers/tests)
     def set_openrouter_key(self, value: str) -> dict:
-        self.secrets.set("openrouter", value or "")
-        return self.openrouter_key_status()
+        return self.set_api_key("openrouter", value)
 
     def clear_openrouter_key(self) -> dict:
-        self.secrets.clear("openrouter")
-        return self.openrouter_key_status()
+        return self.clear_api_key("openrouter")
 
     def openrouter_key_status(self) -> dict:
-        """Masked status of the OpenRouter key — never returns the full key."""
-        return {
-            "present": self.secrets.has("openrouter"),
-            "source": self.secrets.source("openrouter"),  # 'env' | 'stored' | None
-            "masked": SecretStore.mask(self.secrets.get("openrouter")),
-        }
+        return self.api_key_status("openrouter")
 
     def update_settings(self, patch: dict) -> Settings:
         """Apply a partial settings patch, persist it, and re-derive the
@@ -410,7 +440,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self._register_openrouter(agent)
             else:
                 self.registry.register(CliAdapter(
-                    agent=agent, model=(self.settings.cli_models or {}).get(agent)))
+                    agent=agent, model=(self.settings.cli_models or {}).get(agent),
+                    api_key_getter=(lambda: self.secrets.get("gemini"))
+                    if agent == "gemini" else None))
 
     # ---- CLI seats (settings panel) ------------------------------------------
 
@@ -487,15 +519,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def _gemini_sdk_models(self) -> list[str]:
         """Google's own model list via the google-genai SDK — exactly what the
         gemini seat can run, since its calls go through that SDK when a key is
-        present. Best-effort: [] without a key or on any failure."""
-        import os as _os
-
-        if not (_os.environ.get("GEMINI_API_KEY") or _os.environ.get("GOOGLE_API_KEY")):
+        present (env var OR stored in Settings → API keys). Best-effort: []
+        without a key or on any failure."""
+        key = self.secrets.get("gemini")
+        if not key:
             return []
         try:
             from google import genai
 
-            client = genai.Client()
+            client = genai.Client(api_key=key)
             names = []
             for m in client.models.list():
                 tail = str(getattr(m, "name", "")).split("/")[-1]

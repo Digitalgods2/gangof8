@@ -44,10 +44,14 @@ def _neutral_cwd() -> str:
 
 
 class CliAdapter:
-    def __init__(self, agent: str, name: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, agent: str, name: Optional[str] = None, model: Optional[str] = None,
+                 api_key_getter=None):
         self.agent = agent  # claude | codex | gemini
         self.name = name or agent
         self.model = model
+        # gemini only: resolves the key from env OR the Settings-stored secrets
+        # (injected by the service) — an env var must not be the only way in.
+        self._api_key_getter = api_key_getter
 
     def call(self, role: Role, prompt: str, timeout_s: int,
              images: list[dict] | None = None) -> AdapterResult:
@@ -64,12 +68,15 @@ class CliAdapter:
             content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
             # Prefer the google-genai SDK for ALL gemini calls (text AND images)
-            # when an API key is present: a clean inference call that sidesteps the
-            # gemini CLI's headless problems — its long prompts overflow the
-            # Windows command line ('-p <prompt>' as argv), and plan-mode hangs.
-            # No key ⇒ fall back to the CLI (which still has those limitations).
-            if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-                content = self._run_gemini_sdk(prompt, images or [])
+            # when an API key is present — from the env OR stored via Settings →
+            # API keys: a clean inference call that sidesteps the gemini CLI's
+            # headless problems — its long prompts overflow the Windows command
+            # line ('-p <prompt>' as argv), and plan-mode hangs. No key ⇒ fall
+            # back to the CLI (which still has those limitations).
+            key = (self._api_key_getter() if self._api_key_getter else None) \
+                or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if key:
+                content = self._run_gemini_sdk(prompt, images or [], key)
                 model = self.model or "gemini-2.5-flash"  # the SDK default is explicit
             else:
                 content = self._run_gemini(prompt, timeout_s)
@@ -179,10 +186,11 @@ class CliAdapter:
             cmd += ["-m", self.model]
         return self._exec(cmd, "", timeout_s)
 
-    def _run_gemini_sdk(self, prompt: str, images: list[dict]) -> str:
-        """Vision for the gemini role via the google-genai SDK: inline image
-        Parts + the prompt in a single generate_content call. No tools, no file
-        access — a pure inference request, governed like every other agent call."""
+    def _run_gemini_sdk(self, prompt: str, images: list[dict],
+                        api_key: Optional[str] = None) -> str:
+        """Gemini via the google-genai SDK: inline image Parts + the prompt in a
+        single generate_content call. No tools, no file access — a pure
+        inference request, governed like every other agent call."""
         try:
             from google import genai
             from google.genai import types
@@ -198,7 +206,7 @@ class CliAdapter:
                 data=data, mime_type=img.get("media_type", "image/png")))
         contents.append(prompt)
         try:
-            client = genai.Client()
+            client = genai.Client(api_key=api_key) if api_key else genai.Client()
             resp = client.models.generate_content(
                 model=self.model or "gemini-2.5-flash", contents=contents)
         except Exception as e:  # noqa: BLE001 — surface as a normal agent error

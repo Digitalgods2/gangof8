@@ -12,9 +12,10 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# secret name -> the env var that overrides it
+# secret name -> the env var(s) that override it, in precedence order
 ENV_OVERRIDES = {
-    "openrouter": "OPENROUTER_API_KEY",
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
 }
 
 
@@ -39,8 +40,7 @@ class SecretStore:
 
     def get(self, name: str) -> Optional[str]:
         """Resolve a secret: env override wins, else the stored value."""
-        env = ENV_OVERRIDES.get(name)
-        if env:
+        for env in ENV_OVERRIDES.get(name, ()):
             v = os.environ.get(env)
             if v and v.strip():
                 return v.strip()
@@ -52,9 +52,9 @@ class SecretStore:
 
     def source(self, name: str) -> Optional[str]:
         """'env' | 'stored' | None — where the resolved value comes from."""
-        env = ENV_OVERRIDES.get(name)
-        if env and (os.environ.get(env) or "").strip():
-            return "env"
+        for env in ENV_OVERRIDES.get(name, ()):
+            if (os.environ.get(env) or "").strip():
+                return "env"
         v = self._load().get(name)
         return "stored" if isinstance(v, str) and v.strip() else None
 
