@@ -230,6 +230,22 @@ class ConclaveService:
             "masked": SecretStore.mask(self.secrets.get(name)),
         }
 
+    def reveal_api_key(self, name: str) -> dict:
+        """The FULL stored/env key, for the dashboard's explicit eye-reveal.
+        The dashboard binds to localhost and a stored key already lives in
+        plaintext in data/secrets.json owned by the same user — this adds
+        convenience, not exposure. Status calls stay masked; the full value
+        ships only on this explicit request and is never embedded in the
+        rendered settings page."""
+        if name not in self.KNOWN_API_KEYS:
+            raise KeyError(f"unknown API key {name!r}")
+        return {
+            "name": name,
+            "present": self.secrets.has(name),
+            "value": self.secrets.get(name) or "",
+            "source": self.secrets.source(name),
+        }
+
     def set_api_key(self, name: str, value: str) -> dict:
         if name not in self.KNOWN_API_KEYS:
             raise KeyError(f"unknown API key {name!r}")
