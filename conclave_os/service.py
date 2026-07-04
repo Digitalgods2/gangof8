@@ -66,6 +66,11 @@ class ConclaveService:
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
         self._model_catalog_cache: Optional[tuple[float, dict]] = None
         self._apply_settings(backend=backend)
+        # Crash recovery: a previous process may have died mid-run (e.g. a
+        # restart), leaving sessions stuck in a live state with no worker to
+        # advance or cancel them. Finalize those now so they can't linger as
+        # un-cancellable "deliberating" ghosts.
+        self._reconcile_orphans()
 
     def _apply_settings(self, backend: Optional[str] = None) -> None:
         """(Re)derive backend, role mapping and registry from
@@ -97,6 +102,12 @@ class ConclaveService:
         config.ROUNDS_PER_CONSENT = self.settings.rounds_per_consent
         config.BUDGETS_BY_COMPLEXITY = budgets_overrides(self.settings)
 
+        # Local CLI seats the user disabled in Settings fall back to an enabled
+        # OpenRouter seat, so the council can run OpenRouter-only. Skipped for an
+        # explicit role map (tests/embedders manage their own registration).
+        if self.backend == "cli" and not self._explicit_role_agents:
+            self.role_agents = self._apply_cli_disable(self.role_agents)
+
         self.registry = AgentRegistry()
         if self.backend == "cli":
             # OpenRouter seats: enabled ones + any referenced in the role map.
@@ -118,6 +129,38 @@ class ConclaveService:
             self.registry.register(MockAdapter())
         self.panel = self._effective_panel()
 
+    def _disabled_cli_seats(self) -> set[str]:
+        """Local CLI seats the user turned OFF in Settings (absent ⇒ enabled)."""
+        ce = self.settings.cli_enabled or {}
+        return {s for s in ("claude", "codex", "gemini") if ce.get(s, True) is False}
+
+    def _openrouter_fallbacks(self) -> list[str]:
+        """Enabled OpenRouter seats (with a resolvable slug), in a stable order —
+        the pool a disabled CLI seat's roles fall back to."""
+        enabled = self.settings.openrouter_enabled or {}
+        return [n for n in config.OPENROUTER_SEATS
+                if enabled.get(n) and self._openrouter_slug(n)]
+
+    def _apply_cli_disable(self, base: dict) -> dict:
+        """Reassign every role held by a disabled CLI seat to an enabled
+        OpenRouter seat (round-robin, so the lead and talents don't all collapse
+        onto one model). No-op unless there is at least one OpenRouter seat to
+        fall back to — a disable with nothing to replace it is ignored so a role
+        (especially the lead) is never left with no seat."""
+        disabled = self._disabled_cli_seats()
+        if not disabled:
+            return base
+        pool = self._openrouter_fallbacks()
+        if not pool:
+            return base
+        out = dict(base)
+        i = 0
+        for role, agent in base.items():
+            if agent in disabled:
+                out[role] = pool[i % len(pool)]
+                i += 1
+        return out
+
     def _effective_panel(self) -> list[str]:
         """The seats that contribute every round. Explicit ctor arg › settings
         roster › backend default (installed CLI agents + enabled, keyed
@@ -133,7 +176,8 @@ class ConclaveService:
             return [s for s in self.settings.panel_seats if s in self.registry.names()]
         seats = list(config.PANEL_SEATS_BY_BACKEND.get(self.backend, ["mock"]))
         if self.backend == "cli":
-            seats = [s for s in seats if shutil.which(s)]
+            disabled = self._disabled_cli_seats()
+            seats = [s for s in seats if shutil.which(s) and s not in disabled]
             if self.secrets.has("openrouter"):
                 seats += sorted(
                     n for n, on in (self.settings.openrouter_enabled or {}).items()
@@ -166,7 +210,7 @@ class ConclaveService:
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
     _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models",
-                     "cli_models"}
+                     "cli_models", "cli_enabled"}
 
     # API keys the app knows how to use. "openrouter" unlocks the OpenRouter
     # seats; "gemini" is OPTIONAL and upgrades the gemini seat (SDK path),
@@ -545,8 +589,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         import shutil
 
         catalog = self.cli_model_catalog(refresh=refresh)
+        ce = self.settings.cli_enabled or {}
         cli = [
             {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a,
+             "enabled": ce.get(a, True),
              "model": (self.settings.cli_models or {}).get(a) or None,
              "models": catalog.get(a, [])}
             for a in ("claude", "codex", "gemini")
@@ -692,6 +738,36 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     _TERMINAL = {SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}
     _PAUSED = {SessionStatus.awaiting_approval, SessionStatus.awaiting_input}
+    # Live (running) states: a session here needs an active worker thread to
+    # advance. After a process restart there is none, so these become orphans.
+    _LIVE = {SessionStatus.received, SessionStatus.classified,
+             SessionStatus.deliberating, SessionStatus.composing}
+
+    def _reconcile_orphans(self) -> None:
+        """Finalize sessions left in a live state by a process that has since
+        died. Called once at startup, where there can be no surviving worker, so
+        every live-state session is unambiguously orphaned. Marks each cancelled
+        (thread preserved) rather than deleting, and never blocks startup."""
+        try:
+            metas = self.store.list_sessions()
+        except Exception:  # noqa: BLE001 — a bad record must not stop the server
+            return
+        live = {s.value for s in self._LIVE}
+        for meta in metas:
+            if meta.get("status") not in live:
+                continue
+            sid = meta.get("session_id")
+            session = self.manager.load(sid) if sid else None
+            if session is None:
+                continue
+            session.stop_reason = "interrupted by a server restart"
+            cancellation.clear(sid)
+            try:
+                self.manager.transition(session, SessionStatus.cancelled)
+            except ValueError:
+                session.status = SessionStatus.cancelled
+                self.store.save_session(session)
+            self.store.log_event(sid, "session_cancelled", {"from": "restart_reconcile"})
 
     def cancel_session(self, session_id: str) -> dict:
         """Cancel a session. If it's paused (awaiting approval/input) no worker is

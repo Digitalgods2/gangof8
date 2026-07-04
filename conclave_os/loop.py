@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -562,61 +562,72 @@ def _resolve_skill_requests(
 ) -> Contribution:
     """If the agent requested no-approval skills (SKILL: <name> <arg>), run each
     through the permission kernel, execute the authorized ones, and re-call the
-    agent ONCE with the results appended so it can use them. Approval-gated
-    skills (write_file) are NOT honored here — those go through the ARTIFACT
-    proposal path. Returns the (possibly re-called) contribution.
+    agent with the results appended so it can use them. The re-called reply may
+    itself open with NEW requests (read one file → the next read depends on
+    what it said) — those are resolved too, chained, up to MAX_SKILL_CHAIN_TURNS
+    re-calls, every result accumulated. A repeated request is never re-executed;
+    a reply whose requests are ALL repeats stands as-is (the stub check judges
+    what's left). Approval-gated skills (write_file) are NOT honored here —
+    those go through the ARTIFACT proposal path. Returns the (possibly
+    re-called) contribution.
 
-    `recall` is the call used for that follow-up; the LEAD must pass its own
+    `recall` is the call used for the follow-ups; the LEAD must pass its own
     long-timeout call here — a read-then-write task authors whole files in the
     follow-up, and the generic 120s specialist timeout killed exactly that
     (live: 'modify the existing game' read index.html, then timed out
     regenerating it)."""
-    reqs = _SKILL_REQUEST_MARKER.findall(contribution.content)
-    if not reqs:
-        return contribution
     sid = session.session_id
     results: list[str] = []
-    for raw_name, arg in reqs[: _skill_request_cap(session)]:
-        name, arg = raw_name.lower(), arg.strip()
-        store.log_event(sid, "skill_requested",
-                        {"skill": name, "role": member.role.value, "arg": arg})
-        skill = get_skill(name)
-        if skill is None:
-            results.append(f"SKILL {name}: unknown skill")
-            continue
-        # Mid-deliberation SKILL: requests are for DISCOVERY only — reads and web
-        # lookups. Writes/edits/tests/stage/promote carry structured content and
-        # go through the draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE contracts.
-        if skill.category not in ("read", "web"):
-            results.append(
-                f"SKILL {name}: not available mid-deliberation (it changes state) — "
-                "produce it as an ARTIFACT/EDIT/PROMOTE block in your draft instead")
-            continue
-        # map the single positional arg to the skill's first declared input
-        # (read_file→filename, search_project→query)
-        arg_key = skill.inputs[0] if skill.inputs else "filename"
-        action = ProposedAction(session_id=sid, kind=name, args={arg_key: arg}, role=member.role)
-        governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
-        session.proposed_actions.append(action)
-        if action.status == "denied":
-            results.append(f"SKILL {name}: denied — {action.error}")
-            continue
-        try:
-            out = executor.execute(session, action, store.data_dir)
-            action.status = "executed"
-            session.tools_called.append(name)
-            store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
-            results.append(f"SKILL {name} '{arg}' result:\n{out[: _skill_result_cap(session)]}")
-        except ExecutionError as e:
-            action.status = "failed"
-            action.error = str(e)
-            store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
-            results.append(f"SKILL {name}: error — {e}")
-    followup = (
-        f"{prompt}\n\nSkill results (use these; do not request them again):\n"
-        + "\n\n".join(results)
-    )
-    return (recall or call)(member, followup)
+    seen: set[tuple[str, str]] = set()
+    for _ in range(config.MAX_SKILL_CHAIN_TURNS):
+        reqs = [(n.lower(), a.strip())
+                for n, a in _SKILL_REQUEST_MARKER.findall(contribution.content)]
+        fresh = [r for r in reqs if r not in seen]
+        if not fresh:
+            return contribution
+        for name, arg in fresh[: _skill_request_cap(session)]:
+            seen.add((name, arg))
+            store.log_event(sid, "skill_requested",
+                            {"skill": name, "role": member.role.value, "arg": arg})
+            skill = get_skill(name)
+            if skill is None:
+                results.append(f"SKILL {name}: unknown skill")
+                continue
+            # Mid-deliberation SKILL: requests are for DISCOVERY only — reads and
+            # web lookups. Writes/edits/tests/stage/promote carry structured
+            # content and go through the draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE
+            # contracts.
+            if skill.category not in ("read", "web"):
+                results.append(
+                    f"SKILL {name}: not available mid-deliberation (it changes state) — "
+                    "produce it as an ARTIFACT/EDIT/PROMOTE block in your draft instead")
+                continue
+            # map the single positional arg to the skill's first declared input
+            # (read_file→filename, search_project→query)
+            arg_key = skill.inputs[0] if skill.inputs else "filename"
+            action = ProposedAction(session_id=sid, kind=name, args={arg_key: arg}, role=member.role)
+            governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
+            session.proposed_actions.append(action)
+            if action.status == "denied":
+                results.append(f"SKILL {name}: denied — {action.error}")
+                continue
+            try:
+                out = executor.execute(session, action, store.data_dir)
+                action.status = "executed"
+                session.tools_called.append(name)
+                store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
+                results.append(f"SKILL {name} '{arg}' result:\n{out[: _skill_result_cap(session)]}")
+            except ExecutionError as e:
+                action.status = "failed"
+                action.error = str(e)
+                store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
+                results.append(f"SKILL {name}: error — {e}")
+        followup = (
+            f"{prompt}\n\nSkill results (use these; do not request them again):\n"
+            + "\n\n".join(results)
+        )
+        contribution = (recall or call)(member, followup)
+    return contribution
 
 
 def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
@@ -632,7 +643,8 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
     if decision != "DONE":
         return None
     text = rounds.strip_round_marker(synth.content)
-    if len(text) < config.SYNTHESIS_FINAL_MIN_CHARS or rounds.reply_is_stub(text):
+    if len(text) < config.SYNTHESIS_FINAL_MIN_CHARS \
+            or rounds.reply_is_stub(text, skills_resolved=True):
         return None
     had_panel = any(c.role == Role.panelist for c in session.contributions)
     return FinalAnswer(
@@ -751,17 +763,33 @@ def _run_panel_rounds(
         # machine-wide semaphore inside _agent_call); a failing seat is dropped.
         results: list[Contribution] = []
         if panel:
-            with ThreadPoolExecutor(
+            ex = ThreadPoolExecutor(
                 max_workers=min(len(panel), config.MAX_PARALLEL_AGENTS),
                 thread_name_prefix="panel",
-            ) as ex:
+            )
+            try:
                 futures = [
                     ex.submit(_panel_one, session, m,
                               rounds.panel_prompt(session, m, r, ov, readable),
                               call, store)
                     for m in panel
                 ]
+                # Wait cancel-aware. A plain shutdown(wait=True)/f.result() blocks
+                # until the SLOWEST seat returns — and API seats (kimi/qwen/glm/
+                # deepseek) are HTTP calls that cancel can't hard-kill the way it
+                # kills a CLI subprocess. So a stuck/slow seat made "Cancel run"
+                # hang the whole round. Poll the cancel flag instead: the moment
+                # the human cancels, stop waiting, abandon the in-flight seats
+                # (their threads finish on their own timeout) and abort the round.
+                pending = set(futures)
+                while pending:
+                    if cancellation.is_requested(sid):
+                        raise SessionCancelled()
+                    _done, pending = wait(pending, timeout=0.5,
+                                          return_when=FIRST_COMPLETED)
                 results = [f.result() for f in futures]
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
             results = [c for c in results if c]
 
         # (b) SYNTHESIS — the lead does the real work; CONSULT/DELEGATE and
@@ -774,11 +802,12 @@ def _run_panel_rounds(
         c = _resolve_delegations(session, council, lead, p, c, call, store,
                                  recall=lead_call)
         # A synthesis that only ANNOUNCES or ATTEMPTS the work ("I'll read the
-        # files, then deliver..." / blocked tool-call debris) must not be
-        # accepted as DONE — re-call once demanding the result now. A second
-        # stub is noted and the composer synthesizes from the panel views
-        # instead (the proven rescue path).
-        if rounds.reply_is_stub(c.content):
+        # files, then deliver..." / blocked tool-call debris / a dangling
+        # SKILL: request the chain never satisfied) must not be accepted as
+        # DONE — re-call once demanding the result now. A second stub is noted
+        # and the composer synthesizes from the panel views instead (the proven
+        # rescue path).
+        if rounds.reply_is_stub(c.content, skills_resolved=True):
             store.log_event(sid, "synthesis_stub_retry",
                             {"round": r, "stub": c.content.strip()[:200]})
             nudge = (
@@ -796,7 +825,7 @@ def _run_panel_rounds(
                                         recall=lead_call)
             c = _resolve_delegations(session, council, lead, nudge, c, call, store,
                                      recall=lead_call)
-            if rounds.reply_is_stub(c.content):
+            if rounds.reply_is_stub(c.content, skills_resolved=True):
                 session.unresolved.append(
                     "lead synthesis was a stub twice; final answer composed from "
                     "the panel views instead")
@@ -897,14 +926,32 @@ def _deliberate(
     start = time.monotonic()
     # image attachments are shown to vision-capable agents on every call
     images = image_inputs(store.data_dir, session.attachments)
-    # Up-front context the LEAD starts with, so it never depends on a flaky seat or
-    # remembering to request a skill: prior conversation turns, the established
+    # Up-front context the LEAD starts with, so it never depends on a flaky seat
+    # or remembering to request a skill: prior conversation turns, the established
     # folder's real source, and/or live web research for fact-needing questions.
-    established_overview = "\n\n".join(p for p in (
-        _conversation_overview(session),
-        _established_overview(session, store.data_dir),
-        _web_overview(session),
-    ) if p)
+    # The web-research step is a single blocking SDK call that can't be torn down
+    # mid-flight, so run the whole build in a helper thread and wait cancel-aware:
+    # a cancel abandons the in-flight search (it finishes on its own) and
+    # finalizes now instead of blocking on it for seconds.
+    if cancellation.is_requested(sid):
+        raise SessionCancelled()
+    established_overview = ""
+    _ov_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overview")
+    try:
+        _ov_fut = _ov_ex.submit(lambda: "\n\n".join(p for p in (
+            _conversation_overview(session),
+            _established_overview(session, store.data_dir),
+            _web_overview(session),
+        ) if p))
+        while True:
+            if cancellation.is_requested(sid):
+                raise SessionCancelled()
+            _ov_done, _ = wait([_ov_fut], timeout=0.5)
+            if _ov_done:
+                established_overview = _ov_fut.result()
+                break
+    finally:
+        _ov_ex.shutdown(wait=False, cancel_futures=True)
     if established_overview:
         store.log_event(sid, "context_overview", {"chars": len(established_overview)})
 
@@ -922,6 +969,7 @@ def _deliberate(
                            reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
     lead = council.get(Role.lead)
+    lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
         # 5. Panel rounds: every enabled seat contributes in parallel, the lead
         # synthesizes (pulling in talents on demand) and declares the round DONE
@@ -942,10 +990,12 @@ def _deliberate(
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
     except BudgetExceeded as e:
+        lead_failed = True
         session.stop_reason = f"budget exhausted: {e}"
         session.unresolved.append(session.stop_reason)
         store.log_event(sid, "budget_exhausted", {"detail": str(e)})
     except AgentError as e:
+        lead_failed = True
         session.stop_reason = f"agent error: {e}"
         session.unresolved.append(session.stop_reason)
         store.log_event(sid, "agent_error", {"detail": str(e)})
@@ -961,9 +1011,16 @@ def _deliberate(
     # focused single-file call.
     _collect_proposals(session, store)
     if not _has_proposals(session) and cls.produces_output:
-        # materialization authors WHOLE files — it needs the lead's long
-        # timeout, not the composer's 120s (which timed out live on a 30KB file)
-        _materialize_artifacts(session, lead_call, store)
+        # A healthy lead authors the files it described — WHOLE files, so it
+        # needs the lead's long timeout, not the composer's 120s. But if the lead
+        # already timed out/errored, re-calling it just burns another timeout, so
+        # skip straight to salvage.
+        if lead and lead.active and not lead_failed:
+            _materialize_artifacts(session, lead_call, store)
+        # Still nothing? Recover a complete file a panelist wrote inline, so a
+        # lead failure delivers that work instead of shipping nothing.
+        if not _has_proposals(session):
+            _salvage_from_panel(session, store)
     # Free council-space actions first (writes/edits/tests — never pause), so
     # the goal loop can repair failing tests BEFORE anything is delivered.
     _execute_actions(session, manager, governance, store, promotes=False)
@@ -975,6 +1032,12 @@ def _deliberate(
         _complete_truncated_artifacts(session, lead_call, lead, store)
         # The goal loop: failing tests come back to the lead for bounded repair.
         _run_test_fix_loop(session, manager, governance, store, lead, call, lead_call)
+
+    # Safety net: a follow-up that revised an already-delivered file but omitted
+    # its PROMOTE line would otherwise strand the update in the sandbox (the
+    # user's file keeps the old version). Fill in the missing promote — still
+    # gated by the same approval — so 'modify this' follow-ups actually land.
+    _ensure_redelivery_promotes(session, store)
 
     # Delivery last: promotes (the one approval gate) and, if the destination
     # is unknown, the delivery-target question.
@@ -1151,6 +1214,50 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     _append_proposals(session, store, _parse_proposals(session.session_id, draft.content))
 
 
+def _ensure_redelivery_promotes(session: Session, store: LogStore) -> None:
+    """Safety net for follow-ups. When the lead revises a file that was already
+    delivered to the established folder but omits its PROMOTE line, the write
+    executes into the sandbox and the update silently never reaches the user.
+    Re-delivering an already-delivered file is exactly the intent of a
+    'modify this' follow-up, and it still passes through the promote approval
+    gate — so synthesize the missing promote here. Conservative on purpose: only
+    files that ALREADY exist in the established folder are auto-promoted; a
+    brand-new sandbox file the lead didn't ask to deliver is never force-shipped.
+    Idempotent — a file the lead already PROMOTED (or one auto-filled on a prior
+    resume) is skipped."""
+    root = session.established_root
+    if not root:
+        return
+    try:
+        root_path = Path(root)
+    except (OSError, ValueError):
+        return
+    authored = [a.filename for a in session.proposed_actions
+                if a.kind in ("write_file", "edit_file") and a.filename]
+    if not authored:
+        return
+    already = {a.filename for a in session.proposed_actions
+               if a.kind == "promote" and a.filename}
+    missing: list[ProposedAction] = []
+    seen: set[str] = set()
+    for fn in authored:
+        if fn in already or fn in seen:
+            continue
+        seen.add(fn)
+        try:
+            delivered = (root_path / fn).is_file()
+        except OSError:
+            delivered = False
+        if delivered:
+            missing.append(ProposedAction(
+                session_id=session.session_id, kind="promote",
+                role=Role.implementer, filename=fn, args={"filename": fn}))
+    if missing:
+        _append_proposals(session, store, missing)
+        store.log_event(session.session_id, "promote_autofilled",
+                        {"files": [a.filename for a in missing]})
+
+
 # Filenames mentioned anywhere (main.py, requirements.txt) — used to recover the
 # intended file set when the implementer described files instead of emitting them.
 _FILENAME_RE = re.compile(
@@ -1234,7 +1341,13 @@ def _clean_artifact_body(raw: str, filename: str = "") -> str:
 
 def _intended_filenames(session: Session) -> list[str]:
     """The files this task means to produce: explicit ARTIFACT names first, then
-    any filename-like tokens in the lead's draft and the task text."""
+    any filename-like tokens in the lead's draft and the task text. Fallback for
+    revision follow-ups: a task like 'slow the ghosts down' names no file and a
+    flubbed lead draft may name none either — but the file being revised sits in
+    the established folder and the panel discussed it by name all round.
+    Established files mentioned in at least two contributions are the intended
+    targets (the two-mention bar keeps a stray one-off reference — e.g. a seat
+    recalling an earlier run's mistaken artifact — out)."""
     draft = next(
         (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
         None,
@@ -1247,7 +1360,116 @@ def _intended_filenames(session: Session) -> list[str]:
         if name and name.lower() not in seen:
             seen.add(name.lower())
             out.append(name)
-    return out[: config.MAX_ARTIFACT_FILES]
+    if out or not session.established_root:
+        return out[: config.MAX_ARTIFACT_FILES]
+    try:
+        delivered = [p.name for p in Path(session.established_root).iterdir() if p.is_file()]
+    except (OSError, ValueError):
+        return []
+    bodies = [(c.content or "").lower() for c in session.contributions]
+    mentioned = [(sum(1 for b in bodies if name.lower() in b), name) for name in delivered]
+    return [name for n, name in sorted(mentioned, reverse=True)
+            if n >= 2][: config.MAX_ARTIFACT_FILES]
+
+
+# A panelist pastes the whole file inside a ```fence (they're told NOT to emit
+# ARTIFACT blocks — only the lead materializes). This recovers that body.
+_FENCE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)\n?```", re.S)
+
+
+def _basename(name: str) -> str:
+    return name.replace("\\", "/").split("/")[-1].strip()
+
+
+def _salvage_filename(session: Session, block: str, full_text: str) -> str:
+    """Pick a filename for a salvaged panel artifact: an intended name of the
+    right type, else a filename the panelist named in prose ('save as X'), else a
+    type default."""
+    head = block.lstrip()[:400].lower()
+    is_html = "<!doctype" in head or "<html" in head
+    for n in _intended_filenames(session):
+        if not is_html or n.lower().endswith((".html", ".htm")):
+            return _basename(n)
+    pat = (r"\b([\w.\-/\\]+\.html?)\b" if is_html
+           else r"\b([\w.\-/\\]+\.(?:js|mjs|css|py|json|svg|txt|md))\b")
+    m = re.search(pat, full_text, re.IGNORECASE)
+    if m:
+        return _basename(m.group(1))
+    return "index.html" if is_html else "output.txt"
+
+
+def _target_is_html(session: Session) -> bool:
+    """Does this task deliver an HTML file? True if an intended name ends in
+    .html, the established folder already holds one (a revision), or the task
+    explicitly says so. Used to reject non-file snippets during salvage."""
+    if any(n.lower().endswith((".html", ".htm")) for n in _intended_filenames(session)):
+        return True
+    root = session.established_root
+    if root:
+        try:
+            if any(p.suffix.lower() in (".html", ".htm") for p in Path(root).glob("*.htm*")):
+                return True
+        except OSError:
+            pass
+    return ".html" in (session.task.text or "").lower()
+
+
+def _is_complete_file(raw: str, want_html: bool) -> bool:
+    """A salvageable block must be a WHOLE file, not a patch/snippet. Panelists
+    giving revision advice paste fragments ('add this function') — those must
+    never be shipped. For an HTML target, require a full document; otherwise
+    require a complete-looking HTML doc or a substantial standalone block."""
+    low = raw.strip().lower()
+    complete_html = ("<!doctype html" in low or "<html" in low) and "</html>" in low
+    if want_html:
+        return complete_html
+    return complete_html or len(raw.strip()) >= 1500
+
+
+def _best_panel_artifact(session: Session):
+    """The largest COMPLETE file any panelist pasted in a code fence, cleaned.
+    Snippets/patches are rejected so a lead failure never ships a fragment.
+    Returns (agent, filename, body) or None."""
+    want_html = _target_is_html(session)
+    best = None
+    for c in session.contributions:
+        if c.role != Role.panelist or not c.content:
+            continue
+        for m in _FENCE_BLOCK_RE.finditer(c.content):
+            raw = m.group(1)
+            if not _is_complete_file(raw, want_html):
+                continue
+            fn = _salvage_filename(session, raw, c.content)
+            body = _clean_artifact_body(raw, fn)
+            if len(body.strip()) < 800:  # a real single-file deliverable, not a stub
+                continue
+            if best is None or len(body) > len(best[2]):
+                best = (c.agent, fn, body)
+    return best
+
+
+def _salvage_from_panel(session: Session, store: LogStore) -> None:
+    """Last-resort recovery when the lead failed to produce a file (timed out or
+    errored). Panelists routinely paste the entire, working file inline; extract
+    the best one and propose writing + promoting it, so a lead failure delivers
+    that work instead of shipping nothing."""
+    art = _best_panel_artifact(session)
+    if not art:
+        return
+    agent_name, filename, body = art
+    sid = session.session_id
+    _append_proposals(session, store, [
+        ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
+                       filename=filename, content=body,
+                       args={"filename": filename, "content": body}),
+        ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
+                       filename=filename, args={"filename": filename}),
+    ])
+    session.unresolved.append(
+        f"lead produced no file; salvaged a complete artifact from panel seat "
+        f"'{agent_name}' ({filename}, {len(body)} chars)")
+    store.log_event(sid, "panel_artifact_salvaged",
+                    {"agent": agent_name, "filename": filename, "chars": len(body)})
 
 
 def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:

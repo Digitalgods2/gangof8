@@ -260,6 +260,10 @@
     <div id="settingsBody"><div class="empty">Loading…</div></div>
     <div class="row">
       <button onclick="saveSettings()">Save settings</button>
+      <button class="ghost" onclick="applyOpenRouterOnly()"
+              title="Enable all OpenRouter models, turn off the local CLI seats, and save — the council then runs entirely on OpenRouter.">OpenRouter-only</button>
+      <button class="ghost" onclick="applyLocalCliOnly()"
+              title="Turn the local CLI seats back on and disable all OpenRouter models, then save — the council runs entirely on the local CLIs.">Local-CLIs-only</button>
       <span id="savedNote"></span>
     </div>
   </div>
@@ -542,11 +546,17 @@ async function refresh() {
 
 // Re-render the open session's detail ONLY when its data changed and the user
 // isn't selecting text in it — so a static (done) session never gets clobbered.
+// Exception: once the session reaches a terminal state, render through a
+// lingering selection one time. Otherwise leftover highlighted text freezes the
+// detail pane on its last "deliberating" render, and the elapsed ticker (which
+// keys off liveSince, only cleared inside renderDetail) counts up forever.
 async function _refreshDetail() {
   const detail = await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null);
   const right = document.getElementById("right");
   const sig = JSON.stringify(detail);
-  if (sig === _lastDetailSig || _hasSelectionIn(right)) return;
+  if (sig === _lastDetailSig) return;
+  const terminal = detail && TERMINAL_STATES.has(detail.status);
+  if (!terminal && _hasSelectionIn(right)) return;
   _lastDetailSig = sig;
   renderDetail(detail);
 }
@@ -975,7 +985,10 @@ function renderSettings(s, seats) {
         const isCustom = x.model && !catalog.includes(x.model);
         return `
         <div class="field" style="align-items:center">
-          <label style="margin:0;flex:0 0 70px"><b>${esc(x.name)}</b></label>
+          <label style="margin:0;flex:0 0 92px;display:flex;align-items:center;gap:6px"
+                 title="Uncheck to drop this local CLI seat and run its roles on an OpenRouter model instead.">
+            <input type="checkbox" class="cli_enable" data-seat="${esc(x.name)}" ${x.enabled === false ? "" : "checked"}>
+            <b>${esc(x.name)}</b></label>
           <select class="cli_model_sel" data-seat="${esc(x.name)}" style="flex:1;min-width:180px"
                   title="Pin the exact model this seat runs (passed as --model / -m / SDK model)."
                   onchange="this.nextElementSibling.style.display = this.value === '__custom__' ? '' : 'none'">
@@ -990,6 +1003,7 @@ function renderSettings(s, seats) {
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+      <div class="sub">Uncheck a seat to run <b>OpenRouter-only</b>: its roles fall back to an enabled OpenRouter model (below), and it leaves the panel. Needs an OpenRouter key and at least one enabled OpenRouter seat — otherwise the seat stays on so the council always has a lead.</div>
     </div>
 
     <div class="sset">
@@ -1071,6 +1085,30 @@ function _num(id, fallback) {
   return Number.isFinite(v) ? v : fallback;
 }
 
+// One-click preset: enable every OpenRouter seat, turn off the local CLI seats,
+// and save. Needs an OpenRouter key — without one the backend keeps the CLIs on
+// (a role must always have a seat), so we stop and say so rather than no-op.
+async function applyOpenRouterOnly() {
+  const note = document.getElementById("savedNote");
+  if (!orKey.present) {
+    note.style.color = "var(--warn)";
+    note.textContent = "Add an OpenRouter API key first — without it the local CLIs stay on so the council keeps a lead.";
+    return;
+  }
+  if (!confirm("Run OpenRouter-only?\n\nThis enables all OpenRouter models and turns OFF the local CLI seats (claude, codex, gemini). Every role moves to an OpenRouter model. You can re-check the CLI seats anytime to undo.")) return;
+  document.querySelectorAll(".or_enable").forEach(c => { c.checked = true; });
+  document.querySelectorAll(".cli_enable").forEach(c => { c.checked = false; });
+  await saveSettings();
+}
+
+// The inverse preset: local CLIs back on, all OpenRouter seats off, then save.
+async function applyLocalCliOnly() {
+  if (!confirm("Use local CLIs only?\n\nThis turns the local CLI seats (claude, codex, gemini) back ON and disables all OpenRouter models. The council runs entirely on the local CLIs.")) return;
+  document.querySelectorAll(".cli_enable").forEach(c => { c.checked = true; });
+  document.querySelectorAll(".or_enable").forEach(c => { c.checked = false; });
+  await saveSettings();
+}
+
 async function saveSettings() {
   const note = document.getElementById("savedNote");
   note.style.color = "";
@@ -1093,12 +1131,15 @@ async function saveSettings() {
     }
     if (v) cli_models[sel.dataset.seat] = v;
   });
+  const cli_enabled = {};
+  document.querySelectorAll(".cli_enable").forEach(c => { cli_enabled[c.dataset.seat] = c.checked; });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
     openrouter_enabled,
     openrouter_models,
     cli_models,
+    cli_enabled,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),

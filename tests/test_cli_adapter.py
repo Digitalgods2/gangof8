@@ -306,3 +306,38 @@ def test_cli_backend_registers_cli_adapters(tmp_path):
     assert "claude" in svc.registry.names()
     # the registered adapter is a CliAdapter, not the mock one
     assert isinstance(svc.registry._adapters["claude"], CliAdapter)
+
+
+# --- resilience: claude can exit non-zero with a valid result or a real error ---
+
+
+def test_claude_recovers_valid_result_on_nonzero_exit(stub_run):
+    """The claude CLI can exit non-zero AFTER emitting a valid result (a
+    post-generation hiccup). Use the result instead of failing the whole seat."""
+    stub_run(_Proc(returncode=1, stdout=json.dumps({
+        "is_error": False, "result": "<!DOCTYPE html><html></html>",
+        "modelUsage": {"claude-sonnet-5": {}}})))
+    out = CliAdapter("claude").call(Role.lead, "build it", timeout_s=60)
+    assert out.content == "<!DOCTYPE html><html></html>"
+    assert out.model == "claude-sonnet-5"
+
+
+def test_claude_nonzero_with_json_error_surfaces_the_message(stub_run):
+    stub_run(_Proc(returncode=1, stdout=json.dumps(
+        {"is_error": True, "result": "usage limit reached"})))
+    with pytest.raises(AgentError, match="usage limit reached"):
+        CliAdapter("claude").call(Role.researcher, "x", timeout_s=30)
+
+
+def test_claude_nonzero_nonjson_surfaces_stdout_not_blank(stub_run):
+    """The real error lives on stdout; an empty stderr must not hide it behind a
+    blank 'exited 1:' — the bug that made claude failures undiagnosable."""
+    stub_run(_Proc(returncode=1, stdout="Error: model overloaded", stderr=""))
+    with pytest.raises(AgentError, match="exited 1.*overloaded"):
+        CliAdapter("claude").call(Role.researcher, "x", timeout_s=30)
+
+
+def test_exec_error_detail_falls_back_to_stdout(stub_run):
+    stub_run(_Proc(returncode=2, stdout="real detail on stdout", stderr=""))
+    with pytest.raises(AgentError, match="exited 2: real detail on stdout"):
+        CliAdapter("codex")._exec(["codex"], "p", 30)

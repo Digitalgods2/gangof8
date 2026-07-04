@@ -88,12 +88,14 @@ class CliAdapter:
         return AdapterResult(content=content, model=model,
                              duration_ms=int((time.monotonic() - t0) * 1000))
 
-    def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
-        """Run a CLI command with the prompt on stdin; return stdout. Uses Popen
-        (not subprocess.run) and registers the process for the current session so
-        a cancel can KILL it mid-flight — a killed call surfaces as SessionCancelled
-        instead of a generic error. The executable is resolved via PATH
-        (shutil.which) so Windows .cmd/.exe shims are found and run directly."""
+    def _exec_raw(self, cmd: list[str], prompt: str, timeout_s: int) -> tuple[str, str, int]:
+        """Run a CLI command with the prompt on stdin; return (stdout, stderr,
+        returncode). Uses Popen (not subprocess.run) and registers the process for
+        the current session so a cancel can KILL it mid-flight — a killed call
+        surfaces as SessionCancelled. The executable is resolved via PATH
+        (shutil.which) so Windows .cmd/.exe shims are found and run directly.
+        Returns the exit code rather than raising on it, so callers can recover a
+        valid result the CLI printed to stdout even when it exits non-zero."""
         exe = shutil.which(cmd[0])
         if not exe:
             raise AgentError(f"{self.agent} CLI not found on PATH ({cmd[0]!r})")
@@ -121,11 +123,17 @@ class CliAdapter:
         # If a cancel killed the process, report it as cancellation (not an error).
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
-        if proc.returncode != 0:
-            raise AgentError(
-                f"{self.agent} CLI exited {proc.returncode}: {(err or '').strip()[:300]}"
-            )
-        return out or ""
+        return out or "", err or "", proc.returncode
+
+    def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
+        """Run a CLI and return stdout, raising on a non-zero exit. The error
+        detail prefers stderr but falls back to stdout — claude/codex print their
+        real error as JSON on stdout, so a blank stderr must not hide it."""
+        out, err, rc = self._exec_raw(cmd, prompt, timeout_s)
+        if rc != 0:
+            detail = err.strip() or out.strip()
+            raise AgentError(f"{self.agent} CLI exited {rc}: {detail[:300]}")
+        return out
 
     def _run_claude(self, prompt: str, timeout_s: int) -> tuple[str, Optional[str]]:
         """Returns (content, model): the CLI's JSON result names the model that
@@ -133,18 +141,29 @@ class CliAdapter:
         cmd = ["claude", "-p", "--output-format", "json", "--tools", ""]
         if self.model:
             cmd += ["--model", self.model]
-        out = self._exec(cmd, prompt, timeout_s)
+        out, err, rc = self._exec_raw(cmd, prompt, timeout_s)
         try:
             data = json.loads(out)
         except json.JSONDecodeError as e:
+            # No parseable result. If it also exited non-zero, that's the failure —
+            # surface stderr, else the raw stdout (the CLI's error text lives there).
+            if rc != 0:
+                raise AgentError(
+                    f"claude CLI exited {rc}: {(err.strip() or out.strip())[:300]}") from e
             raise AgentError(f"claude CLI returned non-JSON: {out[:200]!r}") from e
         if data.get("is_error"):
             raise AgentError(f"claude CLI error: {data.get('result') or data.get('subtype')}")
+        result = data.get("result") or ""
+        # A clean result that came back with a NON-ZERO exit code still succeeded —
+        # the claude CLI can exit non-zero after emitting a valid result (a
+        # post-generation hiccup). Use the result; only fail if there is none.
+        if not result and rc != 0:
+            raise AgentError(f"claude CLI exited {rc}: {(err.strip() or out.strip())[:300]}")
         used = None
         usage = data.get("modelUsage")
         if isinstance(usage, dict) and usage:
             used = next(iter(usage))
-        return data.get("result") or "", used
+        return result, used
 
     def _run_claude_vision(self, prompt: str, images: list[dict], timeout_s: int) -> str:
         """Send the prompt + image content blocks via stream-json so the model

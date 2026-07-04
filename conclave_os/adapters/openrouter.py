@@ -18,6 +18,8 @@ from typing import Callable, Optional
 
 import httpx
 
+from .. import cancellation
+from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentError
 
@@ -60,14 +62,40 @@ class OpenRouterAdapter:
             "X-Title": _APP_TITLE,
             "HTTP-Referer": _REFERER,
         }
+        # Own the client so a cancel can close it mid-flight. An OpenRouter call
+        # is a plain HTTP request with no subprocess to kill, so without this a
+        # cancelled run's abandoned seat would keep blocking until the timeout.
+        # We register a closer that `cancellation.request` invokes to tear down
+        # the connection; the torn read then surfaces as SessionCancelled.
+        sid = cancellation.current_session()
+        if sid and cancellation.is_requested(sid):
+            raise SessionCancelled()
         t0 = time.monotonic()
+        client = httpx.Client(timeout=max(30, timeout_s))
+
+        def _abort() -> None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+
+        cancellation.register_canceler(sid, _abort)
         try:
-            resp = httpx.post(f"{self.endpoint}/chat/completions",
-                              headers=headers, json=payload, timeout=max(30, timeout_s))
+            resp = client.post(f"{self.endpoint}/chat/completions",
+                               headers=headers, json=payload)
         except httpx.TimeoutException as e:
             raise AgentError(f"{self.name} (OpenRouter) timed out after {timeout_s}s") from e
         except httpx.HTTPError as e:
+            # A cancel that closed the client surfaces here as a transport error;
+            # report it as cancellation, not a generic failure.
+            if sid and cancellation.is_requested(sid):
+                raise SessionCancelled() from e
             raise AgentError(f"{self.name} (OpenRouter) request failed: {e}") from e
+        finally:
+            cancellation.unregister_canceler(sid, _abort)
+            client.close()
+        if sid and cancellation.is_requested(sid):
+            raise SessionCancelled()
         if resp.status_code != 200:
             detail = (resp.text or "").strip()[:300]
             raise AgentError(f"{self.name} (OpenRouter) HTTP {resp.status_code}: {detail}")

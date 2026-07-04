@@ -302,6 +302,22 @@ def test_marker_lines_are_never_stubs():
     assert rounds.reply_is_stub("I'll wrap up here.\nROUND: DONE") is False
 
 
+def test_unresolved_skill_request_is_a_stub_after_resolution():
+    """Before the resolver runs, a SKILL: line is legitimate work-in-progress;
+    after it has run, a line still standing is a request that will never be
+    honored (live: a round ended on the bare line 'SKILL: search_project …'
+    accepted as the synthesis, and nothing was delivered)."""
+    dangling = "SKILL: search_project ghost speed interval moveGhost keydown"
+    assert rounds.reply_is_stub(dangling) is False  # pre-resolution: legitimate
+    assert rounds.reply_is_stub(dangling, skills_resolved=True) is True
+    # substantial prose around a leftover request line still counts as work
+    real = "Substance. " * 40 + "\nSKILL: read_file x.py"
+    assert rounds.reply_is_stub(real, skills_resolved=True) is False
+    # an ARTIFACT block is real work regardless of the flag
+    art = "SKILL: read_file x.py\nARTIFACT: index.html\n<html></html>"
+    assert rounds.reply_is_stub(art, skills_resolved=True) is False
+
+
 def test_long_reply_is_not_a_stub():
     assert rounds.reply_is_stub("I'll now explain in detail. " + "Substance. " * 60) is False
 

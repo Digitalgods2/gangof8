@@ -18,6 +18,7 @@ import threading
 _lock = threading.Lock()
 _requested: set[str] = set()
 _procs: dict[str, set] = {}      # session_id -> set of live subprocess.Popen
+_cancelers: dict[str, set] = {}  # session_id -> set of zero-arg abort callbacks
 _tls = threading.local()         # the worker thread's current session id
 
 
@@ -63,11 +64,44 @@ def _kill_procs(session_id: str) -> None:
             pass
 
 
+# --- abort-callback registry --------------------------------------------------
+# For in-flight work with no killable subprocess (e.g. an OpenRouter HTTP call):
+# the adapter registers a zero-arg callback that tears down its network client,
+# so `request` can interrupt the blocking call the same way it kills a CLI proc.
+def register_canceler(session_id: str | None, fn) -> None:
+    if not session_id:
+        return
+    with _lock:
+        _cancelers.setdefault(session_id, set()).add(fn)
+
+
+def unregister_canceler(session_id: str | None, fn) -> None:
+    if not session_id:
+        return
+    with _lock:
+        fns = _cancelers.get(session_id)
+        if fns:
+            fns.discard(fn)
+            if not fns:
+                _cancelers.pop(session_id, None)
+
+
+def _run_cancelers(session_id: str) -> None:
+    with _lock:
+        fns = list(_cancelers.get(session_id, ()))
+    for fn in fns:
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 — best-effort teardown: ignore
+            pass
+
+
 # --- cancellation flag --------------------------------------------------------
 def request(session_id: str) -> None:
     with _lock:
         _requested.add(session_id)
-    _kill_procs(session_id)  # terminate any in-flight subprocess immediately
+    _kill_procs(session_id)      # terminate any in-flight subprocess immediately
+    _run_cancelers(session_id)   # and tear down any in-flight network client
 
 
 def is_requested(session_id: str) -> bool:
@@ -79,3 +113,4 @@ def clear(session_id: str) -> None:
     with _lock:
         _requested.discard(session_id)
         _procs.pop(session_id, None)
+        _cancelers.pop(session_id, None)

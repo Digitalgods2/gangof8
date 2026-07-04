@@ -25,6 +25,21 @@ class _Resp:
         return self._body
 
 
+def _client_cls(post_fn):
+    """A fake httpx.Client whose .post delegates to post_fn; the adapter now owns
+    and closes its client (so a cancel can tear it down mid-flight)."""
+    class _FakeClient:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        def post(self, url, headers=None, json=None):
+            return post_fn(url, headers=headers, json=json, timeout=self.timeout)
+
+        def close(self):
+            pass
+    return _FakeClient
+
+
 # --- adapter ------------------------------------------------------------------
 
 
@@ -38,7 +53,7 @@ def test_adapter_posts_and_parses(monkeypatch):
             "usage": {"prompt_tokens": 5, "completion_tokens": 3},
         })
 
-    monkeypatch.setattr(orm.httpx, "post", fake_post)
+    monkeypatch.setattr(orm.httpx, "Client", _client_cls(fake_post))
     a = OpenRouterAdapter("deepseek", "deepseek/deepseek-v4-pro", lambda: "sk-or-key")
     out = a.call(Role.researcher, "hello", timeout_s=30)
     assert out.content == "hi from deepseek"
@@ -57,18 +72,70 @@ def test_adapter_without_key_errors():
 
 
 def test_adapter_http_error_raises(monkeypatch):
-    monkeypatch.setattr(orm.httpx, "post", lambda url, **k: _Resp(429, None, "rate limited"))
+    monkeypatch.setattr(orm.httpx, "Client",
+                        _client_cls(lambda url, **k: _Resp(429, None, "rate limited")))
     a = OpenRouterAdapter("kimi", "moonshotai/kimi-k2.6", lambda: "sk-or-key")
     with pytest.raises(AgentError, match="HTTP 429"):
         a.call(Role.critic, "hi", timeout_s=10)
 
 
 def test_adapter_empty_output_raises(monkeypatch):
-    monkeypatch.setattr(orm.httpx, "post",
-                        lambda url, **k: _Resp(200, {"choices": [{"message": {"content": "  "}}]}))
+    monkeypatch.setattr(orm.httpx, "Client",
+                        _client_cls(lambda url, **k: _Resp(200, {"choices": [{"message": {"content": "  "}}]})))
     a = OpenRouterAdapter("qwen", "qwen/qwen3.6-plus", lambda: "sk-or-key")
     with pytest.raises(AgentError, match="empty output"):
         a.call(Role.researcher, "hi", timeout_s=10)
+
+
+def test_adapter_call_interrupted_by_cancel(monkeypatch):
+    """A cancel mid-request tears down the client and surfaces as SessionCancelled
+    instead of blocking until the HTTP timeout."""
+    import threading
+
+    from conclave_os import cancellation
+    from conclave_os.cancellation import SessionCancelled
+
+    sid = "s_or_cancel"
+    entered = threading.Event()
+
+    class _BlockingClient:
+        def __init__(self, timeout=None):
+            self._closed = threading.Event()
+
+        def post(self, url, headers=None, json=None):
+            entered.set()
+            # block like an in-flight call until close() (the cancel) fires
+            if self._closed.wait(5):
+                raise orm.httpx.ReadError("connection closed by cancel")
+            return _Resp(200, {"choices": [{"message": {"content": "late"}}]})
+
+        def close(self):
+            self._closed.set()
+
+    monkeypatch.setattr(orm.httpx, "Client", _BlockingClient)
+    a = OpenRouterAdapter("kimi", "x/y", lambda: "sk-or-key")
+
+    result = {}
+
+    def run():
+        cancellation.set_current_session(sid)
+        try:
+            a.call(Role.critic, "hi", timeout_s=30)
+        except Exception as e:  # noqa: BLE001 — capture for assertion
+            result["exc"] = e
+        finally:
+            cancellation.set_current_session(None)
+
+    t = threading.Thread(target=run)
+    t.start()
+    try:
+        assert entered.wait(5), "the request should be in flight"
+        cancellation.request(sid)          # human hits 'Cancel run'
+        t.join(timeout=5)
+        assert not t.is_alive(), "cancel must interrupt the in-flight HTTP call"
+        assert isinstance(result.get("exc"), SessionCancelled)
+    finally:
+        cancellation.clear(sid)
 
 
 # --- secret store -------------------------------------------------------------
@@ -154,3 +221,73 @@ def test_seat_unavailable_without_key(tmp_path, monkeypatch):
     svc.update_settings({"openrouter_enabled": {"deepseek": True}})
     seat = next(s for s in svc.seats()["seats"] if s["name"] == "deepseek")
     assert seat["enabled"] is True and seat["available"] is False  # enabled but no key
+
+
+# --- disabling local CLI seats → OpenRouter-only fallback ---------------------
+
+_CLI = {"claude", "codex", "gemini"}
+
+
+def test_disabling_cli_seat_falls_back_to_openrouter(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.set_openrouter_key("sk-or-key")
+    svc.update_settings({"backend": "cli",
+                         "openrouter_enabled": {"kimi": True, "qwen": True},
+                         "cli_enabled": {"claude": False}})
+    # every role that was on claude is remapped onto an enabled OpenRouter seat
+    assert "claude" not in svc.role_agents.values()
+    assert svc.role_agents[Role.lead] in ("kimi", "qwen")
+    # claude is no longer registered; the fallback seat is; and it left the panel
+    assert "claude" not in svc.registry.names()
+    assert "kimi" in svc.registry.names()
+    assert "claude" not in svc.panel
+
+
+def test_disabling_all_clis_runs_openrouter_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.set_openrouter_key("sk-or-key")
+    svc.update_settings({"backend": "cli",
+                         "openrouter_enabled": {"deepseek": True, "glm": True},
+                         "cli_enabled": {"claude": False, "codex": False, "gemini": False}})
+    assert not (_CLI & set(svc.role_agents.values())), "no CLI seat left in the role map"
+    assert not (_CLI & set(svc.registry.names())), "no CLI adapter registered"
+    assert set(svc.role_agents.values()) <= {"deepseek", "glm"}
+
+
+def test_disabling_cli_without_openrouter_is_noop(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = ConclaveService(data_dir=tmp_path)
+    # nothing to fall back to → the disable is ignored so the lead still exists
+    svc.update_settings({"backend": "cli", "cli_enabled": {"claude": False}})
+    assert svc.role_agents[Role.lead] == "claude"
+
+
+def test_put_settings_endpoint_persists_cli_enabled(client):
+    """The HTTP PUT path (not just update_settings) must carry cli_enabled/
+    cli_models through — the SettingsPatch model was dropping them, so the
+    dashboard's OpenRouter-only preset saved but the CLI seats stayed on."""
+    client.put("/settings/api-keys/openrouter", json={"value": "sk-or-key"})
+    r = client.put("/settings", json={
+        "backend": "cli",
+        "openrouter_enabled": {"kimi": True},
+        "cli_models": {"claude": "opus"},
+        "cli_enabled": {"claude": False},
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cli_enabled"]["claude"] is False      # persisted, not dropped
+    assert body["cli_models"]["claude"] == "opus"
+    cli = {s["name"]: s for s in client.get("/settings/seats").json()["seats"]
+           if s["kind"] == "cli"}
+    assert cli["claude"]["enabled"] is False            # seats endpoint reflects it
+
+
+def test_seats_reports_cli_enabled_flag(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"backend": "cli", "cli_enabled": {"codex": False}})
+    cli = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "cli"}
+    assert cli["codex"]["enabled"] is False
+    assert cli["claude"]["enabled"] is True and cli["gemini"]["enabled"] is True
