@@ -14,6 +14,7 @@ Supported agents: claude (fully exercised), codex, gemini.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import shutil
@@ -45,16 +46,29 @@ def _neutral_cwd() -> str:
 
 class CliAdapter:
     def __init__(self, agent: str, name: Optional[str] = None, model: Optional[str] = None,
-                 api_key_getter=None):
+                 api_key_getter=None, role_models: Optional[dict] = None):
         self.agent = agent  # claude | codex | gemini
         self.name = name or agent
         self.model = model
+        # role name → model id: optional per-ROLE pins layered over the seat
+        # pin (role pin › seat pin › CLI default), so a rarely-called talent
+        # (code_generator) can run a heavier model than the seat's default.
+        self.role_models = dict(role_models or {})
         # gemini only: resolves the key from env OR the Settings-stored secrets
         # (injected by the service) — an env var must not be the only way in.
         self._api_key_getter = api_key_getter
 
     def call(self, role: Role, prompt: str, timeout_s: int,
              images: list[dict] | None = None) -> AdapterResult:
+        pinned = self.role_models.get(getattr(role, "value", str(role)))
+        if pinned and pinned != self.model:
+            # The runner methods read self.model, and this adapter instance is
+            # shared across the panel fan-out threads — so apply the role pin
+            # on a call-local CLONE, never by mutating self.
+            clone = copy.copy(self)
+            clone.model = pinned
+            clone.role_models = {}
+            return clone.call(role, prompt, timeout_s, images)
         t0 = time.monotonic()
         model = self.model  # the pinned model; branches refine it when they know more
         if self.agent == "claude":

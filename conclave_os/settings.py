@@ -61,6 +61,12 @@ class Settings(BaseModel):
     # gemini → "gemini-2.5-pro"). Empty/absent ⇒ each CLI's own default —
     # note the gemini SDK path defaults to gemini-2.5-flash.
     cli_models: dict[str, str] = {}
+    # Per-ROLE model pins (role name → exact model id, or OpenRouter slug for
+    # an OpenRouter-mapped role), layered over the seat pin: role pin › seat
+    # pin › CLI/seat default. Lets a rarely-called talent run a heavier model
+    # than the seat's everyday default — e.g. lead stays on sonnet while
+    # code_generator gets opus for the few calls it actually makes.
+    role_models: dict[str, str] = {}
     # Which local CLI seats (claude/codex/gemini) are enabled. Absent/true ⇒
     # enabled (today's behaviour). false ⇒ the seat is dropped from the panel and
     # its roles fall back to an enabled OpenRouter seat — letting the app run

@@ -35,11 +35,15 @@ class OpenRouterAdapter:
         api_key_getter: Callable[[], Optional[str]],
         endpoint: str = "https://openrouter.ai/api/v1",
         data_collection: str = "deny",
+        role_models: Optional[dict] = None,
     ) -> None:
         if not name or not model_slug:
             raise ValueError("OpenRouterAdapter requires name and model_slug")
         self.name = name
         self.model_slug = model_slug
+        # role name → slug: optional per-ROLE pins layered over the seat slug
+        # (role pin › seat slug), mirroring the CLI adapter's role_models.
+        self.role_models = dict(role_models or {})
         self._key_getter = api_key_getter
         self.endpoint = endpoint.rstrip("/")
         self.data_collection = data_collection if data_collection in ("deny", "allow") else "deny"
@@ -51,8 +55,9 @@ class OpenRouterAdapter:
             raise AgentError(
                 f"{self.name}: no OpenRouter API key — set OPENROUTER_API_KEY or "
                 "add it in Settings → API Keys")
+        slug = self.role_models.get(getattr(role, "value", str(role))) or self.model_slug
         payload = {
-            "model": self.model_slug,
+            "model": slug,
             "messages": [{"role": "user", "content": prompt}],
             "provider": {"data_collection": self.data_collection},
         }
@@ -117,4 +122,4 @@ class OpenRouterAdapter:
         tokens = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
         return AdapterResult(content=content, tokens=tokens,
                              duration_ms=int((time.monotonic() - t0) * 1000),
-                             model=body.get("model") or self.model_slug)
+                             model=body.get("model") or slug)

@@ -48,6 +48,32 @@ def test_conversation_overview_focuses_on_latest_response(tmp_path):
     assert loop._conversation_overview(s) == ""
 
 
+def test_continue_accepts_attachments_multimodal(tmp_path):
+    """Follow-up responses are multi-modal like the task box: document text is
+    folded into the turn the council reads, and image attachments join
+    session.attachments so vision-capable seats see them on later calls."""
+    import base64
+
+    svc = ConclaveService(data_dir=tmp_path)
+    s = svc.run("What is SQLite?", source="test")
+    doc = svc.save_upload("notes.txt", base64.b64encode(b"prefer WAL mode").decode())
+    img = svc.save_upload("shot.png", base64.b64encode(b"\x89PNG\r\n\x1a\n0000").decode())
+    s2 = svc.continue_session(s.session_id, "consider this", background=False,
+                              attachments=[doc["id"], img["id"]])
+    assert s2.status == SessionStatus.done
+    user_turn = s2.turns[2]["text"]
+    assert user_turn.startswith("consider this")
+    assert "prefer WAL mode" in user_turn, "doc text folded into the turn"
+    assert any(a["name"] == "shot.png" and a["kind"] == "image"
+               for a in s2.attachments), "image joins session attachments (vision)"
+    # an attachment-only response is allowed; a truly empty one is still rejected
+    s3 = svc.continue_session(s2.session_id, "", background=False,
+                              attachments=[doc["id"]])
+    assert s3.turns[-2]["text"].startswith("(see attached)")
+    with pytest.raises(ValueError):
+        svc.continue_session(s3.session_id, "   ")
+
+
 def test_cannot_continue_unfinished_session(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     s = svc._open("x", "test", None)  # status received, not done
