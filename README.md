@@ -253,10 +253,55 @@ behaviour.
   coordinator **materializes** each with a focused single-file call.
 - **Reading mid-deliberation**: any allowed role may emit a plain-text
   `SKILL: read_file <path>` or `SKILL: search_project <query>` line; the kernel
-  authorizes it (reads need no approval) and the result is fed back on a single
-  re-call. The grammar is advertised to a role only when it's useful.
+  authorizes it (reads need no approval) and the results are fed back on a
+  re-call. A follow-up reply may open a NEW request (read one file → the next
+  read depends on what it said) — those resolve too, as a bounded chain
+  (`MAX_SKILL_CHAIN_TURNS`, default 3 re-calls) with every result accumulated
+  and repeats never re-executed. A reply that is nothing but an unresolved
+  request is a stub, never a synthesis. The grammar is advertised to a role
+  only when it's useful.
 - **No agent does I/O itself** — every write flows through the executor +
   human approval; the only ungated capability is `generate_text`.
+
+## Delivery resilience (the safety-net ladder)
+
+A file-producing run must end in exactly one of two states: a real, complete
+file behind the promote gate, or an honest failure that says so. Between a
+flaky seat and an empty delivery stands a ladder of recoveries — each rung
+tried only when the one above produced nothing:
+
+1. **The lead's own `ARTIFACT:` blocks** — the normal path.
+2. **Materialization** — the draft only *described* the files: each intended
+   file is fetched with its own focused single-file call (the lead's long
+   timeout, since it authors whole files). Intended names come from the draft
+   and the task text; when a revision follow-up ("slow the ghosts down")
+   names no file at all, the fallback is the established folder's files the
+   panel discussed by name (two-plus mentions, so a stray reference to an
+   unrelated file doesn't qualify).
+3. **Panel salvage** — the lead shipped nothing (timed out, errored, or
+   stubbed): the best **complete** file a panelist pasted inline is recovered
+   and proposed for write + promote, attributed to that seat. Snippets and
+   patches are rejected — an HTML target must be a whole document — so
+   revision *advice* is never shipped *as* a file (`test_salvage.py`).
+4. **Honest failure** — still nothing real on disk ⇒ the final answer reports
+   artifact verification failed, at low confidence, with the next action —
+   never a success card over a missing file.
+
+Three more nets around the ladder:
+
+- **Truncation continuation** — a large single-file artifact cut off
+  mid-generation is finished from where it stopped (append), not re-drafted.
+- **Redelivery auto-promote** — a follow-up that revises an already-delivered
+  file but omits its `PROMOTE:` line gets the promote synthesized
+  automatically (behind the same approval gate), so "modify this" follow-ups
+  land in your folder instead of stranding the update in the sandbox. Only
+  files that already exist in the established folder qualify — a brand-new
+  sandbox file is never force-shipped.
+- **Stub detection** — a synthesis that merely announces the work, is blocked
+  tool-call debris, or ends on a dangling unresolved `SKILL:` request is never
+  accepted as a round's result: the lead is re-called once demanding the
+  result now, and if it stubs again the composer synthesizes from the panel
+  views instead.
 
 ## Workspaces (allowed work areas)
 
@@ -296,6 +341,14 @@ under `data/uploads/`):
   your real folder without an explicit, diff-carrying `promote` approval
   (`test_actions.py`, `test_established.py`). Risk classification is
   informational and never blocks a run (`test_governance.py`).
+- Cancel always lands — every blocking wait (panel fan-out, the up-front
+  context build, API-seat HTTP calls) polls the cancel flag instead of
+  blocking on the slowest seat, so "Cancel run" finalizes promptly even with
+  a stuck seat in flight (`test_cancel.py`).
+- No fabricated deliveries — a file-producing run either puts a real, complete
+  file behind the promote gate or reports the failure honestly; fragments and
+  advice snippets are never shipped as files (`test_salvage.py`,
+  `test_materialize.py`).
 - Full reasoning trail — every classification, council choice, round,
   panel contribution, synthesis decision, and approval is in
   `data/sessions/<id>.jsonl`, with session state in `data/conclave_os.db`
@@ -385,3 +438,8 @@ files are produced via `ARTIFACT:` + approval.
       hard path containment; the first Type-2 module.
 - [x] Multi-modal input — text / PDF attachments folded in as context; **image
       vision** for claude, codex, and gemini (no tools, governed).
+- [x] Delivery resilience — the safety-net ladder (materialization with an
+      established-folder fallback for revision follow-ups, panel artifact
+      salvage, honest failure reporting), redelivery auto-promote, chained
+      `SKILL:` resolution with dangling-request stub detection, and
+      cancel-aware waits throughout the round loop.
