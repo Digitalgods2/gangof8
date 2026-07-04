@@ -226,6 +226,29 @@ def test_gemini_key_endpoints(tmp_path, monkeypatch):
     assert client.get("/settings/api-keys/stripe").status_code == 404
 
 
+def test_fresh_install_saves_keys_without_env(tmp_path, monkeypatch):
+    """Brand-new machine: no data/ directory yet, no key env vars. Keys pasted
+    in Settings must store to data/secrets.json (created on first save),
+    resolve as 'stored', and survive a service restart — the env-var override
+    is an option, never a requirement."""
+    _no_gemini_env(monkeypatch)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    fresh = tmp_path / "data"  # does not exist — first run must create it
+    assert not fresh.exists()
+    svc = ConclaveService(data_dir=fresh)
+    svc.set_api_key("gemini", "AIza-new-install-1")
+    svc.set_api_key("openrouter", "sk-or-new-install-2")
+    stored = json.loads((fresh / "secrets.json").read_text(encoding="utf-8"))
+    assert stored == {"gemini": "AIza-new-install-1",
+                      "openrouter": "sk-or-new-install-2"}
+    # a restart (new service over the same data dir) still resolves them
+    svc2 = ConclaveService(data_dir=fresh)
+    gem = svc2.api_key_status("gemini")
+    assert gem["present"] is True and gem["source"] == "stored"
+    assert svc2.api_key_status("openrouter")["source"] == "stored"
+    assert svc2.reveal_api_key("openrouter")["value"] == "sk-or-new-install-2"
+
+
 def test_reveal_returns_full_key_only_on_explicit_request(tmp_path, monkeypatch):
     """Status stays masked; the dashboard's eye-reveal fetches the full value
     on demand via the explicit /reveal endpoint (localhost-only app, and the
