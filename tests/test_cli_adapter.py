@@ -73,6 +73,26 @@ def test_pinned_model_is_passed_and_reported(stub_run):
     assert out.model == "claude-opus-4-8", "the result is attributable to the pinned model"
 
 
+def test_role_model_pin_beats_seat_pin_for_that_role_only(stub_run):
+    """Per-role model pins: role pin › seat pin › CLI default. Pinning
+    code_generator to opus must not change what the same seat runs as lead —
+    and the shared adapter instance must not be mutated by the override."""
+    adapter = CliAdapter("claude", model="claude-sonnet-5",
+                         role_models={"code_generator": "claude-opus-4-8"})
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "hi"})))
+    out = adapter.call(Role.code_generator, "write it", timeout_s=60)
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-4-8", "role pin reaches the CLI"
+    assert out.model == "claude-opus-4-8", "attribution names the role-pinned model"
+    assert adapter.model == "claude-sonnet-5", "shared adapter not mutated (thread safety)"
+    # the SAME adapter as lead still runs the seat pin
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "hi"})))
+    out = adapter.call(Role.lead, "synthesize", timeout_s=60)
+    cmd = calls["cmd"]
+    assert cmd[cmd.index("--model") + 1] == "claude-sonnet-5"
+    assert out.model == "claude-sonnet-5"
+
+
 def test_unpinned_claude_reports_the_model_the_cli_ran(stub_run):
     stub_run(_Proc(stdout=json.dumps({
         "is_error": False, "result": "hi",

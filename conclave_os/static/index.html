@@ -124,6 +124,10 @@
   .seat.role-fact_validator { --seat:#84cc16; --seat-bg:rgba(132,204,22,.15); }
   .seat.role-implementer { --seat:#22c55e; --seat-bg:rgba(34,197,94,.16); }
   .seat.role-summarizer { --seat:#e879f9; --seat-bg:rgba(232,121,249,.14); }
+  /* a talent seat the lead pulled in mid-round (CONSULT:/DELEGATE:) */
+  .seat.talent { border-style:dashed; }
+  .talentrow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:7px; }
+  .talentrow .sub { font-size:12px; }
   .card.summary { border-color:var(--accent); background:#15202e; }
   .card.summary pre { margin:0; }
   .stats { display:flex; flex-wrap:wrap; gap:6px 14px; color:var(--dim); font-size:12.5px;
@@ -450,22 +454,27 @@ function pickFile(mode) {
   document.getElementById("plusMenu").classList.remove("open");
 }
 
+// One upload pipeline for BOTH input boxes (main composer + respond-to-council).
+async function uploadFile(file) {
+  const b64 = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result).split(",", 2)[1] || "");
+    fr.onerror = () => rej(fr.error);
+    fr.readAsDataURL(file);
+  });
+  const r = await fetch("/uploads", {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({name: file.name, content_base64: b64})});
+  if (!r.ok) { const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
+  return r.json();
+}
+
 async function onFilePicked(e) {
   const note = document.getElementById("submitNote");
   for (const file of e.target.files) {
     note.style.color = ""; note.textContent = "uploading " + file.name + "…";
     try {
-      const b64 = await new Promise((res, rej) => {
-        const fr = new FileReader();
-        fr.onload = () => res(String(fr.result).split(",", 2)[1] || "");
-        fr.onerror = () => rej(fr.error);
-        fr.readAsDataURL(file);
-      });
-      const r = await fetch("/uploads", {method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({name: file.name, content_base64: b64})});
-      if (!r.ok) { const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
-      const rec = await r.json();
+      const rec = await uploadFile(file);
       attachments.push({id: rec.id, name: rec.name, kind: rec.kind});
       renderAttachments();
       note.textContent = rec.note ? `${rec.name}: ${rec.note}` : `attached ${rec.name}`;
@@ -493,13 +502,49 @@ function clearComposer() {
   document.getElementById("submitNote").textContent = "";
 }
 
+// ---- respond-to-council attachments — multi-modal like the main composer ----
+let fuAttachments = [];  // [{id, name, kind}]
+const fuChips = () => fuAttachments.map(a => `
+  <span class="chip ${esc(a.kind)}">${KIND_ICON[a.kind] || "📎"} ${esc(a.name)}
+    <span class="x" onclick="removeFuAttachment('${esc(a.id)}')">✕</span></span>`).join("");
+function renderFuAttachments() {
+  const el = document.getElementById("fuAttachments");
+  if (el) el.innerHTML = fuChips();
+}
+function removeFuAttachment(id) {
+  fuAttachments = fuAttachments.filter(a => a.id !== id);
+  renderFuAttachments();
+}
+function pickFuFile() {
+  const inp = document.getElementById("fuFileInput");
+  if (!inp) return;
+  inp.accept = "image/*,.txt,.md,.markdown,.rst,.csv,.json,.yaml,.yml,.toml,.ini,.cfg,.log,.pdf,.py,.js,.ts,.html,.css,.sh,.sql";
+  inp.value = "";
+  inp.click();
+}
+async function onFuFilePicked(e) {
+  const note = document.getElementById("fuNote");
+  for (const file of e.target.files) {
+    if (note) { note.style.color = ""; note.textContent = "uploading " + file.name + "…"; }
+    try {
+      const rec = await uploadFile(file);
+      fuAttachments.push({id: rec.id, name: rec.name, kind: rec.kind});
+      renderFuAttachments();
+      if (note) note.textContent = rec.note ? `${rec.name}: ${rec.note}` : `attached ${rec.name}`;
+    } catch (err) {
+      if (note) { note.style.color = "var(--bad)"; note.textContent = "upload failed: " + err.message; }
+    }
+  }
+}
+
 async function sendFollowup(sid) {
   const ta = document.getElementById("followupText");
   const text = (ta?.value || "").trim();
-  if (!text) return;
+  if (!text && !fuAttachments.length) return;
   const r = await fetch(`/sessions/${encodeURIComponent(sid)}/followup`, {method: "POST",
-    headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
-  if (r.ok) { ta.value = ""; _lastDetailSig = ""; pollLoop(); }
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({text, attachments: fuAttachments.map(a => a.id)})});
+  if (r.ok) { if (ta) ta.value = ""; fuAttachments = []; _lastDetailSig = ""; pollLoop(); }
   else { const d = await r.json().catch(() => ({})); alert("could not continue: " + (d.detail || r.status)); }
 }
 function followupKey(e) {
@@ -578,10 +623,29 @@ async function refresh() {
 // lingering selection one time. Otherwise leftover highlighted text freezes the
 // detail pane on its last "deliberating" render, and the elapsed ticker (which
 // keys off liveSince, only cleared inside renderDetail) counts up forever.
+// The latest talent pull still awaiting its answer, read from the event log —
+// a CONSULT/DELEGATE happens INSIDE the lead's call, so the session JSON alone
+// never shows it while it's happening. Returns e.g. "critic ← codex (consult):
+// verify the tunnel math", or "" when nothing is in flight.
+async function _talentInFlight(sid) {
+  const d = await api(`/sessions/${encodeURIComponent(sid)}/timeline`);
+  let open = "";
+  for (const e of (d.events || [])) {
+    if (e.event === "delegation_granted") open = e.detail || "talent";
+    else if (["delegation_resolved", "delegation_failed", "delegation_denied",
+              "round_synthesized", "final_composed"].includes(e.event)) open = "";
+  }
+  return open.slice(0, 90);
+}
+let _liveTalent = "";
+
 async function _refreshDetail() {
   const detail = await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null);
+  const workingNow = detail &&
+    ["received", "classified", "deliberating", "composing"].includes(detail.status);
+  _liveTalent = workingNow ? await _talentInFlight(detail.session_id).catch(() => "") : "";
   const right = document.getElementById("right");
-  const sig = JSON.stringify(detail);
+  const sig = JSON.stringify(detail) + "|talent:" + _liveTalent;
   if (sig === _lastDetailSig) return;
   const terminal = detail && TERMINAL_STATES.has(detail.status);
   if (!terminal && _hasSelectionIn(right)) return;
@@ -631,7 +695,7 @@ function renderDetail(s) {
   // in-progress answer text + focus/caret + scroll so reading/typing isn't
   // clobbered mid-word.
   const draft = {};
-  right.querySelectorAll('textarea[id^="ans_"]').forEach(t => {
+  right.querySelectorAll('textarea[id^="ans_"], #followupText').forEach(t => {
     draft[t.id] = {v: t.value, start: t.selectionStart, end: t.selectionEnd,
                    focused: document.activeElement === t};
   });
@@ -732,9 +796,15 @@ function renderDetail(s) {
     ${s.status === "done" ? `
       <div class="card respond">
         <h3>💬 Respond to the council</h3>
-        <div class="sub" style="margin-bottom:6px">Agree, push back, or add a new angle — it deliberates again with the whole conversation, no starting over.</div>
+        <div class="sub" style="margin-bottom:6px">Agree, push back, or add a new angle — attach documents or images just like the task box; it deliberates again with the whole conversation, no starting over.</div>
+        <div id="fuAttachments" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">${fuChips()}</div>
         <textarea id="followupText" rows="2" placeholder="Your response… (Enter to send, Shift+Enter for a new line)" onkeydown="followupKey(event)"></textarea>
-        <div class="row" style="margin-top:6px"><button onclick="sendFollowup('${esc(s.session_id)}')">Send response</button></div>
+        <div class="row" style="margin-top:6px">
+          <button onclick="sendFollowup('${esc(s.session_id)}')">Send response</button>
+          <button class="ghost" onclick="pickFuFile()" title="Attach a document (text / PDF) or an image — the council reads documents and vision-capable seats really see images">📎 Attach</button>
+          <span class="sub" id="fuNote"></span>
+        </div>
+        <input type="file" id="fuFileInput" multiple style="display:none" onchange="onFuFilePicked(event)">
       </div>` : ``}
 
     ${(s.turns && s.turns.length > 2) ? collapsible("sec_conversation",
@@ -750,7 +820,7 @@ function renderDetail(s) {
         <span class="dot"></span>
         <div>
           <div class="what">${esc(s.status)}<span class="ell"></span></div>
-          <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""} · <span id="elapsed">0:00</span></div>
+          <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""}${_liveTalent ? ` · 🤝 ${esc(_liveTalent)}` : ""} · <span id="elapsed">0:00</span></div>
         </div>
       </div>` : ""}
 
@@ -758,9 +828,28 @@ function renderDetail(s) {
       <div class="card">
         <h3>Council</h3>
         <div class="roster">
-          ${roster.map(m => `<span class="seat role-${esc(m.role)} ${spokenRoles.has(m.role)?"spoke":"on"}" title="${modelOf[m.agent] ? esc(modelOf[m.agent]) : "model: CLI default"}">${esc(m.role)} · ${esc(m.agent)}${modelOf[m.agent] ? ` · ${esc(shortModel(modelOf[m.agent]))}` : ""}</span>`).join("")}
+          ${roster.map(m => {
+            const talent = !DRIVE_ROLES.has(m.role);
+            const model = modelOf[m.agent] ? esc(modelOf[m.agent]) : "model: CLI default";
+            return `<span class="seat role-${esc(m.role)}${talent ? " talent" : ""} ${spokenRoles.has(m.role)?"spoke":"on"}"
+              title="${talent ? "pulled in by the lead mid-round (CONSULT/DELEGATE) — " : ""}${model}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${modelOf[m.agent] ? ` · ${esc(shortModel(modelOf[m.agent]))}` : ""}</span>`;
+          }).join("")}
         </div>
       </div>` : ""}
+
+    ${(() => {
+      // every answer a pulled-in talent gave, so a mid-round CONSULT/DELEGATE
+      // is a first-class visible event, not something buried in the timeline
+      const talentCalls = contribs.filter(c => c.role && !DRIVE_ROLES.has(c.role));
+      return talentCalls.length ? `
+      <div class="card">
+        <h3>🤝 Talents pulled in by the lead</h3>
+        ${talentCalls.map(c => `<div class="talentrow">
+          <span class="seat role-${esc(c.role)} talent spoke" title="${c.model ? esc(c.model) : "model: CLI default"}">🤝 ${esc(c.role)} · ${esc(c.agent)}${c.model ? ` · ${esc(shortModel(c.model))}` : ""}</span>
+          <span class="sub">answered in round ${(c.round ?? 0) + 1} — full reply in Contributions</span>
+        </div>`).join("")}
+      </div>` : "";
+    })()}
 
     ${(s.council_health && s.council_health.degraded) ? `
       <div class="card health">
@@ -892,7 +981,7 @@ let gemKey = {present: false, masked: null, source: null};
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
   backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'cli' runs the local claude/codex/gemini CLIs directly in generation mode, so the implementer emits real file contents — fully self-contained.",
-  roles: "The 'lead' drives every task; the other roles are talents it can pull in on demand. Map each to a model (claude, codex, gemini, or an OpenRouter seat). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
+  roles: "The 'lead' drives every task; the other roles are talents it can pull in on demand. Map each role to a seat (claude, codex, gemini, or an OpenRouter seat) and optionally pin a MODEL for that role — the pin beats the seat's default only when this role runs (role pin › seat pin › CLI default). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
   lead: "The fixed lead model that drives every task end to end and pulls in the talents below only when a specific strength is needed.",
   knowledge_retriever: "Talent that gathers cited evidence and marks unsupported claims as assumptions.",
   researcher: "Agent that interprets gathered evidence for the user's research/development goal.",
@@ -984,6 +1073,38 @@ async function openSettings() {
 
 function closeSettings() {
   document.getElementById("settingsOverlay").classList.remove("open");
+}
+
+// Model options for a ROLE's model pin: the catalog of whichever seat the role
+// is mapped to. "(seat default)" = no pin (the seat's own pinned model or CLI
+// default runs). Rebuilt live when the role's seat dropdown changes.
+function roleModelOptions(seatName, selected) {
+  const seat = seatsCache.find(x => x.name === seatName);
+  let models = [];
+  if (seat && seat.kind === "openrouter") {
+    models = [...new Set([seat.model_slug, seat.default_slug].filter(Boolean))];
+  } else if (seat) {
+    models = seat.models || [];
+  }
+  const opts = ['<option value="">(seat default)</option>'].concat(
+    models.map(m => `<option value="${escAttr(m)}" ${m === selected ? "selected" : ""}>${esc(m)}</option>`));
+  if (selected && !models.includes(selected)) {
+    opts.push(`<option value="${escAttr(selected)}" selected>${esc(selected)} (custom)</option>`);
+  }
+  opts.push('<option value="__custom__">custom…</option>');
+  return opts.join("");
+}
+
+// The role's seat changed → repopulate its model-pin dropdown with the NEW
+// seat's catalog and drop the old pin (a claude model id must not ride along
+// to gemini).
+function roleSeatChanged(r) {
+  const seatSel = document.getElementById(`role_${r}`);
+  const modelSel = document.getElementById(`role_model_${r}`);
+  if (!seatSel || !modelSel) return;
+  modelSel.innerHTML = roleModelOptions(seatSel.value || modelSel.dataset.resolved || "", "");
+  const custom = document.getElementById(`role_model_custom_${r}`);
+  if (custom) { custom.style.display = "none"; custom.value = ""; }
 }
 
 function seatOptions(selected) {
@@ -1129,13 +1250,24 @@ function renderSettings(s, seats) {
     </div>
 
     <div class="sset s-roles">
-      <label>Role mapping → agent ${tip("roles")}</label>
+      <label>Role mapping → agent · model ${tip("roles")}</label>
       ${roleCatalogWarn}
-      ${roles.map(r => `
+      ${roles.map(r => {
+        const rm = s.role_models || {};
+        const mappedSeat = ra[r] || resolved[r] || "";
+        return `
         <div class="field">${lbl(roleLabel(r), r)}
-          <select id="role_${r}">${seatOptions(ra[r] || "")}</select>
-          <span class="sub">current: ${esc(resolved[r] || "backend default")}</span></div>`).join("")}
+          <select id="role_${r}" style="flex:1" onchange="roleSeatChanged('${r}')">${seatOptions(ra[r] || "")}</select>
+          <select id="role_model_${r}" data-resolved="${escAttr(resolved[r] || "")}" style="flex:1.2"
+                  title="Model pin for THIS ROLE only — when ${escAttr(roleLabel(r))} runs on its seat, this model is used instead of the seat's default (role pin › seat pin › CLI default). Talents run rarely, so a heavyweight pin here costs a handful of calls, not the whole run."
+                  onchange="const c=document.getElementById('role_model_custom_${r}'); if(c) c.style.display = this.value === '__custom__' ? '' : 'none'">
+            ${roleModelOptions(mappedSeat, rm[r] || "")}</select>
+          <input type="text" id="role_model_custom_${r}" class="mono" spellcheck="false"
+                 placeholder="exact model id" style="flex:1;display:none">
+          <span class="sub" style="flex:0 0 auto">now: ${esc(resolved[r] || "default")}</span></div>`;
+      }).join("")}
       ${seatErr}
+      <div class="sub">Each role can pin its own model on top of its seat — e.g. keep the claude seat on sonnet for panel/synthesis but give <b>code generator</b> opus for the few calls it makes when the lead pulls it in. "(seat default)" = the seat's Local-CLI-models pin, else the CLI's own default.</div>
     </div>
 
     <div class="sset s-gov">
@@ -1197,9 +1329,19 @@ async function saveSettings() {
   note.style.color = "";
   note.textContent = "saving...";
   const role_agents = {};
+  const role_models = {};
   roleList(settingsCache || {}).forEach(r => {
     const v = document.getElementById("role_" + r).value;
     if (v) role_agents[r] = v;  // empty ⇒ backend default
+    const msel = document.getElementById("role_model_" + r);
+    if (msel) {
+      let m = msel.value;
+      if (m === "__custom__") {
+        const custom = document.getElementById("role_model_custom_" + r);
+        m = custom ? custom.value.trim() : "";
+      }
+      if (m) role_models[r] = m;  // empty ⇒ the seat's own default
+    }
   });
   const openrouter_enabled = {};
   document.querySelectorAll(".or_enable").forEach(c => { openrouter_enabled[c.dataset.seat] = c.checked; });
@@ -1219,6 +1361,7 @@ async function saveSettings() {
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
+    role_models,
     openrouter_enabled,
     openrouter_models,
     cli_models,

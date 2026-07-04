@@ -123,6 +123,7 @@ class ConclaveService:
                 if agent not in config.OPENROUTER_SEATS:
                     self.registry.register(CliAdapter(
                         agent=agent, model=(self.settings.cli_models or {}).get(agent),
+                        role_models=self._role_pins_for(agent),
                         api_key_getter=(lambda: self.secrets.get("gemini"))
                         if agent == "gemini" else None))
         else:
@@ -203,14 +204,32 @@ class ConclaveService:
             api_key_getter=lambda: self.secrets.get("openrouter"),
             endpoint=config.OPENROUTER_ENDPOINT,
             data_collection=config.OPENROUTER_DATA_COLLECTION,
+            role_models=self._role_pins_for(seat),
         ))
+
+    def _role_pins_for(self, agent: str) -> dict[str, str]:
+        """The per-role model pins that apply to THIS seat: a pin follows its
+        role only while the role is mapped to the seat, so a model id can
+        never leak to a different vendor's CLI (pinning code_generator to
+        opus must not pass '--model opus' to gemini after a remap)."""
+        out: dict[str, str] = {}
+        for role_name, model in (self.settings.role_models or {}).items():
+            if not (model or "").strip():
+                continue
+            try:
+                role = Role(role_name)
+            except ValueError:
+                continue  # a stale pin for a role that no longer exists
+            if self.role_agents.get(role) == agent:
+                out[role_name] = model.strip()
+        return out
 
     # role_agents/budgets are the COMPLETE intended set (the dashboard sends all
     # non-default picks each save), so replace them wholesale — merging would
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
     _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models",
-                     "cli_models", "cli_enabled"}
+                     "cli_models", "cli_enabled", "role_models"}
 
     # API keys the app knows how to use. "openrouter" unlocks the OpenRouter
     # seats; "gemini" is OPTIONAL and upgrades the gemini seat (SDK path),
@@ -275,6 +294,7 @@ class ConclaveService:
         backend/role mapping/registry. Some changes (backend, role mapping)
         affect new sessions; in-flight sessions keep their own backend."""
         merged = self.settings.model_dump()
+        old_role_agents = dict(self.role_agents or {})
         for key, value in (patch or {}).items():
             if key not in merged:
                 continue
@@ -285,6 +305,25 @@ class ConclaveService:
         self.settings = Settings.model_validate(merged)
         save_settings(self.settings, self._data_dir)
         self._apply_settings()
+        # A role remapped to a DIFFERENT seat without a fresh role_models set
+        # must drop its model pin — a claude model id riding along to gemini
+        # would be passed as that CLI's --model and kill the seat. The
+        # dashboard sends both keys together (its UI clears the pin on seat
+        # change); this guards API callers patching role_agents alone.
+        if "role_agents" in (patch or {}) and "role_models" not in (patch or {}) \
+                and self.settings.role_models:
+            kept = {}
+            for role_name, model in self.settings.role_models.items():
+                try:
+                    role = Role(role_name)
+                except ValueError:
+                    continue
+                if self.role_agents.get(role) == old_role_agents.get(role):
+                    kept[role_name] = model
+            if kept != self.settings.role_models:
+                self.settings.role_models = kept
+                save_settings(self.settings, self._data_dir)
+                self._apply_settings()
         return self.settings
 
     def _open(self, text: str, source: str, budgets: Optional[Budgets],
@@ -501,6 +540,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             else:
                 self.registry.register(CliAdapter(
                     agent=agent, model=(self.settings.cli_models or {}).get(agent),
+                    role_models=self._role_pins_for(agent),
                     api_key_getter=(lambda: self.secrets.get("gemini"))
                     if agent == "gemini" else None))
 
@@ -694,12 +734,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         """Delete a session from the store (DB + JSONL log)."""
         return self.store.delete_session(session_id)
 
-    def continue_session(self, session_id: str, text: str, background: bool = True) -> Session:
+    def continue_session(self, session_id: str, text: str, background: bool = True,
+                         attachments: Optional[list[str]] = None) -> Session:
         """Continue the conversation: the human responds to the council's
         conclusion and the council deliberates AGAIN with the full thread as
-        context — no starting over. Re-opens a settled (done) session."""
-        if not (text or "").strip():
-            raise ValueError("response text required")
+        context — no starting over. Re-opens a settled (done) session.
+        Responses are multi-modal like the original task: document/PDF text is
+        folded into the turn, and image attachments join session.attachments so
+        vision-capable agents see them on every subsequent call."""
+        if not (text or "").strip() and not attachments:
+            raise ValueError("response text or an attachment required")
         session = self.manager.load(session_id)
         if session is None:
             raise KeyError(f"session {session_id} not found")
@@ -711,7 +755,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             session.turns.append({"role": "user", "text": session.task.text})
             if session.final:
                 session.turns.append({"role": "council", "text": session.final.answer})
-        session.turns.append({"role": "user", "text": text.strip()})
+        turn_text = ((text or "").strip() or "(see attached)") \
+            + attachment_context(self.uploads, attachments or [])
+        session.turns.append({"role": "user", "text": turn_text})
+        for uid in attachments or []:
+            rec = self.uploads.get(uid)
+            if rec:
+                session.attachments.append(
+                    {"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
         # reset per-turn deliberation state (keep turns, backend, roots, files)
         session.rounds = []
         session.contributions = []

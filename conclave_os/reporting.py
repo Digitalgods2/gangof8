@@ -134,7 +134,13 @@ def _detail(event: str, p: dict) -> str:
         return f"after {p.get('iterations','')} round(s)"
     if event in ("delegation_requested", "delegation_granted", "delegation_resolved",
                  "delegation_denied", "delegation_failed"):
-        return " ".join(str(x) for x in (p.get("to", ""), p.get("reason", "")) if x)[:80]
+        head = str(p.get("to", ""))
+        if p.get("agent"):
+            head += f" ← {p['agent']}"  # which model fills the talent seat
+        if p.get("kind"):
+            head += f" ({p['kind']})"
+        reason = str(p.get("reason", ""))
+        return (f"{head}: {reason}" if reason else head)[:110]
     if event in ("artifact_continuation", "artifact_continued", "artifact_continuation_failed"):
         return str(p.get("file", ""))[:60]
     if event == "status_change":

@@ -192,15 +192,18 @@ def cancel_session(session_id: str) -> dict:
 
 
 class FollowUpIn(BaseModel):
-    text: str
+    text: str = ""
+    attachments: list[str] = []
 
 
 @app.post("/sessions/{session_id}/followup")
 def followup_session(session_id: str, body: FollowUpIn) -> dict:
     """Continue the conversation: respond to the council's conclusion; it
-    deliberates again with the full thread as context."""
+    deliberates again with the full thread as context. Multi-modal like the
+    original task box — attachments are upload ids from POST /uploads."""
     try:
-        session = service.continue_session(session_id, body.text, background=True)
+        session = service.continue_session(session_id, body.text, background=True,
+                                           attachments=body.attachments)
     except KeyError:
         raise HTTPException(status_code=404, detail="session not found")
     except ValueError as e:

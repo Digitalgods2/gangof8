@@ -226,6 +226,37 @@ def test_gemini_key_endpoints(tmp_path, monkeypatch):
     assert client.get("/settings/api-keys/stripe").status_code == 404
 
 
+def test_role_model_pins_reach_only_the_mapped_seat(tmp_path):
+    """A per-role model pin is handed to the adapter of the seat its role is
+    mapped to — and no other — so pinning code_generator to opus never passes
+    a claude model id to gemini's CLI."""
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"backend": "cli",
+                         "role_models": {"code_generator": "claude-opus-4-8",
+                                         "researcher": "gemini-2.5-pro"}})
+    # default cli mapping: code_generator → claude, researcher → gemini
+    assert svc.registry._adapters["claude"].role_models == {"code_generator": "claude-opus-4-8"}
+    assert svc.registry._adapters["gemini"].role_models == {"researcher": "gemini-2.5-pro"}
+    assert svc.registry._adapters["codex"].role_models == {}
+
+
+def test_remapping_a_role_drops_its_stale_model_pin(tmp_path):
+    """An API patch that remaps a role's seat WITHOUT sending role_models must
+    drop that role's pin — the old seat's model id would otherwise ride along
+    to the new vendor's CLI and kill the seat. Unrelated pins survive."""
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"backend": "cli",
+                         "role_models": {"code_generator": "claude-opus-4-8",
+                                         "researcher": "gemini-2.5-pro"}})
+    svc.update_settings({"role_agents": {"code_generator": "codex"}})
+    assert "code_generator" not in svc.settings.role_models, "stale pin dropped"
+    assert svc.settings.role_models == {"researcher": "gemini-2.5-pro"}
+    assert svc.registry._adapters["codex"].role_models == {}
+    # persisted too — a restart must not resurrect the stale pin
+    assert ConclaveService(data_dir=tmp_path) \
+        .settings.role_models == {"researcher": "gemini-2.5-pro"}
+
+
 def test_fresh_install_saves_keys_without_env(tmp_path, monkeypatch):
     """Brand-new machine: no data/ directory yet, no key env vars. Keys pasted
     in Settings must store to data/secrets.json (created on first save),
