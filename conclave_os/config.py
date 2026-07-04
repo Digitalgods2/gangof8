@@ -281,6 +281,12 @@ COMPOSER_CONTEXT_CHARS = 1400
 # starved "examine this codebase" runs (a lead asked for 11 reads, got 2).
 MAX_SKILL_REQUESTS_PER_TURN = 2
 MAX_SKILL_REQUESTS_ANALYSIS = 6
+# The re-called reply may itself open with NEW skill requests (read one file →
+# the next read depends on what it said). Resolve those too, chained, up to this
+# many re-calls per turn. A live run ended a round on the bare line
+# 'SKILL: search_project …' because the single-cycle resolver handed the second
+# request back unresolved and it was accepted as the round's synthesis.
+MAX_SKILL_CHAIN_TURNS = 3
 SKILL_RESULT_MAX_CHARS = 2000
 # Analysis tasks also get DEEPER reads: 2000 chars of a 75KB file is ~3%, and a
 # live run showed the lead reasoning to a wrong conclusion from exactly that

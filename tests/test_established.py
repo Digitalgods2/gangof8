@@ -301,3 +301,56 @@ def test_referenced_path_skips_the_gate(tmp_path):
     # a path was referenced → established set, no greenfield question
     assert session.established_root == str(existing.resolve())
     assert not any(r.purpose == "establish_target" for r in session.input_requests)
+
+
+def test_followup_autofills_missing_promote_for_delivered_file(tmp_path):
+    """Follow-up safety net: a revised file that was ALREADY delivered but whose
+    PROMOTE line the lead forgot gets an auto-synthesized promote, so the update
+    reaches the user instead of stranding in the sandbox."""
+    from conclave_os import loop
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import ProposedAction
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "game"
+    est.mkdir()
+    (est / "index.html").write_text("<old build>", encoding="utf-8")  # delivered on turn 1
+    store = LogStore(tmp_path / "data")
+    s = SessionManager(store).create("make it better", source="test")
+    s.established_root = str(est)
+    # the follow-up re-authored the file but emitted NO promote line
+    s.proposed_actions.append(ProposedAction(
+        session_id=s.session_id, kind="write_file", role=Role.implementer,
+        filename="index.html", args={"filename": "index.html", "content": "<new>"}))
+
+    loop._ensure_redelivery_promotes(s, store)
+
+    promotes = [a for a in s.proposed_actions if a.kind == "promote"]
+    assert [a.filename for a in promotes] == ["index.html"]
+
+    # idempotent: a second pass (e.g. on resume) does not duplicate
+    loop._ensure_redelivery_promotes(s, store)
+    assert len([a for a in s.proposed_actions if a.kind == "promote"]) == 1
+
+
+def test_followup_does_not_autopromote_brand_new_file(tmp_path):
+    """Conservative: a file the lead wrote to the sandbox but never delivered
+    (not present in the established folder) is NOT force-promoted — only the lead
+    asking, or a prior delivery, ships a file to the user's real folder."""
+    from conclave_os import loop
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import ProposedAction
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "game"
+    est.mkdir()  # empty — nothing delivered yet
+    store = LogStore(tmp_path / "data")
+    s = SessionManager(store).create("scaffold a helper", source="test")
+    s.established_root = str(est)
+    s.proposed_actions.append(ProposedAction(
+        session_id=s.session_id, kind="write_file", role=Role.implementer,
+        filename="helper.js", args={"filename": "helper.js", "content": "//new"}))
+
+    loop._ensure_redelivery_promotes(s, store)
+
+    assert not any(a.kind == "promote" for a in s.proposed_actions)

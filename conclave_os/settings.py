@@ -61,6 +61,12 @@ class Settings(BaseModel):
     # gemini → "gemini-2.5-pro"). Empty/absent ⇒ each CLI's own default —
     # note the gemini SDK path defaults to gemini-2.5-flash.
     cli_models: dict[str, str] = {}
+    # Which local CLI seats (claude/codex/gemini) are enabled. Absent/true ⇒
+    # enabled (today's behaviour). false ⇒ the seat is dropped from the panel and
+    # its roles fall back to an enabled OpenRouter seat — letting the app run
+    # OpenRouter-only. A disable with no OpenRouter seat to fall back to is
+    # ignored (the seat stays) so the council always has a lead.
+    cli_enabled: dict[str, bool] = {}
     # Automatic rounds between "continue another n rounds?" consent checks.
     rounds_per_consent: int = Field(default_factory=lambda: config.ROUNDS_PER_CONSENT)
 

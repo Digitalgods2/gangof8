@@ -212,7 +212,11 @@ def followup_session(session_id: str, body: FollowUpIn) -> dict:
 
 
 class SettingsPatch(BaseModel):
-    # All optional — a partial patch. Unknown keys are ignored by the service.
+    # All optional — a partial patch. `extra="allow"` lets any Settings field
+    # flow through even if not enumerated here (the service ignores keys that
+    # aren't real settings), so adding a Settings field + UI can't be silently
+    # dropped by a stale patch model — the bug that ate cli_enabled/cli_models.
+    model_config = {"extra": "allow"}
     backend: str | None = None
     role_agents: dict[str, str] | None = None
     budgets: dict[str, dict] | None = None
@@ -221,6 +225,8 @@ class SettingsPatch(BaseModel):
     ui: dict | None = None
     openrouter_enabled: dict[str, bool] | None = None
     openrouter_models: dict[str, str] | None = None
+    cli_models: dict[str, str] | None = None
+    cli_enabled: dict[str, bool] | None = None
 
 
 class ApiKeyIn(BaseModel):

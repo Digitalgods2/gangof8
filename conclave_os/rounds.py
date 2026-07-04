@@ -160,6 +160,10 @@ def _output_contract(session: Session) -> str:
             "you PROMOTE it AND the human approves. For each file that should land in "
             "the real folder, add a line:\n"
             "PROMOTE: <filename>   (one per file you want delivered)\n"
+            "This applies on FOLLOW-UPS too: if you revise a file that was already "
+            "delivered, you MUST re-emit its PROMOTE line — an ARTIFACT/EDIT alone only "
+            "updates your sandbox copy, so without PROMOTE the user's file keeps the OLD "
+            "version and your change never reaches them.\n"
         )
     else:
         promote = (
@@ -286,20 +290,39 @@ _TOOL_DEBRIS_RE = re.compile(
 )
 
 
-def reply_is_stub(content: str) -> bool:
+# A SKILL: request line, whole. A legitimate work-in-progress marker BEFORE the
+# resolver runs; dead weight after — a line still standing then is a request
+# that will never be honored.
+_SKILL_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:\*\*)?SKILL(?:\*\*)?\s*[:—–-].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def reply_is_stub(content: str, skills_resolved: bool = False) -> bool:
     """True when a reply merely announces or ATTEMPTS the work instead of doing
     it: tool-call debris or first-person deferral phrasing, with too little
     real prose left over. A contract marker (SKILL:/CONSULT:/ARTIFACT:/ROUND:)
     always counts as real work; a genuinely short direct answer with no
-    deferral phrasing is NOT a stub."""
+    deferral phrasing is NOT a stub.
+
+    skills_resolved: pass True when the skill resolver has ALREADY run on this
+    reply. Any SKILL: line still standing then is an unresolved request, not
+    work — a live round ended on the bare line 'SKILL: search_project …'
+    accepted as the synthesis, and nothing was delivered. With the flag set,
+    those lines count as debris instead of blessing the reply."""
     text = (content or "").strip()
+    skill_lines = 0
+    if skills_resolved:
+        text, skill_lines = _SKILL_LINE_RE.subn("", text)
+        text = text.strip()
     if _ANY_MARKER_RE.search(text):
         return False
     prose, debris = _TOOL_DEBRIS_RE.subn("", text)
     prose = prose.strip()
     if len(prose) >= config.SYNTHESIS_STUB_CHARS:
         return False
-    return debris > 0 or bool(_DEFERRAL_RE.search(prose))
+    return (debris + skill_lines) > 0 or bool(_DEFERRAL_RE.search(prose))
 
 
 def parse_round_decision(text: str) -> tuple[str, str]:

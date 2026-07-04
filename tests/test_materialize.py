@@ -74,6 +74,34 @@ def test_intended_filenames_from_task(tmp_path):
     assert names == ["main.py", "README.md", "requirements.txt"]
 
 
+def test_intended_filenames_falls_back_to_established_revision_target(tmp_path):
+    """A revision follow-up ('slow the ghosts down') names no file, and a
+    flubbed lead draft may name none either — the established file the panel
+    discussed by name (two+ mentions) is the intended target; a one-off
+    mention of an unrelated established file is not."""
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import Contribution
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "est"
+    est.mkdir()
+    (est / "index.html").write_text("<html></html>", encoding="utf-8")
+    (est / "output.txt").write_text("stray", encoding="utf-8")
+    session = SessionManager(LogStore(tmp_path)).create(
+        "computer characters move too fast, slow the game down", source="test")
+    session.established_root = str(est)
+    session.contributions.extend([
+        Contribution(round=0, role=Role.panelist, agent="a",
+                     content="Change the ghost tick timing in index.html."),
+        Contribution(round=0, role=Role.panelist, agent="b",
+                     content="index.html needs a speed-select screen; the last "
+                             "run mistakenly shipped output.txt."),
+        Contribution(round=0, role=Role.lead, agent="c",
+                     content="SKILL: search_project ghost speed"),
+    ])
+    assert loop._intended_filenames(session) == ["index.html"]
+
+
 # --- end to end ---------------------------------------------------------------
 
 

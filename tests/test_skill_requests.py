@@ -120,6 +120,72 @@ def test_no_marker_is_a_noop(tmp_path, store, governance, session):
     assert session.proposed_actions == []
 
 
+def test_chained_requests_resolve_across_recalls(tmp_path, store, governance, session):
+    """A follow-up reply may open a NEW request the first read made necessary
+    (read one file → decide the next read from what it said). It is resolved
+    too, with every result accumulated — the live failure was a round ending on
+    a bare unresolved 'SKILL: search_project …' line."""
+    _seed(tmp_path, session, "a.txt", "alpha body")
+    _seed(tmp_path, session, "b.txt", "beta body")
+    member = _member(Role.researcher)
+    contribution = _contribution(Role.researcher, "SKILL: read_file a.txt")
+    replies = iter(["Now I need more.\nSKILL: read_file b.txt", "final synthesis"])
+    prompts: list[str] = []
+
+    def call(m, prompt):
+        prompts.append(prompt)
+        return _contribution(m.role, next(replies))
+
+    out = loop._resolve_skill_requests(session, member, "ORIGINAL", contribution, call, governance, store)
+
+    assert out.content == "final synthesis"
+    assert len(prompts) == 2
+    assert "alpha body" in prompts[0]
+    assert "alpha body" in prompts[1] and "beta body" in prompts[1], \
+        "the second re-call carries BOTH results (accumulated)"
+    executed = [a for a in session.proposed_actions if a.status == "executed"]
+    assert len(executed) == 2
+
+
+def test_chain_is_bounded(tmp_path, store, governance, session):
+    """A model that asks for a new file on every re-call stops after
+    MAX_SKILL_CHAIN_TURNS re-calls; the dangling request is returned so the
+    stub check can judge it."""
+    for i in range(6):
+        _seed(tmp_path, session, f"f{i}.txt", f"body {i}")
+    member = _member(Role.researcher)
+    contribution = _contribution(Role.researcher, "SKILL: read_file f0.txt")
+    n = iter(range(1, 6))
+    prompts: list[str] = []
+
+    def call(m, prompt):
+        prompts.append(prompt)
+        return _contribution(m.role, f"SKILL: read_file f{next(n)}.txt")
+
+    out = loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert len(prompts) == config.MAX_SKILL_CHAIN_TURNS
+    assert "SKILL" in out.content, "the unresolved request comes back for the stub check"
+
+
+def test_repeated_request_ends_the_chain(tmp_path, store, governance, session):
+    """A reply that re-asks for exactly what it was already given is returned
+    as-is: no re-execution, no further re-calls."""
+    _seed(tmp_path, session, "a.txt", "alpha body")
+    member = _member(Role.researcher)
+    contribution = _contribution(Role.researcher, "SKILL: read_file a.txt")
+    prompts: list[str] = []
+
+    def call(m, prompt):
+        prompts.append(prompt)
+        return _contribution(m.role, "Still thinking.\nSKILL: read_file a.txt")
+
+    out = loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert len(prompts) == 1, "one re-call; the all-repeats reply ends the chain"
+    executed = [a for a in session.proposed_actions if a.status == "executed"]
+    assert len(executed) == 1
+    assert "Still thinking" in out.content
+
+
 # --- error feedback (never crashes the turn) ----------------------------------
 
 
