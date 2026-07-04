@@ -277,6 +277,16 @@ def get_api_key(name: str) -> dict:
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/settings/api-keys/{name}/reveal")
+def reveal_api_key(name: str) -> dict:
+    """The full key value, fetched on demand by the dashboard's eye-reveal
+    (the app is localhost-only and the key is stored locally anyway)."""
+    try:
+        return service.reveal_api_key(name)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.put("/settings/api-keys/{name}")
 def put_api_key(name: str, body: ApiKeyIn) -> dict:
     try:

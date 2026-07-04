@@ -224,3 +224,23 @@ def test_gemini_key_endpoints(tmp_path, monkeypatch):
     assert "9999" in (r.json()["masked"] or ""), "masked hint, not the key"
     assert client.delete("/settings/api-keys/gemini").json()["present"] is False
     assert client.get("/settings/api-keys/stripe").status_code == 404
+
+
+def test_reveal_returns_full_key_only_on_explicit_request(tmp_path, monkeypatch):
+    """Status stays masked; the dashboard's eye-reveal fetches the full value
+    on demand via the explicit /reveal endpoint (localhost-only app, and the
+    key already lives in plaintext in data/secrets.json)."""
+    from conclave_os import main as main_mod
+
+    _no_gemini_env(monkeypatch)
+    main_mod.service = ConclaveService(data_dir=tmp_path)
+    client = TestClient(main_mod.app)
+    # nothing stored → present False, empty value (never an error)
+    r = client.get("/settings/api-keys/gemini/reveal")
+    assert r.status_code == 200
+    assert r.json() == {"name": "gemini", "present": False, "value": "", "source": None}
+    client.put("/settings/api-keys/gemini", json={"value": "AIza-full-key-5555"})
+    assert client.get("/settings/api-keys/gemini/reveal").json()["value"] == "AIza-full-key-5555"
+    # the plain status endpoint STILL never returns the full key
+    assert "AIza-full-key-5555" not in json.dumps(client.get("/settings/api-keys/gemini").json())
+    assert client.get("/settings/api-keys/stripe/reveal").status_code == 404
