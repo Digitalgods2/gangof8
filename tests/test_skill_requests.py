@@ -199,17 +199,19 @@ def test_unknown_skill_is_fed_back(tmp_path, store, governance, session):
     assert not any(a.status == "executed" for a in session.proposed_actions)
 
 
-def test_role_not_allowed_is_denied_and_fed_back(tmp_path, store, governance, session):
-    _seed(tmp_path, session, "data.txt", "secret-ish")
-    member = _member(Role.critic)  # critic is not in read_file.allowed_roles
+def test_reads_are_open_to_every_seat(tmp_path, store, governance, session):
+    """Discovery is free for ALL roles (owner directive: a seat unable to work
+    with the council space is a design failure) — the critic, once read-gated,
+    now resolves its read like anyone else."""
+    _seed(tmp_path, session, "data.txt", "the evidence")
+    member = _member(Role.critic)
     contribution = _contribution(Role.critic, "SKILL: read_file data.txt")
     call, prompts = _recording_call()
 
     loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
-    assert "denied" in prompts[0]
-    denied = [a for a in session.proposed_actions if a.status == "denied"]
-    assert len(denied) == 1
-    assert session.approvals == [], "a denial creates no approval"
+    assert "the evidence" in prompts[0]
+    assert any(a.status == "executed" for a in session.proposed_actions)
+    assert session.approvals == [], "reads never create approvals"
 
 
 def test_non_read_skill_is_refused_midround(tmp_path, store, governance, session):
@@ -296,8 +298,9 @@ def test_skill_hints_advertise_read_only_with_files_and_allowed_role(session):
     # files + allowed role → advertised with the filename
     p = loop._skill_hints(session, Role.lead, ["notes.md"])
     assert _READ_AD in p and "notes.md" in p
-    # files but a role not allowed to read (critic) → not advertised
-    assert _READ_AD not in loop._skill_hints(session, Role.critic, ["notes.md"])
+    # discovery is open to every seat now — critic and panelist included
+    assert _READ_AD in loop._skill_hints(session, Role.critic, ["notes.md"])
+    assert _READ_AD in loop._skill_hints(session, Role.panelist, ["notes.md"])
 
 
 def test_skill_hints_advertise_list_dir_when_workspace_bound(session, tmp_path):

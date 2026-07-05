@@ -68,6 +68,9 @@ _TIMELINE = {
     # lead-driven model: on-demand delegation + artifact continuation
     "delegation_requested": ("🤝", "Talent requested"),
     "delegation_granted": ("🤝", "Talent pulled in"),
+    "delegation_retry": ("🔁", "Talent retried after a failure"),
+    "delegate_artifacts_captured": ("📦", "Talent's files captured"),
+    "panel_artifact_saved": ("📄", "Panel draft saved to sandbox"),
     "delegation_resolved": ("📥", "Talent answered"),
     "delegation_denied": ("🚫", "Talent unavailable"),
     "delegation_failed": ("⚠️", "Delegation failed"),

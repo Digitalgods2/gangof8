@@ -428,7 +428,12 @@ SKILLS: dict[str, Skill] = {
         category="file_write",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.lead, Role.implementer],
+        # Council-space writes are free for EVERY seat (owner directive: a role
+        # unable to land its work in the sandbox is a design failure — the
+        # roster is pointless if the lead ends up writing everything). The one
+        # boundary is promote: the only path to the user's real folder, still
+        # lead/implementer + a human approval.
+        allowed_roles=list(Role),
         inputs=["filename", "content", "target"],
     ),
     "read_file": Skill(
@@ -437,12 +442,7 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[
-            Role.lead,
-            Role.knowledge_retriever, Role.researcher, Role.architect,
-            Role.api_integrator, Role.code_generator,
-            Role.red_team, Role.fact_validator, Role.implementer,
-        ],
+        allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["filename", "target"],
     ),
     "search_project": Skill(
@@ -451,12 +451,7 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[
-            Role.lead,
-            Role.knowledge_retriever, Role.researcher, Role.architect,
-            Role.api_integrator, Role.code_generator,
-            Role.red_team, Role.fact_validator, Role.implementer,
-        ],
+        allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["query", "target"],
     ),
     "list_dir": Skill(
@@ -466,12 +461,7 @@ SKILLS: dict[str, Skill] = {
         category="read",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[
-            Role.lead,
-            Role.knowledge_retriever, Role.researcher, Role.architect,
-            Role.api_integrator, Role.code_generator,
-            Role.red_team, Role.fact_validator, Role.implementer,
-        ],
+        allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["path", "target"],
     ),
     "web_search": Skill(
@@ -481,12 +471,7 @@ SKILLS: dict[str, Skill] = {
         category="web",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[
-            Role.lead,
-            Role.knowledge_retriever, Role.researcher, Role.architect,
-            Role.api_integrator, Role.code_generator, Role.critic,
-            Role.red_team, Role.fact_validator, Role.implementer,
-        ],
+        allowed_roles=list(Role),  # governed web lookups: free for every seat
         inputs=["query"],
     ),
     "web_fetch": Skill(
@@ -495,12 +480,7 @@ SKILLS: dict[str, Skill] = {
         category="web",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[
-            Role.lead,
-            Role.knowledge_retriever, Role.researcher, Role.architect,
-            Role.api_integrator, Role.code_generator, Role.critic,
-            Role.red_team, Role.fact_validator, Role.implementer,
-        ],
+        allowed_roles=list(Role),  # governed web lookups: free for every seat
         inputs=["url"],
     ),
     "edit_file": Skill(
@@ -509,7 +489,7 @@ SKILLS: dict[str, Skill] = {
         category="file_edit",
         risk=Risk.low,
         requires_approval=False,
-        allowed_roles=[Role.lead, Role.implementer],
+        allowed_roles=list(Role),  # council-space edits: free for every seat
         inputs=["filename", "old", "new", "target"],
     ),
     "run_tests": Skill(
@@ -518,7 +498,7 @@ SKILLS: dict[str, Skill] = {
         category="code_exec",
         risk=Risk.medium,
         requires_approval=False,
-        allowed_roles=[Role.lead, Role.implementer, Role.critic],
+        allowed_roles=[Role.lead, Role.implementer, Role.critic, Role.code_generator],
         inputs=["command", "target"],
     ),
     "stage": Skill(

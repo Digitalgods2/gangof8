@@ -835,21 +835,24 @@ function renderDetail(s) {
               title="${talent ? "pulled in by the lead mid-round (CONSULT/DELEGATE) — " : ""}${model}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${modelOf[m.agent] ? ` · ${esc(shortModel(modelOf[m.agent]))}` : ""}</span>`;
           }).join("")}
         </div>
+        ${(() => {
+          // Recruitment feed: one plain-language row per talent the lead pulled
+          // in — "claude · opus called in as Code Generator" — so a mid-round
+          // CONSULT/DELEGATE is a first-class visible event. Answered pulls
+          // come from contributions (persist forever); an in-flight pull comes
+          // from the event log and shows while the talent is still working.
+          const rows = contribs.filter(c => c.role && !DRIVE_ROLES.has(c.role)).map(c => `
+            <div class="talentrow">🤝
+              <b>${esc(c.agent)}${c.model ? ` · ${esc(shortModel(c.model))}` : ""}</b>
+              called in as <b class="seat role-${esc(c.role)} talent spoke">${esc(roleLabel(c.role))}</b>
+              <span class="sub">answered in round ${(c.round ?? 0) + 1} — full reply in Contributions</span>
+            </div>`);
+          if (_liveTalent) rows.push(`
+            <div class="talentrow">⏳ <b>${esc(_liveTalent)}</b>
+              <span class="sub">— recruited by the lead, answering now…</span></div>`);
+          return rows.join("");
+        })()}
       </div>` : ""}
-
-    ${(() => {
-      // every answer a pulled-in talent gave, so a mid-round CONSULT/DELEGATE
-      // is a first-class visible event, not something buried in the timeline
-      const talentCalls = contribs.filter(c => c.role && !DRIVE_ROLES.has(c.role));
-      return talentCalls.length ? `
-      <div class="card">
-        <h3>🤝 Talents pulled in by the lead</h3>
-        ${talentCalls.map(c => `<div class="talentrow">
-          <span class="seat role-${esc(c.role)} talent spoke" title="${c.model ? esc(c.model) : "model: CLI default"}">🤝 ${esc(c.role)} · ${esc(c.agent)}${c.model ? ` · ${esc(shortModel(c.model))}` : ""}</span>
-          <span class="sub">answered in round ${(c.round ?? 0) + 1} — full reply in Contributions</span>
-        </div>`).join("")}
-      </div>` : "";
-    })()}
 
     ${(s.council_health && s.council_health.degraded) ? `
       <div class="card health">
@@ -981,8 +984,8 @@ let gemKey = {present: false, masked: null, source: null};
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
   backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'cli' runs the local claude/codex/gemini CLIs directly in generation mode, so the implementer emits real file contents — fully self-contained.",
-  roles: "The 'lead' drives every task; the other roles are talents it can pull in on demand. Map each role to a seat (claude, codex, gemini, or an OpenRouter seat) and optionally pin a MODEL for that role — the pin beats the seat's default only when this role runs (role pin › seat pin › CLI default). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
-  lead: "The fixed lead model that drives every task end to end and pulls in the talents below only when a specific strength is needed.",
+  roles: "The 'lead' is the organizer: it breaks each task into assignments and hands them to the talents below, who do the actual work (coding, research, writing, verification). Map each role to a seat (claude, codex, gemini, or an OpenRouter seat) and optionally pin a MODEL for that role — the pin beats the seat's default only when this role runs (role pin › seat pin › CLI default). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
+  lead: "The organizer and integrator: decomposes the task, assigns the substantive work to the talents below, integrates their results, and decides when it's done — it authors only trivial glue itself.",
   knowledge_retriever: "Talent that gathers cited evidence and marks unsupported claims as assumptions.",
   researcher: "Agent that interprets gathered evidence for the user's research/development goal.",
   architect: "Agent that proposes design / structure when a task needs design work.",
@@ -991,7 +994,7 @@ const TIPS = {
   critic: "Agent that challenges the strongest claims and surfaces disagreements.",
   red_team: "Agent that tries to break the proposal with adversarial cases and wrong assumptions.",
   fact_validator: "Agent that independently confirms, refutes, or marks claims as unverifiable.",
-  implementer: "Legacy talent for drafting a working result/artifact; in the lead model the lead authors files directly.",
+  implementer: "Talent that drafts complete written deliverables (docs, reports, prose) when the lead assigns them.",
   summarizer: "Agent that composes the final, reconciled answer.",
   risk: "Tasks classified above this risk level pause for your approval before any deliberation runs.",
   prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried.",

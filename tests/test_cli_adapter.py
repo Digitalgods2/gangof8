@@ -93,6 +93,17 @@ def test_role_model_pin_beats_seat_pin_for_that_role_only(stub_run):
     assert out.model == "claude-sonnet-5"
 
 
+def test_error_detail_shows_the_tail_not_the_banner(stub_run):
+    """CLIs print banners first and the real error LAST — codex's banner alone
+    exceeds the cap, so head-truncation hid every actual error. The AgentError
+    detail must carry the END of the output."""
+    banner = "OpenAI Codex v0.142.5 -------- workdir: sandbox " * 20
+    stub_run(_Proc(returncode=1, stdout="", stderr=banner + "ERROR: the real cause"))
+    with pytest.raises(AgentError) as e:
+        CliAdapter("codex").call(Role.code_generator, "q", timeout_s=60)
+    assert "ERROR: the real cause" in str(e.value)
+
+
 def test_unpinned_claude_reports_the_model_the_cli_ran(stub_run):
     stub_run(_Proc(stdout=json.dumps({
         "is_error": False, "result": "hi",

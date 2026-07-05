@@ -46,10 +46,25 @@ _GOVERNANCE_CONTEXT = (
     "IS your entire contribution.\n"
 )
 
-def delegation_contract(council: "Council", role_agents: dict[Role, str] | None) -> str:
-    """The on-demand delegation menu shown to the lead: each available specialist
-    talent and its backing origin model. The lead pulls one in ONLY when a
-    specific talent materially improves the result — synergy, not a panel."""
+# What a DELEGATED talent needs to know to author files that are captured
+# directly (the lead's fuller _output_contract covers PROMOTE — a talent must
+# not emit those; delivery stays the lead's decision and the human's gate).
+DELEGATE_FILE_CONTRACT = (
+    "If your assignment is to AUTHOR a file, emit it literally and COMPLETELY:\n"
+    "ARTIFACT: <filename>\n"
+    "<full file contents>\n"
+    "Raw bytes right after the ARTIFACT line — no ``` fences, and no commentary "
+    "after the content (the file must end at its real final byte). Your "
+    "ARTIFACT/EDIT blocks are captured directly as real files in the council "
+    "space. Do NOT emit PROMOTE lines — delivery is the lead's decision.\n"
+)
+
+
+def delegation_contract(council: "Council", role_agents: dict[Role, str] | None,
+                        produces_output: bool = False) -> str:
+    """The lead's ORCHESTRATOR charter + the talent menu with each seat's
+    backing origin model. The lead organizes and integrates; the talents do
+    the substantive work — coding, research, writing, verification."""
     mapping = role_agents or config.ROLE_AGENTS
     lines: list[str] = []
     for role, talent in config.TALENTS.items():
@@ -57,13 +72,24 @@ def delegation_contract(council: "Council", role_agents: dict[Role, str] | None)
         origin = (member.agent if member else None) or mapping.get(role) or "?"
         lines.append(f"- {role.value} ({origin}): {talent}")
     menu = "\n".join(lines)
+    author = (
+        "This task ships FILES — DELEGATE the authoring itself, e.g. "
+        "'DELEGATE: code_generator - author the complete <filename>, implementing "
+        "<the agreed design>'. A delegated talent's ARTIFACT/EDIT blocks are "
+        "captured directly as real files in the council space; you then review "
+        "them and emit the PROMOTE lines yourself.\n") if produces_output else ""
     return (
-        "YOU LEAD this task. Do it yourself directly. You MAY pull in another "
-        "talent (a different-origin model with a specific strength) ONLY when it "
-        "materially improves the result — do not convene a panel by default. To "
-        "do so, emit one line exactly:\n"
-        "CONSULT: <talent> - <specific question>   (get an answer back, you stay in control)\n"
-        "DELEGATE: <talent> - <specific subtask>   (hand off a focused piece)\n"
+        "YOU are the LEAD — the organizer and integrator, NOT the doer. Break the "
+        "task into focused assignments, hand each to the right talent below, then "
+        "integrate their results and quality-gate the whole. Author work yourself "
+        "only when it is trivial glue; a substantive piece done solo should be "
+        "the justified exception, not the default. One line per assignment:\n"
+        "CONSULT: <talent> - <specific question>   (advice/verification returns to you)\n"
+        "DELEGATE: <talent> - <specific subtask>   (the talent produces that piece)\n"
+        "Their results come back and you are re-called to integrate and finish. "
+        "When results already appear below, integrate them NOW — do not "
+        "re-request the same work.\n"
+        f"{author}"
         f"Available talents:\n{menu}\n"
     )
 
@@ -215,9 +241,10 @@ def lead_prompt(
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
-        "Your role: lead. You own this task end to end. Produce the real, working "
-        "result — not a plan or a description of it.\n"
-        f"{delegation_contract(council, role_agents)}"
+        "Your role: lead. You own the OUTCOME end to end: organize the work, "
+        "assign it, integrate the results, and deliver the real, working result — "
+        "not a plan or a description of it.\n"
+        f"{delegation_contract(council, role_agents, produces_output=produces)}"
         f"{contract}"
         f"{_skill_hints(session, Role.lead, readable)}"
         f"{overview}"
@@ -230,18 +257,23 @@ def lead_prompt(
 # synthesizes and declares the round DONE or CONTINUE.
 # ---------------------------------------------------------------------------
 
-# Panel seats are pure generate_text voices — no SKILL/ARTIFACT machinery is
-# resolved for them (only the lead's), so their context note must not advertise
-# capabilities they don't have.
+# Panel seats have the same governed discovery skills as the lead (SKILL:
+# lines, chained resolution in _panel_one) and their complete files are saved
+# into the council sandbox namespaced per seat — real read/write access to the
+# council space. Delivery stays with the lead: panel files are advisory drafts
+# it reviews; only the lead PROMOTEs.
 _PANEL_CONTEXT = (
     "You operate inside a governed coordinator with no filesystem or network "
-    "access of your own; the coordinator has already gathered any project "
-    "content shown below. Do not refuse for lack of access — reason from what "
-    "is provided and state assumptions where something is missing.\n"
-    "You have NO tools in this environment, even if your instincts say "
+    "access of your own — but the coordinator READS FOR YOU: emit a plain-text "
+    "line 'SKILL: read_file <path>' / 'SKILL: search_project <query>' / "
+    "'SKILL: list_dir .' and the results are handed back to you. Do not refuse "
+    "for lack of access — request what you need, or reason from what is "
+    "provided and state assumptions where something is missing.\n"
+    "You have NO native tools in this environment, even if your instincts say "
     "otherwise: do NOT emit tool-use syntax (Read/invoke blocks, file-path "
     "JSON) — nothing executes it and your seat's contribution would be lost. "
-    "Your reply text IS your entire contribution.\n"
+    "Plain-text SKILL: lines are the only way to read; your reply text IS your "
+    "entire contribution.\n"
 )
 
 _ROUND_CONTRACT = (
@@ -396,8 +428,10 @@ def panel_prompt(
     session: Session, member: CouncilMember, round_idx: int,
     established_overview: str = "", readable: list[str] = (),
 ) -> str:
-    """One seat's independent take. Panel seats never write files or pull
-    skills — they contribute intelligence; the lead materializes."""
+    """One seat's independent take. Panel seats have the coordinator's
+    discovery skills and may include complete files (saved to the council
+    sandbox, namespaced per seat, for the lead to review); delivery decisions
+    stay with the lead."""
     overview = f"{established_overview}\n\n" if established_overview else ""
     ctx = round_context(session, member.agent, round_idx)
     ctx_block = f"{ctx}\n\n" if ctx else ""
@@ -417,9 +451,15 @@ def panel_prompt(
         f"origin model: {member.agent}). Give YOUR best independent take on the "
         "task: the answer or design as you see it, the strongest objections, and "
         f"{disagree}"
-        "Do NOT emit ARTIFACT/PROMOTE file blocks — the lead "
-        "materializes files; describe what should change instead. Do not ask the "
+        "If your take includes a COMPLETE file, emit it as a block —\n"
+        "ARTIFACT: <filename>\n<full file contents>\n"
+        "— it is saved into the council sandbox under your seat's name for the "
+        "lead to review (raw bytes after the ARTIFACT line: no ``` fences, no "
+        "commentary after the content). Partial advice stays prose: describe "
+        "what should change; never paste fragments as ARTIFACT blocks and never "
+        "emit PROMOTE lines — delivery is the lead's decision. Do not ask the "
         "human questions; state assumptions and proceed.\n"
+        f"{_skill_hints(session, Role.panelist, readable)}"
         f"{overview}"
         f"{ctx_block}"
     )
@@ -453,9 +493,11 @@ def synthesis_prompt(
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
-        f"Your role: lead (round {round_idx + 1}). You own this task end to end. "
-        "Produce the real, working result — not a plan or a description of it.\n"
-        f"{delegation_contract(council, role_agents)}"
+        f"Your role: lead (round {round_idx + 1}). You own the OUTCOME end to "
+        "end: organize the work, assign it to your talents, integrate their "
+        "results, and deliver the real, working result — not a plan or a "
+        "description of it.\n"
+        f"{delegation_contract(council, role_agents, produces_output=produces)}"
         f"{contract}"
         f"{_skill_hints(session, Role.lead, readable)}"
         f"{overview}"

@@ -30,6 +30,16 @@ from ..models import Role
 from ..registry import AdapterResult, AgentError
 
 
+def _err_tail(text: str, limit: int = 300) -> str:
+    """The most informative slice of a CLI's error output: the END. CLIs print
+    banners and prompt echoes first and the actual error last — codex's banner
+    alone exceeds 300 chars, so head-truncation hid every real error behind
+    'OpenAI Codex v… workdir: …' (live: a delegation failure whose cause was
+    unreadable)."""
+    t = (text or "").strip()
+    return t if len(t) <= limit else "… " + t[-limit:]
+
+
 def _neutral_cwd() -> str:
     """CLI subprocesses run from an EMPTY, neutral directory — never the
     server's own repo/cwd. A CLI agent with latent tool instincts (claude
@@ -146,7 +156,7 @@ class CliAdapter:
         out, err, rc = self._exec_raw(cmd, prompt, timeout_s)
         if rc != 0:
             detail = err.strip() or out.strip()
-            raise AgentError(f"{self.agent} CLI exited {rc}: {detail[:300]}")
+            raise AgentError(f"{self.agent} CLI exited {rc}: {_err_tail(detail)}")
         return out
 
     def _run_claude(self, prompt: str, timeout_s: int) -> tuple[str, Optional[str]]:
@@ -163,7 +173,7 @@ class CliAdapter:
             # surface stderr, else the raw stdout (the CLI's error text lives there).
             if rc != 0:
                 raise AgentError(
-                    f"claude CLI exited {rc}: {(err.strip() or out.strip())[:300]}") from e
+                    f"claude CLI exited {rc}: {_err_tail(err.strip() or out.strip())}") from e
             raise AgentError(f"claude CLI returned non-JSON: {out[:200]!r}") from e
         if data.get("is_error"):
             raise AgentError(f"claude CLI error: {data.get('result') or data.get('subtype')}")
@@ -172,7 +182,7 @@ class CliAdapter:
         # the claude CLI can exit non-zero after emitting a valid result (a
         # post-generation hiccup). Use the result; only fail if there is none.
         if not result and rc != 0:
-            raise AgentError(f"claude CLI exited {rc}: {(err.strip() or out.strip())[:300]}")
+            raise AgentError(f"claude CLI exited {rc}: {_err_tail(err.strip() or out.strip())}")
         used = None
         usage = data.get("modelUsage")
         if isinstance(usage, dict) and usage:
