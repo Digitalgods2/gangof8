@@ -130,13 +130,36 @@ def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str
 
 
 def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Read a file from any space (default: the richest bound one)."""
+    """Read a file from any space. With an explicit target, that space only.
+    With none, every bound space is tried — default (richest) first, then the
+    others — because the old single-space default made council-authored
+    SANDBOX drafts unreadable whenever an established folder was bound (live:
+    'Skill failed: read_file centipede.html' while the file sat right there
+    in the sandbox, twice across two runs)."""
     raw_name = _arg(action, "filename")
-    target = _space_arg(action, _default_read_space(session), _READ_SPACES)
-    path = resolve_space(session, data_dir, target, raw_name)
-    if not path.is_file():
-        raise ExecutionError(f"file not found: {raw_name!r}")
-    return path.read_text(encoding="utf-8")
+    if action.args.get("target") or action.args.get("space"):
+        target = _space_arg(action, _default_read_space(session), _READ_SPACES)
+        path = resolve_space(session, data_dir, target, raw_name)
+        if not path.is_file():
+            raise ExecutionError(f"file not found: {raw_name!r}")
+        return path.read_text(encoding="utf-8")
+    default = _default_read_space(session)
+    order = [default] + [s for s in (SANDBOX, WORKSPACE, ESTABLISHED) if s != default]
+    tried: list[str] = []
+    for target in order:
+        if target == WORKSPACE and not session.workspace_root:
+            continue
+        if target == ESTABLISHED and not session.established_root:
+            continue
+        try:
+            path = resolve_space(session, data_dir, target, raw_name)
+        except ExecutionError:
+            continue  # e.g. an absolute/escaping path for this space
+        tried.append(target)
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+    raise ExecutionError(
+        f"file not found in any space ({', '.join(tried) or 'none bound'}): {raw_name!r}")
 
 
 def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:

@@ -333,10 +333,13 @@ def test_followup_autofills_missing_promote_for_delivered_file(tmp_path):
     assert len([a for a in s.proposed_actions if a.kind == "promote"]) == 1
 
 
-def test_followup_does_not_autopromote_brand_new_file(tmp_path):
-    """Conservative: a file the lead wrote to the sandbox but never delivered
-    (not present in the established folder) is NOT force-promoted — only the lead
-    asking, or a prior delivery, ships a file to the user's real folder."""
+def test_declared_destination_promotes_brand_new_files_too(tmp_path):
+    """POLICY CHANGE (live failure 2026-07-05): an established_root only ever
+    comes from the user naming a destination — so a brand-new authored file is
+    PROPOSED for delivery there even on a first (greenfield) run. The old
+    already-delivered-only rule left the user's explicitly named folder empty
+    while the run reported success. Still human-gated: this proposes; the
+    approval click ships. With NO established root, nothing is proposed."""
     from conclave_os import loop
     from conclave_os.logstore import LogStore
     from conclave_os.models import ProposedAction
@@ -352,5 +355,12 @@ def test_followup_does_not_autopromote_brand_new_file(tmp_path):
         filename="helper.js", args={"filename": "helper.js", "content": "//new"}))
 
     loop._ensure_redelivery_promotes(s, store)
+    assert [a.filename for a in s.proposed_actions if a.kind == "promote"] == ["helper.js"]
 
-    assert not any(a.kind == "promote" for a in s.proposed_actions)
+    # no declared destination → no auto-promote (nothing is force-shipped)
+    s2 = SessionManager(store).create("scaffold another helper", source="test")
+    s2.proposed_actions.append(ProposedAction(
+        session_id=s2.session_id, kind="write_file", role=Role.implementer,
+        filename="helper.js", args={"filename": "helper.js", "content": "//new"}))
+    loop._ensure_redelivery_promotes(s2, store)
+    assert not any(a.kind == "promote" for a in s2.proposed_actions)

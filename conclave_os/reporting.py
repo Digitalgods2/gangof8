@@ -69,8 +69,18 @@ _TIMELINE = {
     "delegation_requested": ("🤝", "Talent requested"),
     "delegation_granted": ("🤝", "Talent pulled in"),
     "delegation_retry": ("🔁", "Talent retried after a failure"),
+    "delegation_reseated": ("🔁", "Talent reseated on another model"),
     "delegate_artifacts_captured": ("📦", "Talent's files captured"),
     "panel_artifact_saved": ("📄", "Panel draft saved to sandbox"),
+    "candidates_collected": ("🗳️", "Candidates collected"),
+    "candidate_scored": ("⚖️", "Candidate scored"),
+    "candidate_rejected_runtime": ("💥", "Candidate rejected — does not run"),
+    "best_of_n_all_failed_runtime": ("💥", "All candidates failed to run"),
+    "judge_dropped": ("⚠️", "Judge dropped"),
+    "winner_selected": ("🏆", "Best-of-N winner"),
+    "winner_fixes_applied": ("🔧", "Winner fixes applied"),
+    "winner_fixes_reverted": ("↩️", "Winner fix reverted (broke the file)"),
+    "runtime_ok": ("✅", "File runs (headless smoke test)"),
     "delegation_resolved": ("📥", "Talent answered"),
     "delegation_denied": ("🚫", "Talent unavailable"),
     "delegation_failed": ("⚠️", "Delegation failed"),
@@ -136,16 +146,34 @@ def _detail(event: str, p: dict) -> str:
     if event == "converged":
         return f"after {p.get('iterations','')} round(s)"
     if event in ("delegation_requested", "delegation_granted", "delegation_resolved",
-                 "delegation_denied", "delegation_failed"):
-        head = str(p.get("to", ""))
-        if p.get("agent"):
+                 "delegation_denied", "delegation_failed", "delegation_retry",
+                 "delegation_reseated"):
+        head = str(p.get("role") or p.get("to") or "")
+        if p.get("from"):
+            head = f"{head}: {p['from']} → {p.get('to', '?')}"
+        elif p.get("agent"):
             head += f" ← {p['agent']}"  # which model fills the talent seat
         if p.get("kind"):
             head += f" ({p['kind']})"
-        reason = str(p.get("reason", ""))
-        return (f"{head}: {reason}" if reason else head)[:110]
+        tail = str(p.get("reason") or p.get("error") or "")
+        return (f"{head}: {tail}" if tail else head)[:110]
     if event in ("artifact_continuation", "artifact_continued", "artifact_continuation_failed"):
         return str(p.get("file", ""))[:60]
+    if event == "candidates_collected":
+        return f"{p.get('n','')} candidates for {p.get('base','')}".strip()
+    if event == "candidate_scored":
+        return f"{p.get('judge','')} → winner Candidate {p.get('winner','?')}"
+    if event == "candidate_rejected_runtime":
+        return f"{p.get('agent','')}/{p.get('file','')}: {p.get('detail','')}"[:110]
+    if event in ("runtime_ok",):
+        return str(p.get("file", ""))
+    if event == "winner_selected":
+        score = p.get("score")
+        how = f"score {score}" if score is not None else "sole runner"
+        return (f"{p.get('agent','')}'s {p.get('file','')} — {how}, "
+                f"{p.get('judges','')} judges, {p.get('candidates','')} candidates")
+    if event == "winner_fixes_applied":
+        return f"{p.get('file','')}: {p.get('applied','')} fix(es)"
     if event == "status_change":
         return f"{p.get('from','')} → {p.get('to','')}".strip(" →")
     if event in ("budget_exhausted", "agent_error"):

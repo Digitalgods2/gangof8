@@ -13,7 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor, rounds, skills
+from . import config, executor, rounds, skills, smoke
 from .classifier import classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
@@ -399,7 +399,8 @@ def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
 
 
 def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
-                    *, by: str = "lead", may_subconsult: bool = False) -> str:
+                    *, by: str = "lead", may_subconsult: bool = False,
+                    extra: str = "") -> str:
     produces = bool(session.classification and session.classification.produces_output)
     lines = [
         f"Task: {session.task.text}",
@@ -432,6 +433,8 @@ def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
             "your answer, you MAY pull in ONE with a single line "
             "'CONSULT: <talent> - <specific question>' (do not convene a panel; "
             f"usually just answer). Talents: {others}.")
+    if extra:
+        lines.append(extra)
     lines.append(rounds.RESULT_CONTRACT)
     lines.append(f"Context so far:\n{_recent_context(session, limit=5)}")
     return "\n".join(lines)
@@ -440,6 +443,7 @@ def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
 def _resolve_one_delegation(
     session: Session, council: Council, requester: CouncilMember, m: "re.Match",
     call: AgentCall, store: LogStore, depth: int, can_subconsult: bool,
+    context_extra: str = "",
 ) -> str:
     """Resolve ONE CONSULT:/DELEGATE: grant and return its folded result string.
     Runs on a worker thread when siblings fan out, so every mutation of shared
@@ -473,21 +477,36 @@ def _resolve_one_delegation(
                          "reason": reason, "depth": depth})
         store.save_session(session)  # the talent's roster chip appears the moment it's recruited
     try:
-        # One retry on a transient seat failure BEFORE giving up: the fallback
-        # (the lead doing the talent's work itself) defeats the point of the
-        # roster, so it must be the last resort, not the first response.
-        try:
-            answer = call(helper, delegate_prompt(
+        # Escalation ladder for a failing seat: retry once, then RESEAT the
+        # role on the requester's own model, and only then let the assignment
+        # collapse back onto the lead — the lead doing the talent's work itself
+        # defeats the point of the roster, so it is the LAST resort (live:
+        # codex-as-code_generator failed the same way twice across runs).
+        def _ask(member: CouncilMember) -> Contribution:
+            return call(member, delegate_prompt(
                 session, role, kind, reason,
-                by=requester.role.value, may_subconsult=can_subconsult))
+                by=requester.role.value, may_subconsult=can_subconsult,
+                extra=context_extra))
+
+        try:
+            answer = _ask(helper)
         except AgentError as first:
             with _SESSION_LOCK:
                 store.log_event(sid, "delegation_retry",
                                 {"to": role.value, "agent": helper.agent,
                                  "error": str(first)[:200]})
-            answer = call(helper, delegate_prompt(
-                session, role, kind, reason,
-                by=requester.role.value, may_subconsult=can_subconsult))
+            try:
+                answer = _ask(helper)
+            except AgentError as second:
+                if helper.agent == requester.agent:
+                    raise
+                with _SESSION_LOCK:
+                    store.log_event(sid, "delegation_reseated",
+                                    {"role": role.value, "from": helper.agent,
+                                     "to": requester.agent,
+                                     "error": str(second)[:200]})
+                helper = CouncilMember(role=role, agent=requester.agent, active=True)
+                answer = _ask(helper)
         # ORCHESTRATOR model: a DELEGATED talent produces its piece of the
         # deliverable itself. Its ARTIFACT/EDIT/RUNTESTS blocks become real
         # proposals HERE, stamped with the talent's role — the folded summary
@@ -551,6 +570,7 @@ def _resolve_one_delegation(
 def _run_delegations(
     session: Session, council: Council, requester: CouncilMember, content: str,
     call: AgentCall, store: LogStore, depth: int,
+    produce_call: Optional[AgentCall] = None,
 ) -> list[str]:
     """Resolve the CONSULT:/DELEGATE: lines in `content` (authored by `requester`),
     returning one folded result string per grant, in request order.
@@ -569,17 +589,45 @@ def _run_delegations(
         return []
     can_subconsult = depth < session.budgets.max_delegation_depth
     batch = reqs[: session.budgets.max_delegations]
+    # Two phases: DELEGATE lines (production) resolve FIRST, then CONSULT lines
+    # (advice/review) with the delegates' freshly authored files folded into
+    # their context — so "coder writes, critic reviews the actual file" works
+    # within one scan. All-concurrent siblings made a review consult fire
+    # before the thing it was meant to review existed (live: the critic
+    # answered 'I am awaiting the artifact' — a wasted call).
+    delegates = [m for m in batch if m.group("kind").upper() == "DELEGATE"]
+    consults = [m for m in batch if m.group("kind").upper() == "CONSULT"]
 
-    def resolve(m: "re.Match") -> str:
-        return _resolve_one_delegation(
-            session, council, requester, m, call, store, depth, can_subconsult)
+    def resolve_batch(ms: list, extra: str, use_call: AgentCall) -> list[str]:
+        if not ms:
+            return []
+        if len(ms) == 1:
+            return [_resolve_one_delegation(session, council, requester, ms[0],
+                                            use_call, store, depth, can_subconsult, extra)]
+        workers = min(len(ms), config.MAX_PARALLEL_AGENTS)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="consult") as ex:
+            futures = [ex.submit(_resolve_one_delegation, session, council, requester,
+                                 m, use_call, store, depth, can_subconsult, extra)
+                       for m in ms]
+            return [f.result() for f in futures]  # order preserved → stable folded output
 
-    if len(batch) == 1:
-        return [resolve(batch[0])]
-    workers = min(len(batch), config.MAX_PARALLEL_AGENTS)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="consult") as ex:
-        futures = [ex.submit(resolve, m) for m in batch]
-        return [f.result() for f in futures]  # order preserved → stable folded output
+    n0 = len(session.proposed_actions)
+    # PRODUCTION (delegate) calls author whole files — they need the lead-grade
+    # timeout, not the quick-specialist one (live: the reseated coder was killed
+    # at 240s four minutes into authoring a complete game).
+    out = resolve_batch(delegates, "", produce_call or call)
+    extra = ""
+    if consults and len(session.proposed_actions) > n0:
+        with _SESSION_LOCK:
+            authored = [(a.filename, a.content) for a in session.proposed_actions[n0:]
+                        if a.kind == "write_file" and (a.content or "").strip()]
+        if authored:
+            parts = [f"----- {fn} -----\n{body[:config.SKILL_RESULT_SANDBOX_MAX_CHARS]}"
+                     for fn, body in authored]
+            extra = ("\nFILES JUST AUTHORED by delegated talents this round — "
+                     "review these ACTUAL contents, not a promise of them:\n"
+                     + "\n\n".join(parts))
+    return out + resolve_batch(consults, extra, call)
 
 
 def _resolve_delegations(
@@ -593,7 +641,7 @@ def _resolve_delegations(
     by budgets.max_delegations per scan, budgets.max_delegation_depth levels, and
     the agent-call budget."""
     results = _run_delegations(session, council, lead, contribution.content,
-                               call, store, depth=1)
+                               call, store, depth=1, produce_call=recall)
     if not results:
         return contribution
     followup = (
@@ -692,7 +740,18 @@ def _resolve_skill_requests(
                 with _SESSION_LOCK:
                     session.tools_called.append(name)
                     store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
-                results.append(f"SKILL {name} '{arg}' result:\n{out[: _skill_result_cap(session)]}")
+                cap_chars = _skill_result_cap(session)
+                if name == "read_file":
+                    try:
+                        in_sandbox = (executor.artifacts_dir(store.data_dir, sid)
+                                      / _basename(arg)).is_file()
+                    except OSError:
+                        in_sandbox = False
+                    if in_sandbox:
+                        # a council-authored draft must be reviewable WHOLE —
+                        # the 2k window starved the lead on its own drafts
+                        cap_chars = config.SKILL_RESULT_SANDBOX_MAX_CHARS
+                results.append(f"SKILL {name} '{arg}' result:\n{out[:cap_chars]}")
             except ExecutionError as e:
                 action.status = "failed"
                 action.error = str(e)
@@ -913,9 +972,39 @@ def _run_panel_rounds(
                 ex.shutdown(wait=False, cancel_futures=True)
             results = [c for c in results if c]
 
-        # (b) SYNTHESIS — the lead does the real work; CONSULT/DELEGATE and
-        # SKILL requests remain available inside every round.
+        # (b) BEST-OF-N — on a file build, the panel authored complete candidate
+        # implementations; judges score them blindly and the winning FILE ships
+        # (a real model's code, not a lead re-author). Falls through to the free
+        # synthesis below only when there aren't enough candidates to select
+        # among, or scoring collapsed.
         governance.check(session, "generate_text")
+        produces = bool(session.classification and session.classification.produces_output)
+        if produces:
+            bon = _run_best_of_n(session, council, panel, call, lead_call, store)
+            if bon is not None:
+                if bon["judges"]:
+                    how = (f"the highest-scoring of {bon['candidates']} candidate "
+                           f"implementations (blind vote by {bon['judges']} judges, "
+                           f"score {bon['score']}, {bon['votes']} first-place)")
+                else:
+                    how = (f"the only one of {bon['candidates']} candidates that "
+                           "actually runs (the others crashed on load)")
+                summary = (
+                    f"Best-of-{bon['candidates']}: shipped {bon['agent']}'s "
+                    f"{bon['file']} — {how}"
+                    + (f"; {bon['fixes']} surgical fix pass applied (re-verified to run)."
+                       if bon['fixes'] else ", shipped unchanged. Every candidate was "
+                       "executed headless before judging; crashers were disqualified.")
+                )
+                with _SESSION_LOCK:
+                    session.contributions.append(Contribution(
+                        round=r, role=Role.lead, agent=lead.agent,
+                        content=summary + "\nROUND: DONE"))
+                    store.save_session(session)
+                break
+
+        # (b') SYNTHESIS fallback — the lead does the real work; CONSULT/DELEGATE
+        # and SKILL requests remain available inside every round.
         # panel seats may have saved namespaced draft files during the fan-out —
         # refresh so the synthesis prompt lists them as readable
         readable = _readable_files(session, store.data_dir)
@@ -1163,30 +1252,31 @@ def _deliberate(
     # gated by the same approval — so 'modify this' follow-ups actually land.
     _ensure_redelivery_promotes(session, store)
 
-    # Delivery last: promotes (the one approval gate) and, if the destination
-    # is unknown, the delivery-target question.
-    if _execute_actions(session, manager, governance, store):
-        return session  # paused in awaiting_approval / awaiting_input
-    # Verify whenever the task produced (or was required to produce) files — NOT
-    # just code tasks. A content/design task that emitted an empty or truncated
-    # file must NOT be reported as a confident success. A code task must produce a
-    # real file even if it emitted none.
+    # DELIVERY GATE — verify BEFORE anything is promoted. Files are on disk in
+    # the sandbox by now; this checks each one exists, is complete, AND actually
+    # RUNS (a web file is executed headless). A file that fails is caught HERE:
+    # its promote is stripped so it can NEVER reach the user's folder, and the
+    # run reports honest failure instead of a false success. The old order
+    # verified AFTER the promote already shipped — which let a black-screen file
+    # be delivered and reported high-confidence. Never again.
     _needs_file = cls.task_type == TaskType.code
     _has_file_actions = any(a.kind in _FILE_OUTPUT_KINDS for a in session.proposed_actions)
     if (_needs_file or _has_file_actions) and not _verify_artifact_outputs(
         session, store, require_file=_needs_file
     ):
+        session.proposed_actions = [a for a in session.proposed_actions if a.kind != "promote"]
         manager.transition(session, SessionStatus.composing)
         session.final = FinalAnswer(
             answer=(
-                "The run failed artifact verification: the coordinator did not find "
-                "a real, non-empty, complete file artifact on disk, so this result "
-                "is NOT being reported as a success. See the unresolved risks below."
+                "The run failed artifact verification: the produced file is "
+                "missing, incomplete, or does NOT RUN (it threw on load), so it "
+                "was NOT delivered and this is NOT reported as a success. See the "
+                "unresolved risks below."
             ),
             confidence="low",
             assumptions=[],
             risks_unresolved=list(session.unresolved),
-            next_action="Fix artifact generation and rerun the task.",
+            next_action="Fix the file so it runs, then rerun the task.",
         )
         if not session.turns:
             session.turns.append({"role": "user", "text": session.task.text})
@@ -1195,6 +1285,11 @@ def _deliberate(
         store.log_event(sid, "final_composed", session.final.model_dump())
         store.save_session(session)
         return session
+
+    # Verified — NOW deliver (the one approval gate) and, if the destination is
+    # unknown, ask the delivery-target question.
+    if _execute_actions(session, manager, governance, store):
+        return session  # paused in awaiting_approval / awaiting_input
 
     # 10. Final response
     manager.transition(session, SessionStatus.composing)
@@ -1347,25 +1442,22 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
 
 
 def _ensure_redelivery_promotes(session: Session, store: LogStore) -> None:
-    """Safety net for follow-ups. When the lead revises a file that was already
-    delivered to the established folder but omits its PROMOTE line, the write
-    executes into the sandbox and the update silently never reaches the user.
-    Re-delivering an already-delivered file is exactly the intent of a
-    'modify this' follow-up, and it still passes through the promote approval
-    gate — so synthesize the missing promote here. Conservative on purpose: only
-    files that ALREADY exist in the established folder are auto-promoted; a
-    brand-new sandbox file the lead didn't ask to deliver is never force-shipped.
-    Idempotent — a file the lead already PROMOTED (or one auto-filled on a prior
-    resume) is skipped."""
-    root = session.established_root
-    if not root:
-        return
-    try:
-        root_path = Path(root)
-    except (OSError, ValueError):
+    """Safety net: when a DESTINATION IS DECLARED (established_root set — it
+    only ever comes from the user naming a path in the task or answering the
+    where-should-this-go question), every authored deliverable gets a promote
+    proposal even if the lead omitted its PROMOTE line. Live failure this
+    guards against: a greenfield build wrote a verified centipede.html to the
+    sandbox, reported success — and the user's explicitly named folder stayed
+    EMPTY, because the old rule only auto-promoted files that already existed
+    there (impossible on a first delivery). Still human-gated: this proposes
+    the promote; nothing lands without the approval click. Panel-seat drafts
+    (advisory, namespaced) are never promoted. Idempotent — files already
+    PROMOTED (or auto-filled on a prior resume) are skipped."""
+    if not session.established_root:
         return
     authored = [a.filename for a in session.proposed_actions
-                if a.kind in ("write_file", "edit_file") and a.filename]
+                if a.kind in ("write_file", "edit_file") and a.filename
+                and a.role != Role.panelist]
     if not authored:
         return
     already = {a.filename for a in session.proposed_actions
@@ -1376,14 +1468,9 @@ def _ensure_redelivery_promotes(session: Session, store: LogStore) -> None:
         if fn in already or fn in seen:
             continue
         seen.add(fn)
-        try:
-            delivered = (root_path / fn).is_file()
-        except OSError:
-            delivered = False
-        if delivered:
-            missing.append(ProposedAction(
-                session_id=session.session_id, kind="promote",
-                role=Role.implementer, filename=fn, args={"filename": fn}))
+        missing.append(ProposedAction(
+            session_id=session.session_id, kind="promote",
+            role=Role.implementer, filename=fn, args={"filename": fn}))
     if missing:
         _append_proposals(session, store, missing)
         store.log_event(session.session_id, "promote_autofilled",
@@ -1602,6 +1689,204 @@ def _salvage_from_panel(session: Session, store: LogStore) -> None:
         f"'{agent_name}' ({filename}, {len(body)} chars)")
     store.log_event(sid, "panel_artifact_salvaged",
                     {"agent": agent_name, "filename": filename, "chars": len(body)})
+
+
+# ---------------------------------------------------------------------------
+# Best-of-N: every panel seat authors a complete candidate; independent judges
+# score them blindly; the highest-scoring FILE ships (a real model's code, not
+# a lead re-author). Owner directive 2026-07-05.
+# ---------------------------------------------------------------------------
+def _collect_candidates(session: Session) -> list[dict]:
+    """The complete candidate files panel seats authored (captured namespaced
+    as '<agent>__<base>'). One entry per namespaced file: {agent, base,
+    namespaced, content}. The agent comes from the filename prefix — the
+    capture stamps role=panelist, not the origin model."""
+    seen: dict[str, dict] = {}
+    for a in session.proposed_actions:
+        if a.kind != "write_file" or a.role != Role.panelist:
+            continue
+        fn = a.filename or ""
+        if "__" not in fn or not (a.content or "").strip():
+            continue
+        agent, base = fn.split("__", 1)
+        seen[fn] = {"agent": agent, "base": base, "namespaced": fn, "content": a.content}
+    return list(seen.values())
+
+
+def _dominant_base_group(session: Session, candidates: list[dict]) -> list[dict]:
+    """Candidates for ONE deliverable. Seats disagree on the filename (live:
+    index.html vs centipede.html vs centipede_clone.html for the same game), so
+    group by base name and take the most-agreed group — preferring a base that
+    matches a file already in the established folder (a revision's real name)."""
+    groups: dict[str, list[dict]] = {}
+    for c in candidates:
+        groups.setdefault(_basename(c["base"]).lower(), []).append(c)
+    established = set()
+    if session.established_root:
+        try:
+            established = {p.name.lower() for p in Path(session.established_root).iterdir()
+                          if p.is_file()}
+        except OSError:
+            pass
+    return max(groups.values(), key=lambda g: (
+        any(_basename(c["base"]).lower() in established for c in g),  # revision target wins
+        len(g),                                                       # most candidates
+        sum(len(c["content"]) for c in g),                           # most total content
+    ))
+
+
+def _score_candidates(session: Session, judges: list[CouncilMember], group: list[dict],
+                      call: AgentCall, store: LogStore):
+    """Blind scoring: each judge sees every candidate's full body labeled
+    'Candidate N' (author hidden), scores 0-JUDGE_SCORE_MAX on the criteria and
+    names a winner. Returns (ordered, agg_score, first_place_votes, defects,
+    judge_count). Deterministic candidate order (by namespaced name) → blind but
+    resume-stable, no RNG."""
+    ordered = sorted(group, key=lambda c: c["namespaced"])
+    n = len(ordered)
+    labeled = [(f"Candidate {i + 1}", c["content"]) for i, c in enumerate(ordered)]
+    prompt = rounds.score_candidates_prompt(session, labeled)
+    sid = session.session_id
+    agg = {i + 1: 0 for i in range(n)}
+    votes = {i + 1: 0 for i in range(n)}
+    defects: dict[int, list[str]] = {i + 1: [] for i in range(n)}
+    judged = 0
+    for j in judges:
+        try:
+            ans = call(j, prompt)
+        except (AgentError, BudgetExceeded) as e:
+            store.log_event(sid, "judge_dropped", {"agent": j.agent, "error": str(e)[:120]})
+            continue
+        scores, winner, defs = rounds.parse_candidate_scores(ans.content, n)
+        if not scores and winner is None:
+            continue
+        judged += 1
+        for idx, s in scores.items():
+            agg[idx] += s
+        if winner:
+            votes[winner] += 1
+            defects[winner].extend(defs)
+        store.log_event(sid, "candidate_scored",
+                        {"judge": j.agent, "scores": scores, "winner": winner})
+    return ordered, agg, votes, defects, judged
+
+
+def _apply_targeted_fixes(session: Session, filename: str, content: str,
+                          defects: list[str], call: AgentCall, store: LogStore) -> str:
+    """Surgical fixes ONLY (best-of-N ships the winner's own code): ask for EDIT
+    blocks for the judge-flagged defects and apply them to the content string
+    in-memory (unique-OLD → NEW), never a rewrite. Returns the (possibly) fixed
+    content; degrades to the original on any error."""
+    lead = session.council.get(Role.lead)
+    if not (lead and lead.active):
+        return content
+    try:
+        ans = call(lead, rounds.winner_fix_prompt(session, filename, content, defects))
+    except (AgentError, BudgetExceeded):
+        return content
+    applied = 0
+    for a in _parse_proposals(session.session_id, ans.content):
+        if a.kind != "edit_file":
+            continue
+        old = (a.args.get("old") or "").replace("\r\n", "\n").replace("\r", "\n")
+        new = (a.args.get("new") or "").replace("\r\n", "\n").replace("\r", "\n")
+        norm = content.replace("\r\n", "\n")
+        if old and norm.count(old) == 1:
+            content = norm.replace(old, new, 1)
+            applied += 1
+    if applied:
+        store.log_event(session.session_id, "winner_fixes_applied",
+                        {"file": filename, "applied": applied})
+    return content
+
+
+def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
+                   call: AgentCall, lead_call: AgentCall, store: LogStore) -> Optional[dict]:
+    """Score the panel's candidate files and propose write+promote of the
+    winner. Returns a summary dict, or None to fall back to the author path
+    (too few candidates, or every judge failed)."""
+    candidates = _collect_candidates(session)
+    if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
+        return None
+    group = _dominant_base_group(session, candidates)
+    sid = session.session_id
+    # RUNTIME GATE before judging — a candidate that doesn't RUN can't win.
+    # Judging by reading is blind to load-time crashes (live: 5 judges
+    # unanimously picked the one candidate of 3 that threw on frame 1). Execute
+    # each candidate headless; disqualify crashers so judges only rank runners.
+    runnable: list[dict] = []
+    for c in group:
+        suffix = Path(_basename(c["base"])).suffix or ".html"
+        ran, testable, detail = smoke.smoke_source(c["content"], suffix)
+        if ran:
+            runnable.append(c)
+        else:
+            store.log_event(sid, "candidate_rejected_runtime",
+                            {"agent": c["agent"], "file": _basename(c["base"]), "detail": detail})
+            session.unresolved.append(
+                f"candidate {c['agent']}/{_basename(c['base'])} rejected — does not run: {detail}")
+    if not runnable:
+        store.log_event(sid, "best_of_n_all_failed_runtime", {"n": len(group)})
+        return None  # nothing runs → author path; the delivery gate still blocks broken files
+    store.log_event(sid, "candidates_collected",
+                    {"n": len(runnable), "rejected": len(group) - len(runnable),
+                     "agents": [c["agent"] for c in runnable],
+                     "base": _basename(runnable[0]["base"])})
+
+    if len(runnable) == 1:
+        # the only candidate that runs wins by default — no vote needed
+        winner, base = runnable[0], _basename(runnable[0]["base"])
+        content = winner["content"]
+        store.log_event(sid, "winner_selected",
+                        {"agent": winner["agent"], "file": base, "score": None,
+                         "votes": 0, "judges": 0, "candidates": len(group), "reason": "sole runner"})
+        _append_proposals(session, store, [
+            ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
+                           filename=base, content=content, args={"filename": base, "content": content}),
+            ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
+                           filename=base, args={"filename": base}),
+        ])
+        return {"agent": winner["agent"], "file": base, "score": None, "votes": 0,
+                "judges": 0, "candidates": len(group), "fixes": 0}
+
+    judges = panel[: config.MAX_JUDGES]
+    ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store)
+    if judged == 0:
+        return None  # scoring collapsed → author path (with its own nets) instead
+    # highest aggregate; tie → more first-place votes, then more-complete file
+    wi = max(range(len(ordered)),
+             key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
+    winner, label = ordered[wi], wi + 1
+    base = _basename(winner["base"])
+    content = winner["content"]
+    fixlist = list(dict.fromkeys(defects[label]))[:6]
+    fixes = 0
+    if fixlist:
+        fixed = _apply_targeted_fixes(session, base, content, fixlist, lead_call, store)
+        if fixed != content:
+            # the fix pass itself must not break the winner — re-run it; keep the
+            # (already-passing) original if the "fixed" version no longer runs.
+            suffix = Path(base).suffix or ".html"
+            ran, testable, detail = smoke.smoke_source(fixed, suffix)
+            if ran:
+                content, fixes = fixed, 1
+            else:
+                store.log_event(sid, "winner_fixes_reverted", {"file": base, "detail": detail})
+                session.unresolved.append(
+                    f"winner fix pass broke {base} ({detail}); shipped the unmodified winner")
+    store.log_event(sid, "winner_selected",
+                    {"agent": winner["agent"], "file": base, "score": agg[label],
+                     "votes": votes[label], "judges": judged, "candidates": len(group)})
+    _append_proposals(session, store, [
+        ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
+                       filename=base, content=content,
+                       args={"filename": base, "content": content}),
+        ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
+                       filename=base, args={"filename": base}),
+    ])
+    return {"agent": winner["agent"], "file": base, "score": agg[label],
+            "votes": votes[label], "judges": judged, "candidates": len(group),
+            "fixes": fixes}
 
 
 def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:
@@ -1983,6 +2268,7 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
     file_actions = [a for a in session.proposed_actions if a.kind in _FILE_OUTPUT_KINDS]
     executed = [a for a in file_actions if a.status == "executed" and a.result_path]
     failures: list[str] = []
+    _smoke_checked: set[str] = set()  # smoke-test each filename once
 
     if not executed:
         if file_actions or require_file:
@@ -2014,6 +2300,18 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                             "(not a clean single file)")
                 # a fragment/partial (no <html> opening) is valid — only the
                 # non-empty check above applies to it
+            # RUNTIME: a web file must actually RUN. Reading it — even a complete,
+            # well-formed document — cannot catch a first-frame crash (live: a
+            # blind 5-judge vote shipped a Centipede that threw on load and
+            # showed a black screen). Execute it headless; a throw is a failure.
+            if smoke.is_web_file(path) and action.filename not in _smoke_checked:
+                _smoke_checked.add(action.filename)
+                ran, testable, detail = smoke.smoke_test(path)
+                if not ran:
+                    failures.append(f"{action.filename}: does not run — {detail}")
+                elif testable:
+                    store.log_event(session.session_id, "runtime_ok",
+                                    {"file": action.filename})
         except OSError as e:
             failures.append(f"{action.filename}: verification error: {e}")
 
