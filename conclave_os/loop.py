@@ -59,7 +59,13 @@ _PROPOSAL_KINDS = {"write_file", "edit_file", "run_tests", "stage", "promote"}
 
 
 def _has_proposals(session: Session) -> bool:
-    return any(a.kind in _PROPOSAL_KINDS for a in session.proposed_actions)
+    """Does the DELIVERY pipeline have work: write/edit/test proposals from the
+    lead, a delegated talent, or materialize/salvage. Panel-seat files
+    (namespaced advisory drafts like 'codex__index.html') deliberately do NOT
+    count — they must never suppress materialization/salvage or masquerade as
+    the deliverable."""
+    return any(a.kind in _PROPOSAL_KINDS and a.role != Role.panelist
+               for a in session.proposed_actions)
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
@@ -135,6 +141,11 @@ def _agent_call(
             {"round": contribution.round, "role": member.role.value,
              "agent": member.agent, "chars": len(result.content)},
         )
+        # Persist NOW: the dashboard polls the stored snapshot, and deliberation
+        # otherwise saves only at status transitions — a whole round of panel
+        # takes, syntheses, and talent answers stayed invisible until the run
+        # paused or finished. One small WAL write per multi-second agent call.
+        store.save_session(session)
     return contribution
 
 
@@ -389,14 +400,31 @@ def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
 
 def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
                     *, by: str = "lead", may_subconsult: bool = False) -> str:
+    produces = bool(session.classification and session.classification.produces_output)
     lines = [
         f"Task: {session.task.text}",
-        f"The {by} has asked you ({role.value}) to {kind} on a focused point.",
-        f"Request: {reason}",
+        # The no-native-tools context is NOT optional here: an agentic CLI seat
+        # (codex) told to "author a file" without it tries to CREATE the file
+        # with its own tools inside its read-only sandbox and dies (live:
+        # 'delegation to code_generator failed: codex CLI exited 1 …
+        # sandbox: read-only'). The panel prompt always carries this; the
+        # delegate prompt must too — the reply TEXT is the deliverable.
+        rounds._GOVERNANCE_CONTEXT,
+        f"The {by} has assigned you ({role.value}) a piece of this task.",
+        f"Assignment: {reason}",
         role_instruction(role),
-        "Answer ONLY that request — concise, concrete, task-relevant. Do not produce "
-        "final deliverables or restate the whole task.",
     ]
+    if kind == "delegate":
+        lines.append(
+            "You are the specialist DOING this piece — produce it yourself, "
+            "complete and ready to integrate, not advice about how someone else "
+            "might do it.")
+        if produces:
+            lines.append(rounds.DELEGATE_FILE_CONTRACT)
+    else:
+        lines.append(
+            "Answer ONLY that request — concise, concrete, task-relevant. Do not "
+            "produce final deliverables or restate the whole task.")
     if may_subconsult:
         others = ", ".join(r.value for r in config.TALENTS if r != role)
         lines.append(
@@ -443,16 +471,58 @@ def _resolve_one_delegation(
         store.log_event(sid, "delegation_granted",
                         {"to": role.value, "agent": helper.agent, "kind": kind,
                          "reason": reason, "depth": depth})
+        store.save_session(session)  # the talent's roster chip appears the moment it's recruited
     try:
-        answer = call(helper, delegate_prompt(
-            session, role, kind, reason,
-            by=requester.role.value, may_subconsult=can_subconsult))
+        # One retry on a transient seat failure BEFORE giving up: the fallback
+        # (the lead doing the talent's work itself) defeats the point of the
+        # roster, so it must be the last resort, not the first response.
+        try:
+            answer = call(helper, delegate_prompt(
+                session, role, kind, reason,
+                by=requester.role.value, may_subconsult=can_subconsult))
+        except AgentError as first:
+            with _SESSION_LOCK:
+                store.log_event(sid, "delegation_retry",
+                                {"to": role.value, "agent": helper.agent,
+                                 "error": str(first)[:200]})
+            answer = call(helper, delegate_prompt(
+                session, role, kind, reason,
+                by=requester.role.value, may_subconsult=can_subconsult))
+        # ORCHESTRATOR model: a DELEGATED talent produces its piece of the
+        # deliverable itself. Its ARTIFACT/EDIT/RUNTESTS blocks become real
+        # proposals HERE, stamped with the talent's role — the folded summary
+        # below is capped at DELEGATION_RESULT_MAX_CHARS, a pipe that would
+        # truncate a whole file to nothing. PROMOTE is deliberately NOT
+        # captured from a talent: delivery stays the lead's decision (and the
+        # human's gate). CONSULT stays pure advice — no capture.
+        captured: list[ProposedAction] = []
+        if kind == "delegate":
+            captured = [a for a in _parse_proposals(sid, answer.content, role=role)
+                        if a.kind in ("write_file", "edit_file", "run_tests")]
+            if captured:
+                with _SESSION_LOCK:
+                    _append_proposals(session, store, captured)
+                    store.log_event(sid, "delegate_artifacts_captured",
+                                    {"talent": role.value, "agent": helper.agent,
+                                     "files": [a.filename for a in captured]})
+                    store.save_session(session)
         # Fold the reply back with the CONCLUSION intact: the RESULT: block is
         # kept whole and the preamble absorbs the truncation. A reply without
-        # the block falls back to plain head-truncation.
+        # the block falls back to plain head-truncation. When files were
+        # captured, fold their NAMES plus the talent's rationale — never the
+        # file bodies (they are already real proposals; re-folding them would
+        # both truncate and tempt the lead to re-emit them).
         cap = config.DELEGATION_RESULT_MAX_CHARS
         preamble, result_block = rounds.split_result_block(answer.content)
-        if result_block:
+        if captured:
+            first_block = min(m.start() for m in _BLOCK_START.finditer(answer.content))
+            rationale = answer.content[:first_block].strip()
+            names = ", ".join(a.filename for a in captured)
+            piece = (f"[{role.value} authored directly into the council space: {names} — "
+                     "already captured as real files; do NOT re-emit their contents. "
+                     "Review them and emit PROMOTE lines for what should ship.]\n"
+                     f"{rationale}\n\n{result_block}")[:cap]
+        elif result_block:
             result_block = result_block[:cap]  # a runaway block is still bounded
             head = preamble.strip()[: max(0, cap - len(result_block))].rstrip()
             piece = f"{head}\n\n{result_block}" if head else result_block
@@ -587,8 +657,12 @@ def _resolve_skill_requests(
             return contribution
         for name, arg in fresh[: _skill_request_cap(session)]:
             seen.add((name, arg))
-            store.log_event(sid, "skill_requested",
-                            {"skill": name, "role": member.role.value, "arg": arg})
+            # Panel seats resolve their skills on fan-out worker threads, so
+            # every shared-state mutation here goes under _SESSION_LOCK (the
+            # skill execution itself — file/web I/O — stays outside it).
+            with _SESSION_LOCK:
+                store.log_event(sid, "skill_requested",
+                                {"skill": name, "role": member.role.value, "arg": arg})
             skill = get_skill(name)
             if skill is None:
                 results.append(f"SKILL {name}: unknown skill")
@@ -607,20 +681,23 @@ def _resolve_skill_requests(
             arg_key = skill.inputs[0] if skill.inputs else "filename"
             action = ProposedAction(session_id=sid, kind=name, args={arg_key: arg}, role=member.role)
             governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
-            session.proposed_actions.append(action)
+            with _SESSION_LOCK:
+                session.proposed_actions.append(action)
             if action.status == "denied":
                 results.append(f"SKILL {name}: denied — {action.error}")
                 continue
             try:
                 out = executor.execute(session, action, store.data_dir)
                 action.status = "executed"
-                session.tools_called.append(name)
-                store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
+                with _SESSION_LOCK:
+                    session.tools_called.append(name)
+                    store.log_event(sid, "skill_resolved", {"skill": name, "arg": arg, "chars": len(out)})
                 results.append(f"SKILL {name} '{arg}' result:\n{out[: _skill_result_cap(session)]}")
             except ExecutionError as e:
                 action.status = "failed"
                 action.error = str(e)
-                store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
+                with _SESSION_LOCK:
+                    store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
                 results.append(f"SKILL {name}: error — {e}")
         followup = (
             f"{prompt}\n\nSkill results (use these; do not request them again):\n"
@@ -655,27 +732,69 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
     )
 
 
+def _capture_panel_artifacts(
+    session: Session, member: CouncilMember, content: str,
+    governance: Governance, store: LogStore,
+) -> None:
+    """A panel seat that wrote a COMPLETE file gets it saved into the council
+    sandbox IMMEDIATELY, namespaced to the seat (codex__index.html) so seven
+    parallel takes can never clobber one another or the deliverable. These are
+    advisory drafts the lead can read/compare (they appear in its readable
+    list) — they never count as the delivery itself (_has_proposals excludes
+    the panelist role), so materialization/salvage still guard the pipeline."""
+    for a in _parse_proposals(session.session_id, content, role=Role.panelist):
+        if a.kind != "write_file":
+            continue  # edits/tests/promotes in a panel take are advice, not actions
+        fn = f"{member.agent}__{_basename(a.filename)}"
+        a.filename = fn
+        a.args["filename"] = fn
+        governance.authorize_action(session, a)
+        if a.status != "denied":
+            try:
+                path = executor.execute(session, a, store.data_dir)
+                a.status = "executed"
+            except ExecutionError as e:
+                a.status = "failed"
+                a.error = str(e)
+                path = None
+        else:
+            path = None
+        with _SESSION_LOCK:
+            session.proposed_actions.append(a)
+            if a.status == "executed":
+                if path and path not in session.files_changed:
+                    session.files_changed.append(path)
+                store.log_event(session.session_id, "panel_artifact_saved",
+                                {"agent": member.agent, "file": fn,
+                                 "chars": len(a.content or "")})
+
+
 def _panel_one(
     session: Session, member: CouncilMember, prompt: str,
-    call: AgentCall, store: LogStore,
+    call: AgentCall, governance: Governance, store: LogStore,
 ) -> Optional[Contribution]:
     """One panel seat's contribution, fan-out-safe: a failing seat is dropped
     for the round (logged, noted), never fatal. A panel seat asking the human a
     question is also treated as a drop — pausing mid-fan-out with sibling
-    threads in flight is not sound; only the lead's calls may pause the run."""
+    threads in flight is not sound; only the lead's calls may pause the run.
+    Panel seats have the same discovery skills as the lead (chained SKILL:
+    resolution) and their complete files are saved to the sandbox, namespaced
+    per seat."""
     dropped_contribution = None
     try:
         c = call(member, prompt)
+        c = _resolve_skill_requests(session, member, prompt, c, call, governance, store)
         # A stub take (tool-call debris / announced-but-not-done work) would
         # only pollute the synthesis and later context windows — drop the seat
         # for this round AND remove its debris from the transcript (the
         # panel_seat_dropped event + unresolved note keep the audit trail). No
         # retry: panel seats are best-effort voices, and the lead + composer
         # still have every healthy take.
-        if rounds.reply_is_stub(c.content):
+        if rounds.reply_is_stub(c.content, skills_resolved=True):
             reason = "stub reply (announced or attempted the work instead of doing it)"
             dropped_contribution = c
         else:
+            _capture_panel_artifacts(session, member, c.content, governance, store)
             return c
     except AgentInputRequired:
         reason = "asked for user input"
@@ -755,6 +874,8 @@ def _run_panel_rounds(
         )
         session.rounds.append(spec)
         store.log_event(sid, "round_start", spec.model_dump())
+        with _SESSION_LOCK:
+            store.save_session(session)  # banner shows the round goal + awaited seat live
         readable = _readable_files(session, store.data_dir)
         # the big up-front context is only worth its tokens once — round 1
         ov = established_overview if r == 0 else ""
@@ -771,7 +892,7 @@ def _run_panel_rounds(
                 futures = [
                     ex.submit(_panel_one, session, m,
                               rounds.panel_prompt(session, m, r, ov, readable),
-                              call, store)
+                              call, governance, store)
                     for m in panel
                 ]
                 # Wait cancel-aware. A plain shutdown(wait=True)/f.result() blocks
@@ -795,6 +916,9 @@ def _run_panel_rounds(
         # (b) SYNTHESIS — the lead does the real work; CONSULT/DELEGATE and
         # SKILL requests remain available inside every round.
         governance.check(session, "generate_text")
+        # panel seats may have saved namespaced draft files during the fan-out —
+        # refresh so the synthesis prompt lists them as readable
+        readable = _readable_files(session, store.data_dir)
         p = rounds.synthesis_prompt(session, council, role_agents, r, results, ov, readable)
         c = lead_call(lead, p)
         c = _resolve_skill_requests(session, lead, p, c, call, governance, store,
@@ -1155,9 +1279,12 @@ _BLOCK_START = re.compile(
 )
 
 
-def _parse_proposals(sid: str, text: str) -> list[ProposedAction]:
+def _parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[ProposedAction]:
     """Parse a draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE blocks into ProposedActions,
-    in document order (so writes/edits precede a test run)."""
+    in document order (so writes/edits precede a test run). `role` stamps who
+    authored the blocks — the lead's draft parses as implementer (historical
+    default); a DELEGATED talent's reply parses as that talent, so governance
+    and attribution both see the real author."""
     starts = sorted(m.start() for m in _BLOCK_START.finditer(text))
 
     def _content_end(after: int) -> int:
@@ -1168,17 +1295,17 @@ def _parse_proposals(sid: str, text: str) -> list[ProposedAction]:
         fn = m.group(1).strip()
         body = _clean_artifact_body(text[m.end():_content_end(m.end())], fn)
         found.append((m.start(), ProposedAction(
-            session_id=sid, kind="write_file", role=Role.implementer,
+            session_id=sid, kind="write_file", role=role,
             filename=fn, content=body, args={"filename": fn, "content": body})))
     for m in _EDIT_MARKER.finditer(text):
         fn = m.group("file").strip()
         found.append((m.start(), ProposedAction(
-            session_id=sid, kind="edit_file", role=Role.implementer, filename=fn,
+            session_id=sid, kind="edit_file", role=role, filename=fn,
             args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
     for m in _RUNTESTS_MARKER.finditer(text):
         cmd = (m.group("cmd") or "").strip()
         found.append((m.start(), ProposedAction(
-            session_id=sid, kind="run_tests", role=Role.implementer,
+            session_id=sid, kind="run_tests", role=role,
             filename=cmd or "pytest -q", args={"command": cmd})))
     # PROMOTE is collected even without an established folder: the missing
     # delivery target is asked for at execution time (_execute_actions), not
@@ -1202,8 +1329,13 @@ def _append_proposals(session: Session, store: LogStore, actions: list[ProposedA
 
 def _collect_proposals(session: Session, store: LogStore) -> None:
     """Turn the lead's final draft into ProposedActions (loop step 7b).
-    Idempotent: not re-collected on resume."""
-    if _has_proposals(session):
+    Idempotent: not re-collected on resume — guarded on LEAD/implementer-
+    authored proposals already existing. Proposals captured from DELEGATED
+    talents (stamped with the talent's role) deliberately don't trip the
+    guard: the lead's own draft still needs collecting, or its PROMOTE lines
+    would be dropped exactly when a talent authored the files."""
+    if any(a.role in (Role.lead, Role.implementer) for a in session.proposed_actions
+           if a.kind in ("write_file", "edit_file", "run_tests", "promote")):
         return
     draft = next(
         (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),

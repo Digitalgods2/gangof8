@@ -63,15 +63,17 @@ LEAD_TIMEOUT = 600
 # Talent menu advertised to the lead: each specialist role and what it is good
 # for, so the lead knows what it can reach for (its origin model is filled in
 # from the role→agent map at prompt-build time).
+# The delegable talent menu (orchestrator model: the lead assigns, these DO).
 TALENTS: dict[Role, str] = {
     Role.knowledge_retriever: "gather sourced evidence (file:line / URLs)",
-    Role.researcher: "interpret evidence, current/web research",
-    Role.architect: "system design and structural tradeoffs",
-    Role.code_generator: "focused implementation / algorithm help",
+    Role.researcher: "do the research: interpret evidence, current/web research",
+    Role.architect: "produce the system design and structural tradeoffs",
+    Role.code_generator: "author the implementation: complete files / algorithms",
     Role.api_integrator: "external API contracts (endpoint/auth/errors)",
     Role.critic: "rigorous review of a risky claim or implementation",
     Role.red_team: "adversarial/security/abuse failure modes",
     Role.fact_validator: "independently verify specific claims",
+    Role.implementer: "draft a complete written deliverable (docs, reports, prose)",
 }
 
 

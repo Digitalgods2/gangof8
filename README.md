@@ -8,15 +8,17 @@ your machine (the claude, codex, and gemini CLIs) plus any API seats you
 enable (DeepSeek, GLM, Qwen, Kimi) convenes as a *panel*, each writing its
 take **independently and in parallel** — nobody sees anyone else's answer
 while writing, so you get genuinely different perspectives instead of an echo
-chamber. Then a **lead** model reads them all and does what a good chief
-engineer does: verifies claims against the actual evidence before believing
-them, adopts what's right, overrules what's wrong *by name*, pulls in
-specialist sub-agents when it needs one — and every contribution is tagged
-with the exact model that wrote it.
+chamber. Then a **lead** model reads them all and does what a good engineering
+manager does: verifies claims against the actual evidence before believing
+them, adopts what's right, overrules what's wrong *by name*, and **assigns the
+substantive work to specialist talents** — the coder codes, the researcher
+researches, the critic checks — then integrates what they produce. Every
+contribution is tagged with the exact model that wrote it.
 
 It doesn't just talk — it **builds**. Ask for working software and the
-council designs it, the lead writes complete files, runs their tests, and
-**fixes its own failures** before anything ships. Deliberation rotates
+council designs it, the lead delegates the authoring to its coder talent
+(whose ARTIFACT output is captured directly as real files), runs the tests,
+and **fixes its own failures** before anything ships. Deliberation rotates
 automatically, pausing to ask *you* only when it wants more rounds; work
 happens freely in a sandboxed scratch space; and exactly **one hard gate**
 stands between the council and your real files — a diff-carrying approval
@@ -66,12 +68,22 @@ seat is a **different origin model**. Here is what each is doing:
   their take **independently and in parallel**. None of them sees the others'
   answers while writing, deliberately: you get N genuinely different
   perspectives instead of N models agreeing with whoever spoke first. That is
-  the diversity-of-intelligence bet the whole system is built on.
-- **The lead** (yellow chip) is the synthesizer and decision-maker. After the
-  panel fan-out finishes, it gets all the takes and does the real work: weighs
-  them, adopts what's right, pushes back on what's weak, pulls in specialist
-  talents mid-round when it needs one (`CONSULT:` / `DELEGATE:`), writes any
-  files, and ends with `ROUND: DONE` or `ROUND: CONTINUE`.
+  the diversity-of-intelligence bet the whole system is built on. Panel seats
+  have real hands, not just voices: they pull the same governed discovery
+  skills as the lead (`SKILL: read_file/search_project/list_dir/web_search`,
+  resolved mid-fan-out) so takes are grounded in the actual files, and a
+  complete file in a take is saved to the council sandbox **immediately,
+  namespaced per seat** (`codex__index.html`) — advisory drafts the lead can
+  read and compare, never clobbering each other or the deliverable.
+- **The lead** (yellow chip) is the organizer and integrator — a project
+  manager, not a doer. After the panel fan-out finishes, it weighs the takes,
+  breaks the task into assignments, and hands each to the right specialist
+  talent (`CONSULT:` for advice, `DELEGATE:` for production — a delegated
+  coder's `ARTIFACT:` blocks are captured directly as real files, attributed
+  to that talent and its exact model). The lead integrates what comes back,
+  quality-gates it, decides delivery (`PROMOTE:` stays its call), and ends
+  with `ROUND: DONE` or `ROUND: CONTINUE`. It authors only trivial glue
+  itself.
 - **Why the lead's model also appears as a panelist:** same model, two
   different jobs. As a panelist it is one independent voice among many; as
   the lead it is the judge, not a witness — a separate call with a separate
@@ -81,9 +93,16 @@ seat is a **different origin model**. Here is what each is doing:
 - **The summarizer** (purple chip) composes the final answer card for
   question/research tasks. Build tasks usually skip it entirely — they get a
   fast, deterministic file-manifest summary instead.
-- **The specialist talents** (critic, red_team, fact_validator, …) exist but
-  sit inactive off the roster; one lights up only when the lead actually pulls
-  it in.
+- **The specialist talents** (critic, red_team, fact_validator, …) sit dormant
+  until the lead recruits one — then the dashboard shows it live: the status
+  banner reads `🤝 code_generator ← claude (delegate): …` the moment the
+  assignment is made, a dashed 🤝 chip joins the roster, and a plain-language
+  recruitment row appears under the Council card ("claude · opus called in as
+  Code Generator — answered in round 2"). Each role can pin its own model
+  (Settings → Role mapping → agent · model; role pin › seat pin › CLI
+  default), so a rarely-called coder talent can run a heavyweight model while
+  the seat's everyday default stays fast. A delegation that fails is retried
+  once before the lead falls back to doing the work itself.
 
 **Rotation is automatic but consent-gated.** Rounds proceed on their own; if
 the lead declares CONTINUE three times (`ROUNDS_PER_CONSENT`, settable), the
@@ -94,9 +113,13 @@ model calls (every seat + the lead synthesis) — which is exactly why the
 consent gate exists.
 
 **One hard gate.** Work happens freely in the council's own sandbox/workspace
-(writes, edits, test runs, staging, web lookups — no approvals). The single
-approval in the whole pipeline is **promote**: copying a finished file into
-your real folder, with a diff on the approval card. A promote with no known
+(writes, edits, test runs, staging, web lookups — no approvals), and
+council-space skills are open to **every seat**: a role being unable to land
+its work in the sandbox is treated as a design failure, so role-gating never
+blocks council work. The single approval in the whole pipeline — and the one
+place that stays role-gated (the lead decides delivery) — is **promote**:
+copying a finished file into your real folder, with a diff on the approval
+card. A promote with no known
 destination asks you *where* at delivery time — never up front, never assumed.
 On any approval you can pick **Approve all** to grant that category for the
 whole session — one deliberate decision instead of N identical clicks.
@@ -209,12 +232,17 @@ dashboard at `http://127.0.0.1:8790/`:
 - **Bottom-center chat composer** — auto-growing text box (Enter sends,
   Shift+Enter for a newline), a **Clear** button, and a **+** menu to attach a
   **document (text / PDF)** or **image**. Attachments show as removable chips.
-- **Live progress** — each session shows a pulsing status banner (current round
-  goal, the seat being awaited, a ticking elapsed timer) and a council roster
-  that green-checks each agent as it contributes.
+- **Live progress** — the session state persists at every step (each landed
+  contribution, round start, talent recruitment), so the poll sees work as it
+  happens: a pulsing status banner (current round goal, the seat being
+  awaited, in-flight talent pulls, a ticking elapsed timer) and a council
+  roster that green-checks each agent — with its exact model — as it
+  contributes, plus a plain-language recruitment feed under the roster.
 - **Rollups** — the final answer plus a one-line stats summary; contributions
   and disagreements collapse to informative one-line summaries (expandable),
-  with open/closed state preserved across the 3 s refresh.
+  with open/closed state preserved across the 3 s refresh. Finished sessions
+  grow a **Respond to the council** box — multi-modal like the task composer
+  (attach documents/images) — that re-deliberates with the whole thread.
 - **Approvals & questions** — file-write gates surface **Approve / Deny**
   buttons (naming the exact target path); agent questions surface an
   **Answer / Decline** box.
@@ -236,29 +264,32 @@ its category, risk, `requires_approval`, allowed roles, and inputs; the kernel
 role-gates every action and decides on that metadata — never on hardcoded
 behaviour.
 
-| Skill | Approval | What it does |
-|-------|----------|--------------|
-| `write_file` / `edit_file` | none | Write/edit files in the council's own sandbox or workspace |
-| `run_tests` | none | Run a test command inside the council's spaces (time/output-bounded) |
-| `read_file` / `search_project` / `list_dir` | none (read) | Read, grep, and list — sandbox, workspace, or the established folder |
-| `web_search` / `web_fetch` | none (read) | Governed live-web lookups via the coordinator |
-| `stage` | none | Move a file up from sandbox into the permanent workspace |
-| `promote` | **required** (human, with diff) | **The ONE gate** — copy a council file into your real (established) folder |
+| Skill | Approval | Roles | What it does |
+|-------|----------|-------|--------------|
+| `write_file` / `edit_file` | none | **every seat** | Write/edit files in the council's own sandbox or workspace |
+| `run_tests` | none | lead, implementer, critic, code_generator | Run a test command inside the council's spaces (time/output-bounded) |
+| `read_file` / `search_project` / `list_dir` | none (read) | **every seat** | Read, grep, and list — sandbox, workspace, or the established folder |
+| `web_search` / `web_fetch` | none (read) | **every seat** | Governed live-web lookups via the coordinator |
+| `stage` | none | lead, implementer | Move a file up from sandbox into the permanent workspace |
+| `promote` | **required** (human, with diff) | lead, implementer | **The ONE gate** — copy a council file into your real (established) folder |
 
-- **Producing files**: the lead heads a block with `ARTIFACT: <filename>`
-  (one per file) followed by the full contents; these write freely into the
-  sandbox. A `PROMOTE: <filename>` line is what proposes real delivery — that
-  is where the approval (and, if unset, the "where should this go?" question)
-  happens. If an output task names files but emits no full blocks, the
-  coordinator **materializes** each with a focused single-file call.
-- **Reading mid-deliberation**: any allowed role may emit a plain-text
+- **Producing files**: an `ARTIFACT: <filename>` block (full contents after
+  the header) writes freely into the sandbox — from the lead, from a
+  **delegated talent** (captured directly, attributed to that talent and its
+  exact model), or from a **panel seat** (saved namespaced per seat as an
+  advisory draft). A `PROMOTE: <filename>` line — the lead's call — is what
+  proposes real delivery; that is where the approval (and, if unset, the
+  "where should this go?" question) happens. If an output task names files but
+  emits no full blocks, the coordinator **materializes** each with a focused
+  single-file call.
+- **Reading mid-deliberation**: any seat — panelists included — may emit a plain-text
   `SKILL: read_file <path>` or `SKILL: search_project <query>` line; the kernel
   authorizes it (reads need no approval) and the results are fed back on a
   re-call. A follow-up reply may open a NEW request (read one file → the next
   read depends on what it said) — those resolve too, as a bounded chain
   (`MAX_SKILL_CHAIN_TURNS`, default 3 re-calls) with every result accumulated
   and repeats never re-executed. A reply that is nothing but an unresolved
-  request is a stub, never a synthesis. The grammar is advertised to a role
+  request is a stub, never a synthesis. The grammar is advertised to a seat
   only when it's useful.
 - **No agent does I/O itself** — every write flows through the executor +
   human approval; the only ungated capability is `generate_text`.
@@ -438,6 +469,18 @@ files are produced via `ARTIFACT:` + approval.
       hard path containment; the first Type-2 module.
 - [x] Multi-modal input — text / PDF attachments folded in as context; **image
       vision** for claude, codex, and gemini (no tools, governed).
+- [x] Orchestrator model — the lead organizes and integrates, never does the
+      substantive work itself: it assigns via `CONSULT:`/`DELEGATE:`, a
+      delegated talent's `ARTIFACT:` blocks are captured directly as real
+      files (attributed to that talent + its per-role pinned model), failed
+      delegations retry once, and delivery (`PROMOTE:`) stays the lead's call
+      behind the one human gate.
+- [x] Council-space access for every seat — read/write/discovery skills open
+      to ALL roles (a role unable to land its work in the sandbox is a design
+      failure); panel seats resolve `SKILL:` reads mid-fan-out and their
+      complete files save immediately, namespaced per seat, as advisory
+      drafts. Mid-run state persists at every step, so the dashboard shows
+      contributions, recruitments, and drafts live.
 - [x] Delivery resilience — the safety-net ladder (materialization with an
       established-folder fallback for revision follow-ups, panel artifact
       salvage, honest failure reporting), redelivery auto-promote, chained

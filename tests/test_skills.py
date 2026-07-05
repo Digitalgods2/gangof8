@@ -160,7 +160,8 @@ def test_write_file_metadata():
     assert s.category == "file_write"
     assert s.risk == Risk.low
     assert s.requires_approval is False, "write_file is now free (no approval)"
-    assert s.allowed_roles == [Role.lead, Role.implementer]
+    # council-space writes are open to EVERY seat; promote is the boundary
+    assert all(role in s.allowed_roles for role in Role)
     assert s.inputs == ["filename", "content", "target"]
 
 
@@ -412,9 +413,11 @@ def test_promote_refuses_empty_source(governance, session, tmp_path):
 
 
 def test_role_not_allowed_is_denied_without_approval(governance, session):
+    # council-space skills are open to all roles now; DELIVERY (promote) is the
+    # boundary that stays role-gated — the summarizer may not propose one
     action = ProposedAction(
-        session_id=session.session_id, kind="write_file", role=Role.researcher,
-        args={"filename": "x.md", "content": "y"},
+        session_id=session.session_id, kind="promote", role=Role.summarizer,
+        args={"filename": "x.md"},
     )
     assert governance.authorize_action(session, action) is None
     assert action.status == "denied"

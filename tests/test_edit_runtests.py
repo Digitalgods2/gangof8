@@ -39,7 +39,9 @@ def session(tmp_path):
 def test_edit_file_metadata():
     s = get_skill("edit_file")
     assert s.category == "file_edit" and s.requires_approval is False  # now free
-    assert s.risk == Risk.low and s.allowed_roles == [Role.lead, Role.implementer]
+    assert s.risk == Risk.low
+    # council-space edits are open to EVERY seat; promote is the boundary
+    assert all(role in s.allowed_roles for role in Role)
 
 
 def test_run_tests_metadata():
