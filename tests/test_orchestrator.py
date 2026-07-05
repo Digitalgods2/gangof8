@@ -152,6 +152,30 @@ def test_contribution_is_persisted_immediately(tmp_path, store, session):
     assert snap["contributions"][0]["content"] == "the take"
 
 
+def test_file_builds_ask_every_seat_for_a_full_candidate(session):
+    """Best-of-N: on a file build EVERY seat authors its complete candidate —
+    the candidates are scored and the winner ships, so a full draft is the
+    point, not waste. (Greenfield and revision both.)"""
+    member = CouncilMember(role=Role.panelist, agent="mock", active=True)
+    p = rounds.panel_prompt(session, member, 0)
+    assert "BEST-OF-N build" in p
+    assert "ARTIFACT: <filename>" in p
+    assert "highest-scoring file is shipped" in p
+
+
+def test_non_output_tasks_get_no_file_contract(store):
+    """A research/question task doesn't produce a deliverable — no candidate
+    contract, panel stays prose."""
+    from conclave_os.models import Classification, Complexity, Risk, TaskType
+    s = SessionManager(store).create("compare SQLite vs JSON", source="test")
+    s.classification = Classification(task_type=TaskType.question,
+                                      complexity=Complexity.standard, risk=Risk.none,
+                                      produces_output=False)
+    member = CouncilMember(role=Role.panelist, agent="mock", active=True)
+    p = rounds.panel_prompt(s, member, 0)
+    assert "BEST-OF-N" not in p and "ARTIFACT:" not in p
+
+
 def test_lead_charter_is_orchestrator(session):
     """The lead prompt frames the lead as organizer/integrator and, for output
     tasks, tells it to DELEGATE the authoring."""

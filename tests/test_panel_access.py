@@ -105,6 +105,164 @@ def test_two_seats_same_filename_do_not_clobber(tmp_path, store, governance, ses
     assert "run()" in (d / "gemini__index.html").read_text(encoding="utf-8")
 
 
+def test_council_drafts_read_whole_not_truncated(tmp_path, store, governance, session):
+    """The 2k skill window starved the lead on its own ~25KB drafts (live:
+    'every draft is truncated mid-file', looping on re-reads). A file the
+    council itself wrote into the sandbox reads at the sandbox cap."""
+    d = executor.artifacts_dir(tmp_path, session.session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "codex__game.html").write_text("x" * 3000 + "THE_REAL_ENDING", encoding="utf-8")
+    member = CouncilMember(role=Role.lead, agent="mock", active=True)
+    contribution = _contribution(Role.lead, "mock", "SKILL: read_file codex__game.html")
+    prompts: list[str] = []
+
+    def call(m, prompt):
+        prompts.append(prompt)
+        return _contribution(m.role, m.agent, "picked the winner")
+
+    loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert "THE_REAL_ENDING" in prompts[0], "past the old 2000-char window"
+
+
+def test_consults_run_after_delegates_and_see_their_files(store, session):
+    """DELEGATE (production) resolves before CONSULT (review), and the consult
+    sees the freshly authored file contents — all-concurrent siblings made the
+    critic fire before the artifact existed (live: 'I am awaiting the
+    artifact', a wasted call)."""
+    lead = CouncilMember(role=Role.lead, agent="mock", active=True)
+    coder = CouncilMember(role=Role.code_generator, agent="mock")
+    critic = CouncilMember(role=Role.critic, agent="mock")
+    council = Council(members=[lead, coder, critic])
+    contribution = _contribution(
+        Role.lead, "mock",
+        "DELEGATE: code_generator - author the complete game.html\n"
+        "CONSULT: critic - review the authored file for defects")
+    calls: list[tuple[Role, str]] = []
+
+    def call(m, prompt):
+        calls.append((m.role, prompt))
+        if m.role == Role.code_generator:
+            return _contribution(m.role, m.agent, f"done\nARTIFACT: game.html\n{GAME}")
+        if m.role == Role.critic:
+            return _contribution(m.role, m.agent, "reviewed: sound")
+        return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
+
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    roles = [r for r, _ in calls]
+    assert roles.index(Role.critic) > roles.index(Role.code_generator)
+    critic_prompt = next(p for r, p in calls if r == Role.critic)
+    assert "FILES JUST AUTHORED" in critic_prompt
+    assert GAME in critic_prompt, "the critic reviews the real file, not a promise"
+    assert out.content.startswith("integrated")
+
+
+def test_delegation_reseats_on_requester_model_after_double_failure(store, session):
+    """A seat that fails twice gets the role RESEATED on the requester's own
+    model before the assignment collapses back onto the lead (live: codex as
+    code_generator failed the same way across two runs)."""
+    lead = CouncilMember(role=Role.lead, agent="claude", active=True)
+    critic = CouncilMember(role=Role.critic, agent="codex")
+    council = Council(members=[lead, critic])
+    contribution = _contribution(Role.lead, "claude", "CONSULT: critic - check the loop")
+    seen: list[str] = []
+
+    def call(m, prompt):
+        seen.append(m.agent)
+        if m.agent == "codex":
+            raise AgentError("codex CLI exited 1: sandbox")
+        if m.role == Role.critic:
+            return _contribution(m.role, m.agent, "the loop is sound")
+        return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
+
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    assert seen[:3] == ["codex", "codex", "claude"], "retry, then reseat"
+    assert out.content.startswith("integrated")
+    assert not any("failed" in u for u in session.unresolved), \
+        "a reseated delegation leaves no failure note"
+
+
+def test_sandbox_reads_work_with_established_root_bound(tmp_path, store, governance, session):
+    """The single-space read default made council-authored sandbox drafts
+    unreadable whenever an established folder was bound — the read resolved
+    to the (empty) established folder and failed (live, twice). Reads now
+    fall back across spaces."""
+    est = tmp_path / "est"
+    est.mkdir()
+    (est / "notes.txt").write_text("established copy", encoding="utf-8")
+    session.established_root = str(est)
+    d = executor.artifacts_dir(tmp_path, session.session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "centipede.html").write_text("<html>the draft</html>", encoding="utf-8")
+    member = CouncilMember(role=Role.lead, agent="mock", active=True)
+    contribution = _contribution(Role.lead, "mock",
+                                 "SKILL: read_file centipede.html\n"
+                                 "SKILL: read_file notes.txt")
+    prompts: list[str] = []
+
+    def call(m, prompt):
+        prompts.append(prompt)
+        return _contribution(m.role, m.agent, "grounded take")
+
+    loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert "the draft" in prompts[0], "sandbox draft readable despite established root"
+    assert "established copy" in prompts[0], "established files still read (default space)"
+
+
+def test_declared_destination_autofills_promotes_for_new_files(tmp_path, store, session):
+    """A run that authored a verified file for an explicitly named destination
+    must PROPOSE its delivery even when the lead omitted the PROMOTE line —
+    the old already-delivered-only rule left the user's folder empty on every
+    first (greenfield) delivery while reporting success. Still human-gated.
+    Panel drafts never qualify."""
+    from conclave_os.models import ProposedAction
+
+    est = tmp_path / "est"
+    est.mkdir()  # empty: greenfield — nothing pre-delivered
+    session.established_root = str(est)
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="centipede.html", content=GAME,
+        args={"filename": "centipede.html", "content": GAME}))
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.panelist,
+        filename="codex__centipede.html", content=GAME,
+        args={"filename": "codex__centipede.html", "content": GAME}))
+    loop._ensure_redelivery_promotes(session, store)
+    promotes = [a.filename for a in session.proposed_actions if a.kind == "promote"]
+    assert promotes == ["centipede.html"], "authored deliverable proposed; panel draft not"
+    # idempotent on resume
+    loop._ensure_redelivery_promotes(session, store)
+    assert len([a for a in session.proposed_actions if a.kind == "promote"]) == 1
+
+
+def test_delegates_run_on_the_production_call(store, session):
+    """DELEGATE (whole-file authoring) uses the lead-grade produce_call; the
+    quick-specialist call killed a reseated coder at 240s mid-file (live)."""
+    lead = CouncilMember(role=Role.lead, agent="mock", active=True)
+    coder = CouncilMember(role=Role.code_generator, agent="mock")
+    critic = CouncilMember(role=Role.critic, agent="mock")
+    council = Council(members=[lead, coder, critic])
+    contribution = _contribution(
+        Role.lead, "mock",
+        "DELEGATE: code_generator - author game.html\n"
+        "CONSULT: critic - sanity-check the plan")
+    via: list[tuple[str, Role]] = []
+
+    def call(m, prompt):
+        via.append(("specialist", m.role))
+        return _contribution(m.role, m.agent, "ok. ROUND: DONE")
+
+    def produce(m, prompt):
+        via.append(("production", m.role))
+        return _contribution(m.role, m.agent, f"done\nARTIFACT: game.html\n{GAME}")
+
+    loop._run_delegations(session, council, lead, contribution.content,
+                          call, store, depth=1, produce_call=produce)
+    assert ("production", Role.code_generator) in via
+    assert ("specialist", Role.critic) in via
+    assert ("specialist", Role.code_generator) not in via
+
+
 def test_delegation_retries_once_on_agent_error(store, session):
     lead = CouncilMember(role=Role.lead, agent="mock", active=True)
     critic = CouncilMember(role=Role.critic, agent="mock")

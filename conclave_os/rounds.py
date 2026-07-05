@@ -451,17 +451,117 @@ def panel_prompt(
         f"origin model: {member.agent}). Give YOUR best independent take on the "
         "task: the answer or design as you see it, the strongest objections, and "
         f"{disagree}"
-        "If your take includes a COMPLETE file, emit it as a block —\n"
-        "ARTIFACT: <filename>\n<full file contents>\n"
-        "— it is saved into the council sandbox under your seat's name for the "
-        "lead to review (raw bytes after the ARTIFACT line: no ``` fences, no "
-        "commentary after the content). Partial advice stays prose: describe "
-        "what should change; never paste fragments as ARTIFACT blocks and never "
-        "emit PROMOTE lines — delivery is the lead's decision. Do not ask the "
-        "human questions; state assumptions and proceed.\n"
+        f"{_panel_file_contract(session)}"
+        "Do not ask the human questions; state assumptions and proceed.\n"
         f"{_skill_hints(session, Role.panelist, readable)}"
         f"{overview}"
         f"{ctx_block}"
+    )
+
+
+def _panel_file_contract(session: Session) -> str:
+    """What a panel seat should do about FILES. Best-of-N: on a file-producing
+    build every seat authors its COMPLETE candidate implementation — the
+    candidates are then scored blindly and the best one SHIPS unchanged, so a
+    full draft is the point, not waste (the old design-only greenfield rule was
+    correct only while the lead re-authored; now the winning draft is the
+    deliverable). Non-output tasks stay prose."""
+    produces = bool(session.classification and session.classification.produces_output)
+    if not produces:
+        return ""
+    return (
+        "This is a BEST-OF-N build: emit YOUR COMPLETE candidate implementation "
+        "as a block —\n"
+        "ARTIFACT: <filename>\n<full file contents>\n"
+        "— raw bytes right after the ARTIFACT line (no ``` fences, no commentary "
+        "after the content; the file must end at its real final byte). Every "
+        "seat's candidate is saved and then SCORED by independent judges; the "
+        "single highest-scoring file is shipped to the user UNCHANGED, so make "
+        "yours complete, correct, and the one you'd want to win — not a sketch. "
+        "Do NOT emit PROMOTE lines (delivery is decided by the scored vote). A "
+        "short rationale before the ARTIFACT line is welcome.\n"
+    )
+
+
+CANDIDATE_CRITERIA = (
+    "completeness (no TODOs, stubs, or truncation — the file must be whole and "
+    "runnable), correctness by inspection (logic actually implements the task; "
+    "no obvious bugs), fidelity to the request (every stated requirement met), "
+    "and robustness (handles the edge cases a first attempt misses)"
+)
+
+
+def score_candidates_prompt(session: Session, labeled: list[tuple[str, str]]) -> str:
+    """A blind scoring pass: the judge sees each candidate's FULL body labeled
+    'Candidate N' with author identity stripped, scores each on the criteria,
+    and names its winner. `labeled` is [(label, body), ...]."""
+    blocks = []
+    for label, body in labeled:
+        blocks.append(f"===== {label} =====\n{body[:config.CANDIDATE_SCORE_MAX_CHARS]}")
+    n = len(labeled)
+    return (
+        f"Task the candidates implement: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"You are an impartial JUDGE. Below are {n} independent candidate "
+        "implementations of the SAME task, authorship hidden. Score each STRICTLY "
+        f"on: {CANDIDATE_CRITERIA}.\n"
+        "Read every candidate fully. A candidate that is truncated, stubbed, or "
+        "misses a requirement must score low no matter how elegant the rest is.\n"
+        f"Emit exactly one line per candidate, scoring 0-{config.JUDGE_SCORE_MAX}:\n"
+        "SCORE Candidate 1: <n>\n...\n"
+        f"SCORE Candidate {n}: <n>\n"
+        "Then one line naming your single best:\n"
+        "WINNER: Candidate <k>\n"
+        "Optionally, note concrete defects in the winner the author should fix "
+        "(one per line, prefixed 'DEFECT: ') — surgical fixes only, not a "
+        "rewrite. Base every score on what the code ACTUALLY does.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+_SCORE_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?SCORE\s+Candidate\s+(\d+)\s*[:—–-]\s*(\d+)",
+                       re.IGNORECASE | re.MULTILINE)
+_WINNER_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?WINNER\s*[:—–-]\s*(?:Candidate\s+)?(\d+)",
+                        re.IGNORECASE | re.MULTILINE)
+_DEFECT_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?DEFECT\s*[:—–-]\s*(.+?)\s*$",
+                        re.IGNORECASE | re.MULTILINE)
+
+
+def parse_candidate_scores(text: str, n: int) -> tuple[dict[int, int], int | None, list[str]]:
+    """(scores, winner_index, defects) from a judge reply. scores maps the
+    1-based candidate number → clamped score; winner is the WINNER: line's
+    number (or the top-scored if absent); defects are the winner's noted fixes.
+    1-based candidate numbers out of range are ignored."""
+    scores: dict[int, int] = {}
+    for m in _SCORE_RE.finditer(text or ""):
+        idx = int(m.group(1))
+        if 1 <= idx <= n:
+            scores[idx] = max(0, min(config.JUDGE_SCORE_MAX, int(m.group(2))))
+    wm = _WINNER_RE.search(text or "")
+    winner = int(wm.group(1)) if wm and 1 <= int(wm.group(1)) <= n else None
+    if winner is None and scores:
+        winner = max(scores, key=lambda k: scores[k])
+    defects = [d.strip() for d in _DEFECT_RE.findall(text or "") if d.strip()]
+    return scores, winner, defects
+
+
+def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[str]) -> str:
+    """Ask for SURGICAL edits to the winning candidate — the defects judges
+    flagged — never a rewrite (best-of-N ships the winner's own code)."""
+    deflines = "\n".join(f"- {d}" for d in defects)
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"The file below WON a blind best-of-N vote and will ship. Judges flagged "
+        "these specific defects to fix — fix ONLY these, with surgical edits; do "
+        "NOT rewrite or restyle the file (its author won on merit):\n"
+        f"{deflines}\n"
+        "Emit one EDIT block per fix (the OLD snippet must be unique in the file):\n"
+        "EDIT: " + filename + "\n"
+        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
+        "If a flagged defect is not real or not safely fixable in isolation, skip "
+        "it. Emit nothing but EDIT blocks.\n\n"
+        f"----- {filename} -----\n{body[:config.SKILL_RESULT_SANDBOX_MAX_CHARS]}"
     )
 
 

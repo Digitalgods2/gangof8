@@ -71,25 +71,37 @@ seat is a **different origin model**. Here is what each is doing:
   the diversity-of-intelligence bet the whole system is built on. Panel seats
   have real hands, not just voices: they pull the same governed discovery
   skills as the lead (`SKILL: read_file/search_project/list_dir/web_search`,
-  resolved mid-fan-out) so takes are grounded in the actual files, and a
-  complete file in a take is saved to the council sandbox **immediately,
-  namespaced per seat** (`codex__index.html`) — advisory drafts the lead can
-  read and compare, never clobbering each other or the deliverable.
-- **The lead** (yellow chip) is the organizer and integrator — a project
-  manager, not a doer. After the panel fan-out finishes, it weighs the takes,
-  breaks the task into assignments, and hands each to the right specialist
-  talent (`CONSULT:` for advice, `DELEGATE:` for production — a delegated
-  coder's `ARTIFACT:` blocks are captured directly as real files, attributed
-  to that talent and its exact model). The lead integrates what comes back,
-  quality-gates it, decides delivery (`PROMOTE:` stays its call), and ends
-  with `ROUND: DONE` or `ROUND: CONTINUE`. It authors only trivial glue
-  itself.
+  resolved mid-fan-out) so takes are grounded in the actual files. **On a file
+  build, each seat authors its own COMPLETE candidate implementation** — saved
+  to the sandbox immediately, namespaced per seat (`codex__index.html`), never
+  clobbering each other.
+- **Best-of-N: the winning file is a real model's code, not a re-write.** On
+  any task that produces a file, every candidate is first **executed headless
+  and any that crash on load are disqualified** — because judging by *reading*
+  is blind to runtime failure (a file can read as complete and correct and
+  still show a black screen). Only files that actually run are then **scored
+  blindly by independent judge seats** (author identity stripped — each judge
+  sees "Candidate 1…N", scores every one on completeness / correctness /
+  fidelity / robustness, and names a winner). The highest-scoring file is
+  shipped to you **byte-for-byte**, credited to the model that wrote it — with
+  an optional pass of *surgical* fixes for concrete defects the judges flagged
+  (re-executed afterward; if a fix breaks the file, the original winner ships
+  instead). If only one candidate runs, it wins without a vote; if none run,
+  no winner is declared. The dashboard shows it: 🗳️ candidates, 💥 crashers
+  rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements resolve
+  automatically (seats calling it `index.html` vs `centipede.html` are grouped
+  by the most-agreed name).
+- **The lead** (yellow chip) is the judge-orchestrator, not the author. On a
+  file build it runs the best-of-N selection and applies any winner fixes; when
+  there aren't enough candidates to select among (or the task isn't a file
+  build) it falls back to organizing the work — assigning to talents
+  (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
+  authoring as a last resort. Delivery (`PROMOTE:`) is always gated by your
+  approval. It ends each round with `ROUND: DONE` or `ROUND: CONTINUE`.
 - **Why the lead's model also appears as a panelist:** same model, two
-  different jobs. As a panelist it is one independent voice among many; as
-  the lead it is the judge, not a witness — a separate call with a separate
-  charter, so the synthesis weighs its own panel take like any other input.
-  (Remap the lead in Settings if you'd rather have a different model
-  arbitrate.)
+  different jobs. As a panelist it authors one candidate among many; as the
+  lead it judges/orchestrates — a separate call with a separate charter. (Remap
+  the lead in Settings if you'd rather a different model arbitrate.)
 - **The summarizer** (purple chip) composes the final answer card for
   question/research tasks. Build tasks usually skip it entirely — they get a
   fast, deterministic file-manifest summary instead.
@@ -380,6 +392,13 @@ under `data/uploads/`):
   file behind the promote gate or reports the failure honestly; fragments and
   advice snippets are never shipped as files (`test_salvage.py`,
   `test_materialize.py`).
+- **Nothing that doesn't run ships** — every produced web file is executed
+  headless (stubbed DOM, via Node) *before* the promote, and a file that throws
+  on load fails verification: its promote is stripped and the run reports honest
+  low-confidence failure, never a false success. Judging a file by reading is
+  banned as the sole criterion (`test_smoke.py`, `test_best_of_n.py`). Scope: a
+  smoke test catches load/first-frame crashes — the "dead on arrival" class —
+  not post-gameplay logic bugs.
 - Full reasoning trail — every classification, council choice, round,
   panel contribution, synthesis decision, and approval is in
   `data/sessions/<id>.jsonl`, with session state in `data/conclave_os.db`
@@ -486,3 +505,11 @@ files are produced via `ARTIFACT:` + approval.
       salvage, honest failure reporting), redelivery auto-promote, chained
       `SKILL:` resolution with dangling-request stub detection, and
       cancel-aware waits throughout the round loop.
+- [x] Best-of-N selection — every panel seat authors a complete candidate;
+      candidates are executed headless and crashers disqualified; survivors are
+      scored blindly by independent judges; the winning file ships byte-for-byte
+      (credited to its model), with an optional re-verified surgical fix pass.
+- [x] Runtime delivery gate — every produced web file is executed (stubbed-DOM
+      Node smoke test) *before* the promote; a file that throws on load is
+      blocked from delivery and the run reports honest failure. Verification was
+      moved ahead of the promote so nothing ships unverified.

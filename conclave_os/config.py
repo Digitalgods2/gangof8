@@ -294,8 +294,23 @@ SKILL_RESULT_MAX_CHARS = 2000
 # live run showed the lead reasoning to a wrong conclusion from exactly that
 # truncation (it "read" a test file whose decisive test sat past the cap).
 SKILL_RESULT_ANALYSIS_MAX_CHARS = 8000
+# Council-authored SANDBOX files (panel drafts, delegate artifacts) read whole:
+# a live run generated eight complete ~25KB game drafts and then starved the
+# lead with the 2000-char window — it paid to produce them and couldn't review
+# a single one ("every draft is truncated mid-file", looping on re-reads).
+SKILL_RESULT_SANDBOX_MAX_CHARS = 40000
 MAX_ESCALATION_REQUESTS_PER_TURN = 2
 ESCALATION_RESULT_MAX_CHARS = 2500
+
+# Best-of-N selection: on a file-producing build, every panel seat authors a
+# complete candidate implementation, independent judges SCORE all candidates
+# blindly (author identity stripped), and the highest-scoring file is the one
+# shipped — a real model's code, not a lead re-author. Owner directive
+# 2026-07-05 ("I want true best-of-N selection").
+BEST_OF_N_MIN_CANDIDATES = 2      # fewer than this ⇒ fall back to author path
+MAX_JUDGES = 5                    # independent scoring seats (cost bound)
+CANDIDATE_SCORE_MAX_CHARS = 24000 # per-candidate body shown to each judge
+JUDGE_SCORE_MAX = 10              # score scale a judge gives each candidate
 
 # Per-file artifact materialization: an agent sometimes describes multi-file
 # output in one draft instead of emitting it. When an output task yields no full
