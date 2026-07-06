@@ -281,6 +281,54 @@ def test_read_file_rejects_sandbox_escape(session, tmp_path):
         execute(session, action, tmp_path)
 
 
+def test_read_file_honors_absolute_path_inside_established(session, tmp_path):
+    # A model may cite the full path the USER wrote in the task. When it lands
+    # inside the established folder, the read must succeed (reads are safe) —
+    # not be refused as "must be relative" (live: every seat was denied the
+    # source file it named in full and invented the story instead).
+    est = tmp_path / "Benny"
+    est.mkdir()
+    (est / "Benny").mkdir()  # the decoy subdir the apostrophe bug used to select
+    src = est / "Benny's Splash.txt"
+    src.write_text("SPLASH!", encoding="utf-8")
+    session.established_root = str(est)
+
+    action = ProposedAction(
+        session_id=session.session_id, kind="read_file", role=Role.researcher,
+        args={"filename": str(src)},
+    )
+    assert execute(session, action, tmp_path) == "SPLASH!"
+
+
+def test_read_file_absolute_path_outside_all_spaces_is_refused(session, tmp_path):
+    # The boundary holds: an absolute path NOT inside any bound space is denied.
+    est = tmp_path / "Benny"
+    est.mkdir()
+    session.established_root = str(est)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("top secret", encoding="utf-8")
+    action = ProposedAction(
+        session_id=session.session_id, kind="read_file", role=Role.researcher,
+        args={"filename": str(secret)},
+    )
+    with pytest.raises(ExecutionError):
+        execute(session, action, tmp_path)
+
+
+def test_read_file_absolute_dotdot_escape_still_refused(session, tmp_path):
+    # `..` that climbs out of the established folder is neutralized by resolve().
+    est = tmp_path / "Benny"
+    est.mkdir()
+    session.established_root = str(est)
+    (tmp_path / "secret.txt").write_text("no", encoding="utf-8")
+    action = ProposedAction(
+        session_id=session.session_id, kind="read_file", role=Role.researcher,
+        args={"filename": str(est / ".." / "secret.txt")},
+    )
+    with pytest.raises(ExecutionError):
+        execute(session, action, tmp_path)
+
+
 # --- stage: sandbox → workspace, free -----------------------------------------
 
 

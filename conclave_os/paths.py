@@ -15,21 +15,25 @@ from pathlib import Path
 from typing import Optional
 
 # A quoted string containing a path separator — the most reliable signal
-# (e.g. "C:\Users\me\proj").
-_QUOTED = re.compile(r"""["'`]([^"'`\n]*[\\/][^"'`\n]*)["'`]""")
-# A bare Windows drive path (C:\... or C:/...).
-_WIN = re.compile(r"([A-Za-z]:[\\/][^\n\"'`<>|]+)")
+# (e.g. "C:\Users\me\Benny's Splash.txt"). The closing delimiter must MATCH the
+# opening one (backreference), so an apostrophe inside a double-quoted path no
+# longer ends the match early.
+_QUOTED = re.compile(r"""(?P<q>["'`])(?P<p>(?:(?!(?P=q)).)*[\\/](?:(?!(?P=q)).)*)(?P=q)""")
+# A bare Windows drive path (C:\... or C:/...). Apostrophes are allowed — real
+# filenames contain them ("Benny's Splash.txt"); excluding "'" truncated the
+# path there, pointing the established folder at the wrong directory.
+_WIN = re.compile(r"(?P<p>[A-Za-z]:[\\/][^\n\"`<>|]+)")
 # A UNC path (\\server\share\...).
-_UNC = re.compile(r"(\\\\[^\s\"'`<>|]+)")
+_UNC = re.compile(r"(?P<p>\\\\[^\s\"`<>|]+)")
 # A posix-rooted path (/abs/... or ~/...). Lower confidence — only accepted when
 # it actually exists on disk, to avoid grabbing stray slashes in prose.
-_POSIX = re.compile(r"(?<![\w])((?:~|/)[\w./\- ]+)")
+_POSIX = re.compile(r"(?<![\w])(?P<p>(?:~|/)[\w./\- ']+)")
 
 
 def _candidates(text: str):
     for rx in (_QUOTED, _WIN, _UNC, _POSIX):
         for m in rx.finditer(text):
-            yield rx, m.group(1).strip()
+            yield rx, m.group("p").strip()
 
 
 def extract_established_root(text: str) -> Optional[str]:
