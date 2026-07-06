@@ -72,6 +72,26 @@ def test_extract_new_file_with_prose_returns_parent(tmp_path):
     assert extract_established_root(text) == str(tmp_path.resolve())
 
 
+def test_extract_apostrophe_path_not_truncated(tmp_path):
+    # THE Benny bug: an apostrophe in the filename truncated the path, and a
+    # subfolder sharing the pre-apostrophe prefix got selected as the root.
+    parent = tmp_path / "Benny"
+    parent.mkdir()
+    (parent / "Benny").mkdir()  # the decoy the truncated path used to point at
+    src = parent / "Benny's Splash.txt"
+    src.write_text("splash", encoding="utf-8")
+    text = f"Read the first story at: {src}\nThen write a sequel."
+    # the file's REAL parent, not parent/Benny
+    assert extract_established_root(text) == str(parent.resolve())
+
+
+def test_extract_quoted_apostrophe_path(tmp_path):
+    # A double-quoted path with an apostrophe must not end at the apostrophe.
+    src = tmp_path / "Benny's Splash.txt"
+    src.write_text("x", encoding="utf-8")
+    assert extract_established_root(f'read the story in "{src}" first') == str(tmp_path.resolve())
+
+
 # --- greenfield classification ------------------------------------------------
 
 

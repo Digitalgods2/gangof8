@@ -129,14 +129,52 @@ def _write_file(session: Session, action: ProposedAction, data_dir: Path) -> str
     return str(path)
 
 
+def _abs_read_inside_space(session: Session, data_dir: Path, raw: str) -> Optional[Path]:
+    """If `raw` is an ABSOLUTE path that resolves INSIDE a bound space
+    (established, workspace, or sandbox), return it resolved. Reads are
+    non-destructive, so a model that cites the full path the USER wrote in the
+    task should get the file rather than a 'must be relative' refusal (live:
+    every seat was refused the source file it named in full, then invented the
+    story from scratch). The boundary holds: anything outside every bound root
+    returns None, and `..` is neutralized by resolving before the containment
+    test."""
+    raw = (raw or "").strip().strip("\"'`")
+    if not raw:
+        return None
+    is_abs = ((len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha())
+              or raw.startswith("\\\\") or raw.startswith("//") or Path(raw).is_absolute())
+    if not is_abs:
+        return None
+    try:
+        target = Path(raw).resolve()
+    except OSError:
+        return None
+    for space in (ESTABLISHED, WORKSPACE, SANDBOX):
+        if space == ESTABLISHED and not session.established_root:
+            continue
+        if space == WORKSPACE and not session.workspace_root:
+            continue
+        try:
+            root = space_root(session, data_dir, space).resolve()
+        except (ExecutionError, OSError):
+            continue
+        if (target == root or root in target.parents) and target.is_file():
+            return target
+    return None
+
+
 def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Read a file from any space. With an explicit target, that space only.
     With none, every bound space is tried — default (richest) first, then the
     others — because the old single-space default made council-authored
     SANDBOX drafts unreadable whenever an established folder was bound (live:
     'Skill failed: read_file centipede.html' while the file sat right there
-    in the sandbox, twice across two runs)."""
+    in the sandbox, twice across two runs). An absolute path the user named in
+    the task is honored when it lands inside a bound space (reads are safe)."""
     raw_name = _arg(action, "filename")
+    abs_hit = _abs_read_inside_space(session, data_dir, raw_name)
+    if abs_hit is not None:
+        return abs_hit.read_text(encoding="utf-8")
     if action.args.get("target") or action.args.get("space"):
         target = _space_arg(action, _default_read_space(session), _READ_SPACES)
         path = resolve_space(session, data_dir, target, raw_name)
