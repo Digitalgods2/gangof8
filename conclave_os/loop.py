@@ -80,7 +80,7 @@ _AGENT_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_AGENTS)
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
     member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
-    images: Optional[list[dict]] = None,
+    images: Optional[list[dict]] = None, model_override: Optional[str] = None,
 ) -> Contribution:
     # Cooperative cancellation: every agent call passes through here, so this is
     # the one checkpoint that aborts a run the human cancelled mid-flight.
@@ -111,7 +111,11 @@ def _agent_call(
         # The semaphore bounds how many CLI subprocesses run at once (never held
         # across the budget lock, so bookkeeping never blocks on a slow call).
         with _AGENT_SEMAPHORE:
-            result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
+            # Pass model_override only when set, so registry doubles that don't
+            # take the kwarg keep working (it's None on every coordination call).
+            _extra = {"model_override": model_override} if model_override else {}
+            result = registry.call(member.agent, member.role, prompt, timeout_s,
+                                   images=images, **_extra)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
@@ -902,6 +906,7 @@ def _run_panel_rounds(
     role_agents: Optional[dict[Role, str]],
     established_overview: str,
     start: float,
+    lead_work_call: Optional[AgentCall] = None,
 ) -> bool:
     """Drive panel rounds until the lead declares DONE, the human declines more
     rounds, or budget/wall-time headroom runs out. Returns True when the session
@@ -980,7 +985,8 @@ def _run_panel_rounds(
         governance.check(session, "generate_text")
         produces = bool(session.classification and session.classification.produces_output)
         if produces:
-            bon = _run_best_of_n(session, council, panel, call, lead_call, store)
+            bon = _run_best_of_n(session, council, panel, call, lead_call, store,
+                                 lead_work_call=lead_work_call)
             if bon is not None:
                 chair = bon.get("chair", "")
                 if bon["judges"]:
@@ -1185,6 +1191,17 @@ def _deliberate(
                            timeout_s=config.LEAD_TIMEOUT,
                            reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
+    def lead_work_call(member: CouncilMember, prompt: str) -> Contribution:
+        # The lead's PRODUCTION model: when it authors/repairs/fixes code, escalate
+        # to session.lead_work_model (a stronger, same-vendor model) with a longer
+        # timeout. Its fast coordination model stays on lead_call. Unset ⇒ this is
+        # exactly lead_call (same model, LEAD_TIMEOUT), so behavior is unchanged.
+        wm = (session.lead_work_model or "").strip()
+        return _agent_call(session, registry, store, member, prompt,
+                           timeout_s=config.LEAD_WORK_TIMEOUT if wm else config.LEAD_TIMEOUT,
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images,
+                           model_override=wm or None)
+
     lead = council.get(Role.lead)
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
@@ -1195,7 +1212,7 @@ def _deliberate(
         if not _has_proposals(session) and lead and lead.active and not session.compose_now:
             if _run_panel_rounds(session, manager, council, lead, call, lead_call,
                                  governance, store, role_agents, established_overview,
-                                 start):
+                                 start, lead_work_call=lead_work_call):
                 return session  # paused for round consent
 
             # 7. Mid-flight approval gate (only trips if governance flagged something).
@@ -1233,7 +1250,7 @@ def _deliberate(
         # already timed out/errored, re-calling it just burns another timeout, so
         # skip straight to salvage.
         if lead and lead.active and not lead_failed:
-            _materialize_artifacts(session, lead_call, store)
+            _materialize_artifacts(session, lead_work_call, store)
         # Still nothing? Recover a complete file a panelist wrote inline, so a
         # lead failure delivers that work instead of shipping nothing.
         if not _has_proposals(session):
@@ -1246,9 +1263,9 @@ def _deliberate(
     # Finish it from where it stopped (append) instead of re-drafting — the old
     # failure mode that produced empty/partial HTML over and over.
     if lead and lead.active:
-        _complete_truncated_artifacts(session, lead_call, lead, store)
+        _complete_truncated_artifacts(session, lead_work_call, lead, store)
         # The goal loop: failing tests come back to the lead for bounded repair.
-        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_call)
+        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_work_call)
 
     # Safety net: a follow-up that revised an already-delivered file but omitted
     # its PROMOTE line would otherwise strand the update in the sandbox (the
@@ -1892,12 +1909,18 @@ def _chair_recover(session: Session, crashers: list[dict], lead_call: AgentCall,
 
 
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
-                   call: AgentCall, lead_call: AgentCall, store: LogStore) -> Optional[dict]:
+                   call: AgentCall, lead_call: AgentCall, store: LogStore,
+                   lead_work_call: Optional[AgentCall] = None) -> Optional[dict]:
     """The full best-of-N pipeline the LEAD chairs: gate candidates on whether
     they RUN, judges score the survivors blindly, the lead (chair) ratifies or
     overrides the vote and finishes the winner, and — if nothing ran — the chair
     recovers the best attempt. Returns a summary dict, or None to fall back to
-    the author path (too few candidates or the vote collapsed)."""
+    the author path (too few candidates or the vote collapsed).
+
+    The chair's DECISION (ratify/override) is coordination and stays on lead_call
+    (fast); the chair's PRODUCTION (fixing the winner, recovering a crasher) uses
+    lead_work_call — the lead's stronger production model when one is set."""
+    work_call = lead_work_call or lead_call
     candidates = _collect_candidates(session)
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
@@ -1921,7 +1944,7 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     if not runnable:
         # CHAIR RECOVERY: the lead repairs the most complete failed attempt
         # instead of throwing all the panel's work away.
-        rec = _chair_recover(session, crashers, lead_call, store)
+        rec = _chair_recover(session, crashers, work_call, store)
         if rec is None:
             store.log_event(sid, "best_of_n_all_failed_runtime", {"n": len(group)})
             return None
@@ -1956,7 +1979,7 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     content = winner["content"]
     fixes = 0
     if fixlist:
-        fixed = _apply_targeted_fixes(session, base, content, fixlist, lead_call, store)
+        fixed = _apply_targeted_fixes(session, base, content, fixlist, work_call, store)
         if fixed != content:
             # the fix pass must not break the winner — re-verify; keep the
             # (already-passing) original if the "fixed" version no longer runs.

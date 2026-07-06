@@ -67,6 +67,13 @@ class Settings(BaseModel):
     # than the seat's everyday default — e.g. lead stays on sonnet while
     # code_generator gets opus for the few calls it actually makes.
     role_models: dict[str, str] = {}
+    # The lead wears two hats: a fast COORDINATION model (its normal pin/seat
+    # default — set via role_agents/cli_models/role_models) for synthesis,
+    # chair decisions, and orchestration, which are on the serial critical path;
+    # and this optional PRODUCTION model for when the lead itself authors,
+    # repairs, or fixes code. Same vendor as the lead seat (e.g. lead=claude on
+    # sonnet, lead_work_model="claude-opus-4-8"). Empty ⇒ one model for both.
+    lead_work_model: str = ""
     # Which local CLI seats (claude/codex/gemini) are enabled. Absent/true ⇒
     # enabled (today's behaviour). false ⇒ the seat is dropped from the panel and
     # its roles fall back to an enabled OpenRouter seat — letting the app run

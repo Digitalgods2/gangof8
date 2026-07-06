@@ -105,7 +105,8 @@ class MockAdapter:
         self.name = name
 
     def call(self, role: Role, prompt: str, timeout_s: int,
-             images: list[dict] | None = None) -> AdapterResult:
+             images: list[dict] | None = None,
+             model_override: str | None = None) -> AdapterResult:
         lower = prompt.lower()
         if role == Role.panelist:
             content = PANEL_VIEW

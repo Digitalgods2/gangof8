@@ -335,6 +335,7 @@ class ConclaveService:
         session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
         session.panel = list(self.panel)
+        session.lead_work_model = (self.settings.lead_work_model or "").strip() or None
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
         # Established folder is PER TASK: interpret a path the user referenced in
