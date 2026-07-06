@@ -42,15 +42,58 @@ def extract_established_root(text: str) -> Optional[str]:
         cand = re.sub(r"\s+(?:please|thanks?|now)$", "", cand, flags=re.IGNORECASE)
         if not cand:
             continue
+        root = _resolve_root(cand, rx)
+        if root:
+            return root
+    return None
+
+
+def _resolve_root(cand: str, rx) -> Optional[str]:
+    """The established folder a single referenced path points at, or None.
+
+    Windows and UNC paths legally contain spaces, so the greedy regex can swallow
+    the prose that follows a path — e.g. "…\\tmp and open it in a browser" was
+    taken whole and a folder literally named "tmp and open it in a browser" got
+    created. This resolves the real target instead of trusting the raw capture.
+    """
+    try:
+        p = Path(cand)
+        if p.is_file():
+            return str(p.parent.resolve())
+        if p.is_dir():
+            return str(p.resolve())
+    except OSError:
+        return None
+
+    # Not on disk as written. Recover the real target, most-reliable step first.
+    words = cand.split()
+    if len(words) > 1:
+        # (1) The longest whitespace-delimited prefix that EXISTS on disk. This
+        #     keeps a genuine "C:\My Games\cool project" intact yet stops at a
+        #     real target like "…\tmp" and drops the trailing prose after it.
+        for n in range(len(words) - 1, 0, -1):
+            try:
+                sp = Path(" ".join(words[:n]))
+                if sp.is_dir():
+                    return str(sp.resolve())
+                if sp.is_file():
+                    return str(sp.parent.resolve())
+            except OSError:
+                continue
+
+    # (2) Still nothing on disk — a brand-new target. Accept only an unambiguous
+    #     drive/UNC path, and keep just the FIRST word of the final path segment
+    #     as the new dir/file name; anything after it is prose, not path.
+    if rx in (_WIN, _UNC) or re.match(r"^[A-Za-z]:[\\/]|^\\\\", cand):
+        sep = max(cand.rfind("\\"), cand.rfind("/"))
+        if sep <= 0:
+            return None
+        seg = cand[sep + 1:].split()
+        if not seg:
+            return None
         try:
-            p = Path(cand)
-            if p.is_file():
-                return str(p.parent.resolve())
-            if p.is_dir():
-                return str(p.resolve())
-            # not on disk: accept only an unambiguous drive/UNC target
-            if rx in (_WIN, _UNC) or re.match(r"^[A-Za-z]:[\\/]|^\\\\", cand):
-                return str(p.resolve())
+            target = Path(cand[:sep + 1] + seg[0])
+            return str((target.parent if target.suffix else target).resolve())
         except OSError:
-            continue
+            return None
     return None
