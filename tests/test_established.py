@@ -44,6 +44,34 @@ def test_no_path_referenced_returns_none():
     assert extract_established_root("build me a tic-tac-toe game") is None
 
 
+def test_extract_stops_at_real_dir_ignoring_trailing_prose(tmp_path):
+    # THE bug: "saved to C:\...\tmp and opened directly in a browser..." created a
+    # folder literally named with the whole sentence. The real, existing dir wins.
+    text = f"save centipede.html to {tmp_path} and open it directly in a browser with no server"
+    assert extract_established_root(text) == str(tmp_path.resolve())
+
+
+def test_extract_new_target_drops_trailing_prose(tmp_path):
+    # A brand-new folder inside an existing parent, followed by prose: keep only
+    # the new folder name, not the sentence.
+    target = tmp_path / "newgame"
+    text = f"build it into {target} and then run it in a browser please"
+    assert extract_established_root(text) == str(target.resolve())
+
+
+def test_extract_preserves_legit_dir_with_spaces(tmp_path):
+    # A real folder whose name genuinely contains spaces must survive intact.
+    spaced = tmp_path / "My Cool Project"
+    spaced.mkdir()
+    assert extract_established_root(f"save to {spaced}") == str(spaced.resolve())
+
+
+def test_extract_new_file_with_prose_returns_parent(tmp_path):
+    # "…\out.html and open it" → established root is the existing parent dir.
+    text = fr"write {tmp_path}\out.html and open it in a browser"
+    assert extract_established_root(text) == str(tmp_path.resolve())
+
+
 # --- greenfield classification ------------------------------------------------
 
 
