@@ -982,16 +982,20 @@ def _run_panel_rounds(
         if produces:
             bon = _run_best_of_n(session, council, panel, call, lead_call, store)
             if bon is not None:
+                chair = bon.get("chair", "")
                 if bon["judges"]:
                     how = (f"the highest-scoring of {bon['candidates']} candidate "
                            f"implementations (blind vote by {bon['judges']} judges, "
-                           f"score {bon['score']}, {bon['votes']} first-place)")
+                           f"score {bon['score']}, {bon['votes']} first-place; {chair})")
+                elif chair.startswith("chair recovered"):
+                    how = (f"every one of {bon['candidates']} candidates crashed on "
+                           "load, so the chair repaired the most complete attempt")
                 else:
                     how = (f"the only one of {bon['candidates']} candidates that "
                            "actually runs (the others crashed on load)")
                 summary = (
-                    f"Best-of-{bon['candidates']}: shipped {bon['agent']}'s "
-                    f"{bon['file']} — {how}"
+                    f"Best-of-{bon['candidates']}, chaired by the lead: shipped "
+                    f"{bon['agent']}'s {bon['file']} — {how}"
                     + (f"; {bon['fixes']} surgical fix pass applied (re-verified to run)."
                        if bon['fixes'] else ", shipped unchanged. Every candidate was "
                        "executed headless before judging; crashers were disqualified.")
@@ -1800,74 +1804,163 @@ def _apply_targeted_fixes(session: Session, filename: str, content: str,
     return content
 
 
+def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> None:
+    """Propose write+promote of the chosen file (delivery still gated by the
+    human approval and the runtime verification)."""
+    sid = session.session_id
+    _append_proposals(session, store, [
+        ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
+                       filename=base, content=content, args={"filename": base, "content": content}),
+        ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
+                       filename=base, args={"filename": base}),
+    ])
+
+
+def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
+                  defects: dict, wi: int, lead_call: AgentCall, store: LogStore) -> tuple[int, list[str], str]:
+    """The lead CHAIRS the blind vote: it reviews the top two candidates in full
+    and RATIFIES the vote's winner or OVERRIDES to the runner-up (judges score
+    by reading and can miss a real bug), then names the finishing defects.
+    Returns (final_index, defect_list, action). Degrades to the raw vote result
+    if the chair is absent or errs — the vote is never lost, only reviewed."""
+    fallback = (wi, list(dict.fromkeys(defects[wi + 1]))[:6], "vote (no chair)")
+    lead = session.council.get(Role.lead)
+    if not (lead and lead.active) or len(ordered) < 2:
+        return fallback
+    order = sorted(range(len(ordered)),
+                   key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])),
+                   reverse=True)
+    win_i, run_i = order[0], order[1]
+    top = [
+        {"label": win_i + 1, "score": agg[win_i + 1], "votes": votes[win_i + 1],
+         "content": ordered[win_i]["content"], "role": "VOTE WINNER"},
+        {"label": run_i + 1, "score": agg[run_i + 1], "votes": votes[run_i + 1],
+         "content": ordered[run_i]["content"], "role": "runner-up"},
+    ]
+    sid = session.session_id
+    try:
+        ans = lead_call(lead, rounds.chair_review_prompt(session, top))
+    except (AgentError, BudgetExceeded):
+        return fallback
+    chosen, overrode, chair_defects = rounds.parse_chair_decision(ans.content, win_i + 1, run_i + 1)
+    final_i = run_i if (overrode and chosen == run_i + 1) else win_i
+    if final_i != win_i:
+        store.log_event(sid, "chair_overrode",
+                        {"from": win_i + 1, "to": run_i + 1, "reason": ans.content.strip()[:160]})
+        action = f"chair overrode the vote to Candidate {run_i + 1}"
+    else:
+        store.log_event(sid, "chair_ratified", {"winner": win_i + 1})
+        action = "chair ratified the vote"
+    dl = list(dict.fromkeys(chair_defects or defects[final_i + 1]))[:6]
+    return final_i, dl, action
+
+
+def _chair_recover(session: Session, crashers: list[dict], lead_call: AgentCall,
+                   store: LogStore) -> Optional[dict]:
+    """Every candidate crashed — the chair repairs the most complete attempt to
+    RUN, rather than discarding the panel's work and starting from nothing.
+    Returns {agent, base, content} (re-verified to run) or None."""
+    lead = session.council.get(Role.lead)
+    if not (lead and lead.active) or not crashers:
+        return None
+    target = max(crashers, key=lambda c: len(c["content"]))
+    base = _basename(target["base"])
+    sid = session.session_id
+    try:
+        ans = lead_call(lead, rounds.chair_recover_prompt(
+            session, base, target["content"], target.get("_error", "unknown")))
+    except (AgentError, BudgetExceeded):
+        return None
+    content, applied = target["content"], 0
+    for a in _parse_proposals(sid, ans.content):
+        if a.kind != "edit_file":
+            continue
+        old = (a.args.get("old") or "").replace("\r\n", "\n").replace("\r", "\n")
+        new = (a.args.get("new") or "").replace("\r\n", "\n").replace("\r", "\n")
+        norm = content.replace("\r\n", "\n")
+        if old and norm.count(old) == 1:
+            content = norm.replace(old, new, 1)
+            applied += 1
+    if not applied:
+        return None
+    ran, testable, detail = smoke.smoke_source(content, Path(base).suffix or ".html")
+    if not ran:
+        store.log_event(sid, "chair_recover_failed", {"file": base, "detail": detail})
+        return None
+    store.log_event(sid, "chair_recovered", {"agent": target["agent"], "file": base, "edits": applied})
+    return {"agent": target["agent"] + " (chair-repaired)", "base": base, "content": content}
+
+
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
                    call: AgentCall, lead_call: AgentCall, store: LogStore) -> Optional[dict]:
-    """Score the panel's candidate files and propose write+promote of the
-    winner. Returns a summary dict, or None to fall back to the author path
-    (too few candidates, or every judge failed)."""
+    """The full best-of-N pipeline the LEAD chairs: gate candidates on whether
+    they RUN, judges score the survivors blindly, the lead (chair) ratifies or
+    overrides the vote and finishes the winner, and — if nothing ran — the chair
+    recovers the best attempt. Returns a summary dict, or None to fall back to
+    the author path (too few candidates or the vote collapsed)."""
     candidates = _collect_candidates(session)
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
     group = _dominant_base_group(session, candidates)
     sid = session.session_id
     # RUNTIME GATE before judging — a candidate that doesn't RUN can't win.
-    # Judging by reading is blind to load-time crashes (live: 5 judges
-    # unanimously picked the one candidate of 3 that threw on frame 1). Execute
-    # each candidate headless; disqualify crashers so judges only rank runners.
     runnable: list[dict] = []
+    crashers: list[dict] = []
     for c in group:
-        suffix = Path(_basename(c["base"])).suffix or ".html"
-        ran, testable, detail = smoke.smoke_source(c["content"], suffix)
+        ran, testable, detail = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
         if ran:
             runnable.append(c)
         else:
+            c["_error"] = detail
+            crashers.append(c)
             store.log_event(sid, "candidate_rejected_runtime",
                             {"agent": c["agent"], "file": _basename(c["base"]), "detail": detail})
             session.unresolved.append(
                 f"candidate {c['agent']}/{_basename(c['base'])} rejected — does not run: {detail}")
+
     if not runnable:
-        store.log_event(sid, "best_of_n_all_failed_runtime", {"n": len(group)})
-        return None  # nothing runs → author path; the delivery gate still blocks broken files
+        # CHAIR RECOVERY: the lead repairs the most complete failed attempt
+        # instead of throwing all the panel's work away.
+        rec = _chair_recover(session, crashers, lead_call, store)
+        if rec is None:
+            store.log_event(sid, "best_of_n_all_failed_runtime", {"n": len(group)})
+            return None
+        _ship_winner(session, store, rec["base"], rec["content"])
+        return {"agent": rec["agent"], "file": rec["base"], "score": None, "votes": 0,
+                "judges": 0, "candidates": len(group), "fixes": 1, "chair": "chair recovered a failed candidate"}
+
     store.log_event(sid, "candidates_collected",
-                    {"n": len(runnable), "rejected": len(group) - len(runnable),
+                    {"n": len(runnable), "rejected": len(crashers),
                      "agents": [c["agent"] for c in runnable],
                      "base": _basename(runnable[0]["base"])})
 
     if len(runnable) == 1:
-        # the only candidate that runs wins by default — no vote needed
         winner, base = runnable[0], _basename(runnable[0]["base"])
-        content = winner["content"]
         store.log_event(sid, "winner_selected",
                         {"agent": winner["agent"], "file": base, "score": None,
                          "votes": 0, "judges": 0, "candidates": len(group), "reason": "sole runner"})
-        _append_proposals(session, store, [
-            ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
-                           filename=base, content=content, args={"filename": base, "content": content}),
-            ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
-                           filename=base, args={"filename": base}),
-        ])
+        _ship_winner(session, store, base, winner["content"])
         return {"agent": winner["agent"], "file": base, "score": None, "votes": 0,
-                "judges": 0, "candidates": len(group), "fixes": 0}
+                "judges": 0, "candidates": len(group), "fixes": 0, "chair": "sole runner"}
 
     judges = panel[: config.MAX_JUDGES]
     ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store)
     if judged == 0:
         return None  # scoring collapsed → author path (with its own nets) instead
-    # highest aggregate; tie → more first-place votes, then more-complete file
     wi = max(range(len(ordered)),
              key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
+    # CHAIR: the lead reviews the top two and ratifies or overrides the vote.
+    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, lead_call, store)
     winner, label = ordered[wi], wi + 1
     base = _basename(winner["base"])
     content = winner["content"]
-    fixlist = list(dict.fromkeys(defects[label]))[:6]
     fixes = 0
     if fixlist:
         fixed = _apply_targeted_fixes(session, base, content, fixlist, lead_call, store)
         if fixed != content:
-            # the fix pass itself must not break the winner — re-run it; keep the
+            # the fix pass must not break the winner — re-verify; keep the
             # (already-passing) original if the "fixed" version no longer runs.
-            suffix = Path(base).suffix or ".html"
-            ran, testable, detail = smoke.smoke_source(fixed, suffix)
+            ran, testable, detail = smoke.smoke_source(fixed, Path(base).suffix or ".html")
             if ran:
                 content, fixes = fixed, 1
             else:
@@ -1876,17 +1969,12 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                     f"winner fix pass broke {base} ({detail}); shipped the unmodified winner")
     store.log_event(sid, "winner_selected",
                     {"agent": winner["agent"], "file": base, "score": agg[label],
-                     "votes": votes[label], "judges": judged, "candidates": len(group)})
-    _append_proposals(session, store, [
-        ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
-                       filename=base, content=content,
-                       args={"filename": base, "content": content}),
-        ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
-                       filename=base, args={"filename": base}),
-    ])
+                     "votes": votes[label], "judges": judged, "candidates": len(group),
+                     "chair": chair_action})
+    _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
             "votes": votes[label], "judges": judged, "candidates": len(group),
-            "fixes": fixes}
+            "fixes": fixes, "chair": chair_action}
 
 
 def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:

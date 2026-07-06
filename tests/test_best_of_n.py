@@ -8,7 +8,7 @@ defects.
 
 import pytest
 
-from conclave_os import config, loop, rounds
+from conclave_os import config, loop, rounds, smoke
 from conclave_os.logstore import LogStore
 from conclave_os.models import (Classification, Complexity, Council,
                                 CouncilMember, Contribution, ProposedAction,
@@ -186,6 +186,95 @@ def test_all_judges_failing_falls_back(session, store):
         return Contribution(round=0, role=member.role, agent=member.agent, content="garbage")
 
     assert loop._run_best_of_n(session, council, judges, call, lead_call, store) is None
+
+
+def _chaired(session, judges, judge_reply, chair_reply, lead_agent="claude"):
+    """A council whose lead (chair) answers `chair_reply` and whose judges
+    answer `judge_reply`. Returns (council, call, lead_call)."""
+    lead = CouncilMember(role=Role.lead, agent=lead_agent, active=True)
+    council = Council(members=[lead] + judges)
+    session.council = council
+
+    def call(member, prompt):
+        return Contribution(round=0, role=member.role, agent=member.agent, content=judge_reply)
+
+    def lead_call(member, prompt):
+        return Contribution(round=0, role=member.role, agent=member.agent, content=chair_reply)
+
+    return council, call, lead_call
+
+
+def test_chair_ratifies_the_vote(session, store):
+    """The lead CHAIRS the blind vote — here it ratifies, so the vote's winner
+    (Candidate 2 / zzz / STRONG) ships, credited to that model."""
+    _candidate(session, "aaa", "game.html", WEAK)
+    _candidate(session, "zzz", "game.html", STRONG)
+    judges = [CouncilMember(role=Role.panelist, agent="j1"),
+              CouncilMember(role=Role.panelist, agent="j2")]
+    council, call, lead_call = _chaired(
+        session, judges, "SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2",
+        chair_reply="RATIFY: Candidate 2\nDEFECT: none")
+    out = loop._run_best_of_n(session, council, judges, call, lead_call, store)
+    assert out["agent"] == "zzz" and out["chair"] == "chair ratified the vote"
+    shipped = next(a for a in session.proposed_actions
+                   if a.kind == "write_file" and a.role == Role.implementer)
+    assert shipped.content == STRONG
+
+
+def test_chair_overrides_the_vote_to_the_runner_up(session, store):
+    """When the chair judges the runner-up actually better, it OVERRIDES — the
+    lead's arbitration beats the raw tally. Vote winner is Candidate 2 (zzz);
+    the chair overrides to Candidate 1 (aaa)."""
+    _candidate(session, "aaa", "game.html", WEAK)
+    _candidate(session, "zzz", "game.html", STRONG)
+    judges = [CouncilMember(role=Role.panelist, agent="j1"),
+              CouncilMember(role=Role.panelist, agent="j2")]
+    council, call, lead_call = _chaired(
+        session, judges, "SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2",
+        chair_reply="OVERRIDE: Candidate 1 - the vote winner has a subtle off-by-one the judges missed")
+    out = loop._run_best_of_n(session, council, judges, call, lead_call, store)
+    assert out["agent"] == "aaa", "chair overrode to the runner-up"
+    assert "overrode" in out["chair"]
+    shipped = next(a for a in session.proposed_actions
+                   if a.kind == "write_file" and a.role == Role.implementer)
+    assert shipped.content == WEAK
+
+
+def test_chair_recovers_when_every_candidate_crashes(session, store):
+    """No candidate runs → the chair repairs the most complete attempt to run,
+    instead of discarding the panel's work. The recovered file ships, credited
+    as chair-repaired, and is re-verified to actually run."""
+    import shutil as _sh
+    if _sh.which("node") is None:
+        pytest.skip("node not on PATH")
+    # both crash: empty-array access on load; the larger one is the recovery target
+    small = "<!doctype html><html><body><script>var g=[]; g[0].x=1;</script></body></html>"
+    big = "<!doctype html><html><body><!-- more complete --><script>\nvar grid=[];\n"\
+          "grid[0].y = 2;\n</script></body></html>"
+    _candidate(session, "small", "game.html", small)
+    _candidate(session, "big", "game.html", big)
+    lead = CouncilMember(role=Role.lead, agent="claude", active=True)
+    council = Council(members=[lead])
+    session.council = council
+
+    def call(member, prompt):  # judges never reached (nothing runs)
+        raise AssertionError("no judging when all candidates crash")
+
+    def lead_call(member, prompt):
+        # surgical fix: initialise the array so the load access is valid
+        return Contribution(round=0, role=member.role, agent=member.agent,
+                            content="EDIT: game.html\n<<<<<<< OLD\nvar grid=[];\n"
+                                    "grid[0].y = 2;\n=======\nvar grid=[[0]];\n"
+                                    "grid[0][0] = 2;\n>>>>>>> NEW\n")
+
+    out = loop._run_best_of_n(session, council, [], call, lead_call, store)
+    assert out is not None, "chair recovered rather than failing"
+    assert "chair recovered" in out["chair"]
+    assert out["agent"].startswith("big")
+    shipped = next(a for a in session.proposed_actions
+                   if a.kind == "write_file" and a.role == Role.implementer)
+    ran, _t, _d = smoke.smoke_source(shipped.content, ".html")
+    assert ran, "the recovered file actually runs"
 
 
 def test_broken_candidate_disqualified_sole_runner_wins(session, store):
