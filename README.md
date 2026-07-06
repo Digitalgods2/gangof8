@@ -103,6 +103,16 @@ seat is a **different origin model**. Here is what each is doing:
   (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
   authoring as a last resort. Delivery (`PROMOTE:`) is always gated by your
   approval. It ends each round with `ROUND: DONE` or `ROUND: CONTINUE`.
+  - **Two hats, two models.** The lead's coordination — synthesis, the chair
+    decision, orchestration — is on the serial critical path, so it wants a
+    *fast* model (a slow one stalls or times out the whole run). But when the
+    lead itself *produces* — fixing a best-of-N winner, recovering a crash,
+    finishing a cut-off file, fixing tests — it wants a *stronger* model. Set
+    **Lead — coding/repair model** in Settings (`lead_work_model`, same vendor
+    as the lead seat, e.g. lead=claude on Sonnet, work=Opus) and the lead
+    escalates to it, with a longer timeout, only on those production calls.
+    Blank = one model for both (unchanged). The dashboard shows both models in
+    the same run — Sonnet for a synthesis, Opus for a repair.
 - **Why the lead's model also appears as a panelist:** same model, two
   different jobs. As a panelist it authors one candidate among many; as the
   lead it judges/orchestrates — a separate call with a separate charter. (Remap

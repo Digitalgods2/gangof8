@@ -1004,6 +1004,7 @@ const TIPS = {
   collapse: "Collapse the contributions / disagreements sections by default once a session has finished.",
   workspace: "The active workspace is the real project directory the council reads and (with approval) writes into. With no workspace active, files go to a throwaway per-session sandbox. New sessions capture whichever workspace is active when they start.",
   cli_models: "The local CLI seats (claude, codex, gemini) and the exact model each one runs. Leave '(CLI default)' to inherit that CLI's own configured model, or pin one from the live catalog. Unchecking a seat drops it from the council and its roles fall back to an enabled OpenRouter model.",
+  lead_work: "The lead wears two hats. Its role-mapping model above is the FAST coordination model it uses to synthesize, decide the best-of-N winner, and orchestrate — that path is on the critical loop, so a slow model stalls or times out the whole run. THIS is the stronger model it escalates to only when the lead ITSELF authors, repairs, or fixes code (best-of-N winner fixes, recovering a crash, finishing a cut-off file, fixing tests). Use the same vendor as the lead seat (e.g. lead=claude on sonnet, here claude-opus-4-8). Blank = one model for both (today's behavior).",
   gemini_key: "Optional. With a key the gemini seat runs through Google's SDK (faster and more reliable on Windows than the headless CLI), the gemini dropdown switches to Google's own model list, image vision works, and web_search gains Google Search grounding. Stored locally in data/secrets.json (gitignored) — never sent anywhere but Google.",
   openrouter_key: "Needed only for the pay-per-token OpenRouter seats below. Stored locally in data/secrets.json (gitignored); an OPENROUTER_API_KEY environment variable always wins over the stored value.",
   openrouter_models: "Extra panel seats that run through OpenRouter (DeepSeek, GLM, Qwen, Kimi, …). Enable a seat and it joins every panel round and becomes selectable in Role mapping. Edit the slug to change the exact model (verify at openrouter.ai/models). Billed per token by OpenRouter.",
@@ -1271,6 +1272,11 @@ function renderSettings(s, seats) {
       }).join("")}
       ${seatErr}
       <div class="sub">Each role can pin its own model on top of its seat — e.g. keep the claude seat on sonnet for panel/synthesis but give <b>code generator</b> opus for the few calls it makes when the lead pulls it in. "(seat default)" = the seat's Local-CLI-models pin, else the CLI's own default.</div>
+      <div class="field" style="margin-top:8px">${lbl("Lead — coding/repair model", "lead_work")}
+        <input type="text" id="set_lead_work_model" class="mono" spellcheck="false"
+               value="${escAttr(s.lead_work_model || "")}"
+               placeholder="e.g. claude-opus-4-8 — blank = same as the lead's model" style="flex:1"></div>
+      <div class="sub">The lead's fast model above coordinates every round; this stronger, same-vendor model is used only when the lead itself authors or repairs code — so heavy lifting doesn't stall or time out the loop.</div>
     </div>
 
     <div class="sset s-gov">
@@ -1365,6 +1371,7 @@ async function saveSettings() {
     backend: document.getElementById("set_backend").value,
     role_agents,
     role_models,
+    lead_work_model: (document.getElementById("set_lead_work_model")?.value || "").trim(),
     openrouter_enabled,
     openrouter_models,
     cli_models,

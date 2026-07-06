@@ -105,6 +105,19 @@ def test_explicit_backend_arg_wins(tmp_path):
     assert svc.backend == "mock"
 
 
+def test_lead_work_model_persists_and_reaches_session(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"lead_work_model": "claude-opus-4-8"})
+    assert load_settings(tmp_path).lead_work_model == "claude-opus-4-8"
+    assert svc.settings.lead_work_model == "claude-opus-4-8"
+    # it rides onto a new session so the loop's lead_work_call can read it
+    session = svc._open("build a thing", "test", None, None)
+    assert session.lead_work_model == "claude-opus-4-8"
+    # cleared ⇒ session carries None (one model for both — unchanged behavior)
+    svc.update_settings({"lead_work_model": ""})
+    assert svc._open("build another", "test", None, None).lead_work_model is None
+
+
 def test_update_settings_persists_and_rederives(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})

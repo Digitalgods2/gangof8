@@ -69,14 +69,17 @@ class CliAdapter:
         self._api_key_getter = api_key_getter
 
     def call(self, role: Role, prompt: str, timeout_s: int,
-             images: list[dict] | None = None) -> AdapterResult:
-        pinned = self.role_models.get(getattr(role, "value", str(role)))
-        if pinned and pinned != self.model:
+             images: list[dict] | None = None,
+             model_override: str | None = None) -> AdapterResult:
+        # A per-call override (the lead's production model) wins over the role pin
+        # and the seat default. Same vendor as this seat — it becomes --model.
+        effective = model_override or self.role_models.get(getattr(role, "value", str(role)))
+        if effective and effective != self.model:
             # The runner methods read self.model, and this adapter instance is
-            # shared across the panel fan-out threads — so apply the role pin
+            # shared across the panel fan-out threads — so apply the pin/override
             # on a call-local CLONE, never by mutating self.
             clone = copy.copy(self)
-            clone.model = pinned
+            clone.model = effective
             clone.role_models = {}
             return clone.call(role, prompt, timeout_s, images)
         t0 = time.monotonic()
