@@ -78,6 +78,10 @@ _TIMELINE = {
     "best_of_n_all_failed_runtime": ("💥", "All candidates failed to run"),
     "judge_dropped": ("⚠️", "Judge dropped"),
     "winner_selected": ("🏆", "Best-of-N winner"),
+    "chair_ratified": ("🪑", "Chair ratified the vote"),
+    "chair_overrode": ("🪑", "Chair overrode the vote"),
+    "chair_recovered": ("🛟", "Chair recovered a failed candidate"),
+    "chair_recover_failed": ("⚠️", "Chair could not recover"),
     "winner_fixes_applied": ("🔧", "Winner fixes applied"),
     "winner_fixes_reverted": ("↩️", "Winner fix reverted (broke the file)"),
     "runtime_ok": ("✅", "File runs (headless smoke test)"),
@@ -170,8 +174,12 @@ def _detail(event: str, p: dict) -> str:
     if event == "winner_selected":
         score = p.get("score")
         how = f"score {score}" if score is not None else "sole runner"
-        return (f"{p.get('agent','')}'s {p.get('file','')} — {how}, "
-                f"{p.get('judges','')} judges, {p.get('candidates','')} candidates")
+        return (f"{p.get('agent','')}'s {p.get('file','')} — {how}"
+                + (f", {p['chair']}" if p.get("chair") else ""))[:110]
+    if event == "chair_overrode":
+        return f"→ Candidate {p.get('to','')}: {p.get('reason','')}"[:110]
+    if event == "chair_recovered":
+        return f"{p.get('agent','')} {p.get('file','')} ({p.get('edits','')} edits)"
     if event == "winner_fixes_applied":
         return f"{p.get('file','')}: {p.get('applied','')} fix(es)"
     if event == "status_change":

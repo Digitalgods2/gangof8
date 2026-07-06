@@ -91,9 +91,14 @@ seat is a **different origin model**. Here is what each is doing:
   rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements resolve
   automatically (seats calling it `index.html` vs `centipede.html` are grouped
   by the most-agreed name).
-- **The lead** (yellow chip) is the judge-orchestrator, not the author. On a
-  file build it runs the best-of-N selection and applies any winner fixes; when
-  there aren't enough candidates to select among (or the task isn't a file
+- **The lead** (yellow chip) is the **chair** — the council's final arbiter,
+  not one of its authors, and it is briefed on that standing role up front. On
+  a file build it does not write or judge; it **ratifies or overrides the blind
+  vote** (reading the top two in full — judges score by reading and can miss a
+  real bug), **finishes** the chosen file with surgical fixes, and when *every*
+  candidate crashes it **recovers** the most complete attempt rather than
+  discarding the panel's work. Nothing leaves the council it hasn't ratified.
+  When there aren't enough candidates to select among (or the task isn't a file
   build) it falls back to organizing the work — assigning to talents
   (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
   authoring as a last resort. Delivery (`PROMOTE:`) is always gated by your

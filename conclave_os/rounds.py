@@ -565,6 +565,88 @@ def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[
     )
 
 
+# The lead's standing charter — who it is on EVERY task, stated up front so it
+# acts as the chair by design, not by whatever the flow leaves over.
+CHAIR_CHARTER = (
+    "YOU ARE THE CHAIR of this council — its final arbiter, not one of its "
+    "authors. Here is how this council works and your standing role in it, the "
+    "same on every task: the panel of independent models each produce a "
+    "complete candidate; every candidate is EXECUTED and the ones that crash "
+    "are disqualified; independent judges then score the survivors blindly. "
+    "Your job is to RATIFY OR OVERTURN that vote, FINISH the chosen file with "
+    "surgical corrections, and — only when nothing the panel produced runs — "
+    "RECOVER the best attempt. You do not write the deliverable from scratch "
+    "while any candidate stands; you decide, correct, and stand behind what "
+    "ships. Nothing leaves this council that you have not ratified.\n"
+)
+
+_OVERRIDE_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?OVERRIDE\s*[:—–-]\s*(?:Candidate\s+)?(\d+)",
+                          re.IGNORECASE | re.MULTILINE)
+_RATIFY_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?RATIFY\b", re.IGNORECASE | re.MULTILINE)
+
+
+def chair_review_prompt(session: Session, top: list[dict]) -> str:
+    """The chair reviews the blind vote's top two IN FULL and ratifies or
+    overrides. `top` = [{label, score, votes, content, role}, ...], winner
+    first. Author identity stays hidden (Candidate N) as it was for the judges."""
+    blocks = []
+    for c in top:
+        blocks.append(
+            f"===== Candidate {c['label']} ({c['role']} — score {c['score']}, "
+            f"{c['votes']} first-place vote(s)) =====\n"
+            f"{c['content'][:config.CANDIDATE_SCORE_MAX_CHARS]}")
+    win, run = top[0]["label"], top[1]["label"]
+    return (
+        f"Task the candidates implement: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"{CHAIR_CHARTER}"
+        "The blind judge vote ranked these two highest. The vote is ADVISORY to "
+        "you — judges score by reading and can miss a real bug or a missed "
+        "requirement. Read BOTH in full and decide. Emit exactly one line:\n"
+        f"RATIFY: Candidate {win}\n"
+        "  — or —\n"
+        f"OVERRIDE: Candidate {run} - <specific, concrete reason the runner-up is better>\n"
+        "Then list concrete defects in the file you chose for a surgical finishing "
+        "pass — one per line, 'DEFECT: <what and where>' — or 'DEFECT: none'. "
+        "Do NOT rewrite; the author won on merit.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def parse_chair_decision(text: str, winner_label: int, runnerup_label: int) -> tuple[int, bool, list[str]]:
+    """(chosen_label, overrode, defects). An OVERRIDE naming the runner-up
+    switches the winner; anything else (RATIFY, or an OVERRIDE naming the
+    winner, or silence) keeps the vote's winner. Defects drive the finish pass."""
+    overrode = False
+    chosen = winner_label
+    m = _OVERRIDE_RE.search(text or "")
+    if m and int(m.group(1)) == runnerup_label:
+        chosen, overrode = runnerup_label, True
+    defects = [d.strip() for d in _DEFECT_RE.findall(text or "")
+               if d.strip() and d.strip().lower() != "none"]
+    return chosen, overrode, defects
+
+
+def chair_recover_prompt(session: Session, filename: str, body: str, error: str) -> str:
+    """Every candidate the panel produced crashed. The chair repairs the most
+    complete attempt — surgical EDITs to make it RUN — rather than discarding
+    all the panel's work and starting over."""
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        f"{CHAIR_CHARTER}"
+        "Every candidate the panel produced FAILED to run. Below is the most "
+        f"complete attempt; executed headless, it threw: {error}\n"
+        "As chair, RECOVER it: emit surgical EDIT blocks that make it run "
+        "correctly. Fix the actual failure and any obvious siblings of it; do "
+        "NOT rewrite the file wholesale. The OLD snippet must be unique:\n"
+        "EDIT: " + filename + "\n"
+        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
+        "Emit nothing but EDIT blocks.\n\n"
+        f"----- {filename} -----\n{body[:config.SKILL_RESULT_SANDBOX_MAX_CHARS]}"
+    )
+
+
 def synthesis_prompt(
     session: Session, council: "Council", role_agents: dict[Role, str] | None,
     round_idx: int, panel_results: list[Contribution],
