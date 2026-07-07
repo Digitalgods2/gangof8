@@ -53,12 +53,29 @@ function _el(){
     value: "", width: 800, height: 600, clientWidth: 800, clientHeight: 600, dataset: {},
     onload: null, play: () => Promise.resolve(), pause: _noop };
 }
+let _frameOps = [];  // canvas draw calls recorded for the CURRENT frame
+function _drawSig(name, args){
+  let s = name;
+  for (let i = 0; i < args.length; i++){
+    const a = args[i];
+    s += (typeof a === "number" ? (a | 0) : (typeof a === "string" ? a.slice(0, 10) : "x")) + ",";
+  }
+  _frameOps.push(s);
+}
+// Canvas ops that put pixels on screen — recorded so we can tell whether the
+// picture CHANGES frame to frame (a live game) or is frozen (a static screen).
+const _DRAW = { fillRect:1, strokeRect:1, fillText:1, strokeText:1, drawImage:1, arc:1, arcTo:1,
+  ellipse:1, rect:1, lineTo:1, quadraticCurveTo:1, bezierCurveTo:1, fill:1, stroke:1, putImageData:1, roundRect:1 };
 const _ctx = new Proxy({}, { get(t, k){
   if (k === "canvas") return _el();
-  if (k === "measureText") return () => ({ width: 0 });
-  if (k === "createLinearGradient" || k === "createRadialGradient" || k === "createPattern")
+  if (k === "measureText") return () => ({ width: 0, actualBoundingBoxAscent: 0, actualBoundingBoxDescent: 0 });
+  if (k === "createLinearGradient" || k === "createRadialGradient" || k === "createConicGradient")
     return () => ({ addColorStop: _noop });
-  if (k === "getImageData") return () => ({ data: new Uint8ClampedArray(4) });
+  if (k === "createPattern") return () => ({ setTransform: _noop });
+  if (k === "getImageData") return () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 });
+  if (k === "createImageData") return () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 });
+  if (k === "getLineDash") return () => [];
+  if (typeof k === "string" && _DRAW[k]) return function(){ _drawSig(k, arguments); return _chain; };
   return _noop;
 }});
 const _listeners = {};
@@ -82,9 +99,16 @@ _def("localStorage", { getItem:(k)=> (k in _store ? _store[k] : null), setItem:(
   removeItem:(k)=>{delete _store[k];}, clear:()=>{for (const k in _store) delete _store[k];} });
 _def("requestAnimationFrame", _raf);
 _def("cancelAnimationFrame", _noop);
-_def("setTimeout", () => 0); _def("clearTimeout", _noop);
-_def("setInterval", () => 0); _def("clearInterval", _noop);
-_def("performance", { now: () => 0 });
+// Capture timer callbacks so timer-driven game loops (setTimeout/setInterval) can
+// be advanced by the pump, not silently dropped.
+const _timers = [];
+_def("setTimeout", (fn) => { if (typeof fn === "function") _timers.push(fn); return 0; });
+_def("clearTimeout", _noop);
+_def("setInterval", (fn) => { if (typeof fn === "function") _timers.push(fn); return 0; });
+_def("clearInterval", _noop);
+// An ADVANCING clock so delta-time games (dt = now - last) actually move.
+let _now = 0;
+_def("performance", { now: () => _now });
 _def("matchMedia", () => ({ matches:false, addEventListener:_noop, addListener:_noop, removeListener:_noop }));
 _def("navigator", { userAgent:"node", maxTouchPoints:0, vibrate:_noop, language:"en", platform:"node" });
 _def("devicePixelRatio", 1);
@@ -101,7 +125,8 @@ _def("document", { getElementById: _el, querySelector: _el, querySelectorAll: ()
 _def("window", new Proxy({
   innerWidth:800, innerHeight:600, devicePixelRatio:1, addEventListener:_add, removeEventListener:_noop,
   requestAnimationFrame:_raf, cancelAnimationFrame:_noop,
-  setTimeout: () => 0, clearTimeout:_noop, setInterval: () => 0, clearInterval:_noop,
+  setTimeout:(f)=>globalThis.setTimeout(f), clearTimeout:_noop,
+  setInterval:(f)=>globalThis.setInterval(f), clearInterval:_noop,
   AudioContext:_audioCtor, webkitAudioContext:_audioCtor,
   localStorage: globalThis.localStorage, matchMedia: globalThis.matchMedia, navigator: globalThis.navigator,
   performance: globalThis.performance, location:{ href:"", reload:_noop }, onload:null,
@@ -109,16 +134,68 @@ _def("window", new Proxy({
   document: globalThis.document
 }, { get(t,k){ return k in t ? t[k] : (globalThis[k] !== undefined ? globalThis[k] : _noop); }, set(t,k,v){ t[k]=v; return true; } }));
 
-function _fire(map, type){ (map[type]||[]).slice().forEach(fn => { try { fn({ preventDefault:_noop, code:"", key:"", touches:[], changedTouches:[], clientX:0, clientY:0 }); } catch(e){} }); }
+let _sigs = [];  // one draw-signature per pumped frame (for motion detection)
+function _ev(extra){
+  const b = { preventDefault:_noop, stopPropagation:_noop, stopImmediatePropagation:_noop,
+    bubbles:true, cancelable:true, code:"", key:"", keyCode:0, which:0, button:0, buttons:0,
+    clientX:200, clientY:300, pageX:200, pageY:300, offsetX:200, offsetY:300,
+    touches:[], changedTouches:[], targetTouches:[], deltaY:0 };
+  if (extra) for (const k in extra) b[k] = extra[k];
+  b.target = global.document.body; b.currentTarget = global.document.body;
+  return b;
+}
+function _fire(map, type){ (map[type]||[]).slice().forEach(fn => { try { fn(_ev()); } catch(e){} }); }
+function _fireType(type, ev){
+  (_listeners[type]||[]).slice().forEach(fn => { try { fn(ev); } catch(e){} });
+  const on = "on" + type;
+  [global.window, global.document].forEach(o => { try { if (o && typeof o[on] === "function") o[on](ev); } catch(e){} });
+}
+function _pressKey(kind, key, code){ _fireType(kind, _ev({ key:key, code:code })); }
+// Drive the game the way a player would — press keys, click, tap — so we can see
+// whether it responds. Broad coverage so most games get "started" and moving.
+function _simInput(){
+  const keys = [[" ","Space"],["Enter","Enter"],["ArrowLeft","ArrowLeft"],["ArrowRight","ArrowRight"],
+    ["ArrowUp","ArrowUp"],["ArrowDown","ArrowDown"],["a","KeyA"],["d","KeyD"],["w","KeyW"],["s","KeyS"],["p","KeyP"]];
+  keys.forEach(k => _pressKey("keydown", k[0], k[1]));
+  ["mousedown","mouseup","click","pointerdown","pointerup"].forEach(t => _fireType(t, _ev({})));
+  const touch = { clientX:200, clientY:300, identifier:0, pageX:200, pageY:300 };
+  _fireType("touchstart", _ev({ touches:[touch], changedTouches:[touch], targetTouches:[touch] }));
+  _fireType("touchend", _ev({ touches:[], changedTouches:[touch], targetTouches:[] }));
+}
+function _step(){
+  _frameOps = [];
+  if (_rafState.cb){ const cb = _rafState.cb; _rafState.cb = null; cb(_now); }  // may throw
+  const batch = _timers.splice(0);
+  for (let i = 0; i < batch.length && i < 60; i++){ try { batch[i](); } catch(e){} }
+  _now += 16;
+  _sigs.push(_frameOps.join("|"));
+}
 
 try {
 __SCRIPT__
   _fire(_listeners, "DOMContentLoaded");
   _fire(_listeners, "load");
   if (typeof global.window.onload === "function") { try { global.window.onload(); } catch(e){} }
-  let ts = 0;
-  for (let i = 0; i < 12 && _rafState.cb; i++){ const cb = _rafState.cb; _rafState.cb = null; ts += 16; cb(ts); }
+  // Phase A — load + first frames must not throw (a crasher fails HERE).
+  for (let i = 0; i < 12; i++) _step();
   console.log("SMOKE_OK");
+  // Phase B — gameplay probe: drive input and watch for on-screen motion. LENIENT:
+  // a throw here does NOT fail the file, it only limits what we can assess. A game
+  // that renders a CHANGING picture is "dynamic"; one that draws the same frame
+  // forever despite input is "static/frozen".
+  let dynamic = "na";
+  try {
+    _sigs = [];
+    _simInput();
+    for (let f = 0; f < 90; f++){
+      if (f === 15 || f === 45 || f === 70) _simInput();
+      if (f === 30){ [" ","ArrowLeft","ArrowRight","a","d"].forEach(k => _pressKey("keyup", k, k)); }
+      _step();
+    }
+    const drew = _sigs.filter(s => s.length > 0);
+    if (drew.length >= 3) dynamic = (new Set(drew).size >= 2) ? "true" : "false";
+  } catch (e) { /* probe error — keep whatever we assessed */ }
+  console.log("SMOKE_DYNAMIC:" + dynamic);
 } catch (e) {
   console.log("SMOKE_THREW:" + (e && e.message ? e.message : String(e)));
 }
@@ -129,22 +206,28 @@ def is_web_file(path) -> bool:
     return Path(path).suffix.lower() in _WEB_SUFFIXES
 
 
-def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple[bool, bool, str]:
-    """Run web source and report (ok, testable, detail). testable is False when
-    we could not execute it (no Node / not web / no script) — those never
-    block. ok is False only on a DETECTED runtime failure."""
+def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple[bool, bool, str, Optional[bool]]:
+    """Run web source and report (ran, testable, detail, dynamic).
+
+    - ran: False only on a DETECTED runtime failure (throws on load, hangs).
+    - testable: False when we couldn't execute it (no Node / not web / no
+      script) — those never block.
+    - dynamic: True  → rendered a CHANGING picture under simulated input (live);
+               False → drew, but the same frame forever despite input (frozen);
+               None  → couldn't assess motion (not enough drawing, or a throw
+                       during the probe). None never counts against a file."""
     suffix = (suffix or "").lower()
     if suffix not in _WEB_SUFFIXES:
-        return True, False, "not a runnable web file"
+        return True, False, "not a runnable web file", None
     node = shutil.which("node")
     if not node:
-        return True, False, "node not on PATH — runtime test skipped"
+        return True, False, "node not on PATH — runtime test skipped", None
     if suffix in (".js", ".mjs"):
         src = text
     else:
         scripts = _SCRIPT_RE.findall(text or "")
         if not scripts:
-            return True, False, "no <script> to execute"
+            return True, False, "no <script> to execute", None
         src = "\n".join(scripts)
     harness = _HARNESS.replace("__SCRIPT__", src)
     fd, tmp = tempfile.mkstemp(suffix=".js", prefix="conclave_smoke_")
@@ -154,7 +237,7 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple
         try:
             r = subprocess.run([node, tmp], capture_output=True, text=True, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return False, True, "runtime hung on load (possible infinite loop before first frame)"
+            return False, True, "runtime hung on load (possible infinite loop before first frame)", None
     finally:
         try:
             os.unlink(tmp)
@@ -162,20 +245,24 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple
             pass
     out = (r.stdout or "") + (r.stderr or "")
     if "SMOKE_OK" in out:
-        return True, True, "ran clean through load + first frames"
+        dm = re.search(r"SMOKE_DYNAMIC:(true|false|na)", out)
+        dynamic = {"true": True, "false": False, "na": None}.get(dm.group(1) if dm else "na")
+        if dynamic is False:
+            return True, True, "loads, but renders a static/frozen screen (no motion under input)", False
+        return True, True, "ran clean" + (" and shows motion under input" if dynamic else ""), dynamic
     m = re.search(r"SMOKE_THREW:(.*)", out)
     if m:
-        return False, True, "threw on load — " + m.group(1).strip()[:200]
-    return False, True, "did not run — " + (out.strip()[:200] or "no output")
+        return False, True, "threw on load — " + m.group(1).strip()[:200], None
+    return False, True, "did not run — " + (out.strip()[:200] or "no output"), None
 
 
-def smoke_test(path, timeout_s: int = 25) -> tuple[bool, bool, str]:
-    """(ok, testable, detail) for a file on disk. See smoke_source."""
+def smoke_test(path, timeout_s: int = 25) -> tuple[bool, bool, str, Optional[bool]]:
+    """(ran, testable, detail, dynamic) for a file on disk. See smoke_source."""
     p = Path(path)
     if not is_web_file(p):
-        return True, False, "not a runnable web file"
+        return True, False, "not a runnable web file", None
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
-        return False, True, f"unreadable: {e}"
+        return False, True, f"unreadable: {e}", None
     return smoke_source(text, p.suffix, timeout_s)

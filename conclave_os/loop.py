@@ -1741,14 +1741,30 @@ def _collect_candidates(session: Session) -> list[dict]:
     return list(seen.values())
 
 
+def _norm_base(name: str) -> str:
+    """Grouping key that collapses COSMETIC filename differences so candidates for
+    the same single-file deliverable compete together even when models disagree on
+    separators or case — spaceinvaders.html, space-invaders.html and
+    space_invaders.html are one deliverable, not three. The extension is kept so
+    genuinely different outputs (game.html vs styles.css) still separate. (Live:
+    six Space Invaders candidates fractured 2/2/2 by these three spellings and
+    only ONE group of 2 was ever judged — the other four were silently dropped.)"""
+    b = _basename(name).lower()
+    stem, dot, ext = b.rpartition(".")
+    if not dot:
+        stem, ext = b, ""
+    stem = re.sub(r"[^a-z0-9]", "", stem) or stem
+    return f"{stem}.{ext}" if ext else stem
+
+
 def _dominant_base_group(session: Session, candidates: list[dict]) -> list[dict]:
     """Candidates for ONE deliverable. Seats disagree on the filename (live:
     index.html vs centipede.html vs centipede_clone.html for the same game), so
-    group by base name and take the most-agreed group — preferring a base that
-    matches a file already in the established folder (a revision's real name)."""
+    group by NORMALIZED base name and take the most-agreed group — preferring a
+    base that matches a file already in the established folder (a revision's name)."""
     groups: dict[str, list[dict]] = {}
     for c in candidates:
-        groups.setdefault(_basename(c["base"]).lower(), []).append(c)
+        groups.setdefault(_norm_base(c["base"]), []).append(c)
     established = set()
     if session.established_root:
         try:
@@ -1907,7 +1923,7 @@ def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
             applied += 1
     if not applied:
         return None
-    ran, testable, detail = smoke.smoke_source(content, Path(base).suffix or ".html")
+    ran, testable, detail, _dyn = smoke.smoke_source(content, Path(base).suffix or ".html")
     if not ran:
         store.log_event(sid, "chair_recover_failed", {"file": base, "detail": detail})
         return None
@@ -1929,12 +1945,28 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         return None
     group = _dominant_base_group(session, candidates)
     sid = session.session_id
-    # RUNTIME GATE before judging — a candidate that doesn't RUN can't win.
+    if len(group) < len(candidates):
+        # genuinely differently-named deliverables remain in the minority — say so
+        # instead of dropping them silently (the old failure mode).
+        dropped = [c["agent"] for c in candidates if c not in group]
+        store.log_event(sid, "candidates_ungrouped",
+                        {"judged_base": _basename(group[0]["base"]), "dropped": dropped})
+        session.unresolved.append(
+            f"{len(dropped)} candidate(s) used a different filename "
+            f"({', '.join(dropped)}) and were not in the judged group")
+    # RUNTIME GATE before judging — a candidate that doesn't RUN, or that renders a
+    # frozen/static screen, can't win when a live one exists.
     runnable: list[dict] = []
     crashers: list[dict] = []
+    frozen: list[dict] = []
     for c in group:
-        ran, testable, detail = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
-        if ran:
+        ran, testable, detail, dynamic = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
+        if ran and dynamic is False:
+            c["_error"] = detail
+            frozen.append(c)
+            store.log_event(sid, "candidate_frozen",
+                            {"agent": c["agent"], "file": _basename(c["base"]), "detail": detail})
+        elif ran:
             runnable.append(c)
         else:
             c["_error"] = detail
@@ -1943,6 +1975,20 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                             {"agent": c["agent"], "file": _basename(c["base"]), "detail": detail})
             session.unresolved.append(
                 f"candidate {c['agent']}/{_basename(c['base'])} rejected — does not run: {detail}")
+
+    # A frozen/static candidate loses to a live one; but if EVERY candidate is
+    # static, judge them anyway (best effort) rather than discard the panel's work.
+    if runnable and frozen:
+        store.log_event(sid, "candidates_frozen_dropped",
+                        {"dropped": [c["agent"] for c in frozen]})
+        session.unresolved.append(
+            f"{len(frozen)} candidate(s) rendered a static screen and lost to live ones: "
+            f"{', '.join(c['agent'] for c in frozen)}")
+    elif not runnable and frozen:
+        session.unresolved.append(
+            "no candidate showed motion under simulated input; the shipped file runs "
+            "but may be static — verify it is actually interactive/playable")
+        runnable, frozen = frozen, []
 
     if not runnable:
         # CHAIR RECOVERY: the codifier repairs the most complete failed attempt
@@ -1986,7 +2032,7 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         if fixed != content:
             # the fix pass must not break the winner — re-verify; keep the
             # (already-passing) original if the "fixed" version no longer runs.
-            ran, testable, detail = smoke.smoke_source(fixed, Path(base).suffix or ".html")
+            ran, testable, detail, _dyn = smoke.smoke_source(fixed, Path(base).suffix or ".html")
             if ran:
                 content, fixes = fixed, 1
             else:
@@ -2420,12 +2466,20 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
             # showed a black screen). Execute it headless; a throw is a failure.
             if smoke.is_web_file(path) and action.filename not in _smoke_checked:
                 _smoke_checked.add(action.filename)
-                ran, testable, detail = smoke.smoke_test(path)
+                ran, testable, detail, dynamic = smoke.smoke_test(path)
                 if not ran:
                     failures.append(f"{action.filename}: does not run — {detail}")
                 elif testable:
                     store.log_event(session.session_id, "runtime_ok",
-                                    {"file": action.filename})
+                                    {"file": action.filename, "dynamic": dynamic})
+                    # A static/frozen render is NOT a hard failure (a report or a
+                    # not-yet-started game is legitimately still) — but flag it so a
+                    # possibly-unplayable delivery isn't reported as a clean success.
+                    if dynamic is False:
+                        session.unresolved.append(
+                            f"{action.filename}: the delivered file renders a static "
+                            "screen and showed no motion under simulated input — "
+                            "verify it is actually interactive/playable")
         except OSError as e:
             failures.append(f"{action.filename}: verification error: {e}")
 
