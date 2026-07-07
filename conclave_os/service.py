@@ -119,6 +119,7 @@ class ConclaveService:
         # minutes, so the dashboard submits and polls instead of blocking
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
         self._model_catalog_cache: Optional[tuple[float, dict]] = None
+        self._or_catalog_cache: Optional[tuple[float, dict]] = None
         self._apply_settings(backend=backend)
         # Crash recovery: a previous process may have died mid-run (e.g. a
         # restart), leaving sessions stuck in a live state with no worker to
@@ -324,6 +325,7 @@ class ConclaveService:
             raise KeyError(f"unknown API key {name!r}")
         self.secrets.set(name, value or "")
         self._model_catalog_cache = None  # a new key may unlock a better catalog
+        self._or_catalog_cache = None
         return self.api_key_status(name)
 
     def clear_api_key(self, name: str) -> dict:
@@ -331,6 +333,7 @@ class ConclaveService:
             raise KeyError(f"unknown API key {name!r}")
         self.secrets.clear(name)
         self._model_catalog_cache = None
+        self._or_catalog_cache = None
         return self.api_key_status(name)
 
     # back-compat wrappers (older callers/tests)
@@ -684,18 +687,68 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self._model_catalog_cache = (now, catalog)
         return catalog
 
-    def _fetch_public_catalog(self) -> dict[str, list[str]]:
-        """Vendor → model ids from the public catalog, newest release first.
-        ':free'/':extended' routing variants collapse to the base id (that is
-        what the vendor CLIs accept). Best-effort: {} on any failure."""
+    def _fetch_catalog_raw(self) -> list:
+        """The raw OpenRouter /models list (best-effort: [] on any failure).
+        Shared by the CLI-seat catalog and the OpenRouter vendor catalog."""
         import httpx
 
         try:
             resp = httpx.get(config.MODEL_CATALOG_URL, timeout=config.MODEL_CATALOG_TIMEOUT)
             if resp.status_code != 200:
-                return {}
-            data = (resp.json() or {}).get("data") or []
+                return []
+            return (resp.json() or {}).get("data") or []
         except Exception:  # noqa: BLE001 — offline/misbehaving catalog ⇒ fallback
+            return []
+
+    def openrouter_vendor_catalog(self, refresh: bool = False) -> dict:
+        """Per OpenRouter SEAT, that vendor's live models with capability flags —
+        {seat: [{id, name, vision, reasoning, tools, ctx}], …}, newest first.
+        Powers the model dropdown for each generic vendor seat. Cached; {} of
+        empty lists offline (the seat still runs on its default/custom slug)."""
+        import time as _time
+
+        now = _time.monotonic()
+        if (not refresh and self._or_catalog_cache
+                and now - self._or_catalog_cache[0] < config.MODEL_CATALOG_TTL):
+            return self._or_catalog_cache[1]
+        out: dict[str, list] = {seat: [] for seat in config.OPENROUTER_SEATS}
+        if config.WEB_ENABLED:
+            v2s = {spec.get("vendor"): seat for seat, spec in config.OPENROUTER_SEATS.items()}
+            per: dict[str, dict[str, dict]] = {}
+            for m in self._fetch_catalog_raw():
+                if not isinstance(m, dict):
+                    continue
+                mid = str(m.get("id") or "")
+                seat = v2s.get(mid.split("/", 1)[0])
+                base = mid.split(":")[0]  # collapse :free/:extended routing variants
+                if not seat or not base or any(x in base.lower() for x in self._CATALOG_EXCLUDE):
+                    continue
+                arch = m.get("architecture") or {}
+                mods = arch.get("input_modalities") or []
+                if isinstance(mods, str):
+                    mods = mods.replace("+", ",").split(",")
+                sup = [str(x).lower() for x in (m.get("supported_parameters") or [])]
+                per.setdefault(seat, {}).setdefault(base, {
+                    "id": base,
+                    "name": str(m.get("name") or base).split(":")[0].strip(),
+                    "vision": any("image" in str(x).lower() for x in mods),
+                    "reasoning": ("reasoning" in sup or "include_reasoning" in sup),
+                    "tools": ("tools" in sup),
+                    "ctx": int(m.get("context_length") or 0),
+                    "_created": float(m.get("created") or 0),
+                })
+            for seat, d in per.items():
+                ms = sorted(d.values(), key=lambda x: (x["_created"], x["ctx"]), reverse=True)
+                out[seat] = [{k: v for k, v in mm.items() if not k.startswith("_")} for mm in ms[:24]]
+        self._or_catalog_cache = (now, out)
+        return out
+
+    def _fetch_public_catalog(self) -> dict[str, list[str]]:
+        """Vendor → model ids from the public catalog, newest release first.
+        ':free'/':extended' routing variants collapse to the base id (that is
+        what the vendor CLIs accept). Best-effort: {} on any failure."""
+        data = self._fetch_catalog_raw()
+        if not data:
             return {}
         per: dict[str, list[tuple[float, str]]] = {}
         for m in data:
@@ -757,10 +810,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         ]
         key_present = self.secrets.has("openrouter")
         enabled = self.settings.openrouter_enabled or {}
+        or_catalog = self.openrouter_vendor_catalog(refresh=refresh)
         openrouter = [
             {"name": name, "kind": "openrouter", "label": spec["label"],
+             "vendor": spec.get("vendor"),
              "model_slug": self._openrouter_slug(name),
              "default_slug": spec["model_slug"],
+             "models": or_catalog.get(name, []),
              "enabled": bool(enabled.get(name)),
              "available": bool(enabled.get(name)) and key_present}
             for name, spec in config.OPENROUTER_SEATS.items()

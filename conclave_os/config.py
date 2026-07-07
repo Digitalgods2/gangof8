@@ -152,11 +152,14 @@ CLI_MODEL_CATALOG: dict[str, list[str]] = {
 # OPENROUTER_API_KEY. Mixed freely with the local CLI agents in the role map.
 OPENROUTER_ENDPOINT = os.environ.get("CONCLAVE_OS_OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1")
 OPENROUTER_DATA_COLLECTION = os.environ.get("CONCLAVE_OS_OPENROUTER_DATA", "deny")  # deny | allow
+# Each seat is a generic VENDOR (label) + its OpenRouter namespace prefix
+# (vendor) + a default model_slug. The Settings UI offers that vendor's live
+# models (with capability badges) in a dropdown, plus a custom-slug field.
 OPENROUTER_SEATS: dict[str, dict[str, str]] = {
-    "deepseek": {"model_slug": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
-    "glm":      {"model_slug": "z-ai/glm-4.6",             "label": "GLM-4.6 (Z.ai)"},
-    "qwen":     {"model_slug": "qwen/qwen3.6-plus",        "label": "Qwen 3.6 Plus (Alibaba)"},
-    "kimi":     {"model_slug": "moonshotai/kimi-k2.6",     "label": "Kimi K2.6 (Moonshot)"},
+    "deepseek": {"vendor": "deepseek",   "model_slug": "deepseek/deepseek-v4-pro", "label": "DeepSeek"},
+    "glm":      {"vendor": "z-ai",       "model_slug": "z-ai/glm-4.6",             "label": "z.ai"},
+    "qwen":     {"vendor": "qwen",       "model_slug": "qwen/qwen3.6-plus",        "label": "Alibaba"},
+    "kimi":     {"vendor": "moonshotai", "model_slug": "moonshotai/kimi-k2.6",     "label": "Kimi"},
 }
 
 # Default mapping for the configured backend (modules that need a specific
