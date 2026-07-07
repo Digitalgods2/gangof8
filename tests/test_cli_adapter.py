@@ -18,6 +18,17 @@ from conclave_os.registry import AgentError
 from conclave_os.service import ConclaveService
 
 
+def test_claude_model_id_normalizes_openrouter_dotted_slug():
+    # OpenRouter's public catalog offers claude-opus-4.8 (dots); the claude CLI
+    # needs claude-opus-4-8 (dashes). A dotted pin must be corrected so the seat
+    # runs instead of dropping every round with "model may not exist".
+    assert CliAdapter("claude", model="claude-opus-4.8")._claude_model_id() == "claude-opus-4-8"
+    assert CliAdapter("claude", model="claude-opus-4.6")._claude_model_id() == "claude-opus-4-6"
+    # already-correct and empty ids pass through unchanged
+    assert CliAdapter("claude", model="claude-sonnet-5")._claude_model_id() == "claude-sonnet-5"
+    assert CliAdapter("claude", model=None)._claude_model_id() is None
+
+
 class _Proc:
     """Fake subprocess.Popen — _exec now uses Popen().communicate()."""
 
