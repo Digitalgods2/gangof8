@@ -157,8 +157,8 @@
   .filerow > .fpath { word-break:break-all; }
   .filerow .badge { flex:0 0 auto; }
   .filebtn { margin-left:auto; flex:0 0 auto; background:transparent; border:1px solid var(--line);
-             color:var(--accent); font-size:11px; padding:2px 9px; cursor:pointer; border-radius:4px;
-             white-space:nowrap; }
+             color:var(--accent); font-size:14px; padding:2px 9px; cursor:pointer; border-radius:4px;
+             line-height:1.2; white-space:nowrap; }
   .filebtn:hover { border-color:var(--accent); color:var(--text); background:rgba(255,255,255,.06); }
   #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
                      display:none; z-index:100; }  /* above the composer (60) */
@@ -1009,8 +1009,8 @@ function renderDetail(s) {
         const inEst = f => est && f.toLowerCase().startsWith(est.toLowerCase());
         return `
       <div class="card"><h3>Files written</h3>
-        <div class="sub" style="margin-bottom:6px">Scratch files live in the council's sandbox/workspace. Your established folder is only touched by an approved <b>promote</b>. Use <b>Open ↗</b> to open any file with your default app.</div>
-        <ul class="filelist">${s.files_changed.map(f=>`<li class="mono filerow"><span class="fpath">${esc(f)}</span> <span class="badge" style="font-size:10px">${inEst(f) ? "→ your folder (promoted)" : "sandbox (scratch)"}</span><button class="filebtn" data-path="${escAttr(f)}" title="Open this file with your default app" onclick="openFile(this.dataset.path)">Open ↗</button></li>`).join("")}</ul></div>`;
+        <div class="sub" style="margin-bottom:6px">Scratch files live in the council's sandbox/workspace. Your established folder is only touched by an approved <b>promote</b>. Use the <b>📎</b> button to open any file with your default app.</div>
+        <ul class="filelist">${s.files_changed.map(f=>`<li class="mono filerow"><span class="fpath">${esc(f)}</span> <span class="badge" style="font-size:10px">${inEst(f) ? "→ your folder (promoted)" : "sandbox (scratch)"}</span><button class="filebtn" data-path="${escAttr(f)}" title="Open this file with your default app" onclick="openFile(this.dataset.path)">📎</button></li>`).join("")}</ul></div>`;
       })() : ""}
 
     ${disagreements.length ? collapsible("sec_disagreements",
