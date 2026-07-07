@@ -159,7 +159,7 @@ OPENROUTER_SEATS: dict[str, dict[str, str]] = {
     "deepseek": {"vendor": "deepseek",   "model_slug": "deepseek/deepseek-v4-pro", "label": "DeepSeek"},
     "glm":      {"vendor": "z-ai",       "model_slug": "z-ai/glm-4.6",             "label": "z.ai"},
     "qwen":     {"vendor": "qwen",       "model_slug": "qwen/qwen3.6-plus",        "label": "Alibaba"},
-    "kimi":     {"vendor": "moonshotai", "model_slug": "moonshotai/kimi-k2.6",     "label": "Kimi"},
+    "kimi":     {"vendor": "moonshotai", "model_slug": "moonshotai/kimi-k2.6",     "label": "Moonshot AI"},
 }
 
 # Default mapping for the configured backend (modules that need a specific
