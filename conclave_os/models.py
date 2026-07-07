@@ -271,11 +271,6 @@ class Session(BaseModel):
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
     panel: list[str] = []  # seat names convened for this session (resume-stable)
-    # The model the LEAD escalates to for PRODUCTION work (authoring, repairing,
-    # fixing tests) — distinct from its fast coordination model so a smart-but-slow
-    # model can do the heavy lifting without stalling the round loop. Empty ⇒ the
-    # lead uses its one model for everything (unchanged behavior).
-    lead_work_model: Optional[str] = None
     # Approval categories the human granted a session-wide standing approval for
     # (e.g. "promote" via 'Approve all'): one deliberate grant instead of N
     # identical clicks. Session-scoped — a new task starts clean.

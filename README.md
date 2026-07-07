@@ -91,28 +91,25 @@ seat is a **different origin model**. Here is what each is doing:
   rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements resolve
   automatically (seats calling it `index.html` vs `centipede.html` are grouped
   by the most-agreed name).
-- **The lead** (yellow chip) is the **chair** — the council's final arbiter,
-  not one of its authors, and it is briefed on that standing role up front. On
-  a file build it does not write or judge; it **ratifies or overrides the blind
-  vote** (reading the top two in full — judges score by reading and can miss a
-  real bug), **finishes** the chosen file with surgical fixes, and when *every*
-  candidate crashes it **recovers** the most complete attempt rather than
-  discarding the panel's work. Nothing leaves the council it hasn't ratified.
-  When there aren't enough candidates to select among (or the task isn't a file
-  build) it falls back to organizing the work — assigning to talents
+- **The lead** (yellow chip) is the **orchestrator** — it kicks the task off,
+  feeds the jobs to the panel, and while they work can pull in talents
   (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
-  authoring as a last resort. Delivery (`PROMOTE:`) is always gated by your
-  approval. It ends each round with `ROUND: DONE` or `ROUND: CONTINUE`.
-  - **Two hats, two models.** The lead's coordination — synthesis, the chair
-    decision, orchestration — is on the serial critical path, so it wants a
-    *fast* model (a slow one stalls or times out the whole run). But when the
-    lead itself *produces* — fixing a best-of-N winner, recovering a crash,
-    finishing a cut-off file, fixing tests — it wants a *stronger* model. Set
-    **Lead — coding/repair model** in Settings (`lead_work_model`, same vendor
-    as the lead seat, e.g. lead=claude on Sonnet, work=Opus) and the lead
-    escalates to it, with a longer timeout, only on those production calls.
-    Blank = one model for both (unchanged). The dashboard shows both models in
-    the same run — Sonnet for a synthesis, Opus for a repair.
+  a critic as needed. It stays on a **fast** model on purpose: it's on the
+  serial critical path, so a slow, heavy model there stalls or times out the
+  whole run. It ends each round with `ROUND: DONE` or `ROUND: CONTINUE`, and
+  delivery (`PROMOTE:`) is always gated by your approval.
+- **The codifier does the strong post-panel work.** Once the panel returns its
+  candidates, *examining and finishing* them wants a **strong** model — the
+  opposite of the lead's fast one. That job belongs to the **Summarizer seat**:
+  set it to a strong model in Settings → Role mapping and it becomes the
+  council's codifier. On a file build it **chairs best-of-N** — ratifies or
+  overrides the blind vote (reading the top two in full, since judges score by
+  reading and can miss a real bug), **finishes** the winner with surgical fixes,
+  and when *every* candidate crashes it **recovers** the most complete attempt
+  rather than discarding the panel's work. On a plain-answer task it composes the
+  answer. Same seat, both jobs — and it runs with a longer timeout because the
+  examine-and-finish step is meant to think hard. So a run reads as: a fast lead
+  orchestrating, then the strong summarizer codifying.
 - **Why the lead's model also appears as a panelist:** same model, two
   different jobs. As a panelist it authors one candidate among many; as the
   lead it judges/orchestrates — a separate call with a separate charter. (Remap

@@ -230,7 +230,6 @@ class SettingsPatch(BaseModel):
     openrouter_models: dict[str, str] | None = None
     cli_models: dict[str, str] | None = None
     cli_enabled: dict[str, bool] | None = None
-    lead_work_model: str | None = None
 
 
 class ApiKeyIn(BaseModel):

@@ -49,16 +49,13 @@ class OpenRouterAdapter:
         self.data_collection = data_collection if data_collection in ("deny", "allow") else "deny"
 
     def call(self, role: Role, prompt: str, timeout_s: int,
-             images: Optional[list[dict]] = None,
-             model_override: str | None = None) -> AdapterResult:
+             images: Optional[list[dict]] = None) -> AdapterResult:
         key = self._key_getter()
         if not key:
             raise AgentError(
                 f"{self.name}: no OpenRouter API key — set OPENROUTER_API_KEY or "
                 "add it in Settings → API Keys")
-        # A per-call override (the lead's production model) wins over the role pin
-        # and the seat's default slug.
-        slug = model_override or self.role_models.get(getattr(role, "value", str(role))) or self.model_slug
+        slug = self.role_models.get(getattr(role, "value", str(role))) or self.model_slug
         payload = {
             "model": slug,
             "messages": [{"role": "user", "content": prompt}],

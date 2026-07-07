@@ -77,10 +77,23 @@ _SESSION_LOCK = threading.Lock()
 _AGENT_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_AGENTS)
 
 
+def _codifier(session: Session) -> Optional[CouncilMember]:
+    """Who does the post-panel CODIFY + EXAMINE work — selecting, reviewing, and
+    fixing the panel's output and finishing the deliverable. This is the STRONG
+    model: the SUMMARIZER seat when one is active (set it to a strong model in
+    Settings → Role mapping), else the lead. The lead stays fast for stage-1
+    orchestration (kicking things off, feeding the panel, pulling in talents); the
+    codifier is the strong stage-3 examiner/finisher."""
+    summ = session.council.get(Role.summarizer)
+    if summ and summ.active and summ.agent:
+        return summ
+    return session.council.get(Role.lead)
+
+
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
     member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
-    images: Optional[list[dict]] = None, model_override: Optional[str] = None,
+    images: Optional[list[dict]] = None,
 ) -> Contribution:
     # Cooperative cancellation: every agent call passes through here, so this is
     # the one checkpoint that aborts a run the human cancelled mid-flight.
@@ -111,11 +124,7 @@ def _agent_call(
         # The semaphore bounds how many CLI subprocesses run at once (never held
         # across the budget lock, so bookkeeping never blocks on a slow call).
         with _AGENT_SEMAPHORE:
-            # Pass model_override only when set, so registry doubles that don't
-            # take the kwarg keep working (it's None on every coordination call).
-            _extra = {"model_override": model_override} if model_override else {}
-            result = registry.call(member.agent, member.role, prompt, timeout_s,
-                                   images=images, **_extra)
+            result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
@@ -906,7 +915,7 @@ def _run_panel_rounds(
     role_agents: Optional[dict[Role, str]],
     established_overview: str,
     start: float,
-    lead_work_call: Optional[AgentCall] = None,
+    codifier_call: Optional[AgentCall] = None,
 ) -> bool:
     """Drive panel rounds until the lead declares DONE, the human declines more
     rounds, or budget/wall-time headroom runs out. Returns True when the session
@@ -985,8 +994,7 @@ def _run_panel_rounds(
         governance.check(session, "generate_text")
         produces = bool(session.classification and session.classification.produces_output)
         if produces:
-            bon = _run_best_of_n(session, council, panel, call, lead_call, store,
-                                 lead_work_call=lead_work_call)
+            bon = _run_best_of_n(session, council, panel, call, codifier_call or lead_call, store)
             if bon is not None:
                 chair = bon.get("chair", "")
                 if bon["judges"]:
@@ -1000,7 +1008,7 @@ def _run_panel_rounds(
                     how = (f"the only one of {bon['candidates']} candidates that "
                            "actually runs (the others crashed on load)")
                 summary = (
-                    f"Best-of-{bon['candidates']}, chaired by the lead: shipped "
+                    f"Best-of-{bon['candidates']}, codified by the summarizer: shipped "
                     f"{bon['agent']}'s {bon['file']} — {how}"
                     + (f"; {bon['fixes']} surgical fix pass applied (re-verified to run)."
                        if bon['fixes'] else ", shipped unchanged. Every candidate was "
@@ -1191,16 +1199,15 @@ def _deliberate(
                            timeout_s=config.LEAD_TIMEOUT,
                            reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
-    def lead_work_call(member: CouncilMember, prompt: str) -> Contribution:
-        # The lead's PRODUCTION model: when it authors/repairs/fixes code, escalate
-        # to session.lead_work_model (a stronger, same-vendor model) with a longer
-        # timeout. Its fast coordination model stays on lead_call. Unset ⇒ this is
-        # exactly lead_call (same model, LEAD_TIMEOUT), so behavior is unchanged.
-        wm = (session.lead_work_model or "").strip()
+    def codifier_call(member: CouncilMember, prompt: str) -> Contribution:
+        # Stage 3 — the strong CODIFIER (summarizer seat, else the lead) examines
+        # and finishes the panel's output: best-of-N selection/review/fix/recover,
+        # authoring described files, finishing cut-offs, fixing tests. Heavy work,
+        # so it gets the longer timeout. `member` is the codifier the caller
+        # resolved via _codifier(); the lead's fast path stays on lead_call.
         return _agent_call(session, registry, store, member, prompt,
-                           timeout_s=config.LEAD_WORK_TIMEOUT if wm else config.LEAD_TIMEOUT,
-                           reserve=config.COMPOSER_RESERVED_CALLS, images=images,
-                           model_override=wm or None)
+                           timeout_s=config.CODIFIER_TIMEOUT,
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
     lead = council.get(Role.lead)
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
@@ -1212,7 +1219,7 @@ def _deliberate(
         if not _has_proposals(session) and lead and lead.active and not session.compose_now:
             if _run_panel_rounds(session, manager, council, lead, call, lead_call,
                                  governance, store, role_agents, established_overview,
-                                 start, lead_work_call=lead_work_call):
+                                 start, codifier_call=codifier_call):
                 return session  # paused for round consent
 
             # 7. Mid-flight approval gate (only trips if governance flagged something).
@@ -1250,7 +1257,7 @@ def _deliberate(
         # already timed out/errored, re-calling it just burns another timeout, so
         # skip straight to salvage.
         if lead and lead.active and not lead_failed:
-            _materialize_artifacts(session, lead_work_call, store)
+            _materialize_artifacts(session, lead_call, store)
         # Still nothing? Recover a complete file a panelist wrote inline, so a
         # lead failure delivers that work instead of shipping nothing.
         if not _has_proposals(session):
@@ -1263,9 +1270,9 @@ def _deliberate(
     # Finish it from where it stopped (append) instead of re-drafting — the old
     # failure mode that produced empty/partial HTML over and over.
     if lead and lead.active:
-        _complete_truncated_artifacts(session, lead_work_call, lead, store)
+        _complete_truncated_artifacts(session, lead_call, lead, store)
         # The goal loop: failing tests come back to the lead for bounded repair.
-        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_work_call)
+        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_call)
 
     # Safety net: a follow-up that revised an already-delivered file but omitted
     # its PROMOTE line would otherwise strand the update in the sandbox (the
@@ -1798,11 +1805,11 @@ def _apply_targeted_fixes(session: Session, filename: str, content: str,
     blocks for the judge-flagged defects and apply them to the content string
     in-memory (unique-OLD → NEW), never a rewrite. Returns the (possibly) fixed
     content; degrades to the original on any error."""
-    lead = session.council.get(Role.lead)
-    if not (lead and lead.active):
+    who = _codifier(session)
+    if not (who and who.active):
         return content
     try:
-        ans = call(lead, rounds.winner_fix_prompt(session, filename, content, defects))
+        ans = call(who, rounds.winner_fix_prompt(session, filename, content, defects))
     except (AgentError, BudgetExceeded):
         return content
     applied = 0
@@ -1834,15 +1841,15 @@ def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> 
 
 
 def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
-                  defects: dict, wi: int, lead_call: AgentCall, store: LogStore) -> tuple[int, list[str], str]:
-    """The lead CHAIRS the blind vote: it reviews the top two candidates in full
-    and RATIFIES the vote's winner or OVERRIDES to the runner-up (judges score
-    by reading and can miss a real bug), then names the finishing defects.
-    Returns (final_index, defect_list, action). Degrades to the raw vote result
-    if the chair is absent or errs — the vote is never lost, only reviewed."""
+                  defects: dict, wi: int, call: AgentCall, store: LogStore) -> tuple[int, list[str], str]:
+    """The strong CODIFIER chairs the blind vote: it reviews the top two
+    candidates in full and RATIFIES the vote's winner or OVERRIDES to the
+    runner-up (judges score by reading and can miss a real bug), then names the
+    finishing defects. Returns (final_index, defect_list, action). Degrades to the
+    raw vote result if the codifier is absent or errs — the vote is never lost."""
     fallback = (wi, list(dict.fromkeys(defects[wi + 1]))[:6], "vote (no chair)")
-    lead = session.council.get(Role.lead)
-    if not (lead and lead.active) or len(ordered) < 2:
+    who = _codifier(session)
+    if not (who and who.active) or len(ordered) < 2:
         return fallback
     order = sorted(range(len(ordered)),
                    key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])),
@@ -1856,7 +1863,7 @@ def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
     ]
     sid = session.session_id
     try:
-        ans = lead_call(lead, rounds.chair_review_prompt(session, top))
+        ans = call(who, rounds.chair_review_prompt(session, top))
     except (AgentError, BudgetExceeded):
         return fallback
     chosen, overrode, chair_defects = rounds.parse_chair_decision(ans.content, win_i + 1, run_i + 1)
@@ -1872,19 +1879,19 @@ def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
     return final_i, dl, action
 
 
-def _chair_recover(session: Session, crashers: list[dict], lead_call: AgentCall,
+def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
                    store: LogStore) -> Optional[dict]:
-    """Every candidate crashed — the chair repairs the most complete attempt to
-    RUN, rather than discarding the panel's work and starting from nothing.
-    Returns {agent, base, content} (re-verified to run) or None."""
-    lead = session.council.get(Role.lead)
-    if not (lead and lead.active) or not crashers:
+    """Every candidate crashed — the strong codifier repairs the most complete
+    attempt to RUN, rather than discarding the panel's work and starting from
+    nothing. Returns {agent, base, content} (re-verified to run) or None."""
+    who = _codifier(session)
+    if not (who and who.active) or not crashers:
         return None
     target = max(crashers, key=lambda c: len(c["content"]))
     base = _basename(target["base"])
     sid = session.session_id
     try:
-        ans = lead_call(lead, rounds.chair_recover_prompt(
+        ans = call(who, rounds.chair_recover_prompt(
             session, base, target["content"], target.get("_error", "unknown")))
     except (AgentError, BudgetExceeded):
         return None
@@ -1909,18 +1916,14 @@ def _chair_recover(session: Session, crashers: list[dict], lead_call: AgentCall,
 
 
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
-                   call: AgentCall, lead_call: AgentCall, store: LogStore,
-                   lead_work_call: Optional[AgentCall] = None) -> Optional[dict]:
-    """The full best-of-N pipeline the LEAD chairs: gate candidates on whether
-    they RUN, judges score the survivors blindly, the lead (chair) ratifies or
-    overrides the vote and finishes the winner, and — if nothing ran — the chair
-    recovers the best attempt. Returns a summary dict, or None to fall back to
-    the author path (too few candidates or the vote collapsed).
-
-    The chair's DECISION (ratify/override) is coordination and stays on lead_call
-    (fast); the chair's PRODUCTION (fixing the winner, recovering a crasher) uses
-    lead_work_call — the lead's stronger production model when one is set."""
-    work_call = lead_work_call or lead_call
+                   call: AgentCall, codifier_call: AgentCall, store: LogStore) -> Optional[dict]:
+    """The full best-of-N pipeline: gate candidates on whether they RUN, panel
+    judges score the survivors blindly (`call`), then the strong CODIFIER
+    (`codifier_call` — the summarizer seat) ratifies or overrides the vote,
+    finishes the winner, and — if nothing ran — recovers the best attempt.
+    Returns a summary dict, or None to fall back to the author path (too few
+    candidates or the vote collapsed). The lead only orchestrated getting here;
+    the codify + examine stage is the strong model's job."""
     candidates = _collect_candidates(session)
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
@@ -1942,9 +1945,9 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                 f"candidate {c['agent']}/{_basename(c['base'])} rejected — does not run: {detail}")
 
     if not runnable:
-        # CHAIR RECOVERY: the lead repairs the most complete failed attempt
+        # CHAIR RECOVERY: the codifier repairs the most complete failed attempt
         # instead of throwing all the panel's work away.
-        rec = _chair_recover(session, crashers, work_call, store)
+        rec = _chair_recover(session, crashers, codifier_call, store)
         if rec is None:
             store.log_event(sid, "best_of_n_all_failed_runtime", {"n": len(group)})
             return None
@@ -1972,14 +1975,14 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         return None  # scoring collapsed → author path (with its own nets) instead
     wi = max(range(len(ordered)),
              key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
-    # CHAIR: the lead reviews the top two and ratifies or overrides the vote.
-    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, lead_call, store)
+    # CHAIR: the codifier reviews the top two and ratifies or overrides the vote.
+    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, codifier_call, store)
     winner, label = ordered[wi], wi + 1
     base = _basename(winner["base"])
     content = winner["content"]
     fixes = 0
     if fixlist:
-        fixed = _apply_targeted_fixes(session, base, content, fixlist, work_call, store)
+        fixed = _apply_targeted_fixes(session, base, content, fixlist, codifier_call, store)
         if fixed != content:
             # the fix pass must not break the winner — re-verify; keep the
             # (already-passing) original if the "fixed" version no longer runs.
