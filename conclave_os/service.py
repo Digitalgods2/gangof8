@@ -74,6 +74,7 @@ RULES
 - If the original prompt is already strong, make surgical improvements — don't rewrite for the sake of rewriting.
 - Do not explain your process. Output ONLY the amplified prompt, ready to use.
 - Preserve the user's voice where a clear voice exists.
+- Preserve exact literals VERBATIM — file paths, filenames, URLs, commands, code, and identifiers must be copied character-for-character. Never reword, split, re-quote, or add drive/root mentions around them (e.g. do not turn "C:\\Users\\me\\proj\\index.html" into "the C:\\ drive … at C:\\Users\\me\\proj\\index.html"). Keep each such literal as a single unbroken token.
 
 OUTPUT: Return ONLY the amplified prompt as plain text — no preamble, no commentary, no surrounding code fence."""
 
