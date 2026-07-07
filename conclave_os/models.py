@@ -271,6 +271,7 @@ class Session(BaseModel):
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
     panel: list[str] = []  # seat names convened for this session (resume-stable)
+    cli_timeouts: dict[str, int] = {}  # per-seat call timeout (s), from Settings; {} ⇒ config defaults
     # Approval categories the human granted a session-wide standing approval for
     # (e.g. "promote" via 'Approve all'): one deliberate grant instead of N
     # identical clicks. Session-scoped — a new task starts clean.

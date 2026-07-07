@@ -113,9 +113,14 @@ def _agent_call(
                 + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
             )
         session.agent_calls += 1
-    # Per-agent timeout: the gemini CLI needs more headroom than claude/codex.
-    if timeout_s is None:
-        timeout_s = config.agent_timeout(member.agent)
+    # Per-seat timeout: the Settings override (session.cli_timeouts) wins over the
+    # config.AGENT_TIMEOUTS default. It's the seat's BASE budget — an explicit
+    # heavy-work timeout (lead/panel authoring/codifier) still applies as a floor,
+    # so raising a seat's setting also raises its authoring headroom, while a small
+    # setting can't starve authoring below the built-in minimum.
+    seat_base = (getattr(session, "cli_timeouts", None) or {}).get(member.agent) \
+        or config.agent_timeout(member.agent)
+    timeout_s = seat_base if timeout_s is None else max(timeout_s, seat_base)
     # Tag this worker thread with the session so the CLI adapter can register its
     # subprocess for hard cancellation (kill on request). current_session is
     # thread-local, so each parallel worker tags itself independently.

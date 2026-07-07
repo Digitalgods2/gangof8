@@ -400,6 +400,7 @@ class ConclaveService:
         session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
         session.panel = list(self.panel)
+        session.cli_timeouts = dict(self.settings.cli_timeouts or {})
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
         # Established folder is PER TASK: interpret a path the user referenced in
