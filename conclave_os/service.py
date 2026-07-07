@@ -9,7 +9,9 @@ Backends:
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +38,57 @@ from .sessions import SessionManager
 from .settings import Settings, budgets_overrides, load_settings, save_settings
 from .uploads import UploadStore, attachment_context
 from .workspaces import WorkspaceError, WorkspaceStore
+
+
+# The "Enhance" button runs the lead model with this to amplify a raw prompt into
+# a sharper, more effective one — then returns ONLY the amplified prompt.
+AMPLIFY_PROMPT = """\
+You are a Prompt Amplification Engine. Your sole function is to receive a simple, raw prompt and return a dramatically \
+superior version of it — one that will extract the deepest, most useful, and most precise response from any AI model.
+
+PROCESS
+Phase 1 — Intent Deconstruction
+Before rewriting anything, silently analyze the original prompt across these dimensions:
+- Core intent: What does the user actually want? What outcome are they after?
+- Domain: Is this technical, creative, philosophical, practical, scientific, personal?
+- Implicit assumptions: What is the user taking for granted or leaving unsaid?
+- Gaps: What critical context, constraints, or specifications are missing that, if added, would sharply improve the output?
+- Audience & tone: Who is this for? What register fits — formal, conversational, academic, raw?
+
+Phase 2 — Strategic Amplification
+Rewrite the prompt by applying ONLY the techniques relevant to the domain and intent. Do not apply all techniques universally — match the tool to the task:
+- Precision language: Replace vague words with exact, high-signal terms.
+- Scope framing: Define boundaries. Tell the model what to include AND what to exclude.
+- Perspective injection: Where useful, specify a viewpoint, expertise level, or role the model should adopt.
+- Output architecture: Specify the desired structure — numbered steps, comparative table, narrative arc, decision matrix, annotated code — whatever format best serves the intent.
+- Depth calibration: Add directives like "explain the underlying mechanism," "include edge cases," "address common misconceptions," or "provide the non-obvious insight" — but only when the topic warrants depth.
+- Constraint seeding: Add productive constraints that force quality — word limits, required examples, "avoid clichés," "no filler," "prioritize actionable specifics."
+- Domain-matched descriptors: For scientific prompts, add rigor. For creative prompts, add sensory and emotional texture. For strategic prompts, add frameworks and tradeoffs. Never cross-contaminate.
+
+Phase 3 — Compression & Polish
+Remove any amplification that adds words without adding value. The amplified prompt must feel intentional, not bloated. It should read as if written by someone who deeply understands both the subject and how to communicate with AI.
+
+RULES
+- Never change the user's original intent. Amplify it, don't redirect it.
+- Never add fluff. Every added word must earn its place.
+- If the original prompt is already strong, make surgical improvements — don't rewrite for the sake of rewriting.
+- Do not explain your process. Output ONLY the amplified prompt, ready to use.
+- Preserve the user's voice where a clear voice exists.
+
+OUTPUT: Return ONLY the amplified prompt as plain text — no preamble, no commentary, no surrounding code fence."""
+
+
+def _strip_fence(s: str) -> str:
+    """Drop a wrapping ``` code fence if the model added one, so the textarea
+    gets the clean prompt."""
+    s = (s or "").strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        lines = lines[1:]  # opening ``` / ```text
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines)
+    return s.strip()
 
 
 class ConclaveService:
@@ -346,6 +399,38 @@ class ConclaveService:
                 session.attachments.append({"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
         self.store.save_session(session)
         return session
+
+    def enhance_prompt(self, text: str) -> dict:
+        """The Enhance button: amplify a raw prompt with the LEAD model. Saves a
+        copy of the original + enhanced under data/enhancements/ so nothing is
+        lost, and returns the enhanced text (the caller keeps the original for
+        undo). Does not create or run a session — it's a single model call."""
+        raw = (text or "").strip()
+        if not raw:
+            raise ValueError("nothing to enhance")
+        agent = self.role_agents.get(Role.lead)
+        if not agent or agent not in self.registry.names():
+            raise ValueError("no lead model is available to enhance with")
+        result = self.registry.call(agent, Role.lead,
+                                    f"{AMPLIFY_PROMPT}\n\nRAW PROMPT TO AMPLIFY:\n{raw}",
+                                    timeout_s=180)
+        enhanced = _strip_fence(result.content or "")
+        if not enhanced:
+            raise RuntimeError("the lead model returned nothing")
+        saved = ""
+        try:
+            d = Path(self._data_dir) / "enhancements"
+            d.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+            p = d / f"enh_{stamp}.json"
+            p.write_text(json.dumps({"ts": stamp, "agent": agent, "model": result.model,
+                                     "original": raw, "enhanced": enhanced}, indent=2),
+                         encoding="utf-8")
+            saved = str(p)
+        except OSError:
+            pass  # saving a copy is best-effort; the enhancement still returns
+        return {"enhanced": enhanced, "original": raw, "agent": agent,
+                "model": result.model, "saved": saved}
 
     def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None,
             attachments: Optional[list[str]] = None) -> Session:

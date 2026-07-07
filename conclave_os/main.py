@@ -178,6 +178,21 @@ def session_timeline(session_id: str) -> dict:
     return service.timeline(session_id)
 
 
+class EnhanceIn(BaseModel):
+    text: str = ""
+
+
+@app.post("/enhance")
+def enhance(body: EnhanceIn) -> dict:
+    """Amplify a raw prompt with the lead model (the composer's Enhance button)."""
+    try:
+        return service.enhance_prompt(body.text)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:  # noqa: BLE001 — surface any model/adapter failure to the UI
+        raise HTTPException(status_code=502, detail=f"enhance failed: {e}")
+
+
 class OpenFileIn(BaseModel):
     session_id: str = ""
     path: str = ""
