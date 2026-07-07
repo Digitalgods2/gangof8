@@ -5,6 +5,7 @@ worker thread; the dashboard page is served at /; approvals and answers can
 resume sessions in the background.
 """
 
+import os
 import time
 
 import pytest
@@ -107,6 +108,19 @@ def test_open_file_rejects_path_not_in_session_outputs(client, tmp_path):
     foreign.write_text("secret", encoding="utf-8")
     r = client.post("/files/open", json={"session_id": sid, "path": str(foreign)})
     assert r.status_code == 403
+
+
+def test_enhance_amplifies_prompt_and_saves_a_copy(client):
+    r = client.post("/enhance", json={"text": "write a haiku about rain"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["enhanced"], "the lead model produced an enhanced prompt"
+    assert d["original"] == "write a haiku about rain"
+    assert d["saved"] and os.path.isfile(d["saved"]), "a copy was saved to disk"
+
+
+def test_enhance_rejects_empty_prompt(client):
+    assert client.post("/enhance", json={"text": "   "}).status_code == 422
 
 
 def test_background_submit_completes(client):

@@ -160,6 +160,7 @@
              color:var(--accent); font-size:14px; padding:2px 9px; cursor:pointer; border-radius:4px;
              line-height:1.2; white-space:nowrap; }
   .filebtn:hover { border-color:var(--accent); color:var(--text); background:rgba(255,255,255,.06); }
+  #enhanceBtn.undo { color:var(--accent); border-color:var(--accent); }
   #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
                      display:none; z-index:100; }  /* above the composer (60) */
   /* in-page folder browser (above settings) */
@@ -360,6 +361,8 @@
     <textarea id="task" rows="1" placeholder="Describe a task for the council…  (Enter to send, Shift+Enter for a new line)"
               oninput="autoGrow(this)" onkeydown="composerKey(event)"></textarea>
     <button class="ghost" onclick="clearComposer()">Clear</button>
+    <button id="enhanceBtn" class="ghost" onclick="enhancePrompt()"
+            title="Rewrite your prompt into a sharper, more effective version using the lead model. Click again to Undo.">✨ Enhance</button>
     <button id="cancelBtn" class="deny" style="display:none" onclick="cancelCurrent()">Cancel run</button>
     <button onclick="submitTask()">Send</button>
   </div>
@@ -612,6 +615,45 @@ function clearComposer() {
   box.value = ""; autoGrow(box);
   attachments = []; renderAttachments();
   document.getElementById("submitNote").textContent = "";
+  resetEnhance();
+}
+
+// ---- Enhance: amplify a plain prompt with the lead model (with undo) ---------
+let enhanceOriginal = null;  // the pre-enhance text; non-null ⇒ button is in Undo mode
+
+function resetEnhance() {
+  enhanceOriginal = null;
+  const btn = document.getElementById("enhanceBtn");
+  if (btn) { btn.textContent = "✨ Enhance"; btn.disabled = false; btn.classList.remove("undo"); }
+}
+
+async function enhancePrompt() {
+  const ta = document.getElementById("task");
+  const btn = document.getElementById("enhanceBtn");
+  const note = document.getElementById("submitNote");
+  // UNDO — restore the original prompt
+  if (enhanceOriginal !== null) {
+    ta.value = enhanceOriginal; resetEnhance(); autoGrow(ta); ta.focus();
+    note.style.color = ""; note.textContent = "reverted to your original prompt";
+    return;
+  }
+  const text = (ta.value || "").trim();
+  if (!text) { note.style.color = ""; note.textContent = "type a prompt first, then Enhance"; return; }
+  btn.disabled = true; btn.textContent = "✨ Enhancing…";
+  note.style.color = ""; note.textContent = "enhancing your prompt with the lead model…";
+  try {
+    const r = await fetch("/enhance", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.enhanced) throw new Error(d.detail || ("HTTP " + r.status));
+    enhanceOriginal = text;                 // remember for undo
+    ta.value = d.enhanced; autoGrow(ta); ta.focus();
+    btn.textContent = "↶ Undo"; btn.classList.add("undo"); btn.disabled = false;
+    note.textContent = "enhanced — review it, edit if you like, or Undo to restore your original";
+  } catch (e) {
+    resetEnhance();
+    note.style.color = "var(--deny, #e66)"; note.textContent = "enhance failed: " + (e.message || e);
+  }
 }
 
 // ---- respond-to-council attachments — multi-modal like the main composer ----
