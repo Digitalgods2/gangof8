@@ -1788,7 +1788,7 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
     resume-stable, no RNG."""
     ordered = sorted(group, key=lambda c: c["namespaced"])
     n = len(ordered)
-    labeled = [(f"Candidate {i + 1}", c["content"]) for i, c in enumerate(ordered)]
+    labeled = [(f"Candidate {i + 1}", c["content"], c.get("_runtime") or "") for i, c in enumerate(ordered)]
     prompt = rounds.score_candidates_prompt(session, labeled)
     sid = session.session_id
     agg = {i + 1: 0 for i in range(n)}
@@ -1961,12 +1961,16 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     frozen: list[dict] = []
     for c in group:
         ran, testable, detail, dynamic = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
+        c["_dynamic"] = dynamic
         if ran and dynamic is False:
             c["_error"] = detail
+            c["_runtime"] = "runs, but renders a STATIC/frozen screen — no motion under simulated play"
             frozen.append(c)
             store.log_event(sid, "candidate_frozen",
                             {"agent": c["agent"], "file": _basename(c["base"]), "detail": detail})
         elif ran:
+            c["_runtime"] = ("runs and ANIMATES under simulated play (keys/mouse/touch)" if dynamic
+                             else "runs, but showed little/no on-screen rendering under simulated play")
             runnable.append(c)
         else:
             c["_error"] = detail
