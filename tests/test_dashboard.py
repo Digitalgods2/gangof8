@@ -95,6 +95,20 @@ def test_delete_missing_session_404(client):
     assert client.delete("/sessions/s_nope").status_code == 404
 
 
+def test_open_file_rejects_unknown_session(client):
+    r = client.post("/files/open", json={"session_id": "s_nope", "path": "whatever.txt"})
+    assert r.status_code == 404
+
+
+def test_open_file_rejects_path_not_in_session_outputs(client, tmp_path):
+    # a real file the session did NOT write must never be openable via this endpoint
+    sid = client.post("/tasks", json={"text": "What is 2+2?", "source": "test"}).json()["session_id"]
+    foreign = tmp_path / "not_ours.txt"
+    foreign.write_text("secret", encoding="utf-8")
+    r = client.post("/files/open", json={"session_id": sid, "path": str(foreign)})
+    assert r.status_code == 403
+
+
 def test_background_submit_completes(client):
     created = client.post("/tasks", json={"text": TASK, "background": True}).json()
     assert created["status"] == "received", "background submit must return immediately"

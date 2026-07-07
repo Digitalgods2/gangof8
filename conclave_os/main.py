@@ -7,6 +7,8 @@ Dashboard: http://127.0.0.1:8790/
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -174,6 +176,46 @@ def session_timeline(session_id: str) -> dict:
     if service.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
     return service.timeline(session_id)
+
+
+class OpenFileIn(BaseModel):
+    session_id: str = ""
+    path: str = ""
+
+
+def _norm(p: str) -> str:
+    return os.path.normcase(os.path.abspath(p))
+
+
+def _os_open(path: str) -> None:
+    """Open a file with the host OS's default application (this is a local app,
+    so the server runs on the same machine as the browser)."""
+    if sys.platform.startswith("win"):
+        os.startfile(path)  # type: ignore[attr-defined]  # Windows-only
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+@app.post("/files/open")
+def open_file(body: OpenFileIn) -> dict:
+    """Open one of a session's written files with the OS default app. Guarded:
+    the path MUST be one of the files the session actually wrote (its
+    files_changed list), so this can never open an arbitrary file on disk."""
+    data = service.get(body.session_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    allowed = {_norm(f) for f in (data.get("files_changed") or [])}
+    if not body.path or _norm(body.path) not in allowed:
+        raise HTTPException(status_code=403, detail="file is not one of this session's outputs")
+    if not os.path.isfile(body.path):
+        raise HTTPException(status_code=404, detail="file no longer exists on disk")
+    try:
+        _os_open(body.path)
+    except Exception as e:  # noqa: BLE001 — surface any OS-open failure to the UI
+        raise HTTPException(status_code=500, detail=f"could not open file: {e}")
+    return {"ok": True, "opened": body.path}
 
 
 @app.delete("/sessions/{session_id}")

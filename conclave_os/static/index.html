@@ -148,6 +148,12 @@
   header .gear { margin-left:auto; background:transparent; border:1px solid var(--line);
                  color:var(--dim); font-size:15px; padding:4px 10px; line-height:1; }
   header .gear:hover { color:var(--text); border-color:var(--accent); }
+  header .hgroup { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  header .hbtn { background:transparent; border:1px solid var(--line); color:var(--dim);
+                 font-size:15px; padding:4px 10px; line-height:1; cursor:pointer; }
+  header .hbtn:hover { color:var(--text); border-color:var(--accent); }
+  .filerow { cursor:pointer; border-radius:4px; padding:1px 4px; margin:0 -4px; }
+  .filerow:hover { color:var(--accent); background:rgba(255,255,255,.05); }
   #settingsOverlay { position:fixed; inset:0; background:rgba(0,0,0,.55);
                      display:none; z-index:100; }  /* above the composer (60) */
   /* in-page folder browser (above settings) */
@@ -280,7 +286,11 @@
   <span class="sub" id="backend">backend: …</span>
   <span class="sub" id="workspace">workspace: …</span>
   <span class="sub">human authority preserved — nothing executes without your approval</span>
-  <button class="gear" title="Settings" onclick="openSettings()">⚙</button>
+  <div class="hgroup">
+    <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
+    <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
+    <button class="hbtn" title="Settings" onclick="openSettings()">⚙</button>
+  </div>
 </header>
 
 <div id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
@@ -409,6 +419,102 @@ const diffHtml = s => esc(s).split("\n").map(l => {
   return c ? `<span class="d-${c}">${l}</span>` : l;
 }).join("\n");
 const api = (path, opts) => fetch(path, opts).then(r => r.json());
+
+// ---- top-bar utilities: hard refresh, save-as-file, open-a-file --------------
+function hardRefresh() {
+  // Reload bypassing cache, like Ctrl/Cmd+F5 (a cache-bust param forces a fresh
+  // fetch even when the browser would otherwise serve a stale index.html).
+  const u = new URL(location.href);
+  u.searchParams.set("_", Date.now());
+  location.replace(u.toString());
+}
+
+async function savePage() {
+  if (!current) { alert("Open a session first, then save it."); return; }
+  let s, tl = [];
+  try { s = await api("/sessions/" + encodeURIComponent(current)); } catch (e) { s = null; }
+  if (!s || s.detail) { alert("Could not load this session to save."); return; }
+  try { tl = (await api("/sessions/" + encodeURIComponent(current) + "/timeline")).events || []; } catch (e) {}
+  await saveTextFile(sessionToMarkdown(s, tl), "conclave-" + current + ".md");
+}
+
+// Build the whole session view as Markdown (task, summary, risks, files,
+// contributions, timeline) from the session object — cleaner than scraping DOM.
+function sessionToMarkdown(s, tl) {
+  const L = [], final = s.final || {};
+  const push = (...xs) => L.push(...xs);
+  push("# Conclave OS — session " + (s.session_id || ""), "");
+  push("## Task  (" + (s.status || "") + (s.stop_reason ? " · " + s.stop_reason : "") + ")", "");
+  push((s.task && s.task.text) || "", "");
+  if (s.established_root) push("📂 established folder: `" + s.established_root + "`", "");
+  if (final.answer) {
+    push("## Summary" + (final.confidence ? " — " + final.confidence + " confidence" : ""), "");
+    push(final.answer, "");
+  }
+  if ((final.assumptions || []).length) { push("## Assumptions"); final.assumptions.forEach(x => push("- " + x)); push(""); }
+  if ((final.risks_unresolved || []).length) { push("## Risks / unresolved"); final.risks_unresolved.forEach(x => push("- " + x)); push(""); }
+  if (final.next_action) push("## Next action", "", final.next_action, "");
+  const files = s.files_changed || [];
+  if (files.length) {
+    const est = (s.established_root || "").toLowerCase();
+    push("## Files written");
+    files.forEach(f => push("- `" + f + "` — " + (est && f.toLowerCase().startsWith(est) ? "your folder (promoted)" : "sandbox (scratch)")));
+    push("");
+  }
+  const contribs = s.contributions || [];
+  if (contribs.length) {
+    push("## Contributions (" + contribs.length + ")", "");
+    contribs.forEach(c => {
+      push("### r" + c.round + " · " + c.role + " · " + c.agent + (c.model ? " · " + c.model : "")
+           + "  (" + ((c.content || "").length) + " chars)", "", "```", (c.content || ""), "```", "");
+    });
+  }
+  if ((tl || []).length) {
+    push("## Timeline");
+    tl.forEach(e => push("- " + (e.ts || "") + "  " + (e.label || e.event || "") + (e.detail ? " — " + e.detail : "")));
+    push("");
+  }
+  push("---", "_Exported from Conclave OS_");
+  return L.join("\n");
+}
+
+async function saveTextFile(text, filename) {
+  // Real Save-As dialog where the File System Access API exists (Chrome/Edge);
+  // otherwise fall back to a normal download.
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "Markdown / text", accept: { "text/markdown": [".md"], "text/plain": [".txt"] } }],
+      });
+      const w = await handle.createWritable();
+      await w.write(text);
+      await w.close();
+      return;
+    } catch (e) { if (e && e.name === "AbortError") return; /* else fall through */ }
+  }
+  const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+
+// Open a written file with the host OS's default app (local app: same machine).
+async function openFile(path) {
+  if (!current || !path) return;
+  try {
+    const r = await fetch("/files/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: current, path }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      alert("Could not open the file: " + (e.detail || ("HTTP " + r.status)));
+    }
+  } catch (e) { alert("Could not open the file: " + e); }
+}
 
 async function loadHealth() {
   const h = await api("/health");
@@ -897,8 +1003,8 @@ function renderDetail(s) {
         const inEst = f => est && f.toLowerCase().startsWith(est.toLowerCase());
         return `
       <div class="card"><h3>Files written</h3>
-        <div class="sub" style="margin-bottom:6px">Scratch files live in the council's sandbox/workspace. Your established folder is only touched by an approved <b>promote</b>.</div>
-        <ul>${s.files_changed.map(f=>`<li class="mono">${esc(f)} <span class="badge" style="font-size:10px">${inEst(f) ? "→ your folder (promoted)" : "sandbox (scratch)"}</span></li>`).join("")}</ul></div>`;
+        <div class="sub" style="margin-bottom:6px">Scratch files live in the council's sandbox/workspace. Your established folder is only touched by an approved <b>promote</b>. <b>Click a file to open it</b> with your default app.</div>
+        <ul>${s.files_changed.map(f=>`<li class="mono filerow" data-path="${escAttr(f)}" title="Open this file with your default app" onclick="openFile(this.dataset.path)">🔗 ${esc(f)} <span class="badge" style="font-size:10px">${inEst(f) ? "→ your folder (promoted)" : "sandbox (scratch)"}</span></li>`).join("")}</ul></div>`;
       })() : ""}
 
     ${disagreements.length ? collapsible("sec_disagreements",
