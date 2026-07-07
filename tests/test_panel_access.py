@@ -40,6 +40,30 @@ def session(store):
     return SessionManager(store).create("panel access test task", source="test")
 
 
+def test_agent_call_honors_per_seat_timeout_with_authoring_floor(session, store):
+    # The Settings per-seat timeout is the seat's base budget; an explicit heavy
+    # timeout (authoring) still applies as a floor. Raising the seat raises its
+    # authoring headroom too; lowering it can't starve authoring.
+    from types import SimpleNamespace
+    session.cli_timeouts = {"claude": 500}
+    session.budgets.max_agent_calls = 50
+    seen = []
+
+    class Reg:
+        def call(self, agent, role, prompt, timeout_s=None, images=None):
+            seen.append(timeout_s)
+            return SimpleNamespace(content="ok", model="m", tokens=0, duration_ms=1)
+
+    reg = Reg()
+    claude = CouncilMember(role=Role.panelist, agent="claude")
+    loop._agent_call(session, reg, store, claude, "p")                  # None → seat setting 500
+    loop._agent_call(session, reg, store, claude, "p", timeout_s=300)   # max(300, 500) = 500 (floor)
+    loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # max(800, 500) = 800 (explicit wins)
+    codex = CouncilMember(role=Role.panelist, agent="codex")
+    loop._agent_call(session, reg, store, codex, "p")                   # no override → config default 300
+    assert seen == [500, 500, 800, 300]
+
+
 def test_panel_one_uses_the_authoring_timeout(session, governance, store):
     # On a build, a panel seat authors a whole candidate — it must get the long
     # authoring timeout, not the quick per-agent default (live: claude was killed

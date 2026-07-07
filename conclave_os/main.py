@@ -15,9 +15,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import __version__, reporting
+from . import __version__, config, reporting
 from .models import Role
 from .service import ConclaveService
+
+# The trinity of local CLI seats whose call timeout is user-tunable in Settings.
+_CLI_TIMEOUT_SEATS = ("gemini", "claude", "codex")
+
+
+def _cli_timeout_defaults() -> dict[str, int]:
+    """Built-in per-seat timeout (seconds) — what a seat uses when unset."""
+    return {s: config.agent_timeout(s) for s in _CLI_TIMEOUT_SEATS}
 
 app = FastAPI(title="Conclave OS — Coordinator", version=__version__)
 # env read here (not from config.BACKEND) so `cli.py serve --backend X` can
@@ -286,6 +294,7 @@ class SettingsPatch(BaseModel):
     openrouter_enabled: dict[str, bool] | None = None
     openrouter_models: dict[str, str] | None = None
     cli_models: dict[str, str] | None = None
+    cli_timeouts: dict[str, int] | None = None
     cli_enabled: dict[str, bool] | None = None
 
 
@@ -299,6 +308,7 @@ def get_settings() -> dict:
     data = service.settings.model_dump()
     data["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
     data["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
+    data["cli_timeout_defaults"] = _cli_timeout_defaults()
     data["effective_backend"] = service.backend
     return data
 
@@ -316,6 +326,7 @@ def put_settings(body: SettingsPatch) -> dict:
     out = service.settings.model_dump()
     out["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
     out["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
+    out["cli_timeout_defaults"] = _cli_timeout_defaults()
     out["effective_backend"] = service.backend
     out["note"] = "saved — backend/role changes apply to new sessions"
     return out

@@ -180,6 +180,14 @@ def test_gc_sandboxes_keeps_active_and_recent_deletes_the_rest(tmp_path, monkeyp
     assert out["removed"] == 4
 
 
+def test_cli_timeouts_persist_and_flow_onto_the_session(tmp_path):
+    svc = ConclaveService(data_dir=tmp_path)
+    svc.update_settings({"cli_timeouts": {"claude": 480, "gemini": 200}})
+    assert svc.settings.cli_timeouts == {"claude": 480, "gemini": 200}
+    session = svc._open("build a thing", "test", None)
+    assert session.cli_timeouts == {"claude": 480, "gemini": 200}
+
+
 def test_update_settings_persists_and_rederives(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})

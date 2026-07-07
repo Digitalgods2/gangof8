@@ -61,6 +61,11 @@ class Settings(BaseModel):
     # gemini → "gemini-2.5-pro"). Empty/absent ⇒ each CLI's own default —
     # note the gemini SDK path defaults to gemini-2.5-flash.
     cli_models: dict[str, str] = {}
+    # Per-CLI-seat call timeout in SECONDS (claude/codex/gemini → seconds).
+    # Empty/absent for a seat ⇒ config.AGENT_TIMEOUTS default. A thorough seat
+    # (claude/opus) can be given more room here so it isn't dropped mid-work; the
+    # built-in authoring floors (lead/panel/codifier) still apply as a minimum.
+    cli_timeouts: dict[str, int] = {}
     # Per-ROLE model pins (role name → exact model id, or OpenRouter slug for
     # an OpenRouter-mapped role), layered over the seat pin: role pin › seat
     # pin › CLI/seat default. Lets a rarely-called talent run a heavier model

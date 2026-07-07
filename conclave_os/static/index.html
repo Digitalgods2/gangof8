@@ -1362,13 +1362,15 @@ function renderSettings(s, seats) {
       ${(seats || []).filter(x => x.kind === "cli").map(x => {
         const catalog = x.models || [];
         const isCustom = x.model && !catalog.includes(x.model);
+        const _to = (s.cli_timeouts || {})[x.name] || (s.cli_timeout_defaults || {})[x.name] || "";
+        const _tod = (s.cli_timeout_defaults || {})[x.name] || "—";
         return `
-        <div class="field" style="align-items:center">
+        <div class="field" style="align-items:center;flex-wrap:wrap">
           <label style="margin:0;flex:0 0 92px;display:flex;align-items:center;gap:6px"
                  title="Uncheck to drop this local CLI seat and run its roles on an OpenRouter model instead.">
             <input type="checkbox" class="cli_enable" data-seat="${esc(x.name)}" ${x.enabled === false ? "" : "checked"}>
             <b>${esc(x.name)}</b></label>
-          <select class="cli_model_sel" data-seat="${esc(x.name)}" style="flex:1;min-width:280px"
+          <select class="cli_model_sel" data-seat="${esc(x.name)}" style="flex:1;min-width:240px"
                   title="Pin the exact model this seat runs (passed as --model / -m / SDK model)."
                   onchange="this.nextElementSibling.style.display = this.value === '__custom__' ? '' : 'none'">
             <option value="">(CLI default${x.name === "gemini" ? " · SDK: gemini-2.5-flash" : ""})</option>
@@ -1376,12 +1378,17 @@ function renderSettings(s, seats) {
             ${isCustom ? `<option value="${escAttr(x.model)}" selected>${esc(x.model)} (custom)</option>` : ""}
             <option value="__custom__">custom…</option>
           </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
-                 spellcheck="false" placeholder="exact model id" style="flex:1;min-width:260px;display:none">
+                 spellcheck="false" placeholder="exact model id" style="flex:1;min-width:220px;display:none">
+          <label class="sub" style="flex:0 0 auto;display:flex;align-items:center;gap:5px;margin:0"
+                 title="Call timeout for this seat, in seconds (built-in default ${_tod}s). Raise it so a thorough seat isn't dropped mid-work; heavy authoring keeps a built-in minimum.">⏱
+            <input type="number" class="cli_timeout" data-seat="${esc(x.name)}" min="30" max="3600" step="10"
+                   value="${escAttr(String(_to))}" placeholder="${escAttr(String(_tod))}" style="width:74px">s</label>
         </div>`;}).join("")}
       <div class="field" style="justify-content:flex-end">
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
+      <div class="sub"><b>⏱ timeout</b> is each seat's per-call budget in seconds (built-in defaults: claude 240 · codex 300 · gemini 150). Raise it so a thorough seat (e.g. claude on opus) isn't dropped mid-work; lower it to fail faster on a stall. Heavy authoring (lead / panel / codifier) keeps its own built-in minimum, so a small value here can't starve it.</div>
       <div class="sub">Uncheck a seat to run <b>OpenRouter-only</b>: its roles fall back to an enabled OpenRouter model (below), and it leaves the panel. Needs an OpenRouter key and at least one enabled OpenRouter seat — otherwise the seat stays on so the council always has a lead.</div>
     </div>
 
@@ -1554,6 +1561,11 @@ async function saveSettings() {
   });
   const cli_enabled = {};
   document.querySelectorAll(".cli_enable").forEach(c => { cli_enabled[c.dataset.seat] = c.checked; });
+  const cli_timeouts = {};
+  document.querySelectorAll(".cli_timeout").forEach(i => {
+    const v = parseInt(i.value, 10);
+    if (Number.isFinite(v) && v > 0) cli_timeouts[i.dataset.seat] = v;
+  });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
@@ -1562,6 +1574,7 @@ async function saveSettings() {
     openrouter_models,
     cli_models,
     cli_enabled,
+    cli_timeouts,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),
