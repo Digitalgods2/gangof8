@@ -59,11 +59,11 @@ ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead se
 # The lead authors whole files in one shot, so give it markedly more headroom than
 # a quick specialist call before timing out.
 LEAD_TIMEOUT = 600
-# When the lead escalates to its PRODUCTION model (settings.lead_work_model) for
-# authoring/repair/test-fixing, expect harder thinking — give it even more
-# headroom. Only used when a lead work model is configured; the fast coordination
-# path keeps LEAD_TIMEOUT.
-LEAD_WORK_TIMEOUT = 900
+# The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
+# — best-of-N selection/review/fix/recover, authoring described files, finishing
+# cut-offs, fixing tests — is expected to think hard, so give it more headroom
+# than the lead's fast coordination path.
+CODIFIER_TIMEOUT = 900
 
 # Talent menu advertised to the lead: each specialist role and what it is good
 # for, so the lead knows what it can reach for (its origin model is filled in

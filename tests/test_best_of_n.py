@@ -204,38 +204,35 @@ def _chaired(session, judges, judge_reply, chair_reply, lead_agent="claude"):
     return council, call, lead_call
 
 
-def test_chair_decision_uses_lead_call_but_production_uses_work_call(session, store):
-    """The lead's two hats: the chair's DECISION (ratify/override) runs on the
-    fast coordination model (lead_call); its PRODUCTION (fixing the winner) runs
-    on the stronger work model (lead_work_call). Distinct closures prove the
-    split — the fix must come from the work call, the review from lead_call."""
+def test_chair_work_runs_on_the_codifier_summarizer(session, store):
+    """Stage 3 runs on the strong CODIFIER (the Summarizer seat), not the fast
+    lead: both the chair's review AND its winner fix are made by the summarizer.
+    The panel judges are separate. Distinct agents prove the routing."""
     _candidate(session, "aaa", "game.html", WEAK)
     _candidate(session, "zzz", "game.html", STRONG)
     judges = [CouncilMember(role=Role.panelist, agent="j1")]
     lead = CouncilMember(role=Role.lead, agent="claude", active=True)
-    council = Council(members=[lead] + judges)
+    summ = CouncilMember(role=Role.summarizer, agent="gemini", active=True)
+    council = Council(members=[lead, summ] + judges)
     session.council = council
-    seen = {"coord": 0, "work": 0}
+    codifier_agents = []
 
     def call(m, p):  # judges pick a winner and flag a fixable defect
         return Contribution(round=0, role=m.role, agent=m.agent,
                             content="SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
                                     "DEFECT: rename extra to reviewed")
 
-    def lead_call(m, p):  # chair REVIEW — coordination
-        seen["coord"] += 1
-        return Contribution(round=0, role=m.role, agent=m.agent, content="RATIFY: Candidate 2\nDEFECT: none")
-
-    def lead_work_call(m, p):  # chair FIX — production
-        seen["work"] += 1
+    def codifier_call(m, p):  # BOTH chair review and winner fix land here
+        codifier_agents.append(m.agent)
+        if "RATIFY" in p:  # the chair-review prompt asks for RATIFY/OVERRIDE
+            return Contribution(round=0, role=m.role, agent=m.agent, content="RATIFY: Candidate 2\nDEFECT: none")
         return Contribution(round=0, role=m.role, agent=m.agent,
                             content="EDIT: game.html\n<<<<<<< OLD\nvar extra=2;\n"
                                     "=======\nvar reviewed=2;\n>>>>>>> NEW\n")
 
-    out = loop._run_best_of_n(session, council, judges, call, lead_call, store,
-                              lead_work_call=lead_work_call)
-    assert seen["coord"] >= 1, "the chair's ratify/override decision ran on the coordination model"
-    assert seen["work"] >= 1, "the winner fix ran on the production model"
+    out = loop._run_best_of_n(session, council, judges, call, codifier_call, store)
+    assert codifier_agents and all(a == "gemini" for a in codifier_agents), \
+        "the chair's review AND fix ran on the summarizer/codifier, not the lead"
     assert out["fixes"] == 1
     shipped = next(a for a in session.proposed_actions
                    if a.kind == "write_file" and a.role == Role.implementer)
