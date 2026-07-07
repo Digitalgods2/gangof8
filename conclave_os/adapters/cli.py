@@ -159,12 +159,20 @@ class CliAdapter:
             raise AgentError(f"{self.agent} CLI exited {rc}: {_err_tail(detail)}")
         return out
 
+    def _claude_model_id(self) -> Optional[str]:
+        """The claude CLI expects DASH-form model ids (claude-opus-4-8), but the
+        Settings dropdown is fed from OpenRouter's public catalog, which lists
+        Anthropic models with DOTS (claude-opus-4.8) — the CLI rejects those
+        ('model may not exist'), dropping the seat every round. Claude ids never
+        contain a dot, so normalizing dots→dashes corrects a stale/dotted pin."""
+        return self.model.replace(".", "-") if self.model else self.model
+
     def _run_claude(self, prompt: str, timeout_s: int) -> tuple[str, Optional[str]]:
         """Returns (content, model): the CLI's JSON result names the model that
         actually ran (modelUsage keys), so an unpinned seat is still attributable."""
         cmd = ["claude", "-p", "--output-format", "json", "--tools", ""]
         if self.model:
-            cmd += ["--model", self.model]
+            cmd += ["--model", self._claude_model_id()]
         out, err, rc = self._exec_raw(cmd, prompt, timeout_s)
         try:
             data = json.loads(out)
@@ -208,7 +216,7 @@ class CliAdapter:
         cmd = ["claude", "-p", "--output-format", "stream-json",
                "--input-format", "stream-json", "--verbose", "--tools", ""]
         if self.model:
-            cmd += ["--model", self.model]
+            cmd += ["--model", self._claude_model_id()]
         out = self._exec(cmd, json.dumps(message) + "\n", timeout_s)
         result = ""
         for line in out.splitlines():

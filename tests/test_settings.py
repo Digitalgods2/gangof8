@@ -105,6 +105,24 @@ def test_explicit_backend_arg_wins(tmp_path):
     assert svc.backend == "mock"
 
 
+def test_cli_catalog_normalizes_dotted_claude_slugs(tmp_path, monkeypatch):
+    # The claude dropdown is fed from OpenRouter's public catalog, which lists
+    # Anthropic models with DOTS (claude-opus-4.8) — the claude CLI needs dashes.
+    from conclave_os import config
+    svc = ConclaveService(data_dir=tmp_path)
+    monkeypatch.setattr(config, "WEB_ENABLED", True, raising=False)
+    monkeypatch.setattr(svc, "_fetch_public_catalog",
+                        lambda: {"claude": ["claude-opus-4.8"], "codex": ["gpt-5.5"]})
+    monkeypatch.setattr(svc, "_gemini_sdk_models", lambda: [])
+    cat = svc.cli_model_catalog(refresh=True)
+    # dotted claude slug corrected to the CLI's dash form; no dotted claude id remains
+    assert "claude-opus-4-8" in cat["claude"]
+    assert all("." not in m for m in cat["claude"] if m.startswith("claude-"))
+    # curated known-good ids still offered; codex dots are NOT touched (they're valid)
+    assert "claude-sonnet-5" in cat["claude"]
+    assert "gpt-5.5" in cat["codex"]
+
+
 def test_update_settings_persists_and_rederives(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})

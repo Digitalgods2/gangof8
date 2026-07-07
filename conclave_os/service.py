@@ -668,6 +668,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             sdk = self._gemini_sdk_models()
             if sdk:
                 catalog["gemini"] = sdk
+        # The claude CLI's ids use DASHES, but OpenRouter's public catalog lists
+        # Anthropic models with DOTS (claude-opus-4.8) — offering those verbatim
+        # made the claude seat fail. Normalize claude ids to the CLI form, curated
+        # known-good ids first, deduped. (codex/gemini ids legitimately use dots,
+        # so this is claude-only.)
+        if "claude" in catalog:
+            norm, seen = [], set()
+            for m in config.CLI_MODEL_CATALOG["claude"] + catalog["claude"]:
+                cli = m.replace(".", "-") if m.startswith("claude-") else m
+                if cli not in seen:
+                    seen.add(cli)
+                    norm.append(cli)
+            catalog["claude"] = norm
         self._model_catalog_cache = (now, catalog)
         return catalog
 
