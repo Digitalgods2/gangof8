@@ -152,7 +152,7 @@ def test_seats_openrouter_carry_generic_label_vendor_and_models(tmp_path, monkey
         "glm": [], "qwen": [], "kimi": []})
     seats = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "openrouter"}
     assert seats["deepseek"]["label"] == "DeepSeek" and seats["deepseek"]["vendor"] == "deepseek"
-    assert seats["glm"]["label"] == "z.ai" and seats["qwen"]["label"] == "Alibaba" and seats["kimi"]["label"] == "Kimi"
+    assert seats["glm"]["label"] == "z.ai" and seats["qwen"]["label"] == "Alibaba" and seats["kimi"]["label"] == "Moonshot AI"
     assert seats["deepseek"]["models"][0]["id"] == "deepseek/x"
 
 
