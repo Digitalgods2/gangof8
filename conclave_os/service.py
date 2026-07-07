@@ -401,17 +401,20 @@ class ConclaveService:
         return session
 
     def enhance_prompt(self, text: str) -> dict:
-        """The Enhance button: amplify a raw prompt with the LEAD model. Saves a
-        copy of the original + enhanced under data/enhancements/ so nothing is
-        lost, and returns the enhanced text (the caller keeps the original for
-        undo). Does not create or run a session — it's a single model call."""
+        """The Enhance button: amplify a raw prompt with the strong CODIFIER model
+        (the summarizer seat, else the lead) — prompt amplification benefits from
+        the stronger model. Saves a copy of the original + enhanced under
+        data/enhancements/ so nothing is lost, and returns the enhanced text (the
+        caller keeps the original for undo). No session is created — one call."""
         raw = (text or "").strip()
         if not raw:
             raise ValueError("nothing to enhance")
-        agent = self.role_agents.get(Role.lead)
+        agent, role = self.role_agents.get(Role.summarizer), Role.summarizer
         if not agent or agent not in self.registry.names():
-            raise ValueError("no lead model is available to enhance with")
-        result = self.registry.call(agent, Role.lead,
+            agent, role = self.role_agents.get(Role.lead), Role.lead
+        if not agent or agent not in self.registry.names():
+            raise ValueError("no model is available to enhance with")
+        result = self.registry.call(agent, role,
                                     f"{AMPLIFY_PROMPT}\n\nRAW PROMPT TO AMPLIFY:\n{raw}",
                                     timeout_s=180)
         enhanced = _strip_fence(result.content or "")
