@@ -844,6 +844,7 @@ def _capture_panel_artifacts(
 def _panel_one(
     session: Session, member: CouncilMember, prompt: str,
     call: AgentCall, governance: Governance, store: LogStore,
+    timeout_s: Optional[int] = None,
 ) -> Optional[Contribution]:
     """One panel seat's contribution, fan-out-safe: a failing seat is dropped
     for the round (logged, noted), never fatal. A panel seat asking the human a
@@ -854,7 +855,9 @@ def _panel_one(
     per seat."""
     dropped_contribution = None
     try:
-        c = call(member, prompt)
+        # authoring a whole candidate needs headroom; pass the timeout only when set
+        # so plain 2-arg callers keep working
+        c = call(member, prompt, timeout_s) if timeout_s is not None else call(member, prompt)
         c = _resolve_skill_requests(session, member, prompt, c, call, governance, store)
         # A stub take (tool-call debris / announced-but-not-done work) would
         # only pollute the synthesis and later context windows — drop the seat
@@ -962,10 +965,15 @@ def _run_panel_rounds(
                 thread_name_prefix="panel",
             )
             try:
+                # On a build, seats author whole candidate files — give them
+                # production-grade time so a thorough seat (claude/opus) isn't
+                # killed mid-authoring by the quick per-agent timeout.
+                _produces = bool(session.classification and session.classification.produces_output)
+                _panel_to = config.PANEL_AUTHOR_TIMEOUT if _produces else None
                 futures = [
                     ex.submit(_panel_one, session, m,
                               rounds.panel_prompt(session, m, r, ov, readable),
-                              call, governance, store)
+                              call, governance, store, _panel_to)
                     for m in panel
                 ]
                 # Wait cancel-aware. A plain shutdown(wait=True)/f.result() blocks

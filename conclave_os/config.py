@@ -64,6 +64,13 @@ ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead se
 # The lead authors whole files in one shot, so give it markedly more headroom than
 # a quick specialist call before timing out.
 LEAD_TIMEOUT = 600
+# On a build task each panel seat AUTHORS a complete candidate file — heavy work,
+# like the lead's, not a quick take. The generic per-agent timeout (e.g. claude
+# 240s) kept killing thorough seats mid-authoring (live: "claude timed out after
+# 240s" dropped one of the most important voices every build). Give panel
+# authoring production-grade headroom on produces_output tasks. (OpenRouter seats
+# already run effectively unbounded, so this also levels the field.)
+PANEL_AUTHOR_TIMEOUT = 600
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom

@@ -40,6 +40,21 @@ def session(store):
     return SessionManager(store).create("panel access test task", source="test")
 
 
+def test_panel_one_uses_the_authoring_timeout(session, governance, store):
+    # On a build, a panel seat authors a whole candidate — it must get the long
+    # authoring timeout, not the quick per-agent default (live: claude was killed
+    # at 240s mid-authoring and dropped every build).
+    seen = {}
+
+    def call(m, prompt, timeout_s=None):
+        seen["timeout"] = timeout_s
+        return Contribution(round=0, role=m.role, agent=m.agent, content="a plain take, no skill requests")
+
+    member = CouncilMember(role=Role.panelist, agent="codex", active=True)
+    loop._panel_one(session, member, "author the game", call, governance, store, timeout_s=600)
+    assert seen["timeout"] == 600
+
+
 def _contribution(role: Role, agent: str, content: str) -> Contribution:
     return Contribution(round=0, role=role, agent=agent, content=content)
 
