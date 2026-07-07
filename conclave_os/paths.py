@@ -52,6 +52,21 @@ def extract_established_root(text: str) -> Optional[str]:
     return None
 
 
+def _nonroot(p: Path) -> Optional[str]:
+    """A resolved folder — unless it's a filesystem/drive root (C:\\, /, a bare
+    UNC share). Those are far too broad to be an established folder and dangerous
+    to promote into, so they NEVER qualify (a bare `C:\\` mentioned in prose used
+    to win over the actual target because the drive root exists on disk). A more
+    specific path elsewhere in the text is chosen instead."""
+    try:
+        rp = p.resolve()
+    except OSError:
+        return None
+    if rp.parent == rp:  # a root is its own parent
+        return None
+    return str(rp)
+
+
 def _resolve_root(cand: str, rx) -> Optional[str]:
     """The established folder a single referenced path points at, or None.
 
@@ -63,9 +78,9 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
     try:
         p = Path(cand)
         if p.is_file():
-            return str(p.parent.resolve())
+            return _nonroot(p.parent)
         if p.is_dir():
-            return str(p.resolve())
+            return _nonroot(p)
     except OSError:
         return None
 
@@ -79,9 +94,9 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
             try:
                 sp = Path(" ".join(words[:n]))
                 if sp.is_dir():
-                    return str(sp.resolve())
+                    return _nonroot(sp)
                 if sp.is_file():
-                    return str(sp.parent.resolve())
+                    return _nonroot(sp.parent)
             except OSError:
                 continue
 
@@ -97,7 +112,7 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
             return None
         try:
             target = Path(cand[:sep + 1] + seg[0])
-            return str((target.parent if target.suffix else target).resolve())
+            return _nonroot(target.parent if target.suffix else target)
         except OSError:
             return None
     return None

@@ -92,6 +92,24 @@ def test_extract_quoted_apostrophe_path(tmp_path):
     assert extract_established_root(f'read the story in "{src}" first') == str(tmp_path.resolve())
 
 
+def test_bare_drive_root_never_wins_over_a_specific_path(tmp_path):
+    # A bare filesystem/drive root EXISTS on disk, but must never be chosen as the
+    # established folder — a specific target path wins instead (live: the Enhance
+    # amplifier mentioned `C:\` and it beat the actual save path; promoting into
+    # C:\ would be dangerous).
+    target = tmp_path / "proj"
+    target.mkdir()
+    root = tmp_path.anchor  # "C:\" on Windows, "/" on POSIX — a real root
+    text = f'engineer it on the "{root}" drive, saved into "{target}"'
+    assert extract_established_root(text) == str(target.resolve())
+
+
+def test_bare_root_alone_yields_no_established_folder(tmp_path):
+    # only a bare root referenced ⇒ None (the greenfield gate asks where to save)
+    root = tmp_path.anchor
+    assert extract_established_root(f'just put it on "{root}"') is None
+
+
 # --- greenfield classification ------------------------------------------------
 
 
