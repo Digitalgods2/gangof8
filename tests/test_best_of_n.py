@@ -308,7 +308,7 @@ def test_chair_recovers_when_every_candidate_crashes(session, store):
     assert out["agent"].startswith("big")
     shipped = next(a for a in session.proposed_actions
                    if a.kind == "write_file" and a.role == Role.implementer)
-    ran, _t, _d = smoke.smoke_source(shipped.content, ".html")
+    ran, _t, _d, _dyn = smoke.smoke_source(shipped.content, ".html")
     assert ran, "the recovered file actually runs"
 
 

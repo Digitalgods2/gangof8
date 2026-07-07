@@ -28,33 +28,55 @@ CRASH = "<!doctype html><html><body><script>\n" \
         "function loop(){ draw(); requestAnimationFrame(loop); } requestAnimationFrame(loop);\n" \
         "</script></body></html>"
 
+# a live game: the rectangle MOVES every frame → motion detected
+DYNAMIC = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
+          "const x=document.getElementById('c').getContext('2d'); let t=0;\n" \
+          "function loop(){ x.clearRect(0,0,300,300); x.fillRect(t%280,10,20,20); t+=5; requestAnimationFrame(loop); }\n" \
+          "requestAnimationFrame(loop);\n</script></body></html>"
+
+# a frozen game: it renders, but draws the SAME frame forever despite input
+STATIC = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
+         "const x=document.getElementById('c').getContext('2d');\n" \
+         "function loop(){ x.fillRect(10,10,20,20); requestAnimationFrame(loop); }\n" \
+         "requestAnimationFrame(loop);\n</script></body></html>"
+
 
 def test_clean_web_file_runs():
-    ran, testable, detail = smoke.smoke_source(CLEAN, ".html")
+    ran, testable, detail, _dyn = smoke.smoke_source(CLEAN, ".html")
     assert ran is True and testable is True, detail
 
 
 def test_load_crash_is_caught():
-    ran, testable, detail = smoke.smoke_source(CRASH, ".html")
+    ran, testable, detail, _dyn = smoke.smoke_source(CRASH, ".html")
     assert ran is False and testable is True
     assert "read" in detail.lower() or "undefined" in detail.lower()
 
 
+def test_dynamic_game_is_detected():
+    ran, testable, detail, dynamic = smoke.smoke_source(DYNAMIC, ".html")
+    assert ran is True and testable is True and dynamic is True, detail
+
+
+def test_static_frozen_screen_is_flagged():
+    ran, testable, detail, dynamic = smoke.smoke_source(STATIC, ".html")
+    assert ran is True and testable is True and dynamic is False, detail
+
+
 def test_non_web_file_is_not_blocked():
-    ran, testable, _ = smoke.smoke_source("print('hi')", ".py")
+    ran, testable, _, _dyn = smoke.smoke_source("print('hi')", ".py")
     assert ran is True and testable is False  # can't test → never blocks
 
 
 def test_html_without_script_is_not_blocked():
-    ran, testable, _ = smoke.smoke_source("<html><body>static page</body></html>", ".html")
+    ran, testable, _, _dyn = smoke.smoke_source("<html><body>static page</body></html>", ".html")
     assert ran is True and testable is False
 
 
 def test_bare_js_file_runs():
-    ran, testable, detail = smoke.smoke_source("var x = 1 + 1;", ".js")
+    ran, testable, detail, _dyn = smoke.smoke_source("var x = 1 + 1;", ".js")
     assert ran is True and testable is True, detail
 
 
 def test_bare_js_crash_caught():
-    ran, testable, detail = smoke.smoke_source("var a; a.b.c = 1;", ".js")
+    ran, testable, detail, _dyn = smoke.smoke_source("var a; a.b.c = 1;", ".js")
     assert ran is False and testable is True
