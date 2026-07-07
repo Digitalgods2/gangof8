@@ -1160,7 +1160,7 @@ const TIPS = {
   cli_models: "The local CLI seats (claude, codex, gemini) and the exact model each one runs. Leave '(CLI default)' to inherit that CLI's own configured model, or pin one from the live catalog. Unchecking a seat drops it from the council and its roles fall back to an enabled OpenRouter model.",
   gemini_key: "Optional. With a key the gemini seat runs through Google's SDK (faster and more reliable on Windows than the headless CLI), the gemini dropdown switches to Google's own model list, image vision works, and web_search gains Google Search grounding. Stored locally in data/secrets.json (gitignored) — never sent anywhere but Google.",
   openrouter_key: "Needed only for the pay-per-token OpenRouter seats below. Stored locally in data/secrets.json (gitignored); an OPENROUTER_API_KEY environment variable always wins over the stored value.",
-  openrouter_models: "Extra panel seats that run through OpenRouter (DeepSeek, GLM, Qwen, Kimi, …). Enable a seat and it joins every panel round and becomes selectable in Role mapping. Edit the slug to change the exact model (verify at openrouter.ai/models). Billed per token by OpenRouter.",
+  openrouter_models: "Extra panel seats that run through OpenRouter, one per VENDOR (DeepSeek, z.ai, Alibaba/Qwen, Moonshot/Kimi). Each offers that vendor's live models in a dropdown — 👁 vision, 🧠 reasoning, 🔧 tools/coding, newest first — or pick 'custom slug…' to paste an exact id. Enable a seat and it joins every panel round and becomes selectable in Role mapping. Billed per token by OpenRouter.",
   governance: "Safety and composer tunables: the risk gate that pauses risky tasks for your approval, plus how the final answer is composed and how much budget the critic gets.",
   ui_prefs: "Dashboard-only preferences — they change what you see, never how the council deliberates.",
 };
@@ -1262,6 +1262,31 @@ function roleSeatChanged(r) {
   modelSel.innerHTML = roleModelOptions(seatSel.value || modelSel.dataset.resolved || "", "");
   const custom = document.getElementById(`role_model_custom_${r}`);
   if (custom) { custom.style.display = "none"; custom.value = ""; }
+}
+
+// ---- OpenRouter vendor model dropdown (generic seat → pick a model) ---------
+function orModelBadges(m) {
+  return (m.vision ? " 👁" : "") + (m.reasoning ? " 🧠" : "") + (m.tools ? " 🔧" : "");
+}
+// A vendor's live models (with capability badges) plus "custom slug…". "custom"
+// is selected when the current slug isn't one of the live models — a manual slug,
+// or the catalog was unreachable (offline / no key).
+function orModelOptions(models, current, defaultSlug) {
+  models = models || [];
+  const known = models.some(m => m.id === current);
+  const opts = models.map(m =>
+    `<option value="${escAttr(m.id)}" ${m.id === current ? "selected" : ""}>${esc(m.id)}${orModelBadges(m)}${m.ctx ? "  ·  " + Math.round(m.ctx / 1000) + "k" : ""}</option>`);
+  opts.push(`<option value="__custom__" ${known ? "" : "selected"}>custom slug…</option>`);
+  return opts.join("");
+}
+// vendor dropdown changed → show the custom-slug box only when "custom…" is picked
+function orModelChanged(seat) {
+  const sel = document.getElementById("or_model_" + seat);
+  const inp = document.getElementById("or_custom_" + seat);
+  if (!sel || !inp) return;
+  const custom = sel.value === "__custom__";
+  inp.style.display = custom ? "" : "none";
+  if (custom) inp.focus();
 }
 
 function seatOptions(selected) {
@@ -1392,18 +1417,24 @@ function renderSettings(s, seats) {
 
     <div class="sset s-ormodels">
       <label>OpenRouter models (pay-per-token) ${tip("openrouter_models")}</label>
-      ${(seats || []).filter(s => s.kind === "openrouter").map(s => `
-        <div class="field" style="align-items:center;flex-wrap:wrap">
-          <label style="display:flex;gap:8px;align-items:center;cursor:pointer;margin:0;flex:0 0 auto" title="${esc(s.name)}">
+      ${(seats || []).filter(s => s.kind === "openrouter").map(s => {
+        const known = (s.models || []).some(m => m.id === s.model_slug);
+        return `
+        <div class="field" style="align-items:center;flex-wrap:wrap;gap:8px">
+          <label style="display:flex;gap:8px;align-items:center;cursor:pointer;margin:0;flex:0 0 auto" title="OpenRouter vendor '${esc(s.vendor || s.name)}'">
             <input type="checkbox" class="or_enable" data-seat="${esc(s.name)}" ${s.enabled ? "checked" : ""}>
-            <b>${esc(s.label || s.name)}</b>
+            <b style="min-width:74px;display:inline-block">${esc(s.label || s.name)}</b>
           </label>
-          <input type="text" class="or_slug mono" data-seat="${esc(s.name)}" spellcheck="false"
-                 value="${escAttr(s.model_slug || "")}" placeholder="${escAttr(s.default_slug || "provider/model")}"
-                 title="OpenRouter model slug (default: ${escAttr(s.default_slug || "")})" style="flex:1;min-width:320px">
+          <select id="or_model_${esc(s.name)}" class="or_model" data-seat="${esc(s.name)}"
+                  title="Pick a ${esc(s.label || s.name)} model — 👁 vision · 🧠 reasoning · 🔧 tools/coding — or 'custom slug…' to paste an exact id"
+                  onchange="orModelChanged('${esc(s.name)}')" style="flex:1;min-width:300px">
+            ${orModelOptions(s.models, s.model_slug, s.default_slug)}</select>
+          <input type="text" id="or_custom_${esc(s.name)}" class="or_custom mono" data-seat="${esc(s.name)}" spellcheck="false"
+                 value="${escAttr(known ? "" : (s.model_slug || ""))}" placeholder="${escAttr((s.vendor || "provider") + "/model-id")}"
+                 style="flex:1;min-width:260px;display:${known ? "none" : ""}">
           <span class="badge" style="color:${s.available ? "var(--accent)" : "var(--dim)"}">${s.available ? "ready ✓" : (s.enabled ? "needs key" : "off")}</span>
-        </div>`).join("") || '<div class="sub">none configured</div>'}
-      <div class="sub">Enable a model and edit its slug (verify at openrouter.ai/models). Selectable in Role mapping once enabled. Billed by OpenRouter; data_collection = "deny".</div>
+        </div>`; }).join("") || '<div class="sub">none configured</div>'}
+      <div class="sub">Each vendor offers its live models (👁 vision · 🧠 reasoning · 🔧 tools/coding, newest first) — pick one, or choose <b>custom slug…</b> to paste an exact id from openrouter.ai/models. Enabled seats join every panel round and are selectable in Role mapping. Billed by OpenRouter; data_collection = "deny".</div>
     </div>
 
     <div class="sset s-roles">
@@ -1504,7 +1535,14 @@ async function saveSettings() {
   const openrouter_enabled = {};
   document.querySelectorAll(".or_enable").forEach(c => { openrouter_enabled[c.dataset.seat] = c.checked; });
   const openrouter_models = {};
-  document.querySelectorAll(".or_slug").forEach(i => { const v = i.value.trim(); if (v) openrouter_models[i.dataset.seat] = v; });
+  document.querySelectorAll(".or_model").forEach(sel => {
+    let v = sel.value;
+    if (v === "__custom__") {
+      const c = document.getElementById("or_custom_" + sel.dataset.seat);
+      v = c ? c.value.trim() : "";
+    }
+    if (v) openrouter_models[sel.dataset.seat] = v;
+  });
   const cli_models = {};
   document.querySelectorAll(".cli_model_sel").forEach(sel => {
     let v = sel.value;
@@ -1570,14 +1608,18 @@ async function saveSettings() {
 }
 
 async function _refreshSeatsKeepChecks() {
-  // preserve unsaved enable-checkbox toggles AND slug edits across a re-render
+  // preserve unsaved enable-checkbox toggles AND model picks across a re-render
   const checked = {}, slugs = {};
   document.querySelectorAll(".or_enable").forEach(c => { checked[c.dataset.seat] = c.checked; });
-  document.querySelectorAll(".or_slug").forEach(i => { slugs[i.dataset.seat] = i.value; });
+  document.querySelectorAll(".or_model").forEach(sel => {
+    let v = sel.value;
+    if (v === "__custom__") { const c = document.getElementById("or_custom_" + sel.dataset.seat); v = c ? c.value : ""; }
+    slugs[sel.dataset.seat] = v;
+  });
   seatsCache = (await api("/settings/seats").catch(() => ({seats: []}))).seats || seatsCache;
   seatsCache.forEach(s => {
     if (s.name in checked) s.enabled = checked[s.name];
-    if (s.name in slugs && slugs[s.name].trim()) s.model_slug = slugs[s.name];
+    if (s.name in slugs && (slugs[s.name] || "").trim()) s.model_slug = slugs[s.name];
   });
   renderSettings(settingsCache, seatsCache);
 }

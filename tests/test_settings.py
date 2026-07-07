@@ -123,6 +123,39 @@ def test_cli_catalog_normalizes_dotted_claude_slugs(tmp_path, monkeypatch):
     assert "gpt-5.5" in cat["codex"]
 
 
+def test_openrouter_vendor_catalog_maps_vendors_with_capability_flags(tmp_path, monkeypatch):
+    from conclave_os import config
+    svc = ConclaveService(data_dir=tmp_path)
+    monkeypatch.setattr(config, "WEB_ENABLED", True, raising=False)
+    monkeypatch.setattr(svc, "_fetch_catalog_raw", lambda: [
+        {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro", "created": 200,
+         "context_length": 131072, "architecture": {"input_modalities": ["text", "image"]},
+         "supported_parameters": ["reasoning", "tools"]},
+        {"id": "moonshotai/kimi-k2.6", "name": "Kimi K2.6", "created": 100,
+         "context_length": 200000, "architecture": {"input_modalities": ["text"]},
+         "supported_parameters": ["tools"]},
+        {"id": "openai/gpt-5", "created": 300},  # not an OpenRouter-seat vendor → ignored
+    ])
+    cat = svc.openrouter_vendor_catalog(refresh=True)
+    ds = next(m for m in cat["deepseek"] if m["id"] == "deepseek/deepseek-v4-pro")
+    assert ds["vision"] and ds["reasoning"] and ds["tools"] and ds["ctx"] == 131072
+    km = next(m for m in cat["kimi"] if m["id"] == "moonshotai/kimi-k2.6")
+    assert not km["vision"] and km["tools"]
+    # the non-vendor model was not mis-filed under any seat
+    assert all(not m["id"].startswith("openai/") for v in cat.values() for m in v)
+
+
+def test_seats_openrouter_carry_generic_label_vendor_and_models(tmp_path, monkeypatch):
+    svc = ConclaveService(data_dir=tmp_path)
+    monkeypatch.setattr(svc, "openrouter_vendor_catalog", lambda refresh=False: {
+        "deepseek": [{"id": "deepseek/x", "name": "x", "vision": False, "reasoning": False, "tools": True, "ctx": 1}],
+        "glm": [], "qwen": [], "kimi": []})
+    seats = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "openrouter"}
+    assert seats["deepseek"]["label"] == "DeepSeek" and seats["deepseek"]["vendor"] == "deepseek"
+    assert seats["glm"]["label"] == "z.ai" and seats["qwen"]["label"] == "Alibaba" and seats["kimi"]["label"] == "Kimi"
+    assert seats["deepseek"]["models"][0]["id"] == "deepseek/x"
+
+
 def test_update_settings_persists_and_rederives(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})
