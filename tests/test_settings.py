@@ -156,6 +156,30 @@ def test_seats_openrouter_carry_generic_label_vendor_and_models(tmp_path, monkey
     assert seats["deepseek"]["models"][0]["id"] == "deepseek/x"
 
 
+def test_gc_sandboxes_keeps_active_and_recent_deletes_the_rest(tmp_path, monkeypatch):
+    import os
+    from conclave_os import config
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    sbroot = tmp_path / "sandbox"
+    sbroot.mkdir()
+    monkeypatch.setattr(config, "SANDBOX_ROOT", sbroot)
+    (sbroot / "cli-neutral").mkdir()          # shared CLI working dir — must NEVER be GC'd
+    for i in range(8):                        # s_00 (oldest) .. s_07 (newest)
+        d = sbroot / f"s_{i:02d}"
+        d.mkdir()
+        os.utime(d, (1000 + i, 1000 + i))
+    # s_00 is the OLDEST but still ACTIVE → must be kept regardless of age
+    monkeypatch.setattr(svc.store, "list_sessions",
+                        lambda limit=500: [{"session_id": "s_00", "status": "deliberating"}])
+    out = svc._gc_sandboxes(keep=3)
+    remaining = {d.name for d in sbroot.iterdir()}
+    assert "cli-neutral" in remaining                          # neutral dir untouched
+    assert "s_00" in remaining                                 # active kept despite being oldest
+    assert {"s_07", "s_06", "s_05"} <= remaining               # 3 most-recent non-active kept
+    assert not ({"s_01", "s_02", "s_03", "s_04"} & remaining)  # older non-active swept
+    assert out["removed"] == 4
+
+
 def test_update_settings_persists_and_rederives(tmp_path):
     svc = ConclaveService(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})

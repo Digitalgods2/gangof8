@@ -24,6 +24,11 @@ def _default_sandbox_root() -> Path:
 # The ephemeral per-session sandbox lives here — NEVER under DATA_DIR or any
 # project folder. Each session gets its own subdir (executor.artifacts_dir).
 SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_root())))
+# Sandbox folders are scratch, but pile up (one per session, forever). A sweep at
+# each session start keeps this many most-recent NON-active sandboxes (so recent
+# runs can still be opened/inspected) plus every still-active/paused one, and
+# deletes the rest.
+SANDBOX_KEEP = int(os.environ.get("CONCLAVE_OS_SANDBOX_KEEP", "25"))
 
 # A panel round costs len(panel)+1 calls (every seat + the lead synthesis), so
 # the call budgets carry real multi-round headroom. The terminators are

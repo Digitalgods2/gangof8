@@ -79,6 +79,14 @@ RULES
 OUTPUT: Return ONLY the amplified prompt as plain text — no preamble, no commentary, no surrounding code fence."""
 
 
+def _dir_mtime(p: Path) -> float:
+    """A directory's mtime for GC ordering; 0 if it vanished under us."""
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _strip_fence(s: str) -> str:
     """Drop a wrapping ``` code fence if the model added one, so the textarea
     gets the clean prompt."""
@@ -402,7 +410,45 @@ class ConclaveService:
             if rec:
                 session.attachments.append({"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
         self.store.save_session(session)
+        # Sweep old scratch sandboxes so they don't pile up forever. Background so
+        # it never delays starting the run; the new session is already active and
+        # therefore protected.
+        self._pool.submit(self._gc_sandboxes)
         return session
+
+    def _gc_sandboxes(self, keep: Optional[int] = None) -> dict:
+        """Delete old per-session sandbox scratch folders so they don't accumulate
+        without bound. KEEPS: every sandbox belonging to a still-active/paused
+        session (its files may still be needed to resume or promote), plus the
+        `keep` most-recently-touched of the rest (so recent runs stay openable in
+        the dashboard). Never touches the shared 'cli-neutral' folder or anything
+        that isn't a session sandbox. Best-effort — never raises."""
+        import shutil
+
+        keep = config.SANDBOX_KEEP if keep is None else keep
+        root = config.SANDBOX_ROOT
+        removed = 0
+        try:
+            if not root.is_dir():
+                return {"removed": 0}
+            active = {s.get("session_id") for s in self.store.list_sessions(limit=500)
+                      if s.get("status") not in ("done", "cancelled")}
+            dirs = [d for d in root.iterdir() if d.is_dir() and d.name.startswith("s_")]
+            dirs.sort(key=lambda d: _dir_mtime(d), reverse=True)
+            kept = 0
+            for d in dirs:
+                if d.name in active:
+                    continue  # in use — never GC (and doesn't count toward `keep`)
+                kept += 1
+                if kept <= keep:
+                    continue
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
+        if removed:
+            self.store.log_event("-", "sandboxes_gc", {"removed": removed, "kept": keep})
+        return {"removed": removed}
 
     def enhance_prompt(self, text: str) -> dict:
         """The Enhance button: amplify a raw prompt with the strong CODIFIER model
