@@ -362,7 +362,7 @@
               oninput="autoGrow(this)" onkeydown="composerKey(event)"></textarea>
     <button class="ghost" onclick="clearComposer()">Clear</button>
     <button id="enhanceBtn" class="ghost" onclick="enhancePrompt()"
-            title="Rewrite your prompt into a sharper, more effective version using the lead model. Click again to Undo.">✨ Enhance</button>
+            title="Rewrite your prompt into a sharper, more effective version using your strong codifier model (the Summarizer seat). Click again to Undo.">✨ Enhance</button>
     <button id="cancelBtn" class="deny" style="display:none" onclick="cancelCurrent()">Cancel run</button>
     <button onclick="submitTask()">Send</button>
   </div>
@@ -640,7 +640,7 @@ async function enhancePrompt() {
   const text = (ta.value || "").trim();
   if (!text) { note.style.color = ""; note.textContent = "type a prompt first, then Enhance"; return; }
   btn.disabled = true; btn.textContent = "✨ Enhancing…";
-  note.style.color = ""; note.textContent = "enhancing your prompt with the lead model…";
+  note.style.color = ""; note.textContent = "enhancing your prompt with the strong codifier model…";
   try {
     const r = await fetch("/enhance", { method: "POST",
       headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
