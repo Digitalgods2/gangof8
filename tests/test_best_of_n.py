@@ -204,6 +204,30 @@ def _chaired(session, judges, judge_reply, chair_reply, lead_agent="claude"):
     return council, call, lead_call
 
 
+def test_judges_are_shown_runtime_evidence(session, store):
+    """Judges score by reading; give them the RUNTIME result (does it run/animate)
+    so a good-reading-but-dead candidate can't win a reading contest (live: the
+    judges picked a barely-rendering game over ones that actually run)."""
+    _candidate(session, "aaa", "game.html", WEAK)
+    _candidate(session, "zzz", "game.html", STRONG)
+    judges = [CouncilMember(role=Role.panelist, agent="j1")]
+    lead = CouncilMember(role=Role.lead, agent="claude", active=True)
+    council = Council(members=[lead] + judges)
+    session.council = council
+    seen = {}
+
+    def call(m, p):
+        seen["prompt"] = p
+        return Contribution(round=0, role=m.role, agent=m.agent,
+                            content="SCORE Candidate 1: 5\nSCORE Candidate 2: 9\nWINNER: Candidate 2")
+
+    def codifier_call(m, p):
+        return Contribution(round=0, role=m.role, agent=m.agent, content="RATIFY: Candidate 2\nDEFECT: none")
+
+    loop._run_best_of_n(session, council, judges, call, codifier_call, store)
+    assert "RUNTIME" in seen.get("prompt", ""), "the judge prompt carries per-candidate runtime evidence"
+
+
 def test_chair_work_runs_on_the_codifier_summarizer(session, store):
     """Stage 3 runs on the strong CODIFIER (the Summarizer seat), not the fast
     lead: both the chair's review AND its winner fix are made by the summarizer.

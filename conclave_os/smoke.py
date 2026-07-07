@@ -117,6 +117,28 @@ _def("webkitAudioContext", _audioCtor);
 _def("Image", function(){ return _el(); });
 _def("FontFace", function(){ return { load: () => Promise.resolve() }; });
 _def("screen", { width:800, height:600, orientation:{ lock:_noop } });
+// Browser globals scripts legitimately call BARE (they resolve to window.* in a
+// browser). Missing these here FALSELY rejected valid games as crashers — e.g.
+// "addEventListener is not defined" / "getComputedStyle is not defined" killed
+// two of the best Space Invaders candidates and let a worse one win.
+_def("addEventListener", _add);
+_def("removeEventListener", _noop);
+_def("dispatchEvent", () => true);
+_def("getComputedStyle", () => ({ getPropertyValue: () => "", width:"800px", height:"600px" }));
+_def("getSelection", () => ({ removeAllRanges:_noop, addRange:_noop, empty:_noop, toString:()=>"", rangeCount:0 }));
+_def("scrollTo", _noop); _def("scrollBy", _noop); _def("scroll", _noop);
+_def("alert", _noop); _def("confirm", () => true); _def("prompt", () => null);
+_def("focus", _noop); _def("blur", _noop); _def("print", _noop); _def("stop", _noop);
+_def("open", () => null); _def("close", _noop); _def("postMessage", _noop);
+_def("innerWidth", 800); _def("innerHeight", 600);
+_def("outerWidth", 800); _def("outerHeight", 600);
+_def("pageXOffset", 0); _def("pageYOffset", 0); _def("scrollX", 0); _def("scrollY", 0);
+_def("Path2D", function(){ return { moveTo:_noop, lineTo:_noop, arc:_noop, arcTo:_noop, rect:_noop,
+  roundRect:_noop, closePath:_noop, bezierCurveTo:_noop, quadraticCurveTo:_noop, ellipse:_noop, addPath:_noop }; });
+_def("ImageData", function(w, h){ const W=(w|0)||1, H=(h|0)||1; return { data:new Uint8ClampedArray(W*H*4), width:W, height:H }; });
+_def("Audio", function(){ return _el(); });
+_def("OffscreenCanvas", function(){ return _el(); });
+_def("DOMRect", function(){ return { x:0, y:0, width:0, height:0, top:0, left:0, right:0, bottom:0 }; });
 _def("document", { getElementById: _el, querySelector: _el, querySelectorAll: () => [],
   createElement: _el, createElementNS: _el, getElementsByTagName: () => [ _el() ],
   getElementsByClassName: () => [], addEventListener:_add, removeEventListener:_noop,

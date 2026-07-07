@@ -41,6 +41,22 @@ STATIC = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
          "requestAnimationFrame(loop);\n</script></body></html>"
 
 
+# addEventListener / getComputedStyle are valid BARE in a browser (they resolve
+# to window.*); the harness must provide them or it falsely rejects good games —
+# live, two of the best Space Invaders candidates were killed by exactly this.
+BARE_GLOBALS = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
+               "addEventListener('keydown', function(e){});\n" \
+               "const cs = getComputedStyle(document.body);\n" \
+               "const x = document.getElementById('c').getContext('2d');\n" \
+               "let t=0; function loop(){ x.fillRect(t%100,0,5,5); t++; requestAnimationFrame(loop); }\n" \
+               "requestAnimationFrame(loop);\n</script></body></html>"
+
+
+def test_bare_browser_globals_do_not_falsely_crash():
+    ran, testable, detail, _dyn = smoke.smoke_source(BARE_GLOBALS, ".html")
+    assert ran is True and testable is True, detail  # not "addEventListener is not defined"
+
+
 def test_clean_web_file_runs():
     ran, testable, detail, _dyn = smoke.smoke_source(CLEAN, ".html")
     assert ran is True and testable is True, detail

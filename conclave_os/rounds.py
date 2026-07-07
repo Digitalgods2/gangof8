@@ -491,13 +491,17 @@ CANDIDATE_CRITERIA = (
 )
 
 
-def score_candidates_prompt(session: Session, labeled: list[tuple[str, str]]) -> str:
+def score_candidates_prompt(session: Session, labeled: list[tuple]) -> str:
     """A blind scoring pass: the judge sees each candidate's FULL body labeled
     'Candidate N' with author identity stripped, scores each on the criteria,
-    and names its winner. `labeled` is [(label, body), ...]."""
+    and names its winner. `labeled` is [(label, body[, runtime_note]), ...] — the
+    runtime note is EVIDENCE from actually executing the candidate headless."""
     blocks = []
-    for label, body in labeled:
-        blocks.append(f"===== {label} =====\n{body[:config.CANDIDATE_SCORE_MAX_CHARS]}")
+    for item in labeled:
+        label, body = item[0], item[1]
+        runtime = item[2] if len(item) > 2 else ""
+        head = f"===== {label} =====" + (f"\n[RUNTIME (headless execution): {runtime}]" if runtime else "")
+        blocks.append(f"{head}\n{body[:config.CANDIDATE_SCORE_MAX_CHARS]}")
     n = len(labeled)
     return (
         f"Task the candidates implement: {session.task.text}\n"
@@ -505,6 +509,11 @@ def score_candidates_prompt(session: Session, labeled: list[tuple[str, str]]) ->
         f"You are an impartial JUDGE. Below are {n} independent candidate "
         "implementations of the SAME task, authorship hidden. Score each STRICTLY "
         f"on: {CANDIDATE_CRITERIA}.\n"
+        "Each candidate carries RUNTIME evidence from actually executing it headless "
+        "(does it run, and does it animate/respond under simulated play). WEIGH THIS "
+        "HEAVILY: code that reads beautifully but does NOT visibly run/animate must "
+        "NOT beat code that actually runs — a candidate that renders a static or "
+        "near-empty screen scores LOW however clean it looks.\n"
         "Read every candidate fully. A candidate that is truncated, stubbed, or "
         "misses a requirement must score low no matter how elegant the rest is.\n"
         f"Emit exactly one line per candidate, scoring 0-{config.JUDGE_SCORE_MAX}:\n"
