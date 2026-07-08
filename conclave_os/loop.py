@@ -255,6 +255,29 @@ def _established_overview(session: Session, data_dir) -> str:
             parts.append(f"--- {name} ---\n{body[:1100]}")
             docs += 1
 
+    # 2b. SOURCE FILES THE TASK NAMED — read them regardless of extension. The
+    # code-extension filter in section 3 SKIPS a .txt/.md the task explicitly told
+    # the council to read ("read Benny's Splash.txt and match its style"), so
+    # seats invented the canon (the owner's name, the voice) instead of matching
+    # it. Any established file whose name appears in the task text is source
+    # material and is read here, prose or code, near the front of the overview.
+    task_text = session.task.text or ""
+    named: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root)
+        if any(part in _OVERVIEW_SKIP_DIRS for part in rel.parts):
+            continue
+        if p.is_file() and p.name and p.name in task_text:
+            named.append(p)
+    for p in named[:3]:
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if body.strip():
+            parts.append(f"--- {p.relative_to(root).as_posix()} "
+                         f"(source the task named — read in full) ---\n{body[:8000]}")
+
     # 3. ACTUAL SOURCE — entry points + architecturally CENTRAL files (registry/
     # protocol/config/models/…) + the largest code files, excluding tests/vendored.
     # Central files are often small (an interface/Protocol) so the largest-file
@@ -269,6 +292,8 @@ def _established_overview(session: Session, data_dir) -> str:
     for p in root.rglob("*"):
         rel = p.relative_to(root)
         if any(part in _OVERVIEW_SKIP_DIRS for part in rel.parts):
+            continue
+        if p in named:  # already read in full as task-named source
             continue
         if not p.is_file() or p.suffix.lower() not in _OVERVIEW_CODE_EXTS:
             continue
@@ -310,7 +335,12 @@ def _established_overview(session: Session, data_dir) -> str:
 
     if not parts:
         return ""
-    directive = (
+    # The "HOW TO RECOMMEND" directive is for ANALYSIS tasks (research/question)
+    # whose deliverable is advice. For a task that PRODUCES output — a story to
+    # write, a file to build — it is wrong-altitude noise that reframes "write
+    # Benny's next story" as "recommend improvements", so omit it there.
+    cls = session.classification
+    directive = "" if (cls and cls.produces_output) else (
         "\n\nHOW TO RECOMMEND:\n"
         "1. FIRST infer WHAT THIS APP IS and its constraints from its README/docs "
         "and code — e.g. a LOCAL single-user tool vs a production multi-user "
@@ -691,6 +721,13 @@ def _skill_result_cap(session: Session) -> int:
         else config.SKILL_RESULT_MAX_CHARS
 
 
+def _reply_has_artifact(sid: str, content: str) -> bool:
+    """Does this reply carry a COMPLETE file (an ARTIFACT/write block)? Used to
+    preserve a seat's authored candidate across the skill-resolution chain."""
+    return any(a.kind == "write_file"
+               for a in _parse_proposals(sid, content or "", role=Role.panelist))
+
+
 def _resolve_skill_requests(
     session: Session, member: CouncilMember, prompt: str, contribution: Contribution,
     call: AgentCall, governance: Governance, store: LogStore,
@@ -715,12 +752,20 @@ def _resolve_skill_requests(
     sid = session.session_id
     results: list[str] = []
     seen: set[tuple[str, str]] = set()
+    # A seat may AUTHOR its complete candidate in the same reply that requests a
+    # read (or in an early chain step, then re-stub on the follow-up). Each
+    # re-call below REPLACES `contribution`, so without this the authored ARTIFACT
+    # is silently discarded and the seat is dropped as a stub — which is exactly
+    # how reading-the-source-before-writing (the responsible behavior) lost two
+    # complete story candidates. Remember the most recent artifact-bearing reply
+    # and fall back to it whenever the final reply carries no file of its own.
+    authored = contribution if _reply_has_artifact(sid, contribution.content) else None
     for _ in range(config.MAX_SKILL_CHAIN_TURNS):
         reqs = [(n.lower(), a.strip())
                 for n, a in _SKILL_REQUEST_MARKER.findall(contribution.content)]
         fresh = [r for r in reqs if r not in seen]
         if not fresh:
-            return contribution
+            return authored or contribution
         for name, arg in fresh[: _skill_request_cap(session)]:
             seen.add((name, arg))
             # Panel seats resolve their skills on fan-out worker threads, so
@@ -781,7 +826,9 @@ def _resolve_skill_requests(
             + "\n\n".join(results)
         )
         contribution = (recall or call)(member, followup)
-    return contribution
+        if _reply_has_artifact(sid, contribution.content):
+            authored = contribution
+    return authored or contribution
 
 
 def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
@@ -1494,7 +1541,7 @@ def _ensure_redelivery_promotes(session: Session, store: LogStore) -> None:
     the promote; nothing lands without the approval click. Panel-seat drafts
     (advisory, namespaced) are never promoted. Idempotent — files already
     PROMOTED (or auto-filled on a prior resume) are skipped."""
-    if not session.established_root:
+    if not (session.established_root or session.delivery_root):
         return
     authored = [a.filename for a in session.proposed_actions
                 if a.kind in ("write_file", "edit_file") and a.filename
@@ -1792,6 +1839,28 @@ def _dominant_base_group(session: Session, candidates: list[dict]) -> list[dict]
     ))
 
 
+def _candidate_pool(session: Session, candidates: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(judged, dropped). Best-of-N gives each seat ONE complete candidate for
+    the SAME single deliverable, and seats routinely NAME it differently — a
+    task may even invite an author-chosen title ("name it to fit the series").
+    Differently-named SINGLE files are alternative takes on the one deliverable,
+    not different deliverables, so JUDGE THEM ALL and let the blind vote pick
+    (the winner ships under its own name). Dropping the minority filename group
+    here is what silently discarded 3 of 5 legitimate story candidates — one of
+    the dropped names was the eventual winner's rival, and better drafts than the
+    judged pair sat in the dropped group.
+
+    Only when a seat produced MULTIPLE files (a genuine multi-file project, where
+    a filename is a meaningful identity — game.html vs styles.css) do we fall
+    back to the dominant-base group, which keeps one coherent deliverable set."""
+    from collections import Counter
+    per_agent = Counter(c["agent"] for c in candidates)
+    if per_agent and max(per_agent.values()) == 1:
+        return candidates, []  # single file per seat → every seat's take competes
+    group = _dominant_base_group(session, candidates)
+    return group, [c for c in candidates if c not in group]
+
+
 def _score_candidates(session: Session, judges: list[CouncilMember], group: list[dict],
                       call: AgentCall, store: LogStore):
     """Blind scoring: each judge sees every candidate's full body labeled
@@ -1956,17 +2025,17 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     candidates = _collect_candidates(session)
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
-    group = _dominant_base_group(session, candidates)
     sid = session.session_id
-    if len(group) < len(candidates):
-        # genuinely differently-named deliverables remain in the minority — say so
-        # instead of dropping them silently (the old failure mode).
-        dropped = [c["agent"] for c in candidates if c not in group]
+    group, dropped = _candidate_pool(session, candidates)
+    if dropped:
+        # genuinely differently-named deliverables from a MULTI-file build remain
+        # in the minority — say so instead of dropping them silently.
+        dnames = [c["agent"] for c in dropped]
         store.log_event(sid, "candidates_ungrouped",
-                        {"judged_base": _basename(group[0]["base"]), "dropped": dropped})
+                        {"judged_base": _basename(group[0]["base"]), "dropped": dnames})
         session.unresolved.append(
-            f"{len(dropped)} candidate(s) used a different filename "
-            f"({', '.join(dropped)}) and were not in the judged group")
+            f"{len(dnames)} candidate(s) used a different filename "
+            f"({', '.join(dnames)}) and were not in the judged group")
     # RUNTIME GATE before judging — a candidate that doesn't RUN, or that renders a
     # frozen/static screen, can't win when a live one exists.
     runnable: list[dict] = []
@@ -1975,6 +2044,14 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     for c in group:
         ran, testable, detail, dynamic = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
         c["_dynamic"] = dynamic
+        if not testable:
+            # Not an executable web artifact (a prose .txt/.md, an unknown type,
+            # or no Node): there is NO runtime signal. Judge it on content alone —
+            # do NOT stamp a "little/no on-screen rendering" note, which is
+            # meaningless for a story and once made a judge penalise one for not
+            # "animating under play".
+            runnable.append(c)
+            continue
         if ran and dynamic is False:
             c["_error"] = detail
             c["_runtime"] = "runs, but renders a STATIC/frozen screen — no motion under simulated play"
@@ -2213,7 +2290,7 @@ def _execute_actions(
                     if a.kind == "promote" and a.status == "proposed"]
     if not promotes:
         needs_target = []
-    if needs_target and not session.established_root:
+    if needs_target and not (session.established_root or session.delivery_root):
         if session.established_asked:
             for a in needs_target:
                 a.status = "denied"

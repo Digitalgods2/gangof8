@@ -31,7 +31,7 @@ from .loop import (
     run_session,
 )
 from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
-from .paths import extract_established_root
+from .paths import extract_delivery_target, extract_established_root
 from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
@@ -406,6 +406,10 @@ class ConclaveService:
         # Established folder is PER TASK: interpret a path the user referenced in
         # the prompt (a file → its parent). None ⇒ the greenfield gate may ask.
         session.established_root = extract_established_root(text or "")
+        # An explicit "save it in <X>" destination (distinct from a read source
+        # the task also names) — promote delivers HERE, so "read from A, save to
+        # B" lands in B and never overwrites A.
+        session.delivery_root = extract_delivery_target(text or "")
         for uid in attachments or []:
             rec = self.uploads.get(uid)
             if rec:

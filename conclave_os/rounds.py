@@ -503,17 +503,27 @@ def score_candidates_prompt(session: Session, labeled: list[tuple]) -> str:
         head = f"===== {label} =====" + (f"\n[RUNTIME (headless execution): {runtime}]" if runtime else "")
         blocks.append(f"{head}\n{body[:config.CANDIDATE_SCORE_MAX_CHARS]}")
     n = len(labeled)
+    # The runtime-weighing instruction is RIGHT for executable candidates (a game
+    # that reads clean but crashes must lose) and WRONG for prose — a .txt story
+    # has no "on-screen rendering", and injecting this made a judge invent an
+    # "animates under simulated play" defect and penalise the story for it. Only
+    # include it when a candidate actually carries runtime evidence.
+    has_runtime = any(len(it) > 2 and (it[2] or "").strip() for it in labeled)
+    runtime_guidance = (
+        "Each candidate carries RUNTIME evidence from actually executing it headless "
+        "(whether it runs without throwing, and whether it updates/responds under "
+        "simulated input). WEIGH THIS HEAVILY: a candidate that reads beautifully but "
+        "does NOT actually run must NOT beat one that runs — a file that throws on "
+        "load or renders a static/near-empty screen scores LOW however clean it "
+        "looks.\n"
+    ) if has_runtime else ""
     return (
         f"Task the candidates implement: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"You are an impartial JUDGE. Below are {n} independent candidate "
         "implementations of the SAME task, authorship hidden. Score each STRICTLY "
         f"on: {CANDIDATE_CRITERIA}.\n"
-        "Each candidate carries RUNTIME evidence from actually executing it headless "
-        "(does it run, and does it animate/respond under simulated play). WEIGH THIS "
-        "HEAVILY: code that reads beautifully but does NOT visibly run/animate must "
-        "NOT beat code that actually runs — a candidate that renders a static or "
-        "near-empty screen scores LOW however clean it looks.\n"
+        f"{runtime_guidance}"
         "Read every candidate fully. A candidate that is truncated, stubbed, or "
         "misses a requirement must score low no matter how elegant the rest is.\n"
         f"Emit exactly one line per candidate, scoring 0-{config.JUDGE_SCORE_MAX}:\n"

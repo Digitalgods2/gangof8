@@ -270,6 +270,10 @@ class Session(BaseModel):
     established_root: Optional[str] = None  # external real folder (per task): read-only; the
     #                                         approval-gated promote target. Never written directly.
     established_asked: bool = False  # the greenfield "where should this go?" gate has been resolved
+    delivery_root: Optional[str] = None  # explicit "save it in <X>" DESTINATION the task
+    #                                      named — distinct from the READ source above; where
+    #                                      promote lands, so a "read A, save to B" task never
+    #                                      overwrites its source. None ⇒ deliver to established_root.
     panel: list[str] = []  # seat names convened for this session (resume-stable)
     cli_timeouts: dict[str, int] = {}  # per-seat call timeout (s), from Settings; {} ⇒ config defaults
     # Approval categories the human granted a session-wide standing approval for

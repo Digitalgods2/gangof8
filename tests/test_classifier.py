@@ -115,3 +115,30 @@ def test_write_content_still_content():
     cls = classify("Write a short blog article about home baking.")
     assert cls.task_type == TaskType.content
     assert cls.produces_output is True
+
+
+def test_story_saved_to_txt_is_content_not_code():
+    """Regression: a writing task whose ONLY code signal is the .txt it saves to
+    was classified `code`, dropping the prose into the game/runtime judging path
+    (a judge then penalised it for 'no on-screen rendering'). It must be content,
+    yet still produce the file."""
+    cls = classify(
+        "You are a children's book author. Write the second story about Benny "
+        "the dog and save it as a .txt file named Benny's Big Ride.txt in the "
+        "output folder."
+    )
+    assert cls.task_type == TaskType.content
+    assert cls.produces_output is True
+    assert cls.tools_allowed is True
+
+
+def test_write_essay_to_markdown_is_content():
+    cls = classify("Draft an essay on tide pools and save it as essay.md")
+    assert cls.task_type == TaskType.content
+
+
+def test_script_over_csv_stays_code():
+    """A real code word ('script') keeps a file-producing task as code even
+    though it names a data file — the content-override must not swallow it."""
+    cls = classify("Write a python script to parse data.csv and print totals.")
+    assert cls.task_type == TaskType.code
