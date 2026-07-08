@@ -1,6 +1,6 @@
 """Cancelling a session + workspace idempotency.
 
-Cancel is cooperative: a flag (conclave_os.cancellation) is checked at every
+Cancel is cooperative: a flag (gangof8.cancellation) is checked at every
 agent call, so a running session aborts at the next checkpoint and finalizes to
 `cancelled`. A paused (awaiting approval/input) session is cancelled immediately.
 """
@@ -9,16 +9,16 @@ import tempfile
 
 import pytest
 
-from conclave_os import cancellation
-from conclave_os.models import Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.service import ConclaveService
+from gangof8 import cancellation
+from gangof8.models import Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.adapters.mock import MockAdapter
+from gangof8.service import GangOf8Service
 
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 # --- cooperative cancel of a running session ----------------------------------
@@ -37,7 +37,7 @@ def test_precancel_skips_preround_web_research(service, monkeypatch):
     """A cancel requested before deliberation must abort BEFORE the pre-round
     context build — which can include a slow, non-interruptible web search — not
     pay for it and then cancel."""
-    from conclave_os import cancellation, loop
+    from gangof8 import cancellation, loop
 
     called = {"overview": False}
 
@@ -58,7 +58,7 @@ def test_cancel_during_preround_overview_is_prompt(service, monkeypatch):
     promptly (abandon the un-killable search) rather than block until it returns."""
     import threading
 
-    from conclave_os import cancellation, loop
+    from gangof8 import cancellation, loop
 
     started = threading.Event()
     release = threading.Event()  # never set during the run: the search stays slow
@@ -88,12 +88,12 @@ def test_startup_reconciles_orphaned_live_session(tmp_path):
     """A session left in a live state by a dead process (e.g. a restart) is
     finalized to cancelled when a fresh service boots on the same data dir, so it
     can't linger as an un-cancellable 'deliberating' ghost."""
-    svc1 = ConclaveService(data_dir=tmp_path)
+    svc1 = GangOf8Service(data_dir=tmp_path)
     s = svc1._open("build a thing", "test", None)
     s.status = SessionStatus.deliberating          # simulate a crash mid-run
     svc1.store.save_session(s)
 
-    svc2 = ConclaveService(data_dir=tmp_path)       # a fresh process boots
+    svc2 = GangOf8Service(data_dir=tmp_path)       # a fresh process boots
     reloaded = svc2.manager.load(s.session_id)
     assert reloaded.status == SessionStatus.cancelled
     assert "restart" in (reloaded.stop_reason or "")
@@ -134,7 +134,7 @@ def test_cancel_paused_session_immediately(tmp_path):
     est = tmp_path / "established"
     est.mkdir()
 
-    class _Svc(ConclaveService):
+    class _Svc(GangOf8Service):
         def _open(self, *a, **k):
             sess = super()._open(*a, **k)
             sess.established_root = str(est)
@@ -198,7 +198,7 @@ def test_cancel_aborts_while_a_panel_seat_is_stuck(tmp_path):
             return AdapterResult(content="late take", duration_ms=1)
 
     # panel = default 'mock' seat (fast) + the stuck seat; lead resolves to 'mock'
-    svc = ConclaveService(data_dir=tmp_path, panel=["mock", "stuck"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["mock", "stuck"])
     svc.registry.register(StuckSeat())
     s = svc._open("compare SQLite vs JSON for session logs", "test", None)
 

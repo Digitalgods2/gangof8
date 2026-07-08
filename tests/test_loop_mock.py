@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from conclave_os.models import Complexity, Risk, Role, SessionStatus, TaskType
-from conclave_os.service import ConclaveService
+from gangof8.models import Complexity, Risk, Role, SessionStatus, TaskType
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -16,7 +16,7 @@ TASK = (
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 @pytest.fixture()
@@ -119,12 +119,12 @@ class _BoomAdapter:
     name = "boom"
 
     def call(self, role, prompt, timeout_s, images=None):
-        from conclave_os.registry import AgentError
+        from gangof8.registry import AgentError
         raise AgentError("boom CLI timed out after 120s")
 
 
 def test_failing_lead_is_not_fatal(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(_BoomAdapter())
     # the lead fails; the summarizer still composes a final answer from the rest
     service.role_agents = {**service.role_agents, Role.lead: "boom"}

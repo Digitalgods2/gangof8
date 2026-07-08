@@ -1,6 +1,6 @@
-' Conclave OS — elegant windowless launcher.
+' Gang of 8 — elegant windowless launcher.
 ' Double-click in Explorer: starts the dashboard server hidden (no console
-' window) and opens the dashboard in your browser. Use "Stop Conclave OS.bat"
+' window) and opens the dashboard in your browser. Use "Stop Gang of 8.bat"
 ' to stop it (there's no window to close).
 
 Set sh  = CreateObject("WScript.Shell")

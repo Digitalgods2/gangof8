@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import executor, loop
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.logstore import LogStore
-from conclave_os.models import Contribution, ProposedAction, Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
-from conclave_os.sessions import SessionManager
+from gangof8 import executor, loop
+from gangof8.adapters.mock import MockAdapter
+from gangof8.logstore import LogStore
+from gangof8.models import Contribution, ProposedAction, Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
+from gangof8.sessions import SessionManager
 
 
 def _draft_session(tmp_path, content: str):
@@ -95,7 +95,7 @@ def test_edit_marker_tolerates_doctest_in_new(tmp_path):
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 # --- easy task: one lead pass, no delegation ---------------------------------
@@ -142,7 +142,7 @@ class DelegatingLead:
 
 
 def test_lead_delegates_then_finishes(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     adapter = DelegatingLead()
     svc.registry.register(adapter)
 
@@ -207,7 +207,7 @@ class NestedDelegatingLead:
 
 
 def test_specialist_consults_subagent_bounded_by_depth(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     adapter = NestedDelegatingLead()
     svc.registry.register(adapter)
 
@@ -314,7 +314,7 @@ class PreambleArtifactLead:
 def test_build_uses_deterministic_summary_and_one_call(tmp_path):
     # panel=[] → solo mode: the lead is the only model called, so a build spends
     # exactly one agent call and the summary stays deterministic.
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(PreambleArtifactLead())
 
     s = svc.run("Produce index.html with a calendar", source="test")
@@ -347,7 +347,7 @@ def test_blank_artifact_on_noncode_task_is_not_a_confident_success(tmp_path):
     """Regression: a non-code (content) task that produces an empty/blank file
     must FAIL verification and report low confidence — never high confidence on an
     empty file. (Verification used to run only for code tasks.)"""
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(BlankFileLead())
 
     session = svc.run("Write a short report summarizing the storage options.", source="test")
@@ -382,7 +382,7 @@ class TruncatedLead:
 
 
 def test_truncated_artifact_is_continued_to_completion(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(TruncatedLead())
 
     # "Produce ... index.html" → code task, not greenfield (no build/create verb),

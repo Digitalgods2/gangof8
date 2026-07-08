@@ -3,8 +3,8 @@ degrades to a partial answer instead of spinning or crashing."""
 
 import pytest
 
-from conclave_os.models import Budgets, SessionStatus
-from conclave_os.service import ConclaveService
+from gangof8.models import Budgets, SessionStatus
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -14,7 +14,7 @@ TASK = (
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 def test_lead_runs_a_single_round(service):

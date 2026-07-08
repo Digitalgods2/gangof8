@@ -1,4 +1,4 @@
-"""Conclave OS — Type 1 Coordinator OS.
+"""Gang of 8 — Type 1 Coordinator OS.
 
 A coordination layer that receives a user task, classifies it, assembles an
 agent council, runs a bounded deliberation loop under human authority, logs

@@ -8,13 +8,13 @@ coordinator ask WHERE — at delivery time, never up front.
 
 import pytest
 
-from conclave_os.classifier import classify
-from conclave_os.models import Role, SessionStatus, TaskType
-from conclave_os.paths import (extract_delivery_target, extract_established_root,
+from gangof8.classifier import classify
+from gangof8.models import Role, SessionStatus, TaskType
+from gangof8.paths import (extract_delivery_target, extract_established_root,
                                prior_deliverable_files)
-from conclave_os.registry import AdapterResult
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.service import ConclaveService
+from gangof8.registry import AdapterResult
+from gangof8.adapters.mock import MockAdapter
+from gangof8.service import GangOf8Service
 
 
 # --- path extraction ----------------------------------------------------------
@@ -143,11 +143,11 @@ def test_delivery_target_none_without_explicit_save_dest(tmp_path):
 def test_promote_delivers_to_declared_target_not_source(tmp_path):
     """With a delivery target set, promote lands THERE — and never writes into
     the read-source folder (which keeps its original file byte-for-byte)."""
-    from conclave_os import executor
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
-    from conclave_os.skills import _promote
+    from gangof8 import executor
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
+    from gangof8.skills import _promote
 
     source = tmp_path / "Benny"
     source.mkdir()
@@ -172,10 +172,10 @@ def test_promote_delivers_to_declared_target_not_source(tmp_path):
 def test_promote_approval_flags_overwrite_vs_new(tmp_path):
     """The approval summary must say whether a promote OVERWRITES an existing file
     — so a standing 'approve all promote' can't silently clobber canon."""
-    from conclave_os.governance import Governance
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
+    from gangof8.governance import Governance
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
 
     dest = tmp_path / "out"
     dest.mkdir()
@@ -247,7 +247,7 @@ class _ImplAdapter:
 
 
 def _svc(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(_ImplAdapter())
     return svc
 
@@ -279,7 +279,7 @@ class _PromotingImplAdapter:
 
 
 def _promote_svc(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(_PromotingImplAdapter())
     return svc
 
@@ -332,10 +332,10 @@ def test_free_write_into_established_subfolder_is_refused(tmp_path):
     """A subfolder of the source IS the source: a free write (workspace target)
     that resolves inside the established folder must be refused — only an approved
     promote may reach it."""
-    from conclave_os.executor import ExecutionError, execute
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
+    from gangof8.executor import ExecutionError, execute
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "pushmodo"
     est.mkdir()
@@ -356,11 +356,11 @@ def test_free_write_into_established_subfolder_is_refused(tmp_path):
 def test_established_overview_injected_into_prompts(tmp_path):
     """The council must START with the established folder's real content, not
     depend on an agent remembering to request a SKILL (the gemini-refusal bug)."""
-    from conclave_os import loop
-    from conclave_os.classifier import classify
-    from conclave_os.logstore import LogStore
-    from conclave_os.roles import build_council
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.classifier import classify
+    from gangof8.logstore import LogStore
+    from gangof8.roles import build_council
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "app"
     (est / "src").mkdir(parents=True)
@@ -388,10 +388,10 @@ def test_named_txt_source_is_pre_read_regardless_of_extension(tmp_path):
     overview filter skipped prose sources, so seats invented the canon (they wrote
     owner 'Emma'/'Sam' when the real owner was Grace). A produces_output task must
     also NOT carry the analysis-only 'HOW TO RECOMMEND' directive."""
-    from conclave_os import loop
-    from conclave_os.classifier import classify
-    from conclave_os.logstore import LogStore
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.classifier import classify
+    from gangof8.logstore import LogStore
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "Benny"
     est.mkdir()
@@ -418,9 +418,9 @@ def test_benny_scenario_wires_source_dest_and_classifies_content(tmp_path):
     compose — content classification (not code), the source folder bound for
     reads, a SEPARATE save target for delivery, and the named source pre-read
     into the overview (so seats match the canon instead of inventing it)."""
-    from conclave_os import loop
-    from conclave_os.classifier import classify
-    from conclave_os.service import ConclaveService
+    from gangof8 import loop
+    from gangof8.classifier import classify
+    from gangof8.service import GangOf8Service
 
     src_dir = tmp_path / "Benny"
     src_dir.mkdir()
@@ -433,7 +433,7 @@ def test_benny_scenario_wires_source_dest_and_classifies_content(tmp_path):
             f"Write story #2 about Benny's first car ride and save it as a .txt "
             f"file in: {out_dir}")
 
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     session = svc._open(task, source="test", budgets=None)
     assert session.established_root == str(src_dir.resolve()), "read source bound"
     assert session.delivery_root == str(out_dir.resolve()), "separate save target bound"
@@ -470,7 +470,7 @@ def test_promote_pipeline_end_to_end(tmp_path):
     approval with a diff → approve → the file lands in the real folder."""
     established = tmp_path / "realproj"
     established.mkdir()
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(_PromoteAdapter())
 
     session = svc.run(f'add a feature to the app in "{established}"', source="test")
@@ -491,7 +491,7 @@ def test_promote_pipeline_end_to_end(tmp_path):
 def test_promote_denied_leaves_established_untouched(tmp_path):
     established = tmp_path / "realproj"
     established.mkdir()
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(_PromoteAdapter())
     session = svc.run(f'add a feature to the app in "{established}"', source="test")
     promote_approval = next(a for a in session.approvals if a.category == "promote")
@@ -501,7 +501,7 @@ def test_promote_denied_leaves_established_untouched(tmp_path):
 
 
 def test_empty_workspace_clears_contents_only(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     proj = tmp_path / "proj"
     ws = svc.create_workspace("proj", str(proj))
     svc.set_active_workspace(ws.id)
@@ -528,10 +528,10 @@ def test_followup_autofills_missing_promote_for_delivered_file(tmp_path):
     """Follow-up safety net: a revised file that was ALREADY delivered but whose
     PROMOTE line the lead forgot gets an auto-synthesized promote, so the update
     reaches the user instead of stranding in the sandbox."""
-    from conclave_os import loop
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "game"
     est.mkdir()
@@ -561,10 +561,10 @@ def test_declared_destination_promotes_brand_new_files_too(tmp_path):
     already-delivered-only rule left the user's explicitly named folder empty
     while the run reported success. Still human-gated: this proposes; the
     approval click ships. With NO established root, nothing is proposed."""
-    from conclave_os import loop
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "game"
     est.mkdir()  # empty — nothing delivered yet
@@ -594,9 +594,9 @@ def test_source_digest_returns_named_source_not_prior_deliverable(tmp_path):
     """Fix 1: the digest fed to the blind judges is the task's NAMED source, and
     NOT a prior copy of the deliverable sitting in the same folder (referenced by
     title without extension — that is a prior answer, not source)."""
-    from conclave_os import loop
-    from conclave_os.logstore import LogStore
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.logstore import LogStore
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "Benny"
     est.mkdir()
@@ -635,7 +635,7 @@ def test_open_warns_when_source_folder_holds_a_prior_deliverable(tmp_path):
     src_file = src_dir / "Benny's Splash.txt"
     task = (f"Read the first story at: {src_file}\nWrite story #2, Benny's First "
             f"Car Ride, and save it as a .txt file.")
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     session = svc._open(task, source="test", budgets=None)
     assert any("Benny's First Car Ride.txt" in u and "PRIOR" in u
                for u in session.unresolved), "prior deliverable surfaced at open"

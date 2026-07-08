@@ -12,11 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import config, executor, loop
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import Contribution, Council, CouncilMember, Role, Session
-from conclave_os.sessions import SessionManager
+from gangof8 import config, executor, loop
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import Contribution, Council, CouncilMember, Role, Session
+from gangof8.sessions import SessionManager
 
 
 @pytest.fixture()

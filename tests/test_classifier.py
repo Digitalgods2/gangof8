@@ -3,12 +3,12 @@
 Regression for a real run where "Build a tiny app ... main.py,
 requirements.txt" classified as a plain question, so the implementer (the only
 role that can propose a write_file/ARTIFACT) never joined the council and the
-conclave concluded the task was impossible. Build/app verbs and filenames with
+gangof8 concluded the task was impossible. Build/app verbs and filenames with
 known extensions must mark the task as output-producing code.
 """
 
-from conclave_os.classifier import classify
-from conclave_os.models import TaskType
+from gangof8.classifier import classify
+from gangof8.models import TaskType
 
 
 def test_build_an_app_is_code():
@@ -21,8 +21,8 @@ def test_build_an_app_is_code():
 def test_code_tasks_are_led_with_specialists_on_standby():
     """Every task — code included — is driven by the lead; the specialist
     talents are present but inactive until the lead delegates."""
-    from conclave_os.roles import build_council
-    from conclave_os.models import Role
+    from gangof8.roles import build_council
+    from gangof8.models import Role
 
     cls = classify("Edit main.py to add a logging line")
     assert cls.task_type == TaskType.code
@@ -36,8 +36,8 @@ def test_code_tasks_are_led_with_specialists_on_standby():
 
 
 def test_greenfield_build_is_led_directly():
-    from conclave_os.roles import build_council
-    from conclave_os.models import Role
+    from gangof8.roles import build_council
+    from gangof8.models import Role
 
     cls = classify("create an app that shows a calendar selectable by year and month")
     assert cls.task_type == TaskType.code
@@ -152,7 +152,7 @@ def test_matched_set_intent_detected():
     marks the output as one that must MIRROR a source — structural fidelity is a
     hard requirement, so the judges/finisher weigh it (a plain-prose candidate
     that dropped the source's whole format won this task before)."""
-    from conclave_os.classifier import wants_matched_output
+    from gangof8.classifier import wants_matched_output
     task = ("Write story #2 about Benny. Match the first story's style exactly, "
             "so the two books feel like a matched set. Save it as a .txt file.")
     assert wants_matched_output(task) is True
@@ -164,6 +164,6 @@ def test_matched_set_intent_detected():
 def test_no_match_intent_on_plain_build():
     """A build with no 'match/matched set/same style' phrasing does not set the
     flag — greenfield judging is unchanged."""
-    from conclave_os.classifier import wants_matched_output
+    from gangof8.classifier import wants_matched_output
     assert wants_matched_output("Build a tic-tac-toe game in game.html") is False
     assert classify("Build a tic-tac-toe game in game.html").match_source is False

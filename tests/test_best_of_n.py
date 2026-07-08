@@ -8,12 +8,12 @@ defects.
 
 import pytest
 
-from conclave_os import config, loop, rounds, smoke
-from conclave_os.logstore import LogStore
-from conclave_os.models import (Classification, Complexity, Council,
+from gangof8 import config, loop, rounds, smoke
+from gangof8.logstore import LogStore
+from gangof8.models import (Classification, Complexity, Council,
                                 CouncilMember, Contribution, ProposedAction,
                                 Risk, Role, TaskType)
-from conclave_os.sessions import SessionManager
+from gangof8.sessions import SessionManager
 
 # Both RUN clean under the headless smoke gate (best-of-N executes every
 # candidate before judging). "weak"/"strong" differ only so the mock judges can
@@ -189,7 +189,7 @@ def test_verification_fails_a_web_file_that_does_not_run(tmp_path, session, stor
     import shutil as _sh
     if _sh.which("node") is None:
         pytest.skip("node not on PATH")
-    from conclave_os.models import ProposedAction
+    from gangof8.models import ProposedAction
 
     broken = tmp_path / "broken.html"
     broken.write_text(BROKEN, encoding="utf-8")

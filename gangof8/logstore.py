@@ -15,7 +15,7 @@ class LogStore:
         self.data_dir = Path(data_dir)
         self.sessions_dir = self.data_dir / "sessions"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.data_dir / "conclave_os.db"
+        self.db_path = self.data_dir / "gangof8.db"
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:

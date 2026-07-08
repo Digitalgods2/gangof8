@@ -11,7 +11,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os.service import ConclaveService
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -32,12 +32,12 @@ class _PromotingLead:
     name = "mock"
 
     def __init__(self):
-        from conclave_os.adapters.mock import MockAdapter
+        from gangof8.adapters.mock import MockAdapter
         self._inner = MockAdapter()
 
     def call(self, role, prompt, timeout_s, images=None):
-        from conclave_os.models import Role
-        from conclave_os.registry import AdapterResult
+        from gangof8.models import Role
+        from gangof8.registry import AdapterResult
         # promote only for the delivery-flavored task; plain tasks stay mock
         if role == Role.lead and "delivered into" in prompt:
             return AdapterResult(content=PROMOTE_DRAFT, duration_ms=1)
@@ -53,9 +53,9 @@ def est(tmp_path):
 
 @pytest.fixture()
 def client(tmp_path, est):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    main_mod.service = ConclaveService(data_dir=tmp_path / "data")
+    main_mod.service = GangOf8Service(data_dir=tmp_path / "data")
     main_mod.service.registry.register(_PromotingLead())
     return TestClient(main_mod.app)
 
@@ -73,7 +73,7 @@ def _poll_until(client, session_id, statuses, timeout_s=10.0):
 def test_dashboard_page_served(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "Conclave OS" in r.text
+    assert "Gang of 8" in r.text
     assert "human authority preserved" in r.text
 
 

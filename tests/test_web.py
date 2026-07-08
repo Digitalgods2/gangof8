@@ -4,18 +4,18 @@ governed as no-approval 'web' skills usable mid-deliberation. SSRF-guarded.
 
 import pytest
 
-from conclave_os import config, web
+from gangof8 import config, web
 
 
 @pytest.fixture(autouse=True)
 def _web_on(monkeypatch):
     monkeypatch.setattr(config, "WEB_ENABLED", True)
-from conclave_os.executor import ExecutionError, execute
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import ProposedAction, Role
-from conclave_os.sessions import SessionManager
-from conclave_os.skills import get_skill
+from gangof8.executor import ExecutionError, execute
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import ProposedAction, Role
+from gangof8.sessions import SessionManager
+from gangof8.skills import get_skill
 
 
 @pytest.fixture()
@@ -93,8 +93,8 @@ def test_web_overview_proactively_researches_factual_questions(tmp_path, monkeyp
     """Internet access being AVAILABLE isn't enough — the coordinator proactively
     web-searches a fact-needing question so the council has real data even if the
     researcher seat fails. Skipped when a local source (established folder) exists."""
-    from conclave_os import loop
-    from conclave_os.models import Classification, Complexity, Risk, TaskType
+    from gangof8 import loop
+    from gangof8.models import Classification, Complexity, Risk, TaskType
 
     monkeypatch.setattr(web, "web_search",
                         lambda q: "Current: M51 is well placed tonight.\nSources:\n- ex: http://e")
@@ -109,8 +109,8 @@ def test_web_overview_proactively_researches_factual_questions(tmp_path, monkeyp
 
 
 def test_web_search_runs_mid_deliberation(session, tmp_path, monkeypatch):
-    from conclave_os import loop
-    from conclave_os.models import Contribution, CouncilMember
+    from gangof8 import loop
+    from gangof8.models import Contribution, CouncilMember
 
     monkeypatch.setattr(web, "web_search", lambda q: "web result for " + q)
     store = LogStore(tmp_path)

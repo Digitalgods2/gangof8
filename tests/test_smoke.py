@@ -9,7 +9,7 @@ import shutil
 
 import pytest
 
-from conclave_os import smoke
+from gangof8 import smoke
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None,
                                 reason="node not on PATH — runtime smoke test unavailable")

@@ -10,10 +10,10 @@ import json
 
 import pytest
 
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.models import Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
+from gangof8.adapters.mock import MockAdapter
+from gangof8.models import Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
 
 TASK = "Write a short report recommending SQLite or plain JSON for session logs."
 
@@ -39,7 +39,7 @@ class PromotingLead:
         return self._inner.call(role, prompt, timeout_s)
 
 
-class _EstablishedService(ConclaveService):
+class _EstablishedService(GangOf8Service):
     """Stamps an established folder onto every session so PROMOTE lines become
     approval-gated promote actions — the pause under test."""
 
@@ -119,10 +119,10 @@ def test_unknown_ids_rejected(service):
 
 
 def test_resume_only_from_awaiting_approval(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     done = service.run("What is SQLite?", source="test")
     assert done.status == SessionStatus.done
-    from conclave_os.loop import resume_session
+    from gangof8.loop import resume_session
 
     with pytest.raises(ValueError):
         resume_session(done, service.manager, service.registry, service.governance, service.store)
@@ -130,7 +130,7 @@ def test_resume_only_from_awaiting_approval(tmp_path):
 
 def test_api_approval_endpoint(tmp_path):
     from fastapi.testclient import TestClient
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
     est = tmp_path / "established"
     est.mkdir()

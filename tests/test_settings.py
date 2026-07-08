@@ -10,9 +10,9 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os import config
-from conclave_os.service import ConclaveService
-from conclave_os.settings import Settings, load_settings, save_settings
+from gangof8 import config
+from gangof8.service import GangOf8Service
+from gangof8.settings import Settings, load_settings, save_settings
 
 
 # ---- Settings model + persistence + precedence -------------------------------
@@ -51,12 +51,12 @@ def test_partial_file_overlays(tmp_path):
 
 
 def test_env_respected_when_file_lacks_key(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONCLAVE_OS_BACKEND", "cli")
+    monkeypatch.setenv("GANGOF8_BACKEND", "cli")
     import importlib
 
-    from conclave_os import config as cfg
+    from gangof8 import config as cfg
     importlib.reload(cfg)
-    import conclave_os.settings as settings_mod
+    import gangof8.settings as settings_mod
     importlib.reload(settings_mod)
     try:
         # No settings.json ⇒ env-derived config default wins.
@@ -69,7 +69,7 @@ def test_env_respected_when_file_lacks_key(tmp_path, monkeypatch):
         s2 = settings_mod.load_settings(tmp_path)
         assert s2.backend == "mock"
     finally:
-        monkeypatch.delenv("CONCLAVE_OS_BACKEND", raising=False)
+        monkeypatch.delenv("GANGOF8_BACKEND", raising=False)
         importlib.reload(cfg)
         importlib.reload(settings_mod)
 
@@ -84,7 +84,7 @@ def test_corrupt_file_falls_back(tmp_path):
 
 
 def test_service_unchanged_without_settings_file(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     assert svc.backend == config.BACKEND
     assert svc.role_agents == config.ROLE_AGENTS_BY_BACKEND[config.BACKEND]
     assert "mock" in svc.registry.names()
@@ -92,8 +92,8 @@ def test_service_unchanged_without_settings_file(tmp_path):
 
 def test_service_consumes_settings_file(tmp_path):
     save_settings(Settings(role_agents={"critic": "codex"}), tmp_path)
-    svc = ConclaveService(data_dir=tmp_path)
-    from conclave_os.models import Role
+    svc = GangOf8Service(data_dir=tmp_path)
+    from gangof8.models import Role
     assert svc.role_agents[Role.critic] == "codex"
     assert Role.knowledge_retriever in svc.role_agents
     assert Role.fact_validator in svc.role_agents
@@ -101,15 +101,15 @@ def test_service_consumes_settings_file(tmp_path):
 
 def test_explicit_backend_arg_wins(tmp_path):
     save_settings(Settings(backend="cli"), tmp_path)
-    svc = ConclaveService(data_dir=tmp_path, backend="mock")
+    svc = GangOf8Service(data_dir=tmp_path, backend="mock")
     assert svc.backend == "mock"
 
 
 def test_cli_catalog_normalizes_dotted_claude_slugs(tmp_path, monkeypatch):
     # The claude dropdown is fed from OpenRouter's public catalog, which lists
     # Anthropic models with DOTS (claude-opus-4.8) — the claude CLI needs dashes.
-    from conclave_os import config
-    svc = ConclaveService(data_dir=tmp_path)
+    from gangof8 import config
+    svc = GangOf8Service(data_dir=tmp_path)
     monkeypatch.setattr(config, "WEB_ENABLED", True, raising=False)
     monkeypatch.setattr(svc, "_fetch_public_catalog",
                         lambda: {"claude": ["claude-opus-4.8"], "codex": ["gpt-5.5"]})
@@ -124,8 +124,8 @@ def test_cli_catalog_normalizes_dotted_claude_slugs(tmp_path, monkeypatch):
 
 
 def test_openrouter_vendor_catalog_maps_vendors_with_capability_flags(tmp_path, monkeypatch):
-    from conclave_os import config
-    svc = ConclaveService(data_dir=tmp_path)
+    from gangof8 import config
+    svc = GangOf8Service(data_dir=tmp_path)
     monkeypatch.setattr(config, "WEB_ENABLED", True, raising=False)
     monkeypatch.setattr(svc, "_fetch_catalog_raw", lambda: [
         {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro", "created": 200,
@@ -146,7 +146,7 @@ def test_openrouter_vendor_catalog_maps_vendors_with_capability_flags(tmp_path, 
 
 
 def test_seats_openrouter_carry_generic_label_vendor_and_models(tmp_path, monkeypatch):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     monkeypatch.setattr(svc, "openrouter_vendor_catalog", lambda refresh=False: {
         "deepseek": [{"id": "deepseek/x", "name": "x", "vision": False, "reasoning": False, "tools": True, "ctx": 1}],
         "glm": [], "qwen": [], "kimi": []})
@@ -158,8 +158,8 @@ def test_seats_openrouter_carry_generic_label_vendor_and_models(tmp_path, monkey
 
 def test_gc_sandboxes_keeps_active_and_recent_deletes_the_rest(tmp_path, monkeypatch):
     import os
-    from conclave_os import config
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    from gangof8 import config
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     sbroot = tmp_path / "sandbox"
     sbroot.mkdir()
     monkeypatch.setattr(config, "SANDBOX_ROOT", sbroot)
@@ -181,7 +181,7 @@ def test_gc_sandboxes_keeps_active_and_recent_deletes_the_rest(tmp_path, monkeyp
 
 
 def test_cli_timeouts_persist_and_flow_onto_the_session(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"cli_timeouts": {"claude": 480, "gemini": 200}})
     assert svc.settings.cli_timeouts == {"claude": 480, "gemini": 200}
     session = svc._open("build a thing", "test", None)
@@ -189,7 +189,7 @@ def test_cli_timeouts_persist_and_flow_onto_the_session(tmp_path):
 
 
 def test_update_settings_persists_and_rederives(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"ui": {"poll_interval_ms": 7000}})
     assert load_settings(tmp_path).ui.poll_interval_ms == 7000
     assert svc.settings.ui.poll_interval_ms == 7000
@@ -202,7 +202,7 @@ def test_update_settings_persists_and_rederives(tmp_path):
 def test_role_agents_replace_not_merge(tmp_path):
     """role_agents is the complete intended set — a new map replaces the old, so
     resetting (or shrinking) the mapping actually takes effect."""
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"role_agents": {"researcher": "gemini", "critic": "codex"}})
     assert svc.settings.role_agents == {"researcher": "gemini", "critic": "codex"}
     svc.update_settings({"role_agents": {"researcher": "claude"}})  # replaces, not merges
@@ -214,9 +214,9 @@ def test_role_agents_replace_not_merge(tmp_path):
 
 @pytest.fixture()
 def client(tmp_path):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     return TestClient(main_mod.app)
 
 
@@ -272,7 +272,7 @@ def _no_gemini_env(monkeypatch):
 
 def test_gemini_key_stored_in_settings_no_env_needed(tmp_path, monkeypatch):
     _no_gemini_env(monkeypatch)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     assert svc.api_key_status("gemini")["present"] is False
     status = svc.set_api_key("gemini", "AIza-test-key-1234")
     assert status["present"] is True and status["source"] == "stored"
@@ -284,22 +284,22 @@ def test_gemini_key_stored_in_settings_no_env_needed(tmp_path, monkeypatch):
 def test_google_api_key_env_also_counts(tmp_path, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GOOGLE_API_KEY", "g-env-key")
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     st = svc.api_key_status("gemini")
     assert st["present"] is True and st["source"] == "env"
 
 
 def test_unknown_api_key_name_rejected(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     with pytest.raises(KeyError):
         svc.api_key_status("stripe")
 
 
 def test_gemini_key_endpoints(tmp_path, monkeypatch):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
     _no_gemini_env(monkeypatch)
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     client = TestClient(main_mod.app)
     assert client.get("/settings/api-keys/gemini").json()["present"] is False
     r = client.put("/settings/api-keys/gemini", json={"value": "AIza-abc-9999"})
@@ -313,7 +313,7 @@ def test_role_model_pins_reach_only_the_mapped_seat(tmp_path):
     """A per-role model pin is handed to the adapter of the seat its role is
     mapped to — and no other — so pinning code_generator to opus never passes
     a claude model id to gemini's CLI."""
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"backend": "cli",
                          "role_models": {"code_generator": "claude-opus-4-8",
                                          "researcher": "gemini-2.5-pro"}})
@@ -327,7 +327,7 @@ def test_remapping_a_role_drops_its_stale_model_pin(tmp_path):
     """An API patch that remaps a role's seat WITHOUT sending role_models must
     drop that role's pin — the old seat's model id would otherwise ride along
     to the new vendor's CLI and kill the seat. Unrelated pins survive."""
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"backend": "cli",
                          "role_models": {"code_generator": "claude-opus-4-8",
                                          "researcher": "gemini-2.5-pro"}})
@@ -336,7 +336,7 @@ def test_remapping_a_role_drops_its_stale_model_pin(tmp_path):
     assert svc.settings.role_models == {"researcher": "gemini-2.5-pro"}
     assert svc.registry._adapters["codex"].role_models == {}
     # persisted too — a restart must not resurrect the stale pin
-    assert ConclaveService(data_dir=tmp_path) \
+    assert GangOf8Service(data_dir=tmp_path) \
         .settings.role_models == {"researcher": "gemini-2.5-pro"}
 
 
@@ -349,14 +349,14 @@ def test_fresh_install_saves_keys_without_env(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     fresh = tmp_path / "data"  # does not exist — first run must create it
     assert not fresh.exists()
-    svc = ConclaveService(data_dir=fresh)
+    svc = GangOf8Service(data_dir=fresh)
     svc.set_api_key("gemini", "AIza-new-install-1")
     svc.set_api_key("openrouter", "sk-or-new-install-2")
     stored = json.loads((fresh / "secrets.json").read_text(encoding="utf-8"))
     assert stored == {"gemini": "AIza-new-install-1",
                       "openrouter": "sk-or-new-install-2"}
     # a restart (new service over the same data dir) still resolves them
-    svc2 = ConclaveService(data_dir=fresh)
+    svc2 = GangOf8Service(data_dir=fresh)
     gem = svc2.api_key_status("gemini")
     assert gem["present"] is True and gem["source"] == "stored"
     assert svc2.api_key_status("openrouter")["source"] == "stored"
@@ -367,10 +367,10 @@ def test_reveal_returns_full_key_only_on_explicit_request(tmp_path, monkeypatch)
     """Status stays masked; the dashboard's eye-reveal fetches the full value
     on demand via the explicit /reveal endpoint (localhost-only app, and the
     key already lives in plaintext in data/secrets.json)."""
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
     _no_gemini_env(monkeypatch)
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     client = TestClient(main_mod.app)
     # nothing stored → present False, empty value (never an error)
     r = client.get("/settings/api-keys/gemini/reveal")

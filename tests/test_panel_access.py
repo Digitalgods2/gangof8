@@ -14,13 +14,13 @@ unable to land its work in the sandbox is a design failure).
 
 import pytest
 
-from conclave_os import executor, loop
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import Contribution, Council, CouncilMember, Role
-from conclave_os.registry import AgentError
-from conclave_os.sessions import SessionManager
-from conclave_os.skills import get_skill
+from gangof8 import executor, loop
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import Contribution, Council, CouncilMember, Role
+from gangof8.registry import AgentError
+from gangof8.sessions import SessionManager
+from gangof8.skills import get_skill
 
 GAME = "<!doctype html>\n<html><body><script>go()</script></body></html>"
 
@@ -253,7 +253,7 @@ def test_declared_destination_autofills_promotes_for_new_files(tmp_path, store, 
     the old already-delivered-only rule left the user's folder empty on every
     first (greenfield) delivery while reporting success. Still human-gated.
     Panel drafts never qualify."""
-    from conclave_os.models import ProposedAction
+    from gangof8.models import ProposedAction
 
     est = tmp_path / "est"
     est.mkdir()  # empty: greenfield — nothing pre-delivered

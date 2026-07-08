@@ -3,16 +3,16 @@ explicit human approval, and risky tasks pause before round 1."""
 
 import pytest
 
-from conclave_os.governance import ApprovalRequired, Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import Risk, SessionStatus
-from conclave_os.service import ConclaveService
-from conclave_os.sessions import SessionManager
+from gangof8.governance import ApprovalRequired, Governance
+from gangof8.logstore import LogStore
+from gangof8.models import Risk, SessionStatus
+from gangof8.service import GangOf8Service
+from gangof8.sessions import SessionManager
 
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 @pytest.fixture()

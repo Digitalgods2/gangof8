@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Conclave OS</title>
+<title>Gang of 8</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { --bg:#0f1218; --panel:#171c26; --line:#2a3242; --text:#d7dce5; --dim:#8b94a7;
@@ -289,7 +289,7 @@
 </head>
 <body>
 <header>
-  <h1>Conclave OS</h1>
+  <h1>Gang of 8</h1>
   <span class="sub" id="backend">backend: …</span>
   <span class="sub" id="workspace">workspace: …</span>
   <span class="sub">human authority preserved — nothing executes without your approval</span>
@@ -444,7 +444,7 @@ async function savePage() {
   try { s = await api("/sessions/" + encodeURIComponent(current)); } catch (e) { s = null; }
   if (!s || s.detail) { alert("Could not load this session to save."); return; }
   try { tl = (await api("/sessions/" + encodeURIComponent(current) + "/timeline")).events || []; } catch (e) {}
-  await saveTextFile(sessionToMarkdown(s, tl), "conclave-" + current + ".md");
+  await saveTextFile(sessionToMarkdown(s, tl), "gangof8-" + current + ".md");
 }
 
 // Build the whole session view as Markdown (task, summary, risks, files,
@@ -452,7 +452,7 @@ async function savePage() {
 function sessionToMarkdown(s, tl) {
   const L = [], final = s.final || {};
   const push = (...xs) => L.push(...xs);
-  push("# Conclave OS — session " + (s.session_id || ""), "");
+  push("# Gang of 8 — session " + (s.session_id || ""), "");
   push("## Task  (" + (s.status || "") + (s.stop_reason ? " · " + s.stop_reason : "") + ")", "");
   push((s.task && s.task.text) || "", "");
   if (s.established_root) push("📂 established folder: `" + s.established_root + "`", "");
@@ -483,7 +483,7 @@ function sessionToMarkdown(s, tl) {
     tl.forEach(e => push("- " + (e.ts || "") + "  " + (e.label || e.event || "") + (e.detail ? " — " + e.detail : "")));
     push("");
   }
-  push("---", "_Exported from Conclave OS_");
+  push("---", "_Exported from Gang of 8_");
   return L.join("\n");
 }
 
@@ -1314,7 +1314,7 @@ function renderSettings(s, seats) {
   const resolved = s.resolved_role_agents || {};
   const roles = roleList(s);
   const roleCatalogWarn = s.role_catalog ? "" :
-    '<div class="sub" style="color:var(--bad);margin-bottom:8px">Backend role catalog is missing. Restart Conclave OS to load the new specialist roles.</div>';
+    '<div class="sub" style="color:var(--bad);margin-bottom:8px">Backend role catalog is missing. Restart Gang of 8 to load the new specialist roles.</div>';
   const seatErr = (seatsCache.length === 0)
     ? '<div class="sub" style="margin-top:4px">no CLI agents found on PATH</div>' : "";
 

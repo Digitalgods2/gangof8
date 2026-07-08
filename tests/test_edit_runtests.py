@@ -11,16 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import executor, loop
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.executor import ExecutionError, execute
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import ProposedAction, Risk, Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
-from conclave_os.sessions import SessionManager
-from conclave_os.skills import get_skill
+from gangof8 import executor, loop
+from gangof8.adapters.mock import MockAdapter
+from gangof8.executor import ExecutionError, execute
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import ProposedAction, Risk, Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
+from gangof8.sessions import SessionManager
+from gangof8.skills import get_skill
 
 
 @pytest.fixture()
@@ -119,7 +119,7 @@ def test_run_tests_reports_nonzero_exit(session, tmp_path):
 def test_collect_parses_edit_and_runtests_blocks(tmp_path):
     store = LogStore(tmp_path)
     session = SessionManager(store).create("t", source="test")
-    from conclave_os.models import Contribution
+    from gangof8.models import Contribution
     draft = Contribution(round=0, role=Role.implementer, agent="mock", content=(
         "Here is the plan.\n"
         "ARTIFACT: new.py\nprint('new')\n"
@@ -162,7 +162,7 @@ class EditAdapter:
 
 
 def test_edit_end_to_end_free(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(EditAdapter())
 
     # write + edit are free now: no approval gate — the session completes directly

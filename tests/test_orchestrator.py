@@ -6,11 +6,11 @@ capped folded-summary pipe (which would truncate a whole file to nothing).
 
 import pytest
 
-from conclave_os import loop, rounds
-from conclave_os.logstore import LogStore
-from conclave_os.models import (Classification, Complexity, Contribution,
+from gangof8 import loop, rounds
+from gangof8.logstore import LogStore
+from gangof8.models import (Classification, Complexity, Contribution,
                                 Council, CouncilMember, Risk, Role, TaskType)
-from conclave_os.sessions import SessionManager
+from gangof8.sessions import SessionManager
 
 GAME_HTML = "<!doctype html>\n<html><body><script>go()</script></body></html>"
 
@@ -91,7 +91,7 @@ def test_lead_promotes_still_collected_after_delegate_capture(store, session):
     """The lead's final draft (PROMOTE lines) must still be collected when
     talent-captured proposals already exist — the old any-proposals guard
     would have dropped delivery exactly when a talent authored the files."""
-    from conclave_os.models import ProposedAction
+    from gangof8.models import ProposedAction
 
     session.proposed_actions.append(ProposedAction(
         session_id=session.session_id, kind="write_file", role=Role.code_generator,
@@ -137,7 +137,7 @@ def test_contribution_is_persisted_immediately(tmp_path, store, session):
     transitions — so every landed contribution must persist the session at
     once, or a whole round of panel takes and talent answers stays invisible
     until the run pauses or finishes (live: 'why am I not seeing anything?')."""
-    from conclave_os.registry import AdapterResult
+    from gangof8.registry import AdapterResult
 
     store.save_session(session)
 
@@ -166,7 +166,7 @@ def test_file_builds_ask_every_seat_for_a_full_candidate(session):
 def test_non_output_tasks_get_no_file_contract(store):
     """A research/question task doesn't produce a deliverable — no candidate
     contract, panel stays prose."""
-    from conclave_os.models import Classification, Complexity, Risk, TaskType
+    from gangof8.models import Classification, Complexity, Risk, TaskType
     s = SessionManager(store).create("compare SQLite vs JSON", source="test")
     s.classification = Classification(task_type=TaskType.question,
                                       complexity=Complexity.standard, risk=Risk.none,

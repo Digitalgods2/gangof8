@@ -8,11 +8,11 @@ import time
 
 import pytest
 
-from conclave_os import config, rounds
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.models import Role, Session, SessionStatus, Task
-from conclave_os.registry import AdapterResult, AgentError
-from conclave_os.service import ConclaveService
+from gangof8 import config, rounds
+from gangof8.adapters.mock import MockAdapter
+from gangof8.models import Role, Session, SessionStatus, Task
+from gangof8.registry import AdapterResult, AgentError
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -84,7 +84,7 @@ class DoneAfterLead:
 
 
 def _svc(tmp_path, adapter=None, **kwargs):
-    svc = ConclaveService(data_dir=tmp_path, **kwargs)
+    svc = GangOf8Service(data_dir=tmp_path, **kwargs)
     if adapter is not None:
         svc.registry.register(adapter)
     return svc
@@ -195,7 +195,7 @@ class ProbeSeat:
 
 def test_panel_seats_run_concurrently(tmp_path):
     shared = _SharedCounter()
-    svc = ConclaveService(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
     for name in ("alpha", "beta", "gamma"):
         svc.registry.register(ProbeSeat(name, shared))
     session = svc.run(TASK, source="test")
@@ -215,7 +215,7 @@ def test_failing_seat_is_dropped_not_fatal(tmp_path):
         def call(self, role, prompt, timeout_s, images=None):
             raise AgentError("boom seat exploded")
 
-    svc = ConclaveService(data_dir=tmp_path, panel=["mock", "boom"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["mock", "boom"])
     svc.registry.register(BoomSeat())
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -229,10 +229,10 @@ def test_failing_seat_is_dropped_not_fatal(tmp_path):
 def test_budget_exact_under_panel_contention(tmp_path):
     """With fewer budget slots than concurrent seats, the reserve-under-lock
     accounting never oversubscribes and the run degrades to compose."""
-    from conclave_os.models import Budgets
+    from gangof8.models import Budgets
 
     shared = _SharedCounter()
-    svc = ConclaveService(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
     for name in ("alpha", "beta", "gamma"):
         svc.registry.register(ProbeSeat(name, shared))
     budgets = Budgets(max_agent_calls=2, max_wall_seconds=60)
@@ -243,7 +243,7 @@ def test_budget_exact_under_panel_contention(tmp_path):
 
 
 def test_solo_mode_with_empty_panel(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
     assert session.panel == []
@@ -290,7 +290,7 @@ def test_stub_detection_matches_the_live_failure():
 
 def test_short_direct_answer_is_not_a_stub():
     # the mock lead's legitimate short answer has no deferral phrasing
-    from conclave_os.adapters.mock import LEAD_ANSWER
+    from gangof8.adapters.mock import LEAD_ANSWER
 
     assert rounds.reply_is_stub(LEAD_ANSWER) is False
     assert rounds.reply_is_stub("SQLite. It is the safer default.") is False
@@ -329,17 +329,17 @@ LIVE_TOOL_DEBRIS = (
     "than relying on the excerpts — starting with the loop, delegation machinery, "
     "and the prompt layer.\n\n"
     "<summary>Read loop.py (deliberation loop core)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\loop.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\loop.py"\n}\n\n'
     "<summary>Read rounds.py (prompt layer)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\rounds.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\rounds.py"\n}\n\n'
     "<summary>Read config.py (budgets, seats)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\config.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\config.py"\n}\n\n'
     "<summary>Read models.py</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\models.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\models.py"\n}\n\n'
     "<summary>Read roles.py (council building)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\roles.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\roles.py"\n}\n\n'
     "<summary>Read governance.py</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Conclave OS\\\\conclave_os\\\\governance.py"\n}'
+    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\governance.py"\n}'
 )
 
 
@@ -435,7 +435,7 @@ def test_stubbing_panel_seat_is_dropped_from_synthesis(tmp_path):
             return self._inner.call(role, prompt, timeout_s)
 
     lead = CapturingLead()
-    svc = ConclaveService(data_dir=tmp_path, panel=["alpha", "beta"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["alpha", "beta"])
     svc.registry.register(HealthySeat())
     svc.registry.register(DebrisSeat())
     svc.registry.register(lead)
@@ -451,10 +451,10 @@ def test_stubbing_panel_seat_is_dropped_from_synthesis(tmp_path):
 
 
 def test_analysis_tasks_get_a_higher_skill_cap(tmp_path):
-    from conclave_os import loop
-    from conclave_os.classifier import classify
-    from conclave_os.logstore import LogStore
-    from conclave_os.sessions import SessionManager
+    from gangof8 import loop
+    from gangof8.classifier import classify
+    from gangof8.logstore import LogStore
+    from gangof8.sessions import SessionManager
 
     store = LogStore(tmp_path)
     s = SessionManager(store).create("t", source="test")
@@ -522,7 +522,7 @@ def test_analysis_read_results_get_more_room(tmp_path):
             return self._inner.call(role, prompt, timeout_s)
 
     lead = ReadingLead()
-    svc = ConclaveService(data_dir=tmp_path / "data", panel=[])
+    svc = GangOf8Service(data_dir=tmp_path / "data", panel=[])
     svc.registry.register(lead)
     session = svc.run(f'examine and evaluate the project in "{est}"', source="test")
     assert session.status == SessionStatus.done
@@ -569,7 +569,7 @@ def test_substantial_done_synthesis_is_the_final_answer(tmp_path):
 
 
 def test_solo_synthesis_final_is_medium_confidence(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(SubstantialLead())
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -579,7 +579,7 @@ def test_solo_synthesis_final_is_medium_confidence(tmp_path):
 
 def test_thin_synthesis_still_composes_via_summarizer(tmp_path):
     # the default mock lead's short answer must NOT bypass the summarizer
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
     assert any(c.role == Role.summarizer for c in session.contributions)
@@ -590,7 +590,7 @@ def test_thin_synthesis_still_composes_via_summarizer(tmp_path):
 
 
 def test_settings_roster_filtered_to_registered_seats(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.settings.panel_seats = ["mock", "ghost"]
     assert svc._effective_panel() == ["mock"], "unregistered seats are dropped"
 
@@ -599,7 +599,7 @@ def test_cli_panel_degrades_without_openrouter_key(tmp_path, monkeypatch):
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda n: f"/bin/{n}" if n in ("claude", "codex") else None)
-    svc = ConclaveService(data_dir=tmp_path, backend="cli")
+    svc = GangOf8Service(data_dir=tmp_path, backend="cli")
     assert svc.panel == ["claude", "codex"], "installed CLIs only; no OpenRouter without a key"
 
 
@@ -607,7 +607,7 @@ def test_cli_panel_appends_enabled_keyed_openrouter_seats(tmp_path, monkeypatch)
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda n: f"/bin/{n}" if n in ("claude", "codex") else None)
-    svc = ConclaveService(data_dir=tmp_path, backend="cli")
+    svc = GangOf8Service(data_dir=tmp_path, backend="cli")
     svc.secrets.set("openrouter", "sk-test-key")
     svc.settings.openrouter_enabled = {"deepseek": True, "glm": False}
     svc._apply_settings(backend="cli")
@@ -636,7 +636,7 @@ def test_lead_recall_after_skill_results_keeps_the_lead_timeout(tmp_path):
             return self._inner.call(role, prompt, timeout_s)
 
     probe = TimeoutProbe()
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(probe)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -682,7 +682,7 @@ def test_delegated_result_block_survives_truncation(tmp_path):
             return self._inner.call(role, prompt, timeout_s)
 
     lead = ConsultingLead()
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -695,8 +695,8 @@ def test_delegated_result_block_survives_truncation(tmp_path):
 
 
 def test_delegation_shape_scales_with_complexity():
-    from conclave_os.config import budgets_for
-    from conclave_os.models import Complexity
+    from gangof8.config import budgets_for
+    from gangof8.models import Complexity
 
     assert budgets_for(Complexity.trivial).max_delegation_depth == 1
     assert budgets_for(Complexity.standard).max_delegation_depth == 2
@@ -714,7 +714,7 @@ def test_contributions_record_the_model_that_produced_them(tmp_path):
         def call(self, role, prompt, timeout_s, images=None):
             return AdapterResult(content="my take", model="alpha-9000", duration_ms=1)
 
-    svc = ConclaveService(data_dir=tmp_path, panel=["alpha"])
+    svc = GangOf8Service(data_dir=tmp_path, panel=["alpha"])
     svc.registry.register(NamedModelSeat())
     session = svc.run(TASK, source="test")
     panelist = next(c for c in session.contributions if c.role == Role.panelist)
@@ -728,7 +728,7 @@ def test_cli_model_pins_flow_from_settings_to_adapters(tmp_path, monkeypatch):
     import shutil
 
     monkeypatch.setattr(shutil, "which", lambda n: f"/bin/{n}")
-    svc = ConclaveService(data_dir=tmp_path, backend="cli")
+    svc = GangOf8Service(data_dir=tmp_path, backend="cli")
     svc.update_settings({"backend": "cli",
                          "cli_models": {"claude": "claude-opus-4-8", "gemini": "gemini-2.5-pro"}})
     assert svc.registry._adapters["claude"].model == "claude-opus-4-8"
@@ -780,8 +780,8 @@ def _catalog_service(tmp_path, monkeypatch, get=None):
         return _FakeResp(_PUBLIC_CATALOG)
 
     monkeypatch.setattr(httpx, "get", fake_get)
-    monkeypatch.setattr(ConclaveService, "_gemini_sdk_models", lambda self: [])
-    return ConclaveService(data_dir=tmp_path), calls
+    monkeypatch.setattr(GangOf8Service, "_gemini_sdk_models", lambda self: [])
+    return GangOf8Service(data_dir=tmp_path), calls
 
 
 def test_live_catalog_groups_by_vendor_newest_first(tmp_path, monkeypatch):
@@ -827,7 +827,7 @@ def test_web_disabled_never_fetches(tmp_path, monkeypatch):
         return _FakeResp(_PUBLIC_CATALOG)
 
     monkeypatch.setattr(httpx, "get", fake_get)  # WEB stays off via conftest
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     assert svc.cli_model_catalog() == config.CLI_MODEL_CATALOG
     assert calls["n"] == 0
 
@@ -849,9 +849,9 @@ def test_old_session_dict_without_new_fields_still_validates():
 def test_legacy_establish_target_input_still_answerable(tmp_path):
     """A session paused on the OLD up-front greenfield question (written to disk
     before the promote-time ask replaced it) must still resume."""
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     session = svc._open("build something new", "test", None)
-    from conclave_os.models import InputRequest
+    from gangof8.models import InputRequest
 
     session.classification = None  # pre-deliberation pause, as the old gate left it
     req = InputRequest(

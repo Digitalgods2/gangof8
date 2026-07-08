@@ -1,7 +1,7 @@
 """Action executor — the ONLY code that performs side effects for agents.
 
 Dispatch is registry-driven: `execute` looks up the handler for
-`action.kind` in conclave_os.skills.HANDLERS. Every approval-requiring call
+`action.kind` in gangof8.skills.HANDLERS. Every approval-requiring call
 must already carry an approved ApprovalRequest — the kernel enforces that;
 the skill handlers enforce their own sandboxes (the shared filename/sandbox
 helpers live here so skills.py can reuse them without a circular import).

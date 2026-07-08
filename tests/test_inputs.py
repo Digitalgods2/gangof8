@@ -9,10 +9,10 @@ import json
 
 import pytest
 
-from conclave_os.adapters.mock import FINAL_JSON, MockAdapter
-from conclave_os.models import Role, SessionStatus
-from conclave_os.registry import AdapterResult, AgentInputRequired
-from conclave_os.service import ConclaveService
+from gangof8.adapters.mock import FINAL_JSON, MockAdapter
+from gangof8.models import Role, SessionStatus
+from gangof8.registry import AdapterResult, AgentInputRequired
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -54,7 +54,7 @@ class PausingAdapter:
 
 @pytest.fixture()
 def service(tmp_path):
-    return ConclaveService(data_dir=tmp_path)
+    return GangOf8Service(data_dir=tmp_path)
 
 
 def _pause(service, role=Role.lead):
@@ -129,9 +129,9 @@ def test_answer_requires_text_and_valid_ids(service):
 
 def test_api_input_endpoint(tmp_path):
     from fastapi.testclient import TestClient
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(PausingAdapter(Role.lead))
     main_mod.service = service
     client = TestClient(main_mod.app)

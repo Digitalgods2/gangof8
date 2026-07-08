@@ -5,12 +5,12 @@ enable→register wiring that lets a role be assigned to an OpenRouter model.
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os.adapters import openrouter as orm
-from conclave_os.adapters.openrouter import OpenRouterAdapter
-from conclave_os.models import Role
-from conclave_os.registry import AgentError
-from conclave_os.secrets import SecretStore
-from conclave_os.service import ConclaveService
+from gangof8.adapters import openrouter as orm
+from gangof8.adapters.openrouter import OpenRouterAdapter
+from gangof8.models import Role
+from gangof8.registry import AgentError
+from gangof8.secrets import SecretStore
+from gangof8.service import GangOf8Service
 
 
 class _Resp:
@@ -92,8 +92,8 @@ def test_adapter_call_interrupted_by_cancel(monkeypatch):
     instead of blocking until the HTTP timeout."""
     import threading
 
-    from conclave_os import cancellation
-    from conclave_os.cancellation import SessionCancelled
+    from gangof8 import cancellation
+    from gangof8.cancellation import SessionCancelled
 
     sid = "s_or_cancel"
     entered = threading.Event()
@@ -167,8 +167,8 @@ def test_secret_env_overrides_stored(tmp_path, monkeypatch):
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from conclave_os import main as main_mod
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    from gangof8 import main as main_mod
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     return TestClient(main_mod.app)
 
 
@@ -187,7 +187,7 @@ def test_key_endpoints_never_leak_the_key(client):
 
 def test_enabling_seat_registers_openrouter_adapter(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.set_openrouter_key("sk-or-key")
     svc.update_settings({"backend": "cli", "openrouter_enabled": {"kimi": True}})
     assert "kimi" in svc.registry.names()
@@ -199,7 +199,7 @@ def test_enabling_seat_registers_openrouter_adapter(tmp_path, monkeypatch):
 
 def test_model_slug_override_is_used(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.set_openrouter_key("sk-or-key")
     svc.update_settings({
         "backend": "cli",
@@ -217,7 +217,7 @@ def test_model_slug_override_is_used(tmp_path, monkeypatch):
 
 def test_seat_unavailable_without_key(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"openrouter_enabled": {"deepseek": True}})
     seat = next(s for s in svc.seats()["seats"] if s["name"] == "deepseek")
     assert seat["enabled"] is True and seat["available"] is False  # enabled but no key
@@ -230,7 +230,7 @@ _CLI = {"claude", "codex", "gemini"}
 
 def test_disabling_cli_seat_falls_back_to_openrouter(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.set_openrouter_key("sk-or-key")
     svc.update_settings({"backend": "cli",
                          "openrouter_enabled": {"kimi": True, "qwen": True},
@@ -246,7 +246,7 @@ def test_disabling_cli_seat_falls_back_to_openrouter(tmp_path, monkeypatch):
 
 def test_disabling_all_clis_runs_openrouter_only(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.set_openrouter_key("sk-or-key")
     svc.update_settings({"backend": "cli",
                          "openrouter_enabled": {"deepseek": True, "glm": True},
@@ -258,7 +258,7 @@ def test_disabling_all_clis_runs_openrouter_only(tmp_path, monkeypatch):
 
 def test_disabling_cli_without_openrouter_is_noop(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     # nothing to fall back to → the disable is ignored so the lead still exists
     svc.update_settings({"backend": "cli", "cli_enabled": {"claude": False}})
     assert svc.role_agents[Role.lead] == "claude"
@@ -286,7 +286,7 @@ def test_put_settings_endpoint_persists_cli_enabled(client):
 
 def test_seats_reports_cli_enabled_flag(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"backend": "cli", "cli_enabled": {"codex": False}})
     cli = {s["name"]: s for s in svc.seats()["seats"] if s["kind"] == "cli"}
     assert cli["codex"]["enabled"] is False

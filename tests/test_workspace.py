@@ -12,16 +12,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os import executor
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.executor import ExecutionError, execute, resolve_in_workspace
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import ProposedAction, Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
-from conclave_os.sessions import SessionManager
-from conclave_os.workspaces import WorkspaceError, WorkspaceStore
+from gangof8 import executor
+from gangof8.adapters.mock import MockAdapter
+from gangof8.executor import ExecutionError, execute, resolve_in_workspace
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import ProposedAction, Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
+from gangof8.sessions import SessionManager
+from gangof8.workspaces import WorkspaceError, WorkspaceStore
 
 
 # ---- WorkspaceStore ----------------------------------------------------------
@@ -145,7 +145,7 @@ class WsArtifactAdapter:
 
 
 def test_session_binds_active_workspace_and_writes_free_into_sandbox(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     svc.registry.register(WsArtifactAdapter())
     proj = tmp_path / "proj"
     ws = svc.create_workspace("proj", str(proj))
@@ -169,9 +169,9 @@ def test_session_binds_active_workspace_and_writes_free_into_sandbox(tmp_path):
 
 @pytest.fixture()
 def client(tmp_path):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    main_mod.service = ConclaveService(data_dir=tmp_path / "data")
+    main_mod.service = GangOf8Service(data_dir=tmp_path / "data")
     return TestClient(main_mod.app)
 
 
@@ -185,7 +185,7 @@ def test_pick_folder_returns_selected_path(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     assert svc.pick_folder() == {"path": "C:\\Users\\me\\proj"}
 
 
@@ -199,7 +199,7 @@ def test_pick_folder_cancel_returns_none(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     assert svc.pick_folder() == {"path": None}
 
 
@@ -207,7 +207,7 @@ def test_list_dir_lists_subdirs_and_parent(tmp_path):
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
     (tmp_path / "f.txt").write_text("x", encoding="utf-8")  # files excluded
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     out = svc.list_dir(str(tmp_path))
     names = {Path(d).name for d in out["dirs"]}
     assert names == {"a", "b", "data"}  # only directories
@@ -215,7 +215,7 @@ def test_list_dir_lists_subdirs_and_parent(tmp_path):
 
 
 def test_list_dir_bad_path_errors_gracefully(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     out = svc.list_dir(str(tmp_path / "does_not_exist"))
     assert out["dirs"] == [] and "error" in out
 
@@ -228,7 +228,7 @@ def test_fs_list_endpoint(client, tmp_path):
 
 
 def test_fs_mkdir(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path / "data")
+    svc = GangOf8Service(data_dir=tmp_path / "data")
     out = svc.make_dir(str(tmp_path), "fresh")
     assert (tmp_path / "fresh").is_dir()
     assert any(Path(d).name == "fresh" for d in out["dirs"])

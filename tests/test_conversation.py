@@ -5,15 +5,15 @@ and it deliberates again with the full thread as context — no starting over.
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os import loop
-from conclave_os.logstore import LogStore
-from conclave_os.models import SessionStatus
-from conclave_os.sessions import SessionManager
-from conclave_os.service import ConclaveService
+from gangof8 import loop
+from gangof8.logstore import LogStore
+from gangof8.models import SessionStatus
+from gangof8.sessions import SessionManager
+from gangof8.service import GangOf8Service
 
 
 def test_first_run_records_one_conversation_turn(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     s = svc.run("Compare SQLite vs JSON for logs and recommend one", source="test")
     assert s.status == SessionStatus.done
     assert len(s.turns) == 2
@@ -22,7 +22,7 @@ def test_first_run_records_one_conversation_turn(tmp_path):
 
 
 def test_continue_grows_the_conversation(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     s = svc.run("Compare SQLite vs JSON for logs and recommend one", source="test")
     s2 = svc.continue_session(s.session_id, "I disagree — JSON is simpler for my case.", background=False)
     assert s2.status == SessionStatus.done
@@ -54,7 +54,7 @@ def test_continue_accepts_attachments_multimodal(tmp_path):
     session.attachments so vision-capable seats see them on later calls."""
     import base64
 
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     s = svc.run("What is SQLite?", source="test")
     doc = svc.save_upload("notes.txt", base64.b64encode(b"prefer WAL mode").decode())
     img = svc.save_upload("shot.png", base64.b64encode(b"\x89PNG\r\n\x1a\n0000").decode())
@@ -75,14 +75,14 @@ def test_continue_accepts_attachments_multimodal(tmp_path):
 
 
 def test_cannot_continue_unfinished_session(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     s = svc._open("x", "test", None)  # status received, not done
     with pytest.raises(ValueError):
         svc.continue_session(s.session_id, "hi")
 
 
 def test_continue_rejects_empty_text(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     s = svc.run("What is SQLite?", source="test")
     with pytest.raises(ValueError):
         svc.continue_session(s.session_id, "   ")
@@ -90,8 +90,8 @@ def test_continue_rejects_empty_text(tmp_path):
 
 @pytest.fixture()
 def client(tmp_path):
-    from conclave_os import main as main_mod
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    from gangof8 import main as main_mod
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     return TestClient(main_mod.app)
 
 

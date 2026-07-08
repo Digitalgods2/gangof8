@@ -6,11 +6,11 @@ import json
 
 import pytest
 
-from conclave_os import config
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.models import Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
+from gangof8 import config
+from gangof8.adapters.mock import MockAdapter
+from gangof8.models import Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
 
 # classified as code (filename artifact) → file contract + verification
 TASK = "Write check.py, a tiny script, and make sure it runs clean."
@@ -54,7 +54,7 @@ def _events(svc, session):
 
 def test_failing_tests_are_repaired_and_rerun(tmp_path):
     lead = FixingLead()
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -83,7 +83,7 @@ def test_unfixable_failure_gives_up_with_the_reason(tmp_path):
             return super().call(role, prompt, timeout_s, images)
 
     lead = GivingUpLead()
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done, "an honest failure still completes"
@@ -93,7 +93,7 @@ def test_unfixable_failure_gives_up_with_the_reason(tmp_path):
 
 def test_fix_attempts_are_bounded_and_reported(tmp_path):
     lead = FixingLead(keep_failing=True)
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -112,7 +112,7 @@ def test_passing_tests_never_enter_the_loop(tmp_path):
                     duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    svc = ConclaveService(data_dir=tmp_path, panel=[])
+    svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(PassingLead())
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done

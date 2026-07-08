@@ -2,9 +2,9 @@
 
 Each Skill lifts what used to be hardcoded write_file literals (category,
 risk, approval requirement, allowed roles) into metadata the permission
-kernel (conclave_os.governance.authorize_action) reads instead of branching
+kernel (gangof8.governance.authorize_action) reads instead of branching
 on action.kind. HANDLERS maps a skill name to the function that performs the
-effect, sharing the sandbox helpers in conclave_os.executor.
+effect, sharing the sandbox helpers in gangof8.executor.
 
 executor.py must NOT import this module at top level — execute() imports
 HANDLERS lazily to keep the dependency one-directional.
@@ -399,7 +399,7 @@ def _web_search(session: Session, action: ProposedAction, data_dir: Path) -> str
     from . import web
 
     if not config.WEB_ENABLED:
-        raise ExecutionError("web access is disabled (CONCLAVE_OS_WEB=0)")
+        raise ExecutionError("web access is disabled (GANGOF8_WEB=0)")
     query = _arg(action, "query").strip()
     if not query:
         raise ExecutionError("web_search requires a non-empty query")
@@ -414,7 +414,7 @@ def _web_fetch(session: Session, action: ProposedAction, data_dir: Path) -> str:
     from . import web
 
     if not config.WEB_ENABLED:
-        raise ExecutionError("web access is disabled (CONCLAVE_OS_WEB=0)")
+        raise ExecutionError("web access is disabled (GANGOF8_WEB=0)")
     url = _arg(action, "url").strip()
     if not url:
         raise ExecutionError("web_fetch requires a URL")

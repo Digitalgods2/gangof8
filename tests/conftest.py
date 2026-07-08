@@ -7,7 +7,7 @@ stay isolated and never share scratch state.
 
 import pytest
 
-from conclave_os import config
+from gangof8 import config
 
 
 @pytest.fixture(autouse=True)
