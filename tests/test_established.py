@@ -10,7 +10,7 @@ import pytest
 
 from conclave_os.classifier import classify
 from conclave_os.models import Role, SessionStatus, TaskType
-from conclave_os.paths import extract_established_root
+from conclave_os.paths import extract_delivery_target, extract_established_root
 from conclave_os.registry import AdapterResult
 from conclave_os.adapters.mock import MockAdapter
 from conclave_os.service import ConclaveService
@@ -108,6 +108,95 @@ def test_bare_root_alone_yields_no_established_folder(tmp_path):
     # only a bare root referenced ⇒ None (the greenfield gate asks where to save)
     root = tmp_path.anchor
     assert extract_established_root(f'just put it on "{root}"') is None
+
+
+# --- explicit delivery target (save-dest ≠ read-source) -----------------------
+
+
+def test_delivery_target_distinguishes_save_dest_from_read_source(tmp_path):
+    """THE Benny overwrite bug: the task read a source AND named a separate save
+    folder. The FIRST path (the read source) became the promote target and the
+    story overwrote the source's canon. The read source and the save target must
+    resolve independently."""
+    src_dir = tmp_path / "Benny"
+    src_dir.mkdir()
+    src_file = src_dir / "Benny's Splash.txt"
+    src_file.write_text("canon", encoding="utf-8")
+    out_dir = tmp_path / "out"  # save target — need not exist yet
+    text = (f"Read the first story at: {src_file}\n"
+            f"Write the sequel and save it as a .txt file in: {out_dir}")
+    assert extract_established_root(text) == str(src_dir.resolve()), "read source"
+    assert extract_delivery_target(text) == str(out_dir.resolve()), "save target"
+
+
+def test_delivery_target_none_without_explicit_save_dest(tmp_path):
+    d = tmp_path / "proj"
+    d.mkdir()
+    # 'add a feature to the app in <path>' names a LOCATION, not a save target
+    assert extract_delivery_target(f'add a feature to the app in "{d}"') is None
+    # a save verb with no destination path is not a delivery instruction
+    assert extract_delivery_target("write the story and save it to disk") is None
+    assert extract_delivery_target("summarize the notes") is None
+
+
+def test_promote_delivers_to_declared_target_not_source(tmp_path):
+    """With a delivery target set, promote lands THERE — and never writes into
+    the read-source folder (which keeps its original file byte-for-byte)."""
+    from conclave_os import executor
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import ProposedAction
+    from conclave_os.sessions import SessionManager
+    from conclave_os.skills import _promote
+
+    source = tmp_path / "Benny"
+    source.mkdir()
+    (source / "story.txt").write_text("ORIGINAL CANON — do not touch", encoding="utf-8")
+    dest = tmp_path / "out"  # explicit save target (does not exist yet)
+    store = LogStore(tmp_path / "data")
+    s = SessionManager(store).create("read + save", source="test")
+    s.established_root = str(source)
+    s.delivery_root = str(dest)
+    sandbox = executor.artifacts_dir(store.data_dir, s.session_id)
+    sandbox.mkdir(parents=True, exist_ok=True)
+    (sandbox / "story.txt").write_text("NEW STORY", encoding="utf-8")
+
+    action = ProposedAction(session_id=s.session_id, kind="promote",
+                            filename="story.txt", args={"filename": "story.txt"})
+    _promote(s, action, store.data_dir)
+
+    assert (dest / "story.txt").read_text(encoding="utf-8") == "NEW STORY"
+    assert (source / "story.txt").read_text(encoding="utf-8") == "ORIGINAL CANON — do not touch"
+
+
+def test_promote_approval_flags_overwrite_vs_new(tmp_path):
+    """The approval summary must say whether a promote OVERWRITES an existing file
+    — so a standing 'approve all promote' can't silently clobber canon."""
+    from conclave_os.governance import Governance
+    from conclave_os.logstore import LogStore
+    from conclave_os.models import ProposedAction
+    from conclave_os.sessions import SessionManager
+
+    dest = tmp_path / "out"
+    dest.mkdir()
+    store = LogStore(tmp_path / "data")
+    gov = Governance(store)
+    s = SessionManager(store).create("t", source="test")
+    s.delivery_root = str(dest)
+
+    def _promote_action():
+        return ProposedAction(session_id=s.session_id, kind="promote",
+                              role=Role.implementer, filename="story.txt",
+                              args={"filename": "story.txt"})
+
+    # new file → "(new file)"
+    new_ap = gov.authorize_action(s, _promote_action())
+    assert new_ap is not None and "new file" in new_ap.action
+    assert str(dest) in new_ap.action
+
+    # pre-existing file → "(OVERWRITES an existing file)"
+    (dest / "story.txt").write_text("existing canon", encoding="utf-8")
+    over_ap = gov.authorize_action(s, _promote_action())
+    assert over_ap is not None and "OVERWRITES" in over_ap.action
 
 
 # --- greenfield classification ------------------------------------------------
@@ -290,6 +379,71 @@ def test_established_overview_injected_into_prompts(tmp_path):
     assert "CoolApp" in p                                         # injected into the lead prompt
     # and the governance context forbids the "can't access" refusal
     assert "NEVER say you 'cannot access'" in p
+
+
+def test_named_txt_source_is_pre_read_regardless_of_extension(tmp_path):
+    """A writing task that names a .txt source ('read Benny's Splash.txt and match
+    its style') must get that file's REAL content up front. The code-extension
+    overview filter skipped prose sources, so seats invented the canon (they wrote
+    owner 'Emma'/'Sam' when the real owner was Grace). A produces_output task must
+    also NOT carry the analysis-only 'HOW TO RECOMMEND' directive."""
+    from conclave_os import loop
+    from conclave_os.classifier import classify
+    from conclave_os.logstore import LogStore
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "Benny"
+    est.mkdir()
+    (est / "Benny's Splash.txt").write_text(
+        "Benny loved three things: his yellow ball, his person named Grace, and naps.",
+        encoding="utf-8")
+    store = LogStore(tmp_path / "data")
+    task = ("Read Benny's Splash.txt and write the next story in the same style, "
+            "saving it as story.txt")
+    s = SessionManager(store).create(task, source="test")
+    s.established_root = str(est)
+    s.classification = classify(task)
+    assert s.classification.task_type == TaskType.content  # Fix A routed it to content
+
+    overview = loop._established_overview(s, store.data_dir)
+    assert "named Grace" in overview, "the named .txt source is read into the overview"
+    assert "the task named" in overview                    # labeled as source material
+    assert "HOW TO RECOMMEND" not in overview              # no analysis directive on a build
+
+
+def test_benny_scenario_wires_source_dest_and_classifies_content(tmp_path):
+    """The whole failing Benny task, end to end at the service wiring: read a .txt
+    source in one folder, save the new story in ANOTHER. All the fixes must
+    compose — content classification (not code), the source folder bound for
+    reads, a SEPARATE save target for delivery, and the named source pre-read
+    into the overview (so seats match the canon instead of inventing it)."""
+    from conclave_os import loop
+    from conclave_os.classifier import classify
+    from conclave_os.service import ConclaveService
+
+    src_dir = tmp_path / "Benny"
+    src_dir.mkdir()
+    src_file = src_dir / "Benny's Splash.txt"
+    src_file.write_text(
+        "Benny loved three things: his ball, his person named Grace, and naps.",
+        encoding="utf-8")
+    out_dir = tmp_path / "out"
+    task = (f"You are a children's book author. Read the first story at: {src_file}\n"
+            f"Write story #2 about Benny's first car ride and save it as a .txt "
+            f"file in: {out_dir}")
+
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    session = svc._open(task, source="test", budgets=None)
+    assert session.established_root == str(src_dir.resolve()), "read source bound"
+    assert session.delivery_root == str(out_dir.resolve()), "separate save target bound"
+
+    session.classification = classify(task)
+    assert session.classification.task_type == TaskType.content   # Fix A
+    assert session.classification.produces_output is True
+
+    overview = loop._established_overview(session, svc.store.data_dir)
+    assert "named Grace" in overview                              # Fix E: source pre-read
+    assert "HOW TO RECOMMEND" not in overview                     # Fix E: no analysis directive
 
 
 class _PromoteAdapter:

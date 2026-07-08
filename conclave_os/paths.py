@@ -52,6 +52,41 @@ def extract_established_root(text: str) -> Optional[str]:
     return None
 
 
+# An explicit OUTPUT-destination instruction: a save/write/output verb, then
+# (closely) a destination preposition, then a path. This is the DELIVERY target —
+# distinct from a READ source the task may ALSO name. "read from A, save to B"
+# must deliver to B and never overwrite the source A. The lookahead requires the
+# preposition to be followed by something that actually starts a path (quote,
+# drive, UNC, posix root, ~), so "save it to disk" / "write to the user" do NOT
+# match — only a real destination path does.
+_SAVE_VERB = (
+    r"(?:sav(?:e|ed|ing)|writ(?:e|ing|ten)|output|export(?:ed|ing)?|"
+    r"put|plac(?:e|ed|ing)|stor(?:e|ed|ing)|deliver(?:ed|ing)?|drop)"
+)
+_DELIVERY_RE = re.compile(
+    r"\b" + _SAVE_VERB + r"\b[^\n]{0,70}?\b(?:in|into|to|under|at|inside)\b\s*:?\s*"
+    r"(?=[\"'`/~]|[A-Za-z]:[\\/]|\\\\)",
+    re.IGNORECASE,
+)
+
+
+def extract_delivery_target(text: str) -> Optional[str]:
+    """The folder an explicit SAVE/OUTPUT instruction points at ("save it as a
+    .txt file in: C:\\...\\tmp", "write the report to <path>"), or None. Distinct
+    from extract_established_root, which returns the FIRST path in the task — often
+    a READ source ("read Benny's Splash.txt ..."). When a task both reads a source
+    and states where to save, this is the destination promote should use, so the
+    source folder is never silently overwritten."""
+    text = text or ""
+    for m in _DELIVERY_RE.finditer(text):
+        # resolve the path that begins right after the preposition (bounded window
+        # so we don't wander into a later sentence's path)
+        root = extract_established_root(text[m.end(): m.end() + 400])
+        if root:
+            return root
+    return None
+
+
 def _nonroot(p: Path) -> Optional[str]:
     """A resolved folder — unless it's a filesystem/drive root (C:\\, /, a bare
     UNC share). Those are far too broad to be an established folder and dangerous

@@ -88,9 +88,14 @@ seat is a **different origin model**. Here is what each is doing:
   (re-executed afterward; if a fix breaks the file, the original winner ships
   instead). If only one candidate runs, it wins without a vote; if none run,
   no winner is declared. The dashboard shows it: 🗳️ candidates, 💥 crashers
-  rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements resolve
-  automatically (seats calling it `index.html` vs `centipede.html` are grouped
-  by the most-agreed name).
+  rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements never cost a
+  candidate: when each seat wrote a single file — even under different names (a
+  task may invite an author-chosen title) — **all** of them are judged together
+  and the winner ships under its own name; only a genuine multi-file build
+  groups by the most-agreed name. Judging is scored purely on the content for a
+  prose deliverable — the "does it run / animate under play" weighting applies
+  only to candidates that actually carry headless-runtime evidence, never to a
+  `.txt` story.
 - **The lead** (yellow chip) is the **orchestrator** — it kicks the task off,
   feeds the jobs to the panel, and while they work can pull in talents
   (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
@@ -143,8 +148,12 @@ its work in the sandbox is treated as a design failure, so role-gating never
 blocks council work. The single approval in the whole pipeline — and the one
 place that stays role-gated (the lead decides delivery) — is **promote**:
 copying a finished file into your real folder, with a diff on the approval
-card. A promote with no known
-destination asks you *where* at delivery time — never up front, never assumed.
+card that says whether it **creates a new file or OVERWRITES an existing one**.
+It lands where the task said to save it — an explicit *"save it in ‹folder›"*
+target is honored as the destination even when the task *reads* from a different
+folder, so a "read from A, save to B" job delivers to B and never overwrites the
+source A. A promote with no known destination asks you *where* at delivery time
+— never up front, never assumed.
 On any approval you can pick **Approve all** to grant that category for the
 whole session — one deliberate decision instead of N identical clicks.
 
@@ -349,9 +358,11 @@ Three more nets around the ladder:
 - **Redelivery auto-promote** — a follow-up that revises an already-delivered
   file but omits its `PROMOTE:` line gets the promote synthesized
   automatically (behind the same approval gate), so "modify this" follow-ups
-  land in your folder instead of stranding the update in the sandbox. Only
-  files that already exist in the established folder qualify — a brand-new
-  sandbox file is never force-shipped.
+  land in your folder instead of stranding the update in the sandbox. Whenever a
+  destination is declared — a folder the task referenced, or an explicit *"save
+  it in ‹folder›"* target — every authored deliverable is proposed for promote,
+  brand-new files included, so the run never reports success while your named
+  folder stays empty. With no declared destination, nothing is force-shipped.
 - **Stub detection** — a synthesis that merely announces the work, is blocked
   tool-call debris, or ends on a dangling unresolved `SKILL:` request is never
   accepted as a round's result: the lead is re-called once demanding the

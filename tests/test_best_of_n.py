@@ -100,6 +100,33 @@ def test_dominant_base_group_prefers_established_revision_name(tmp_path, session
     assert {c["base"] for c in group} == {"index.html"}, "the revision target wins the group"
 
 
+def test_divergent_single_file_names_are_all_judged(session):
+    """Regression: seats that named their ONE candidate differently (the task
+    invited an author-chosen title) were fractured by filename and the minority
+    group was silently dropped — discarding 3 of 5 legitimate story candidates.
+    A single file per seat ⇒ every seat's take competes."""
+    _candidate(session, "aaa", "First Car Ride.txt", "story A" * 20)
+    _candidate(session, "bbb", "First Car Ride.txt", "story B" * 20)
+    _candidate(session, "ccc", "Big Ride.txt", "story C" * 20)
+    _candidate(session, "ddd", "Big Ride.txt", "story D" * 20)
+    _candidate(session, "eee", "Big Ride.txt", "story E" * 20)
+    judged, dropped = loop._candidate_pool(session, loop._collect_candidates(session))
+    assert dropped == []
+    assert len(judged) == 5
+
+
+def test_multi_file_project_falls_back_to_dominant_group(session):
+    """When a seat produced MULTIPLE files (a real multi-file build), filenames
+    are meaningful identities — keep the dominant-base group so we ship one
+    coherent deliverable, not a css judged against an html."""
+    _candidate(session, "aaa", "index.html", STRONG)
+    _candidate(session, "aaa", "styles.css", "body{color:red}")  # aaa = two files
+    _candidate(session, "bbb", "index.html", WEAK)
+    judged, dropped = loop._candidate_pool(session, loop._collect_candidates(session))
+    assert {c["base"] for c in judged} == {"index.html"}
+    assert {c["base"] for c in dropped} == {"styles.css"}
+
+
 # --- end to end ---------------------------------------------------------------
 
 
@@ -116,6 +143,22 @@ def _bon(session, judges, judge_reply, lead=None):
         return Contribution(round=0, role=member.role, agent=member.agent, content="")
 
     return council, call, lead_call
+
+
+def test_prose_judge_prompt_omits_runtime_framing(session):
+    """Fix B: prose candidates carry no runtime note, so the judge prompt must NOT
+    tell judges to weigh 'animate/respond under simulated play' or 'static screen
+    scores LOW' — the framing that made a judge invent an on-screen-rendering
+    defect for a .txt story. A runtime-bearing candidate still gets it."""
+    prose = [("Candidate 1", "Benny loved three things...", ""),
+             ("Candidate 2", "Benny sniffed the car...", "")]
+    p = rounds.score_candidates_prompt(session, prose)
+    assert "RUNTIME" not in p and "animate" not in p.lower()
+
+    runtime = [("Candidate 1", "<html>..", "runs and ANIMATES under play"),
+               ("Candidate 2", "<html>..", "throws on load")]
+    p2 = rounds.score_candidates_prompt(session, runtime)
+    assert "RUNTIME" in p2 and "throws on load" in p2
 
 
 def test_winner_is_highest_scored_and_ships(session, store):

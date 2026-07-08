@@ -24,6 +24,7 @@ from .executor import (
     WORKSPACE,
     ExecutionError,
     artifacts_dir,
+    resolve_in_workspace,
     resolve_space,
     space_root,
 )
@@ -298,17 +299,29 @@ def _promote_source(session: Session, data_dir: Path, raw_name: str) -> Optional
     return sb if sb.is_file() else None
 
 
+def _promote_dest(session: Session, data_dir: Path, raw_name: str) -> Path:
+    """Where `promote` LANDS. An explicit delivery target the task named ("save
+    it in <X>") WINS over the established source folder, so a "read from A, save
+    to B" task delivers to B and never overwrites the source A. Falls back to the
+    established folder (the historical in-place promote target)."""
+    if session.delivery_root:
+        root = Path(session.delivery_root)
+        root.mkdir(parents=True, exist_ok=True)
+        return resolve_in_workspace(root, raw_name)
+    return resolve_space(session, data_dir, ESTABLISHED, raw_name)
+
+
 def promote_diff(session: Session, data_dir: Path, raw_name: str) -> str:
-    """Unified diff of what `promote` would change in the established folder: the
-    existing established file (if any) → the council version. Shown in the
-    approval so the human sees exactly what lands in their real code."""
+    """Unified diff of what `promote` would change at the delivery target: the
+    existing file there (if any) → the council version. Shown in the approval so
+    the human sees exactly what lands in their real folder."""
     import difflib
 
     src = _promote_source(session, data_dir, raw_name)
     if src is not None and src.stat().st_size == 0:
         return f"REFUSING PROMOTE: council/{raw_name} is empty (0 bytes)"
     new = src.read_text(encoding="utf-8", errors="replace") if src else ""
-    dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
+    dst = _promote_dest(session, data_dir, raw_name)
     old = dst.read_text(encoding="utf-8", errors="replace") if dst.is_file() else ""
     label = "new file" if not old else "modified"
     diff = "".join(difflib.unified_diff(
@@ -327,7 +340,7 @@ def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
         raise ExecutionError(f"nothing to promote (not in workspace/sandbox): {raw_name!r}")
     if src.stat().st_size == 0:
         raise ExecutionError(f"refusing to promote empty artifact: {raw_name!r}")
-    dst = resolve_space(session, data_dir, ESTABLISHED, raw_name)
+    dst = _promote_dest(session, data_dir, raw_name)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
     return str(dst)

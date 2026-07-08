@@ -147,6 +147,42 @@ def test_chained_requests_resolve_across_recalls(tmp_path, store, governance, se
     assert len(executed) == 2
 
 
+def test_authored_candidate_survives_a_later_stub(tmp_path, store, governance, session):
+    """A seat that reads the source AND authors its candidate in one reply must
+    keep the candidate when the post-read re-call returns no file. Regression:
+    the re-call replaced the reply, discarding the ARTIFACT, so the seat was
+    dropped as a stub — the mechanism that lost two complete story drafts and
+    punished reading-before-writing."""
+    _seed(tmp_path, session, "src.txt", "canon: the owner is Grace")
+    member = _member(Role.researcher)
+    contribution = _contribution(
+        Role.researcher,
+        "SKILL: read_file src.txt\nARTIFACT: story.txt\nOnce upon a time Grace...\n")
+
+    def call(m, prompt):  # post-read reply re-asks (repeat) and carries NO file
+        return _contribution(m.role, "SKILL: read_file src.txt")
+
+    out = loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert "ARTIFACT: story.txt" in out.content, "authored candidate is preserved"
+    assert not loop.rounds.reply_is_stub(out.content, skills_resolved=True), \
+        "a reply that authored a file is not a stub"
+
+
+def test_refined_artifact_supersedes_the_earlier_one(tmp_path, store, governance, session):
+    """When a seat authors, reads, then RE-authors a better version, the latest
+    artifact-bearing reply wins (one candidate per seat = its final draft)."""
+    _seed(tmp_path, session, "src.txt", "canon")
+    member = _member(Role.researcher)
+    contribution = _contribution(
+        Role.researcher, "SKILL: read_file src.txt\nARTIFACT: story.txt\nDRAFT ONE\n")
+
+    def call(m, prompt):
+        return _contribution(m.role, "ARTIFACT: story.txt\nDRAFT TWO (revised)\n")
+
+    out = loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
+    assert "DRAFT TWO" in out.content and "DRAFT ONE" not in out.content
+
+
 def test_chain_is_bounded(tmp_path, store, governance, session):
     """A model that asks for a new file on every re-call stops after
     MAX_SKILL_CHAIN_TURNS re-calls; the dangling request is returned so the

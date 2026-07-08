@@ -7,6 +7,8 @@ the human. This module is the ONLY path to side effects.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .config import ALWAYS_ALLOWED_CAPABILITIES
 from .logstore import LogStore
 from .models import ApprovalRequest, ProposedAction, Risk, Session, utcnow
@@ -92,8 +94,21 @@ class Governance:
         details = None
         if skill.category == "promote":
             fname = action.args.get("filename") or action.filename
-            where = f"established folder {session.established_root}"
-            summary = f"promote: {fname} → {where}"
+            # Deliver to the explicit save target if the task named one, else the
+            # established folder. Flag OVERWRITE vs new so a standing "approve all
+            # promote" never silently clobbers a pre-existing file the human
+            # didn't realise was there.
+            dest = session.delivery_root or session.established_root
+            where = (f"folder {dest}" if session.delivery_root
+                     else f"established folder {dest}")
+            overwrite = False
+            try:
+                overwrite = bool(dest and fname
+                                 and (Path(dest) / Path(fname).name).is_file())
+            except OSError:
+                overwrite = False
+            summary = (f"promote: {fname} → {where}"
+                       + (" (OVERWRITES an existing file)" if overwrite else " (new file)"))
             try:
                 from .skills import promote_diff
                 details = promote_diff(session, self.store.data_dir, fname)

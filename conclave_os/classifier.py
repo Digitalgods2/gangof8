@@ -29,6 +29,13 @@ _FILE_ARTIFACT = re.compile(
     r"json|ya?ml|toml|ini|cfg|csv|html|css|scss|sh|bat|ps1|sql)\b",
     re.IGNORECASE,
 )
+# A PROSE-DOCUMENT artifact (story.txt, essay.md) — the container of a writing
+# deliverable, NOT a code signal. Used to keep "write the story, save it as
+# X.txt" a CONTENT task instead of letting the .txt route it to code (which
+# drops the prose into the game/runtime best-of-N judging path).
+_DOC_ARTIFACT = re.compile(
+    r"\b[\w\-]+\.(txt|md|markdown|rst|rtf|tex|docx?)\b", re.IGNORECASE
+)
 # Building something NEW (vs. examining/improving an existing folder). A
 # greenfield build needs a destination — the loop ASKS if none was referenced.
 GREENFIELD_WORDS = [
@@ -117,6 +124,19 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         task_type = TaskType.research
         notes.append("analysis/examination intent (no create/modify verb) — "
                      "treated as research; produces no files")
+
+    # Content override: a WRITING task ("write the story, save it as Benny's
+    # Ride.txt") is CONTENT even though the .txt artifact tripped the code rule
+    # above. The prose-document extension is the deliverable's container, not a
+    # code signal — so when a content verb is present and the ONLY code marker is
+    # a prose-document file (no real code word), route it to content. This keeps
+    # it out of the game/runtime judging framing while still producing the file
+    # (content is a produces_output type).
+    if (content and task_type == TaskType.code
+            and not _any(CODE_WORDS, lower)
+            and _DOC_ARTIFACT.search(text)):
+        task_type = TaskType.content
+        notes.append("writing task producing a prose document — treated as content")
 
     words = len(text.split())
     if words <= 8:
