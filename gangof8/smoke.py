@@ -252,7 +252,7 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple
             return True, False, "no <script> to execute", None
         src = "\n".join(scripts)
     harness = _HARNESS.replace("__SCRIPT__", src)
-    fd, tmp = tempfile.mkstemp(suffix=".js", prefix="conclave_smoke_")
+    fd, tmp = tempfile.mkstemp(suffix=".js", prefix="gangof8_smoke_")
     os.close(fd)
     try:
         Path(tmp).write_text(harness, encoding="utf-8")

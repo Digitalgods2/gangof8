@@ -1,11 +1,11 @@
-"""Direct local-CLI agent adapter — Conclave OS runs the agent CLIs itself.
+"""Direct local-CLI agent adapter — Gang of 8 runs the agent CLIs itself.
 
 Each call invokes the local CLI in plain non-interactive generation mode and
 returns its raw text output. That is what lets the implementer emit real file
-bodies instead of descriptions — Conclave OS is fully self-contained.
+bodies instead of descriptions — Gang of 8 is fully self-contained.
 
 Tools are disabled / read-only so the agent cannot perform side effects itself;
-every write stays governed by Conclave OS (executor + approval kernel). Print
+every write stays governed by Gang of 8 (executor + approval kernel). Print
 mode is one-shot, so there is no awaiting_user_input/resume path here.
 
 Supported agents: claude (fully exercised), codex, gemini.

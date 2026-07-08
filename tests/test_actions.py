@@ -13,15 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import executor
-from conclave_os.executor import ExecutionError
-from conclave_os.logstore import LogStore
-from conclave_os.loop import _collect_proposals
-from conclave_os.models import Contribution, Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.sessions import SessionManager
+from gangof8 import executor
+from gangof8.executor import ExecutionError
+from gangof8.logstore import LogStore
+from gangof8.loop import _collect_proposals
+from gangof8.models import Contribution, Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
+from gangof8.adapters.mock import MockAdapter
+from gangof8.sessions import SessionManager
 
 # 'write' + 'report' → content task → implementer active, no risk gate
 TASK = "Write a short report recommending SQLite or plain JSON for session logs."
@@ -50,7 +50,7 @@ class ArtifactAdapter:
 
 @pytest.fixture()
 def service(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(ArtifactAdapter())
     return svc
 
@@ -88,7 +88,7 @@ def test_artifact_writes_freely_into_sandbox(service, tmp_path):
 def test_unsafe_filenames_fail_without_writing(tmp_path):
     """An ESCAPING artifact filename is rejected by containment (charset checks
     are gone) — the action fails, nothing is written, the session still completes."""
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(ArtifactAdapter(draft="ARTIFACT: ..\\..\\evil.md\ncontent"))
     session = service.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -100,10 +100,10 @@ def test_unsafe_filenames_fail_without_writing(tmp_path):
 
 def test_escaping_path_raises_execution_error(tmp_path):
     """Direct executor check: escaping paths raise (no more silent flattening)."""
-    from conclave_os.executor import execute
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import ProposedAction
-    from conclave_os.sessions import SessionManager
+    from gangof8.executor import execute
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
 
     session = SessionManager(LogStore(tmp_path)).create(TASK, source="test")
     action = ProposedAction(
@@ -115,7 +115,7 @@ def test_escaping_path_raises_execution_error(tmp_path):
 
 
 def test_artifact_content_strips_code_fence(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(
         ArtifactAdapter(draft="ARTIFACT: app.py\n```python\nprint('x')\n```\n")
     )
@@ -148,7 +148,7 @@ def test_collects_multifile_artifacts_after_blank_lines(tmp_path):
 
 
 def test_draft_without_marker_proposes_nothing(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)  # plain MockAdapter draft has no marker
+    service = GangOf8Service(data_dir=tmp_path)  # plain MockAdapter draft has no marker
     session = service.run(TASK, source="test")
     assert session.status == SessionStatus.done
     assert session.proposed_actions == []
@@ -158,7 +158,7 @@ def test_draft_without_marker_proposes_nothing(tmp_path):
 # --- the approval gate now lives in PROMOTE (council → established folder) -----
 
 
-class _EstablishedService(ConclaveService):
+class _EstablishedService(GangOf8Service):
     """Test service that stamps an established folder onto every session, so the
     implementer's PROMOTE lines become approval-gated promote actions."""
 
@@ -237,7 +237,7 @@ def test_promote_denial_skips_but_completes_session(promote_service):
 def test_risky_task_has_no_pre_run_gate(tmp_path):
     """Risk classification is informational — a risky-sounding task with only
     sandbox output runs straight through with zero approvals."""
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     session = service.run("Delete all temp files in C:\\temp and email me the report", source="test")
     assert session.status == SessionStatus.done
     assert session.approvals == []
@@ -342,7 +342,7 @@ class MultiArtifactAdapter:
 
 @pytest.fixture()
 def multi_service(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(MultiArtifactAdapter())
     return svc
 
@@ -383,7 +383,7 @@ def test_code_task_with_no_artifact_fails_verification(tmp_path):
                 return AdapterResult(content="I would create an app here.", duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(NoArtifactAdapter())
 
     session = service.run("Create a simple app from scratch", source="test")

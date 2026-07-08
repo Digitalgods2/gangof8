@@ -213,7 +213,7 @@ class ProposedAction(BaseModel):
     """A concrete side effect an agent wants — never executed without an
     explicitly approved ApprovalRequest (unless the skill's metadata declares
     no approval needed). The `kind` names a skill in the registry-driven
-    permission kernel (conclave_os.skills); the kernel role-gates and gates on
+    permission kernel (gangof8.skills); the kernel role-gates and gates on
     that skill's metadata rather than on hardcoded write_file literals.
 
     `args` carries the skill inputs (preferred); `filename`/`content` remain for

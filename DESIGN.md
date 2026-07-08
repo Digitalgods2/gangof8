@@ -1,4 +1,4 @@
-# Conclave OS — Type 1: Coordinator OS
+# Gang of 8 — Type 1: Coordinator OS
 
 **Design document v0.1 — 2026-06-12** *(see "Current model" below for the
 2026-07-01 panel-round revision; sections further down describe the original
@@ -37,17 +37,17 @@ Deliberation is an automatic round loop built for **diversity of intelligence**:
 
 ## Agent backend (self-contained)
 
-**Conclave OS owns its agent backend.** It is fully self-contained — there is no
+**Gang of 8 owns its agent backend.** It is fully self-contained — there is no
 external service, no HTTP, no API-key proxy. Agent invocation lives behind a small
 adapter interface with two implementations:
 
 - **`mock`** — a deterministic offline adapter returning canned contributions; the
   default, used by the test suite. Zero cost, zero external dependencies.
-- **`cli`** — the real backend. Conclave OS runs the local `claude`, `codex`, and
+- **`cli`** — the real backend. Gang of 8 runs the local `claude`, `codex`, and
   `gemini` CLIs itself, in plain non-interactive generation mode (e.g.
   `claude -p --output-format json --tools ""`). Tools are disabled / read-only in
   those calls, so the agents perform no side effects of their own — every write
-  stays governed by Conclave OS. The CLIs manage their own authentication.
+  stays governed by Gang of 8. The CLIs manage their own authentication.
 
 Adding another backend later is just another adapter; the coordinator, governance,
 and logging are agnostic to which one is active.
@@ -290,7 +290,7 @@ def run_session(task_text, source):
   CLIs per role, in plain non-interactive generation mode with tools disabled. The
   adapter owns the CLI invocation, timeouts, and output parsing.
 - **Phase 2 — human authority surface.** Approval endpoints + a tiny CLI
-  (`conclave-os approve <id>`); pending approvals block the session. Rule-based
+  (`gangof8 approve <id>`); pending approvals block the session. Rule-based
   classifier flags any task mentioning files/exec/network/money as
   `human_approval_required`.
 - **Phase 3 — disagreement resolution + composer polish.** Critic pass, ruling
@@ -303,11 +303,11 @@ direct talk.
 ## 5. Files and folders
 
 ```
-Conclave OS/
+Gang of 8/
 ├── DESIGN.md                  # this document
 ├── README.md
 ├── pyproject.toml
-├── conclave_os/
+├── gangof8/
 │   ├── __init__.py
 │   ├── main.py                # FastAPI app + endpoints
 │   ├── config.py              # budgets, agent config, approval categories (YAML/env)
@@ -324,7 +324,7 @@ Conclave OS/
 │   ├── logstore.py            # SQLite + per-session JSONL trail
 │   └── composer.py            # Final Response Composer
 ├── cli.py                     # submit / status / approve / show-log
-├── data/                      # conclave_os.db + sessions/<id>.jsonl  (gitignored)
+├── data/                      # gangof8.db + sessions/<id>.jsonl  (gitignored)
 └── tests/
     ├── test_loop_mock.py      # full pipeline with MockAdapter
     ├── test_budgets.py        # loops always terminate

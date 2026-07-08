@@ -4,11 +4,11 @@ agent-call budget stays exact under that concurrency (no oversubscription)."""
 import threading
 import time
 
-from conclave_os import config, loop
-from conclave_os.logstore import LogStore
-from conclave_os.models import Complexity, Council, CouncilMember, Role
-from conclave_os.registry import AdapterResult, AgentRegistry
-from conclave_os.sessions import SessionManager
+from gangof8 import config, loop
+from gangof8.logstore import LogStore
+from gangof8.models import Complexity, Council, CouncilMember, Role
+from gangof8.registry import AdapterResult, AgentRegistry
+from gangof8.sessions import SessionManager
 
 
 class ConcurrencyProbe:

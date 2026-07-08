@@ -2,7 +2,7 @@
 
 Subprocess is stubbed so no real CLI runs: we verify claude JSON parsing, error
 handling, and that the `cli` backend wires CliAdapters into the registry. This
-is the path that lets Conclave OS generate real file content itself instead of
+is the path that lets Gang of 8 generate real file content itself instead of
 descriptions.
 """
 
@@ -11,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os.adapters import cli as cli_mod
-from conclave_os.adapters.cli import CliAdapter
-from conclave_os.models import Role
-from conclave_os.registry import AgentError
-from conclave_os.service import ConclaveService
+from gangof8.adapters import cli as cli_mod
+from gangof8.adapters.cli import CliAdapter
+from gangof8.models import Role
+from gangof8.registry import AgentError
+from gangof8.service import GangOf8Service
 
 
 def test_claude_model_id_normalizes_openrouter_dotted_slug():
@@ -162,7 +162,7 @@ def test_cli_subprocess_runs_from_a_neutral_cwd(stub_run):
     """The agent CLI must never inherit the server's cwd (the repo): a model
     with latent tool instincts would perceive — and could ungovernedly read —
     whatever folder the server runs in. It runs from an empty sandbox dir."""
-    from conclave_os import config
+    from gangof8 import config
 
     calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "ok"})))
     CliAdapter("claude").call(Role.lead, "hello", timeout_s=60)
@@ -327,8 +327,8 @@ def test_unknown_agent_raises():
 def test_killed_subprocess_surfaces_as_cancellation(stub_run):
     """When a cancel kills the CLI process, _exec raises SessionCancelled (not a
     generic AgentError), so the loop treats it as a cancel, not a seat failure."""
-    from conclave_os import cancellation
-    from conclave_os.cancellation import SessionCancelled
+    from gangof8 import cancellation
+    from gangof8.cancellation import SessionCancelled
 
     cancellation.set_current_session("s_test")
     cancellation.request("s_test")  # simulate the cancel having fired
@@ -343,7 +343,7 @@ def test_killed_subprocess_surfaces_as_cancellation(stub_run):
 
 
 def test_cli_backend_registers_cli_adapters(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path, backend="cli")
+    svc = GangOf8Service(data_dir=tmp_path, backend="cli")
     assert svc.backend == "cli"
     assert "claude" in svc.registry.names()
     # the registered adapter is a CliAdapter, not the mock one

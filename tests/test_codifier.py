@@ -6,8 +6,8 @@ codifier does stage 3 (select/review/fix the best-of-N winner, finish it).
 
 from types import SimpleNamespace
 
-from conclave_os import loop
-from conclave_os.models import Council, CouncilMember, Role
+from gangof8 import loop
+from gangof8.models import Council, CouncilMember, Role
 
 
 def _session(members):

@@ -8,27 +8,27 @@ from pathlib import Path
 
 from .models import Budgets, Complexity, Risk, Role
 
-DATA_DIR = Path(os.environ.get("CONCLAVE_OS_DATA", str(Path(__file__).resolve().parent.parent / "data")))
+DATA_DIR = Path(os.environ.get("GANGOF8_DATA", str(Path(__file__).resolve().parent.parent / "data")))
 
 
 def _default_sandbox_root() -> Path:
     """A NEUTRAL scratch location, deliberately OUTSIDE any project/source folder
     so the ephemeral sandbox can never sit inside (or corrupt) source material.
-    Windows → %LOCALAPPDATA%\\ConclaveOS\\sandbox; else a temp-dir subfolder.
-    Override with CONCLAVE_OS_SANDBOX."""
+    Windows → %LOCALAPPDATA%\\GangOf8\\sandbox; else a temp-dir subfolder.
+    Override with GANGOF8_SANDBOX."""
     base = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
-    root = Path(base) / "ConclaveOS" if base else Path(tempfile.gettempdir()) / "conclave_os"
+    root = Path(base) / "GangOf8" if base else Path(tempfile.gettempdir()) / "gangof8"
     return root / "sandbox"
 
 
 # The ephemeral per-session sandbox lives here — NEVER under DATA_DIR or any
 # project folder. Each session gets its own subdir (executor.artifacts_dir).
-SANDBOX_ROOT = Path(os.environ.get("CONCLAVE_OS_SANDBOX", str(_default_sandbox_root())))
+SANDBOX_ROOT = Path(os.environ.get("GANGOF8_SANDBOX", str(_default_sandbox_root())))
 # Sandbox folders are scratch, but pile up (one per session, forever). A sweep at
 # each session start keeps this many most-recent NON-active sandboxes (so recent
 # runs can still be opened/inspected) plus every still-active/paused one, and
 # deletes the rest.
-SANDBOX_KEEP = int(os.environ.get("CONCLAVE_OS_SANDBOX_KEEP", "25"))
+SANDBOX_KEEP = int(os.environ.get("GANGOF8_SANDBOX_KEEP", "25"))
 
 # A panel round costs len(panel)+1 calls (every seat + the lead synthesis), so
 # the call budgets carry real multi-round headroom. The terminators are
@@ -55,7 +55,7 @@ DELEGATION_RESULT_MAX_CHARS = 2500
 # This caps how many agent subprocesses run at once MACHINE-WIDE (the CLIs are
 # heavy local processes; unbounded fan-out would thrash the host). The budget lock
 # keeps max_agent_calls exact under this concurrency.
-MAX_PARALLEL_AGENTS = int(os.environ.get("CONCLAVE_OS_MAX_PARALLEL_AGENTS", "4"))
+MAX_PARALLEL_AGENTS = int(os.environ.get("GANGOF8_MAX_PARALLEL_AGENTS", "4"))
 # A large single-file artifact can exceed one model response. When a written file
 # looks cut off (e.g. HTML missing </html>), the lead is asked to CONTINUE it from
 # where it stopped — appending, never re-drafting. Bound how many continuations.
@@ -98,9 +98,9 @@ def budgets_for(complexity: Complexity) -> Budgets:
     return BUDGETS_BY_COMPLEXITY[complexity].model_copy()
 
 
-# Backend selection: "mock" (offline, default for tests) or "cli" (Conclave OS
+# Backend selection: "mock" (offline, default for tests) or "cli" (Gang of 8
 # runs the local claude/codex/gemini CLIs itself, in plain generation mode).
-BACKEND = os.environ.get("CONCLAVE_OS_BACKEND", "mock")
+BACKEND = os.environ.get("GANGOF8_BACKEND", "mock")
 
 ROLE_AGENTS_MOCK: dict[Role, str] = {
     Role.lead: "mock",
@@ -116,9 +116,9 @@ ROLE_AGENTS_MOCK: dict[Role, str] = {
     Role.summarizer: "mock",
 }
 
-# Direct local-CLI backend: Conclave OS invokes the agent CLIs itself in plain
+# Direct local-CLI backend: Gang of 8 invokes the agent CLIs itself in plain
 # generation mode (no plan-mode), so the implementer emits real file bodies.
-# Multi-model conclave via the local CLIs — gemini researches, codex critiques,
+# Multi-model gangof8 via the local CLIs — gemini researches, codex critiques,
 # claude designs/implements/summarizes. Remap any role in settings.
 ROLE_AGENTS_CLI: dict[Role, str] = {
     # The fixed lead drives every task and pulls in the talents below on demand.
@@ -147,7 +147,7 @@ ROLE_AGENTS_BY_BACKEND: dict[str, dict[Role, str]] = {
 # This static list is only the OFFLINE FALLBACK, plus the claude tier aliases
 # (sonnet/opus/haiku), which the CLI always resolves to its current best.
 MODEL_CATALOG_URL = os.environ.get(
-    "CONCLAVE_OS_MODEL_CATALOG_URL", "https://openrouter.ai/api/v1/models")
+    "GANGOF8_MODEL_CATALOG_URL", "https://openrouter.ai/api/v1/models")
 MODEL_CATALOG_TTL = 900      # seconds the fetched catalog is cached
 MODEL_CATALOG_TIMEOUT = 6    # seconds before the fetch gives up (fallback wins)
 CLI_MODEL_CATALOG: dict[str, list[str]] = {
@@ -162,8 +162,8 @@ CLI_MODEL_CATALOG: dict[str, list[str]] = {
 # OpenRouter council seats (pay-per-token API models, no CLI). Each is a friendly
 # seat name → OpenRouter model slug; opt-in per seat in Settings, needs an
 # OPENROUTER_API_KEY. Mixed freely with the local CLI agents in the role map.
-OPENROUTER_ENDPOINT = os.environ.get("CONCLAVE_OS_OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1")
-OPENROUTER_DATA_COLLECTION = os.environ.get("CONCLAVE_OS_OPENROUTER_DATA", "deny")  # deny | allow
+OPENROUTER_ENDPOINT = os.environ.get("GANGOF8_OPENROUTER_ENDPOINT", "https://openrouter.ai/api/v1")
+OPENROUTER_DATA_COLLECTION = os.environ.get("GANGOF8_OPENROUTER_DATA", "deny")  # deny | allow
 # Each seat is a generic VENDOR (label) + its OpenRouter namespace prefix
 # (vendor) + a default model_slug. The Settings UI offers that vendor's live
 # models (with capability badges) in a dropdown, plus a custom-slug field.
@@ -352,9 +352,9 @@ LIST_DIR_RESULT_MAX_CHARS = 4000  # cap the formatted listing fed back to the ag
 
 # Web access: the coordinator reaches the internet for the council (web_search /
 # web_fetch skills). Read-only, no side effects on the host. NOTE: queries/URLs
-# leave the machine. Disable by setting CONCLAVE_OS_WEB=0.
-WEB_ENABLED = os.environ.get("CONCLAVE_OS_WEB", "1") != "0"
-WEB_SEARCH_MODEL = os.environ.get("CONCLAVE_OS_WEB_MODEL", "gemini-2.5-flash")
+# leave the machine. Disable by setting GANGOF8_WEB=0.
+WEB_ENABLED = os.environ.get("GANGOF8_WEB", "1") != "0"
+WEB_SEARCH_MODEL = os.environ.get("GANGOF8_WEB_MODEL", "gemini-2.5-flash")
 WEB_SEARCH_MAX_CHARS = 4000     # cap a search result fed back to the agent
 WEB_FETCH_TIMEOUT = 20          # seconds
 WEB_FETCH_MAX_BYTES = 2_000_000  # cap the download

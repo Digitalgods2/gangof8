@@ -1,9 +1,9 @@
-# Conclave OS — Type 1: Coordinator OS
+# Gang of 8 — Type 1: Coordinator OS
 
 **One question. Every AI you have. One answer you can trust.**
 
 Ask a single AI something hard and you get one perspective — with that model's
-blind spots baked in. Conclave OS asks **all of them at once**: every AI on
+blind spots baked in. Gang of 8 asks **all of them at once**: every AI on
 your machine (the claude, codex, and gemini CLIs) plus any API seats you
 enable (DeepSeek, GLM, Qwen, Kimi) convenes as a *panel*, each writing its
 take **independently and in parallel** — nobody sees anyone else's answer
@@ -31,22 +31,22 @@ and the receipts of an audit trail — running entirely on your desk. See
 [How a deliberation works](#how-a-deliberation-works-the-panel-model) below;
 full design in [DESIGN.md](DESIGN.md).
 
-Conclave OS is **fully self-contained**: it runs the local agent CLIs itself.
+Gang of 8 is **fully self-contained**: it runs the local agent CLIs itself.
 Two backends sit behind one adapter interface — `mock` (offline, deterministic,
-default) and `cli` (the real backend: Conclave OS invokes the local `claude` /
+default) and `cli` (the real backend: Gang of 8 invokes the local `claude` /
 `codex` / `gemini` CLIs directly, in plain non-interactive generation mode,
 e.g. `claude -p --output-format json --tools ""`). Tools are disabled /
 read-only in those calls, so agents perform **no** side effects themselves —
-Conclave OS governance remains the only path to side effects.
+Gang of 8 governance remains the only path to side effects.
 
 ```powershell
 # real agents — nothing else to start; the CLIs manage their own auth
 .venv\Scripts\python cli.py serve --backend cli
 # or one-shot: .venv\Scripts\python cli.py submit "your task" --backend cli
-# or: $env:CONCLAVE_OS_BACKEND = "cli"
+# or: $env:GANGOF8_BACKEND = "cli"
 ```
 
-Default role mapping (edit `conclave_os/config.py` → `ROLE_AGENTS_CLI`):
+Default role mapping (edit `gangof8/config.py` → `ROLE_AGENTS_CLI`):
 lead→claude, researcher→gemini, critic→codex, summarizer→claude. Any role is
 remappable in settings. The **panel** roster is derived automatically: the
 installed CLI agents plus every OpenRouter seat you enable in Settings
@@ -177,7 +177,7 @@ python -m venv .venv
 The `cli` backend uses your locally-installed agent CLIs (`claude`, `codex`,
 `gemini` on PATH), each with its own auth — there is no external service.
 
-### How Conclave OS detects your CLIs
+### How Gang of 8 detects your CLIs
 
 There is no configuration file listing which AIs you have — detection is the
 same PATH lookup your terminal does when you type `claude` and press Enter:
@@ -192,7 +192,7 @@ mechanism drives three behaviors:
   seats join only when enabled *and* an API key is present).
 - **Windows gotcha, already handled**: npm installs `codex` and `gemini` as
   `.cmd`/`.ps1` shims, not `.exe` files, and spawning them by bare name fails
-  with `WinError 2`. Conclave OS resolves the shim's real path via
+  with `WinError 2`. Gang of 8 resolves the shim's real path via
   `shutil.which` before launching — if you ever add another npm-installed CLI,
   that's the pattern to copy.
 
@@ -203,7 +203,7 @@ Get-Command claude, codex, gemini -ErrorAction SilentlyContinue
 ```
 
 Each CLI manages its own login (`claude`, `codex`, and `gemini` all have their
-own auth flows) — Conclave OS never sees or stores those credentials. Which
+own auth flows) — Gang of 8 never sees or stores those credentials. Which
 underlying *model* each CLI runs is a separate question: pick it per seat in
 Settings → Local CLI models, or leave it empty to inherit that CLI's own
 default (every contribution displays the model that actually produced it).
@@ -249,7 +249,7 @@ no OpenRouter key ⇒ the panel is simply CLI-only.
 .venv\Scripts\python cli.py workspace none                         # back to the sandbox
 
 # API
-.venv\Scripts\uvicorn conclave_os.main:app --port 8790
+.venv\Scripts\uvicorn gangof8.main:app --port 8790
 # POST /tasks {"text": "...", "attachments": ["up_..."]} · GET /sessions · GET /sessions/{id}
 # POST /uploads {"name": "...", "content_base64": "..."}  → {id, kind, ...}
 # GET /approvals · POST /sessions/{id}/approvals/{aid} {"approved": true|false}
@@ -424,7 +424,7 @@ under `data/uploads/`):
   not post-gameplay logic bugs.
 - Full reasoning trail — every classification, council choice, round,
   panel contribution, synthesis decision, and approval is in
-  `data/sessions/<id>.jsonl`, with session state in `data/conclave_os.db`
+  `data/sessions/<id>.jsonl`, with session state in `data/gangof8.db`
   (`test_loop_mock.py`).
 
 ## Validated against real agents
@@ -471,7 +471,7 @@ files are produced via `ARTIFACT:` + approval.
   local CLIs and need no key.
 - Each agent call re-sends an attached image, so vision adds token cost per call.
 - A session paused mid-round for an agent question skips that round's step 8 on
-  resume (a deliberate simplification — actions are governed Conclave-OS-side).
+  resume (a deliberate simplification — actions are governed Gang of 8-side).
 
 ## Utilities
 
@@ -481,20 +481,20 @@ files are produced via `ARTIFACT:` + approval.
 ## Status
 
 - [x] Phase 0 — skeleton + MockAdapter
-- [x] Phase 1 — CliAdapter (Conclave OS drives the local claude/codex/gemini
+- [x] Phase 1 — CliAdapter (Gang of 8 drives the local claude/codex/gemini
       CLIs itself); agent failures degrade to a partial answer, never a crash.
       Live integration tests auto-skip when a CLI is not on PATH.
 - [x] Phase 2 — approval resolution (API + CLI) with session resume: approving
       the gate continues deliberation from where it paused (state reloaded
       from SQLite); denying cancels the session before any agent runs.
 - [x] Phase 3 — agent-question passthrough: when an agent asks a clarifying
-      question it becomes a Conclave OS input request (`awaiting_input` status);
+      question it becomes a Gang of 8 input request (`awaiting_input` status);
       the human's answer resumes the session and deliberation continues. Plus
       richer disagreement detection (bullets, any case, multi-line claims, PASS,
       claim-role attribution) and composer polish (one strict retry on
       unparseable JSON, graceful fallbacks). Known simplification: step 8 of a
       round paused mid-call is skipped on resume — actions are governed only on
-      the Conclave OS side.
+      the Gang of 8 side.
 - [x] Phase 4 — governed tool execution: the implementer can head its draft
       with `ARTIFACT: <filename>` to propose saving it as a file. The proposal
       becomes a `file_write` approval; only an explicit human approval executes

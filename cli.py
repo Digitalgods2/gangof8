@@ -1,4 +1,4 @@
-"""Conclave OS CLI.
+"""Gang of 8 CLI.
 
   python cli.py submit "your task text"
   python cli.py list
@@ -12,11 +12,11 @@ import argparse
 import json
 import sys
 
-from conclave_os.service import ConclaveService
+from gangof8.service import GangOf8Service
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="conclave-os")
+    parser = argparse.ArgumentParser(prog="gangof8")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_submit = sub.add_parser("submit", help="submit a task and run it")
@@ -24,12 +24,12 @@ def main(argv: list[str] | None = None) -> int:
     p_submit.add_argument("--source", default="cli")
     p_submit.add_argument(
         "--backend", default=None, choices=["mock", "cli"],
-        help="agent backend (default: CONCLAVE_OS_BACKEND env or mock)",
+        help="agent backend (default: GANGOF8_BACKEND env or mock)",
     )
 
     sub.add_parser("list", help="list sessions")
 
-    p_serve = sub.add_parser("serve", help="run the Conclave OS service + web dashboard")
+    p_serve = sub.add_parser("serve", help="run the Gang of 8 service + web dashboard")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8790)
     p_serve.add_argument("--backend", default=None, choices=["mock", "cli"])
@@ -87,12 +87,12 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         if args.backend:
-            os.environ["CONCLAVE_OS_BACKEND"] = args.backend
-        print(f"Conclave OS dashboard: http://{args.host}:{args.port}/")
-        uvicorn.run("conclave_os.main:app", host=args.host, port=args.port)
+            os.environ["GANGOF8_BACKEND"] = args.backend
+        print(f"Gang of 8 dashboard: http://{args.host}:{args.port}/")
+        uvicorn.run("gangof8.main:app", host=args.host, port=args.port)
         return 0
 
-    service = ConclaveService(backend=getattr(args, "backend", None))
+    service = GangOf8Service(backend=getattr(args, "backend", None))
 
     if args.command == "submit":
         session = service.run(args.text, source=args.source)

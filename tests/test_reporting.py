@@ -1,8 +1,8 @@
 """Council-health summary (#5) and the run timeline (#3)."""
 
-from conclave_os.models import SessionStatus
-from conclave_os.reporting import council_health, format_timeline
-from conclave_os.service import ConclaveService
+from gangof8.models import SessionStatus
+from gangof8.reporting import council_health, format_timeline
+from gangof8.service import GangOf8Service
 
 
 # --- council health -----------------------------------------------------------
@@ -56,7 +56,7 @@ def test_unknown_event_gets_a_friendly_label():
 
 
 def test_timeline_endpoint_data_from_a_real_run(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     session = svc.run("What is SQLite?", source="test")
     assert session.status == SessionStatus.done
     tl = svc.timeline(session.session_id)

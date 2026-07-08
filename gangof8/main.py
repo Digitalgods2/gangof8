@@ -1,6 +1,6 @@
 """FastAPI surface for the Coordinator OS.
 
-Run with:  python cli.py serve   (or: uvicorn conclave_os.main:app --port 8790)
+Run with:  python cli.py serve   (or: uvicorn gangof8.main:app --port 8790)
 Dashboard: http://127.0.0.1:8790/
 """
 
@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import __version__, config, reporting
 from .models import Role
-from .service import ConclaveService
+from .service import GangOf8Service
 
 # The trinity of local CLI seats whose call timeout is user-tunable in Settings.
 _CLI_TIMEOUT_SEATS = ("gemini", "claude", "codex")
@@ -27,10 +27,10 @@ def _cli_timeout_defaults() -> dict[str, int]:
     """Built-in per-seat timeout (seconds) — what a seat uses when unset."""
     return {s: config.agent_timeout(s) for s in _CLI_TIMEOUT_SEATS}
 
-app = FastAPI(title="Conclave OS — Coordinator", version=__version__)
+app = FastAPI(title="Gang of 8 — Coordinator", version=__version__)
 # env read here (not from config.BACKEND) so `cli.py serve --backend X` can
 # set it just before uvicorn imports this module
-service = ConclaveService(backend=os.environ.get("CONCLAVE_OS_BACKEND"))
+service = GangOf8Service(backend=os.environ.get("GANGOF8_BACKEND"))
 
 _STATIC = Path(__file__).parent / "static"
 

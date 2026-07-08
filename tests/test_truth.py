@@ -1,5 +1,5 @@
-from conclave_os.models import Contribution, Role, Session, Task
-from conclave_os.truth import build_truth_ledger, ledger_prompt
+from gangof8.models import Contribution, Role, Session, Task
+from gangof8.truth import build_truth_ledger, ledger_prompt
 
 
 def _session() -> Session:

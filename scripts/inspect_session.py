@@ -4,9 +4,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from conclave_os.service import ConclaveService
+from gangof8.service import GangOf8Service
 
-s = ConclaveService().get(sys.argv[1])
+s = GangOf8Service().get(sys.argv[1])
 print("agent_calls:", s["agent_calls"], " rounds:", len(s["rounds"]))
 print("--- contributions ---")
 for c in s["contributions"]:

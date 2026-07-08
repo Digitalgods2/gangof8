@@ -4,7 +4,7 @@ OpenRouter is an OpenAI-compatible gateway to many providers (DeepSeek, GLM,
 Qwen, Kimi, …). Each seat is registered under a friendly name (e.g. "deepseek")
 and can be assigned to any role, alongside the local CLI agents.
 
-Pure inference (no tools), like every Conclave OS agent — the council reasons,
+Pure inference (no tools), like every Gang of 8 agent — the council reasons,
 the coordinator governs side effects. Privacy: `provider.data_collection: deny`
 by default so OpenRouter won't route through providers that retain/train on the
 prompt. The API key is resolved lazily via the injected getter (env or the
@@ -23,8 +23,8 @@ from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentError
 
-_APP_TITLE = "Conclave OS"
-_REFERER = "https://github.com/Digitalgods2/conclave-os"
+_APP_TITLE = "Gang of 8"
+_REFERER = "https://github.com/Digitalgods2/gangof8"
 
 
 class OpenRouterAdapter:

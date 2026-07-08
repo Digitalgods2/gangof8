@@ -2,11 +2,11 @@
 CLI times out authoring a big single-file game), recover the complete file a
 panelist pasted inline instead of shipping nothing."""
 
-from conclave_os import loop
-from conclave_os.logstore import LogStore
-from conclave_os.models import Contribution, Role, Session, SessionStatus, Task
-from conclave_os.registry import AdapterResult, AgentError
-from conclave_os.service import ConclaveService
+from gangof8 import loop
+from gangof8.logstore import LogStore
+from gangof8.models import Contribution, Role, Session, SessionStatus, Task
+from gangof8.registry import AdapterResult, AgentError
+from gangof8.service import GangOf8Service
 
 
 def _session(task_text: str) -> Session:
@@ -121,7 +121,7 @@ def test_run_salvages_a_delivered_file_when_lead_fails(tmp_path):
                         + "\n```\nSave as game.html and open it.",
                 duration_ms=1)
 
-    class _Svc(ConclaveService):
+    class _Svc(GangOf8Service):
         def _open(self, *a, **k):
             sess = super()._open(*a, **k)
             sess.established_root = str(est)

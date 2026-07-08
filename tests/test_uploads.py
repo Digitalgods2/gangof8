@@ -11,8 +11,8 @@ import base64
 import pytest
 from fastapi.testclient import TestClient
 
-from conclave_os.service import ConclaveService
-from conclave_os.uploads import UploadError, UploadStore, attachment_context, image_inputs
+from gangof8.service import GangOf8Service
+from gangof8.uploads import UploadError, UploadStore, attachment_context, image_inputs
 
 
 def _b64(s: str) -> str:
@@ -86,7 +86,7 @@ def test_image_inputs_resolves_supported_images(tmp_path):
 
 
 def test_run_folds_attachment_text_into_task(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     rec = svc.save_upload("spec.txt", _b64("REQUIREMENT: be fast"))
     session = svc.run("Summarize the attached spec", source="test", attachments=[rec["id"]])
     assert "REQUIREMENT: be fast" in session.task.text
@@ -94,9 +94,9 @@ def test_run_folds_attachment_text_into_task(tmp_path):
 
 
 def test_upload_and_task_endpoints(tmp_path):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     client = TestClient(main_mod.app)
     up = client.post("/uploads", json={"name": "ctx.md", "content_base64": _b64("context here")})
     assert up.status_code == 200
@@ -107,9 +107,9 @@ def test_upload_and_task_endpoints(tmp_path):
 
 
 def test_upload_endpoint_rejects_bad_base64(tmp_path):
-    from conclave_os import main as main_mod
+    from gangof8 import main as main_mod
 
-    main_mod.service = ConclaveService(data_dir=tmp_path)
+    main_mod.service = GangOf8Service(data_dir=tmp_path)
     client = TestClient(main_mod.app)
     r = client.post("/uploads", json={"name": "x.txt", "content_base64": "@@@"})
     assert r.status_code == 422

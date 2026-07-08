@@ -11,11 +11,11 @@ import re
 
 import pytest
 
-from conclave_os import executor, loop
-from conclave_os.adapters.mock import MockAdapter
-from conclave_os.models import Role, SessionStatus
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
+from gangof8 import executor, loop
+from gangof8.adapters.mock import MockAdapter
+from gangof8.models import Role, SessionStatus
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
 
 # real-agent-style: the draft only NAMES the files; bodies arrive one at a time.
 DRAFT_DESCRIPTION = (
@@ -49,7 +49,7 @@ class MaterializeAdapter:
 
 @pytest.fixture()
 def service(tmp_path):
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(MaterializeAdapter())
     return svc
 
@@ -64,8 +64,8 @@ def test_strip_code_fence():
 
 
 def test_intended_filenames_from_task(tmp_path):
-    from conclave_os.logstore import LogStore
-    from conclave_os.sessions import SessionManager
+    from gangof8.logstore import LogStore
+    from gangof8.sessions import SessionManager
 
     session = SessionManager(LogStore(tmp_path)).create(
         "Build an app with main.py, README.md, and requirements.txt", source="test"
@@ -79,9 +79,9 @@ def test_intended_filenames_falls_back_to_established_revision_target(tmp_path):
     flubbed lead draft may name none either — the established file the panel
     discussed by name (two+ mentions) is the intended target; a one-off
     mention of an unrelated established file is not."""
-    from conclave_os.logstore import LogStore
-    from conclave_os.models import Contribution
-    from conclave_os.sessions import SessionManager
+    from gangof8.logstore import LogStore
+    from gangof8.models import Contribution
+    from gangof8.sessions import SessionManager
 
     est = tmp_path / "est"
     est.mkdir()
@@ -151,7 +151,7 @@ def test_no_materialization_when_artifacts_emitted(tmp_path):
                 return AdapterResult(content="acceptable", duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(DirectAdapter())
     session = service.run("Produce an app: only.py", source="test")
     assert {a.filename for a in session.proposed_actions} == {"only.py"}

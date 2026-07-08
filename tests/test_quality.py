@@ -2,15 +2,15 @@
 
 import pytest
 
-from conclave_os.adapters.mock import FINAL_JSON, MockAdapter
-from conclave_os.models import (
+from gangof8.adapters.mock import FINAL_JSON, MockAdapter
+from gangof8.models import (
     Role,
     Session,
     SessionStatus,
     Task,
 )
-from conclave_os.registry import AdapterResult
-from conclave_os.service import ConclaveService
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -21,8 +21,8 @@ TASK = (
 def test_compose_prompt_includes_authoritative_action_outcomes():
     """The summarizer must see what the coordinator actually did, so it reports
     an applied edit as done (not 'couldn't confirm')."""
-    from conclave_os.composer import compose_prompt
-    from conclave_os.models import ProposedAction
+    from gangof8.composer import compose_prompt
+    from gangof8.models import ProposedAction
 
     session = Session(session_id="s_x", task=Task(task_id="t", session_id="s_x", text="edit it"))
     session.proposed_actions.append(ProposedAction(
@@ -39,8 +39,8 @@ def test_compose_prompt_includes_authoritative_action_outcomes():
 def test_compose_prompt_omits_ledger_and_rulings_ceremony():
     """The verdict/ruling/ledger ceremony is gone from composition — the prompt
     stays lean even when legacy sessions still carry truth claims."""
-    from conclave_os.composer import compose_prompt
-    from conclave_os.models import TruthClaim
+    from gangof8.composer import compose_prompt
+    from gangof8.models import TruthClaim
 
     session = Session(session_id="s_x", task=Task(task_id="t", session_id="s_x", text="research it"))
     session.truth_claims.append(TruthClaim(
@@ -75,7 +75,7 @@ class FlakyComposer:
 
 
 def test_composer_retries_once_on_unparseable_output(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(FlakyComposer(garbage_calls=1))
     session = service.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -83,7 +83,7 @@ def test_composer_retries_once_on_unparseable_output(tmp_path):
 
 
 def test_composer_falls_back_after_two_failures(tmp_path):
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(FlakyComposer(garbage_calls=2))
     session = service.run(TASK, source="test")
     assert session.status == SessionStatus.done
@@ -94,7 +94,7 @@ def test_composer_falls_back_after_two_failures(tmp_path):
 def test_composer_recomposes_with_a_working_agent_when_summarizer_errors(tmp_path):
     """A flaky summarizer (e.g. gemini timeout) must NOT collapse the answer to a
     partial — recompose with an agent that already worked this run."""
-    from conclave_os.registry import AgentError
+    from gangof8.registry import AgentError
 
     class GoodAgent:
         name = "good"
@@ -111,7 +111,7 @@ def test_composer_recomposes_with_a_working_agent_when_summarizer_errors(tmp_pat
         def call(self, role, prompt, timeout_s):
             raise AgentError("flaky CLI timed out after 150s")
 
-    svc = ConclaveService(data_dir=tmp_path)
+    svc = GangOf8Service(data_dir=tmp_path)
     svc.registry.register(GoodAgent())
     svc.registry.register(FlakyAgent())
     # the lead runs on 'good'; only the summarizer is the flaky agent
@@ -146,7 +146,7 @@ def test_substantial_prose_is_accepted_at_medium_confidence(tmp_path):
                 return AdapterResult(content=PROSE, duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(ProseComposer(garbage_calls=0))
     session = service.run(TASK, source="test")
     assert session.final.answer == PROSE, "prose must be accepted whole, not truncated as 'Partial result'"
@@ -172,7 +172,7 @@ def test_labeled_sections_are_parsed(tmp_path):
                 return AdapterResult(content=LABELED, duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(LabeledComposer(garbage_calls=0))
     session = service.run(TASK, source="test")
     final = session.final
@@ -191,7 +191,7 @@ def test_fenced_json_is_parsed(tmp_path):
                 return AdapterResult(content=f"```json\n{FINAL_JSON}\n```", duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 
-    service = ConclaveService(data_dir=tmp_path)
+    service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(FencedComposer(garbage_calls=0))
     session = service.run(TASK, source="test")
     assert session.final.confidence == "high"

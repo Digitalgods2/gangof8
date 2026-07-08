@@ -11,13 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from conclave_os import executor
-from conclave_os.executor import ExecutionError, execute
-from conclave_os.governance import Governance
-from conclave_os.logstore import LogStore
-from conclave_os.models import ProposedAction, Risk, Role, Session
-from conclave_os.sessions import SessionManager
-from conclave_os.skills import HANDLERS, SKILLS, Skill, get_skill
+from gangof8 import executor
+from gangof8.executor import ExecutionError, execute
+from gangof8.governance import Governance
+from gangof8.logstore import LogStore
+from gangof8.models import ProposedAction, Risk, Role, Session
+from gangof8.sessions import SessionManager
+from gangof8.skills import HANDLERS, SKILLS, Skill, get_skill
 
 
 @pytest.fixture()

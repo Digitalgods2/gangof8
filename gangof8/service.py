@@ -3,7 +3,7 @@ governance, used by both the FastAPI app and the CLI.
 
 Backends:
   mock — deterministic offline adapter (default; tests, Phase 0)
-  cli  — Conclave OS runs the local claude/codex/gemini CLIs itself, in plain
+  cli  — Gang of 8 runs the local claude/codex/gemini CLIs itself, in plain
          generation mode → real file content; fully self-contained
 """
 
@@ -100,7 +100,7 @@ def _strip_fence(s: str) -> str:
     return s.strip()
 
 
-class ConclaveService:
+class GangOf8Service:
     def __init__(
         self,
         data_dir: Optional[Path] = None,
@@ -125,7 +125,7 @@ class ConclaveService:
         self.secrets = SecretStore(self._data_dir)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="conclave-os")
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gangof8")
         self._model_catalog_cache: Optional[tuple[float, dict]] = None
         self._or_catalog_cache: Optional[tuple[float, dict]] = None
         self._apply_settings(backend=backend)
@@ -583,7 +583,7 @@ public static class Fg {
 "@
 [Fg]::StartForcer()
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
-$d.Description = 'Select a workspace folder for Conclave OS'
+$d.Description = 'Select a workspace folder for Gang of 8'
 $d.ShowNewFolderButton = $true
 $r = $d.ShowDialog()
 if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }

@@ -65,7 +65,7 @@ def web_fetch(url: str) -> str:
     """Fetch a public http(s) URL and return its readable text (bounded)."""
     _guard_url(url)
     req = urllib.request.Request(
-        url, headers={"User-Agent": "ConclaveOS/1.0 (council web_fetch)"})
+        url, headers={"User-Agent": "GangOf8/1.0 (council web_fetch)"})
     try:
         with urllib.request.urlopen(req, timeout=config.WEB_FETCH_TIMEOUT) as resp:
             ctype = (resp.headers.get("Content-Type") or "").lower()
