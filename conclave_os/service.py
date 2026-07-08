@@ -31,7 +31,7 @@ from .loop import (
     run_session,
 )
 from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
-from .paths import extract_delivery_target, extract_established_root
+from .paths import extract_delivery_target, extract_established_root, prior_deliverable_files
 from .registry import AgentError
 from .registry import AgentRegistry
 from .sessions import SessionManager
@@ -410,6 +410,14 @@ class ConclaveService:
         # the task also names) — promote delivers HERE, so "read from A, save to
         # B" lands in B and never overwrites A.
         session.delivery_root = extract_delivery_target(text or "")
+        # If the SOURCE folder already holds a file matching this task's deliverable
+        # by title, it is a prior/existing version (not an authorized input) — seats
+        # can read it and a shipped copy would go unnoticed. Surface it up front.
+        for name in prior_deliverable_files(session.established_root, session.task.text or ""):
+            session.unresolved.append(
+                f"source folder already contains '{name}', matching this task's "
+                "deliverable by title — a PRIOR/existing version, not an authorized "
+                "input; verify the shipped file is freshly authored, not a copy")
         for uid in attachments or []:
             rec = self.uploads.get(uid)
             if rec:

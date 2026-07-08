@@ -220,6 +220,55 @@ def _read_established(session: Session, data_dir, name: str) -> str:
         return ""
 
 
+_SOURCE_DIGEST_MAX_CHARS = 8000
+
+
+def _task_named_paths(session: Session) -> list[Path]:
+    """Established files whose NAME appears in the task text — the source(s) the
+    task explicitly told the council to read ("read Benny's Splash.txt and match
+    its style"). A file's STEM alone is deliberately NOT enough: a task names its
+    *deliverable* by title without an extension ("Benny's First Car Ride"), and a
+    prior copy of that sitting in the source folder is NOT authorized source — the
+    name-with-extension test keeps the real source in and the prior answer out."""
+    if not session.established_root:
+        return []
+    root = Path(session.established_root)
+    if not root.is_dir():
+        return []
+    task_text = session.task.text or ""
+    out: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root)
+        if any(part in _OVERVIEW_SKIP_DIRS for part in rel.parts):
+            continue
+        if p.is_file() and p.name and p.name in task_text:
+            out.append(p)
+    return out
+
+
+def _source_digest(session: Session) -> str:
+    """A compact 'here is the source the output must match' block for the blind
+    judges / chair / finisher — who otherwise never see it. The panel AUTHORS get
+    the source in the round-0 overview, but scoring/chair/finish run with only the
+    candidate bodies, so 'matched-set' fidelity was literally unjudgeable (a
+    plain-prose candidate that dropped the source's whole illustrated-spread format
+    won a 'match the first book exactly' task). Empty when no source was named."""
+    named = _task_named_paths(session)
+    if not named:
+        return ""
+    root = Path(session.established_root)
+    parts: list[str] = []
+    for p in named[:2]:
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if body.strip():
+            parts.append(f"----- SOURCE: {p.relative_to(root).as_posix()} -----\n"
+                         f"{body[:_SOURCE_DIGEST_MAX_CHARS]}")
+    return "\n\n".join(parts)
+
+
 def _established_overview(session: Session, data_dir) -> str:
     """Proactively read the established folder so EVERY agent starts with concrete
     content — NOT just the README/manifests (which yield generic advice) but the
@@ -261,14 +310,7 @@ def _established_overview(session: Session, data_dir) -> str:
     # seats invented the canon (the owner's name, the voice) instead of matching
     # it. Any established file whose name appears in the task text is source
     # material and is read here, prose or code, near the front of the overview.
-    task_text = session.task.text or ""
-    named: list[Path] = []
-    for p in sorted(root.rglob("*")):
-        rel = p.relative_to(root)
-        if any(part in _OVERVIEW_SKIP_DIRS for part in rel.parts):
-            continue
-        if p.is_file() and p.name and p.name in task_text:
-            named.append(p)
+    named = _task_named_paths(session)
     for p in named[:3]:
         try:
             body = p.read_text(encoding="utf-8", errors="replace")
@@ -1862,16 +1904,18 @@ def _candidate_pool(session: Session, candidates: list[dict]) -> tuple[list[dict
 
 
 def _score_candidates(session: Session, judges: list[CouncilMember], group: list[dict],
-                      call: AgentCall, store: LogStore):
+                      call: AgentCall, store: LogStore, source: str = ""):
     """Blind scoring: each judge sees every candidate's full body labeled
     'Candidate N' (author hidden), scores 0-JUDGE_SCORE_MAX on the criteria and
-    names a winner. Returns (ordered, agg_score, first_place_votes, defects,
-    judge_count). Deterministic candidate order (by namespaced name) → blind but
-    resume-stable, no RNG."""
+    names a winner. `source` (when the task named one) is the reference the output
+    must match — injected so judges can weigh structural fidelity instead of
+    scoring prose in a vacuum. Returns (ordered, agg_score, first_place_votes,
+    defects, judge_count). Deterministic candidate order (by namespaced name) →
+    blind but resume-stable, no RNG."""
     ordered = sorted(group, key=lambda c: c["namespaced"])
     n = len(ordered)
     labeled = [(f"Candidate {i + 1}", c["content"], c.get("_runtime") or "") for i, c in enumerate(ordered)]
-    prompt = rounds.score_candidates_prompt(session, labeled)
+    prompt = rounds.score_candidates_prompt(session, labeled, source)
     sid = session.session_id
     agg = {i + 1: 0 for i in range(n)}
     votes = {i + 1: 0 for i in range(n)}
@@ -1898,16 +1942,20 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
 
 
 def _apply_targeted_fixes(session: Session, filename: str, content: str,
-                          defects: list[str], call: AgentCall, store: LogStore) -> str:
+                          defects: list[str], call: AgentCall, store: LogStore,
+                          source: str = "") -> str:
     """Surgical fixes ONLY (best-of-N ships the winner's own code): ask for EDIT
     blocks for the judge-flagged defects and apply them to the content string
-    in-memory (unique-OLD → NEW), never a rewrite. Returns the (possibly) fixed
-    content; degrades to the original on any error."""
+    in-memory (unique-OLD → NEW), never a rewrite. `source` (the reference to
+    match) is passed through so the finisher isn't blind to it — the live failure
+    was the codifier emitting `SKILL: read_file` to fetch the source it lacked
+    instead of edits, so the orphaned scaffolding shipped unfixed and SILENTLY.
+    Returns the (possibly) fixed content; degrades to the original on any error."""
     who = _codifier(session)
     if not (who and who.active):
         return content
     try:
-        ans = call(who, rounds.winner_fix_prompt(session, filename, content, defects))
+        ans = call(who, rounds.winner_fix_prompt(session, filename, content, defects, source))
     except (AgentError, BudgetExceeded):
         return content
     applied = 0
@@ -1923,6 +1971,16 @@ def _apply_targeted_fixes(session: Session, filename: str, content: str,
     if applied:
         store.log_event(session.session_id, "winner_fixes_applied",
                         {"file": filename, "applied": applied})
+    elif defects:
+        # The finisher returned no usable edits (declined the defects, or — as seen
+        # live — answered with a skill request instead of EDIT blocks). Ship the
+        # winner, but SURFACE that its flagged defects are unaddressed rather than
+        # letting them ship silently.
+        store.log_event(session.session_id, "winner_fixes_none",
+                        {"file": filename, "defects": len(defects)})
+        session.unresolved.append(
+            f"{filename} shipped with {len(defects)} judge-flagged defect(s) the "
+            "finish pass did not apply: " + "; ".join(d[:90] for d in defects[:3]))
     return content
 
 
@@ -1939,7 +1997,8 @@ def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> 
 
 
 def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
-                  defects: dict, wi: int, call: AgentCall, store: LogStore) -> tuple[int, list[str], str]:
+                  defects: dict, wi: int, call: AgentCall, store: LogStore,
+                  source: str = "") -> tuple[int, list[str], str]:
     """The strong CODIFIER chairs the blind vote: it reviews the top two
     candidates in full and RATIFIES the vote's winner or OVERRIDES to the
     runner-up (judges score by reading and can miss a real bug), then names the
@@ -1961,7 +2020,7 @@ def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
     ]
     sid = session.session_id
     try:
-        ans = call(who, rounds.chair_review_prompt(session, top))
+        ans = call(who, rounds.chair_review_prompt(session, top, source))
     except (AgentError, BudgetExceeded):
         return fallback
     chosen, overrode, chair_defects = rounds.parse_chair_decision(ans.content, win_i + 1, run_i + 1)
@@ -2026,6 +2085,10 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
     sid = session.session_id
+    # The reference the output must match (if the task named one) — the blind
+    # judges, the chair, and the finisher all get it, so 'matched-set' fidelity is
+    # actually judged instead of assumed. Computed once; empty for greenfield.
+    source = _source_digest(session)
     group, dropped = _candidate_pool(session, candidates)
     if dropped:
         # genuinely differently-named deliverables from a MULTI-file build remain
@@ -2110,19 +2173,19 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                 "judges": 0, "candidates": len(group), "fixes": 0, "chair": "sole runner"}
 
     judges = panel[: config.MAX_JUDGES]
-    ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store)
+    ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store, source)
     if judged == 0:
         return None  # scoring collapsed → author path (with its own nets) instead
     wi = max(range(len(ordered)),
              key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
     # CHAIR: the codifier reviews the top two and ratifies or overrides the vote.
-    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, codifier_call, store)
+    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, codifier_call, store, source)
     winner, label = ordered[wi], wi + 1
     base = _basename(winner["base"])
     content = winner["content"]
     fixes = 0
     if fixlist:
-        fixed = _apply_targeted_fixes(session, base, content, fixlist, codifier_call, store)
+        fixed = _apply_targeted_fixes(session, base, content, fixlist, codifier_call, store, source)
         if fixed != content:
             # the fix pass must not break the winner — re-verify; keep the
             # (already-passing) original if the "fixed" version no longer runs.

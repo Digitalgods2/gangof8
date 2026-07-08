@@ -430,3 +430,69 @@ def test_winner_gets_surgical_fixes_when_defects_flagged(session, store):
     shipped = next(a for a in session.proposed_actions
                    if a.kind == "write_file" and a.role == Role.implementer)
     assert "var reviewed=2;" in shipped.content and "var extra=2;" not in shipped.content
+
+
+# --- Fix 1: the blind stages get the source they must match -------------------
+
+
+def test_judge_prompt_carries_source_and_fidelity_when_named(session):
+    """Fix 1: when the task named a source to MATCH, the blind judges must SEE it
+    and be told to score structural fidelity — not judge prose in a vacuum (the
+    plain-prose candidate that dropped an illustrated-spread source's whole format
+    won a 'matched set' vote because judges never saw the source)."""
+    session.classification.match_source = True
+    labeled = [("Candidate 1", "Benny loved three things...", "")]
+    src = "----- SOURCE: Splash.txt -----\nSPREAD 1\n[RIGHT PAGE — ILLUSTRATION PROMPT]\n"
+    p = rounds.score_candidates_prompt(session, labeled, source=src)
+    assert "SOURCE THE OUTPUT MUST MATCH" in p
+    assert "ILLUSTRATION PROMPT" in p              # the real source text is present
+    assert "MATCHED SET" in p                      # hard requirement (match_source)
+    assert "never the 'commentary'" in p           # the don't-strip-the-format guidance
+
+    # no source named → no fidelity block (greenfield judging is unchanged)
+    assert "SOURCE THE OUTPUT MUST MATCH" not in rounds.score_candidates_prompt(session, labeled)
+
+
+def test_judge_prompt_source_is_soft_without_match_intent(session):
+    """A source is referenced but the task didn't ask for an exact match: the
+    block still appears (judges should weigh fidelity) but is stated softly, not
+    as a HARD 'matched set' requirement."""
+    session.classification.match_source = False
+    labeled = [("Candidate 1", "body", "")]
+    p = rounds.score_candidates_prompt(session, labeled, source="SRC BODY")
+    assert "SOURCE THE OUTPUT MUST MATCH" in p and "SRC BODY" in p
+    assert "MATCHED SET" not in p
+    assert "references this source" in p
+
+
+def test_finish_pass_with_no_edits_surfaces_unaddressed_defects(session, store):
+    """Fix 4: if the finisher returns no usable edits for judge-flagged defects
+    (live: it answered with a SKILL request instead of EDIT blocks), the winner
+    still ships — but the unaddressed defects are SURFACED, not shipped silently."""
+    _candidate(session, "aaa", "game.html", WEAK)
+    _candidate(session, "zzz", "game.html", STRONG)
+    lead = CouncilMember(role=Role.lead, agent="claude", active=True)
+    judges = [CouncilMember(role=Role.panelist, agent="j1")]
+    council = Council(members=[lead] + judges)
+    session.council = council
+    reply = ("SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
+             "DEFECT: strip the orphan scaffolding line")
+
+    def call(member, prompt):
+        return Contribution(round=0, role=member.role, agent=member.agent, content=reply)
+
+    def codifier_call(member, prompt):
+        # chair ratifies (keeping the judges' defect); the fix pass then gets a
+        # skill request instead of EDIT blocks — the exact live failure mode
+        if "RATIFY" in prompt:
+            return Contribution(round=0, role=member.role, agent=member.agent,
+                                content="RATIFY: Candidate 2")
+        return Contribution(round=0, role=member.role, agent=member.agent,
+                            content="SKILL: read_file Splash.txt")
+
+    out = loop._run_best_of_n(session, council, judges, call, codifier_call, store)
+    assert out["fixes"] == 0
+    shipped = next(a for a in session.proposed_actions
+                   if a.kind == "write_file" and a.role == Role.implementer)
+    assert shipped.content == STRONG                       # shipped unchanged...
+    assert any("did not apply" in u for u in session.unresolved)  # ...but surfaced

@@ -491,7 +491,35 @@ CANDIDATE_CRITERIA = (
 )
 
 
-def score_candidates_prompt(session: Session, labeled: list[tuple]) -> str:
+def _source_fidelity_block(session: Session, source: str) -> str:
+    """Injected into the judge / chair / finish prompts when the task named a
+    source the output must MATCH — so structural fidelity is actually scored
+    instead of assumed. The blind stages never saw the source otherwise (authors
+    get it in the round-0 overview), which is how a plain-prose candidate that
+    dropped an illustrated-spread source's entire format won a 'match the first
+    book exactly' vote. When the task also explicitly asked for a 'matched set'
+    (classification.match_source), the requirement is stated as HARD."""
+    if not source:
+        return ""
+    cls = getattr(session, "classification", None)
+    hard = bool(cls and cls.match_source)
+    strength = (
+        "The task explicitly asks for a MATCHED SET: reproducing this source's "
+        "STRUCTURE and FORMAT is a HARD requirement, weighed as strongly as prose "
+        "quality. " if hard else
+        "The task references this source; weigh how faithfully each candidate "
+        "matches its structure and format. ")
+    return (
+        "\n===== SOURCE THE OUTPUT MUST MATCH (read it before scoring) =====\n"
+        f"{source}\n===== end source =====\n"
+        f"{strength}A candidate that drops sections, tables, or per-unit "
+        "scaffolding the source has (e.g. per-spread illustration prompts) does NOT "
+        "match, however clean it reads — and the source's own structure IS the "
+        "required format here, never the 'commentary' or 'outline' a generic "
+        "instruction might tell you to strip.\n")
+
+
+def score_candidates_prompt(session: Session, labeled: list[tuple], source: str = "") -> str:
     """A blind scoring pass: the judge sees each candidate's FULL body labeled
     'Candidate N' with author identity stripped, scores each on the criteria,
     and names its winner. `labeled` is [(label, body[, runtime_note]), ...] — the
@@ -524,6 +552,7 @@ def score_candidates_prompt(session: Session, labeled: list[tuple]) -> str:
         "implementations of the SAME task, authorship hidden. Score each STRICTLY "
         f"on: {CANDIDATE_CRITERIA}.\n"
         f"{runtime_guidance}"
+        f"{_source_fidelity_block(session, source)}"
         "Read every candidate fully. A candidate that is truncated, stubbed, or "
         "misses a requirement must score low no matter how elegant the rest is.\n"
         f"Emit exactly one line per candidate, scoring 0-{config.JUDGE_SCORE_MAX}:\n"
@@ -564,13 +593,18 @@ def parse_candidate_scores(text: str, n: int) -> tuple[dict[int, int], int | Non
     return scores, winner, defects
 
 
-def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[str]) -> str:
+def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[str],
+                      source: str = "") -> str:
     """Ask for SURGICAL edits to the winning candidate — the defects judges
-    flagged — never a rewrite (best-of-N ships the winner's own code)."""
+    flagged — never a rewrite (best-of-N ships the winner's own code). `source`
+    (the reference to match) is included so the finisher isn't blind to it: the
+    live failure was the codifier answering with `SKILL: read_file` to fetch the
+    source it lacked instead of edits, so the winner shipped unfixed."""
     deflines = "\n".join(f"- {d}" for d in defects)
     return (
         f"Task: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
+        f"{_source_fidelity_block(session, source)}"
         f"The file below WON a blind best-of-N vote and will ship. Judges flagged "
         "these specific defects to fix — fix ONLY these, with surgical edits; do "
         "NOT rewrite or restyle the file (its author won on merit):\n"
@@ -604,10 +638,12 @@ _OVERRIDE_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?OVERRIDE\s*[:—–-]\s*
 _RATIFY_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?RATIFY\b", re.IGNORECASE | re.MULTILINE)
 
 
-def chair_review_prompt(session: Session, top: list[dict]) -> str:
+def chair_review_prompt(session: Session, top: list[dict], source: str = "") -> str:
     """The chair reviews the blind vote's top two IN FULL and ratifies or
     overrides. `top` = [{label, score, votes, content, role}, ...], winner
-    first. Author identity stays hidden (Candidate N) as it was for the judges."""
+    first. Author identity stays hidden (Candidate N) as it was for the judges.
+    `source` (when named) is the reference the output must match — the chair, like
+    the judges, otherwise never saw it."""
     blocks = []
     for c in top:
         blocks.append(
@@ -619,6 +655,7 @@ def chair_review_prompt(session: Session, top: list[dict]) -> str:
         f"Task the candidates implement: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"{CHAIR_CHARTER}"
+        f"{_source_fidelity_block(session, source)}"
         "The blind judge vote ranked these two highest. The vote is ADVISORY to "
         "you — judges score by reading and can miss a real bug or a missed "
         "requirement. Read BOTH in full and decide. Emit exactly one line:\n"
