@@ -164,6 +164,51 @@ def _abs_read_inside_space(session: Session, data_dir: Path, raw: str) -> Option
     return None
 
 
+def _sandbox_candidate_bases(session: Session, data_dir: Path) -> set[str]:
+    """Deliverable basenames the panel drafted to the sandbox THIS round — files
+    saved namespaced '<agent>__<base>' → '<base>'. These are the candidates being
+    judged; a file by the same name elsewhere is a copy of one, not source."""
+    out: set[str] = set()
+    d = artifacts_dir(data_dir, session.session_id)
+    if not d.is_dir():
+        return out
+    for f in d.iterdir():
+        if f.is_file() and "__" in f.name:
+            out.add(f.name.split("__", 1)[1])
+    return out
+
+
+def _guard_rival_read(session: Session, data_dir: Path, path: Path, raw_name: str) -> None:
+    """Refuse a panel read of a file that sits INSIDE the source folder but whose
+    name is a candidate deliverable being produced and judged this round — a prior
+    or rival answer to the very task at hand. Left open, a seat can pull a prior
+    run's 'Benny's First Car Ride.txt' out of the source folder and crib it,
+    contaminating the blind best-of-N (this is exactly what happened: three seats
+    read a prior version nobody authorized). The task-NAMED source (its full name,
+    with extension, appears in the task) is always allowed — that is real source,
+    not a rival answer, so genuine 'read the file I told you to' reads still work."""
+    if not session.established_root:
+        return
+    try:
+        est = Path(session.established_root).resolve()
+        p = Path(path).resolve()
+    except OSError:
+        return
+    if not (p == est or est in p.parents):
+        return  # not inside the source folder — sandbox/workspace reads are free
+    if p.name and p.name in (session.task.text or ""):
+        return  # the task named this exact file as source — authorized
+    if p.name not in _sandbox_candidate_bases(session, data_dir):
+        return  # not a candidate deliverable — an ordinary source read, allowed
+    session.unresolved.append(
+        f"blocked a panel read of '{p.name}' from the source folder — it matches a "
+        "candidate being produced and judged this round (a prior/rival answer)")
+    raise ExecutionError(
+        f"refusing to read {raw_name!r}: a file by that name is a candidate "
+        "deliverable being produced and judged this round — author your own; do "
+        "not copy a prior or rival answer sitting in the source folder")
+
+
 def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Read a file from any space. With an explicit target, that space only.
     With none, every bound space is tried — default (richest) first, then the
@@ -175,12 +220,14 @@ def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
     raw_name = _arg(action, "filename")
     abs_hit = _abs_read_inside_space(session, data_dir, raw_name)
     if abs_hit is not None:
+        _guard_rival_read(session, data_dir, abs_hit, raw_name)
         return abs_hit.read_text(encoding="utf-8")
     if action.args.get("target") or action.args.get("space"):
         target = _space_arg(action, _default_read_space(session), _READ_SPACES)
         path = resolve_space(session, data_dir, target, raw_name)
         if not path.is_file():
             raise ExecutionError(f"file not found: {raw_name!r}")
+        _guard_rival_read(session, data_dir, path, raw_name)
         return path.read_text(encoding="utf-8")
     default = _default_read_space(session)
     order = [default] + [s for s in (SANDBOX, WORKSPACE, ESTABLISHED) if s != default]
@@ -196,6 +243,7 @@ def _read_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
             continue  # e.g. an absolute/escaping path for this space
         tried.append(target)
         if path.is_file():
+            _guard_rival_read(session, data_dir, path, raw_name)
             return path.read_text(encoding="utf-8")
     raise ExecutionError(
         f"file not found in any space ({', '.join(tried) or 'none bound'}): {raw_name!r}")

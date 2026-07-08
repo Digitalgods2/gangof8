@@ -10,7 +10,8 @@ import pytest
 
 from conclave_os.classifier import classify
 from conclave_os.models import Role, SessionStatus, TaskType
-from conclave_os.paths import extract_delivery_target, extract_established_root
+from conclave_os.paths import (extract_delivery_target, extract_established_root,
+                               prior_deliverable_files)
 from conclave_os.registry import AdapterResult
 from conclave_os.adapters.mock import MockAdapter
 from conclave_os.service import ConclaveService
@@ -584,3 +585,57 @@ def test_declared_destination_promotes_brand_new_files_too(tmp_path):
         filename="helper.js", args={"filename": "helper.js", "content": "//new"}))
     loop._ensure_redelivery_promotes(s2, store)
     assert not any(a.kind == "promote" for a in s2.proposed_actions)
+
+
+# --- Fix 1 + Fix 5: source digest for judges, prior-deliverable warning -------
+
+
+def test_source_digest_returns_named_source_not_prior_deliverable(tmp_path):
+    """Fix 1: the digest fed to the blind judges is the task's NAMED source, and
+    NOT a prior copy of the deliverable sitting in the same folder (referenced by
+    title without extension — that is a prior answer, not source)."""
+    from conclave_os import loop
+    from conclave_os.logstore import LogStore
+    from conclave_os.sessions import SessionManager
+
+    est = tmp_path / "Benny"
+    est.mkdir()
+    (est / "Benny's Splash.txt").write_text("SPLASH SPREAD 1 ILLUSTRATION PROMPT", encoding="utf-8")
+    (est / "Benny's First Car Ride.txt").write_text("A PRIOR ANSWER", encoding="utf-8")
+    s = SessionManager(LogStore(tmp_path / "data")).create(
+        "Read Benny's Splash.txt and write Benny's First Car Ride, save as a .txt", source="test")
+    s.established_root = str(est)
+    digest = loop._source_digest(s)
+    assert "SPLASH SPREAD 1" in digest        # the named source is included
+    assert "A PRIOR ANSWER" not in digest      # the prior deliverable is NOT source
+
+
+def test_prior_deliverable_files_flags_title_match_only(tmp_path):
+    """Fix 5: a file referenced by TITLE (stem in task) but not as a named input
+    (full name not in task) is a prior/existing version of the deliverable; the
+    named source (full name in task) and unrelated files are not flagged."""
+    est = tmp_path / "Benny"
+    est.mkdir()
+    (est / "Benny's Splash.txt").write_text("x", encoding="utf-8")            # named source
+    (est / "Benny's First Car Ride.txt").write_text("prior", encoding="utf-8")  # prior deliverable
+    (est / "unrelated.txt").write_text("y", encoding="utf-8")
+    task = "Read Benny's Splash.txt and write Benny's First Car Ride, save as a .txt"
+    assert prior_deliverable_files(str(est), task) == ["Benny's First Car Ride.txt"]
+    assert prior_deliverable_files(None, task) == []
+
+
+def test_open_warns_when_source_folder_holds_a_prior_deliverable(tmp_path):
+    """Fix 5, at the service wiring: opening the Benny task whose source folder
+    already contains 'Benny's First Car Ride.txt' surfaces an up-front warning so
+    a shipped copy of a prior answer is never silent."""
+    src_dir = tmp_path / "Benny"
+    src_dir.mkdir()
+    (src_dir / "Benny's Splash.txt").write_text("Grace and the ball.", encoding="utf-8")
+    (src_dir / "Benny's First Car Ride.txt").write_text("A PRIOR ANSWER", encoding="utf-8")
+    src_file = src_dir / "Benny's Splash.txt"
+    task = (f"Read the first story at: {src_file}\nWrite story #2, Benny's First "
+            f"Car Ride, and save it as a .txt file.")
+    svc = ConclaveService(data_dir=tmp_path / "data")
+    session = svc._open(task, source="test", budgets=None)
+    assert any("Benny's First Car Ride.txt" in u and "PRIOR" in u
+               for u in session.unresolved), "prior deliverable surfaced at open"

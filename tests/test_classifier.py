@@ -142,3 +142,28 @@ def test_script_over_csv_stays_code():
     though it names a data file — the content-override must not swallow it."""
     cls = classify("Write a python script to parse data.csv and print totals.")
     assert cls.task_type == TaskType.code
+
+
+# --- Fix 2: matched-set intent ------------------------------------------------
+
+
+def test_matched_set_intent_detected():
+    """Fix 2: 'match the first story ... so the two books feel like a matched set'
+    marks the output as one that must MIRROR a source — structural fidelity is a
+    hard requirement, so the judges/finisher weigh it (a plain-prose candidate
+    that dropped the source's whole format won this task before)."""
+    from conclave_os.classifier import wants_matched_output
+    task = ("Write story #2 about Benny. Match the first story's style exactly, "
+            "so the two books feel like a matched set. Save it as a .txt file.")
+    assert wants_matched_output(task) is True
+    cls = classify(task)
+    assert cls.match_source is True
+    assert cls.task_type == TaskType.content   # still a writing task (Fix A)
+
+
+def test_no_match_intent_on_plain_build():
+    """A build with no 'match/matched set/same style' phrasing does not set the
+    flag — greenfield judging is unchanged."""
+    from conclave_os.classifier import wants_matched_output
+    assert wants_matched_output("Build a tic-tac-toe game in game.html") is False
+    assert classify("Build a tic-tac-toe game in game.html").match_source is False

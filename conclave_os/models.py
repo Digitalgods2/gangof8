@@ -100,6 +100,9 @@ class Classification(BaseModel):
     quality_matters: bool = True
     needs_governance: bool = False
     greenfield: bool = False  # builds something NEW — needs a target if none referenced
+    match_source: bool = False  # output must MATCH a named source's structure/format
+    #                             exactly (a "matched set") — structural fidelity is
+    #                             a hard requirement the judges/finisher must weigh
 
 
 class CouncilMember(BaseModel):

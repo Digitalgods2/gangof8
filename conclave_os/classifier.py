@@ -74,6 +74,30 @@ HIGH_RISK_WORDS = [
 GOVERNANCE_WORDS = ["file", "files", "money", "private", "secret", "account"]
 
 
+# "Make the output MATCH an existing reference exactly / a matched set": the user
+# wants the deliverable to mirror a named source. When true (and a source is
+# named), that source's STRUCTURE — its headings, tables, per-unit scaffolding
+# (e.g. a picture book's per-spread illustration prompts) — is a HARD requirement,
+# not the "commentary/outline" a generic 'no commentary' instruction would strip.
+# Carried on the classification so the blind judges and the finisher weigh
+# structural fidelity to the source, not prose alone (a plain-prose candidate that
+# dropped the source's format once won a "matched set" task it did not match).
+_MATCH_INTENT = (
+    "matched set", "match the first", "match the existing", "match its",
+    "match the source", "match the style", "same style", "same format",
+    "same structure", "match exactly", "exactly the same", "mirror the",
+    "in the same style", "consistent with the series", "feel like a matched",
+)
+
+
+def wants_matched_output(text: str) -> bool:
+    """True when the task asks for the output to MATCH a referenced source (a
+    'matched set' / 'same style/format' / 'match … exactly'). Substring match —
+    these are multi-word phrases, not single tokens."""
+    low = (text or "").lower()
+    return any(p in low for p in _MATCH_INTENT)
+
+
 def _any(words: list[str], lower: str) -> bool:
     return any(re.search(rf"\b{re.escape(w)}\b", lower) for w in words)
 
@@ -137,6 +161,11 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
             and _DOC_ARTIFACT.search(text)):
         task_type = TaskType.content
         notes.append("writing task producing a prose document — treated as content")
+
+    match_source = wants_matched_output(text)
+    if match_source:
+        notes.append("wants a MATCHED SET with a referenced source — structural "
+                     "fidelity to that source is a hard requirement, not commentary")
 
     words = len(text.split())
     if words <= 8:
@@ -206,4 +235,5 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         quality_matters=quality_matters,
         needs_governance=needs_governance,
         greenfield=greenfield,
+        match_source=match_source,
     )

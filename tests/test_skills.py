@@ -494,3 +494,55 @@ def test_no_approval_skill_executes_without_gate(governance, session, tmp_path):
     assert governance.authorize_action(session, action) is None
     assert action.status == "proposed", "kernel does not mutate a permitted, ungated action"
     assert session.approvals == []
+
+
+# --- Fix 3: no cribbing a rival/prior answer from the source folder -----------
+
+
+def test_read_of_rival_candidate_in_source_folder_is_blocked(tmp_path):
+    """Fix 3: a seat may read the task's NAMED source, but NOT a file in the
+    source folder whose name is a candidate deliverable being judged this round —
+    a prior/rival answer to the same task (live: three seats read a prior
+    'Benny's First Car Ride.txt' from the source folder that nobody authorized)."""
+    task = ("Read Benny's Splash.txt and write the next story, Benny's First Car "
+            "Ride, saving it as a .txt file.")
+    session = SessionManager(LogStore(tmp_path)).create(task, source="test")
+    est = tmp_path / "Benny"
+    est.mkdir()
+    (est / "Benny's Splash.txt").write_text("SPLASH!", encoding="utf-8")
+    (est / "Benny's First Car Ride.txt").write_text("A PRIOR ANSWER", encoding="utf-8")
+    session.established_root = str(est)
+    # a sibling seat has drafted its candidate for the same deliverable this round
+    sb = executor.artifacts_dir(tmp_path, session.session_id)
+    sb.mkdir(parents=True, exist_ok=True)
+    (sb / "codex__Benny's First Car Ride.txt").write_text("draft", encoding="utf-8")
+
+    # the NAMED source still reads (its full name appears in the task)
+    ok = ProposedAction(session_id=session.session_id, kind="read_file",
+                        role=Role.researcher, args={"filename": str(est / "Benny's Splash.txt")})
+    assert execute(session, ok, tmp_path) == "SPLASH!"
+
+    # the prior/rival answer by that candidate's name is refused
+    bad = ProposedAction(session_id=session.session_id, kind="read_file",
+                         role=Role.researcher,
+                         args={"filename": str(est / "Benny's First Car Ride.txt")})
+    with pytest.raises(ExecutionError):
+        execute(session, bad, tmp_path)
+    assert any("prior/rival" in u for u in session.unresolved)
+
+
+def test_source_read_allowed_when_no_candidate_shares_its_name(tmp_path):
+    """The guard is surgical: with candidates drafted under DIFFERENT names, an
+    ordinary source read still works — only a name-collision with a live candidate
+    is blocked, so real source reads are never caught."""
+    session = SessionManager(LogStore(tmp_path)).create("read notes.txt", source="test")
+    est = tmp_path / "src"
+    est.mkdir()
+    (est / "notes.txt").write_text("NOTES", encoding="utf-8")
+    session.established_root = str(est)
+    sb = executor.artifacts_dir(tmp_path, session.session_id)
+    sb.mkdir(parents=True, exist_ok=True)
+    (sb / "codex__game.html").write_text("draft", encoding="utf-8")  # different name
+    action = ProposedAction(session_id=session.session_id, kind="read_file",
+                            role=Role.researcher, args={"filename": str(est / "notes.txt")})
+    assert execute(session, action, tmp_path) == "NOTES"

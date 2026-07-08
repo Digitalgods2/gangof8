@@ -151,3 +151,29 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
         except OSError:
             return None
     return None
+
+
+def prior_deliverable_files(established_root: Optional[str], task_text: str) -> list[str]:
+    """Basenames in the SOURCE folder that look like a prior version of THIS
+    task's deliverable: referenced by TITLE (the file's stem appears in the task)
+    but NOT an authorized named input (its full name, with extension, does not).
+
+    A task names its read-source WITH the extension ("read Benny's Splash.txt")
+    and its deliverable by TITLE ("write Benny's First Car Ride") — so a
+    stem-but-not-name match is a prior/existing answer already sitting in the
+    source folder. Seats can read it, and a shipped copy of it would otherwise go
+    unnoticed. This only WARNS; blocking a rival CANDIDATE read is a separate,
+    stronger guard in the read skill. Stems under 4 chars are ignored to avoid
+    matching stray common words."""
+    if not established_root:
+        return []
+    root = Path(established_root)
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.iterdir()):
+        stem = p.stem
+        if (p.is_file() and stem and len(stem) >= 4
+                and stem in task_text and p.name not in task_text):
+            out.append(p.name)
+    return out
