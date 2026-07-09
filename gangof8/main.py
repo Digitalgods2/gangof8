@@ -93,6 +93,14 @@ def dashboard() -> FileResponse:
     )
 
 
+@app.get("/logo.png")
+def logo() -> FileResponse:
+    """The Gang of 8 emblem — shown in the header and used as the browser-tab
+    favicon (referenced from index.html)."""
+    return FileResponse(_STATIC / "logo.png", media_type="image/png",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "version": __version__, "backend": service.backend}
@@ -174,6 +182,7 @@ def get_session(session_id: str) -> dict:
     data = service.get(session_id)
     if data is None:
         raise HTTPException(status_code=404, detail="session not found")
+    service.annotate_council_models(data)  # label each member with the model it runs
     data["council_health"] = reporting.council_health(data.get("unresolved", []))
     return data
 
