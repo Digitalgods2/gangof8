@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>Gang of 8</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { --bg:#0f1218; --panel:#171c26; --line:#2a3242; --text:#d7dce5; --dim:#8b94a7;
@@ -10,9 +11,11 @@
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text);
          font:14px/1.5 "Segoe UI", system-ui, sans-serif; }
-  header { display:flex; align-items:baseline; gap:12px; padding:14px 22px;
+  header { display:flex; align-items:center; gap:12px; padding:12px 22px;
            border-bottom:1px solid var(--line); }
-  header h1 { font-size:17px; margin:0; }
+  header .brand { display:flex; align-items:center; gap:11px; flex:none; }
+  header .brand-logo { height:92px; width:92px; display:block; flex:none; }
+  header h1 { font-size:19px; margin:0; letter-spacing:.2px; white-space:nowrap; }
   header .sub { color:var(--dim); font-size:12px; }
   main { display:grid; grid-template-columns: 430px 1fr; gap:0; height:calc(100vh - 53px); }
   /* bottom padding leaves room for the fixed composer so content isn't hidden */
@@ -289,7 +292,7 @@
 </head>
 <body>
 <header>
-  <h1>Gang of 8</h1>
+  <span class="brand"><img src="/logo.png" class="brand-logo" alt="Gang of 8 logo"><h1>Gang of 8</h1></span>
   <span class="sub" id="backend">backend: …</span>
   <span class="sub" id="workspace">workspace: …</span>
   <span class="sub">human authority preserved — nothing executes without your approval</span>
@@ -861,8 +864,13 @@ function renderDetail(s) {
   const roster = members.filter(m => m.active && m.agent && m.agent !== "system");
   const agentOf = Object.fromEntries(members.map(m => [m.role, m.agent]));
   // exact model per seat, learned from the contributions that carried it
-  const modelOf = {};
-  (s.contributions||[]).forEach(c => { if (c.model) modelOf[c.agent] = c.model; });
+  // exact model per ROLE+AGENT, learned from the contributions that carried it —
+  // keyed by role+agent (not agent alone) so a seat that ran two roles (claude as
+  // lead AND panelist) shows each role's real model, not whichever call reported
+  // last (which mislabelled the sonnet lead as opus after the opus panelist ran).
+  const modelKey = (r, a) => (r || "") + "|" + (a || "");
+  const contribModel = {};
+  (s.contributions||[]).forEach(c => { if (c.model) contribModel[modelKey(c.role, c.agent)] = c.model; });
 
   // What is it doing right now? Current round's goal + the seat we're waiting
   // on, so a long single agent call doesn't read as frozen.
@@ -984,9 +992,12 @@ function renderDetail(s) {
         <div class="roster">
           ${roster.map(m => {
             const talent = !DRIVE_ROLES.has(m.role);
-            const model = modelOf[m.agent] ? esc(modelOf[m.agent]) : "model: CLI default";
+            // the model this member's role+agent actually ran; else the one it
+            // WILL run (resolved server-side: role pin › seat pin › CLI default).
+            const full = contribModel[modelKey(m.role, m.agent)] || m.model || "";
+            const title = (talent ? "pulled in by the lead mid-round (CONSULT/DELEGATE) — " : "") + (full ? esc(full) : "model: CLI default");
             return `<span class="seat role-${esc(m.role)}${talent ? " talent" : ""} ${spokenRoles.has(m.role)?"spoke":"on"}"
-              title="${talent ? "pulled in by the lead mid-round (CONSULT/DELEGATE) — " : ""}${model}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${modelOf[m.agent] ? ` · ${esc(shortModel(modelOf[m.agent]))}` : ""}</span>`;
+              title="${title}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${full ? ` · ${esc(shortModel(full))}` : ""}</span>`;
           }).join("")}
         </div>
         ${(() => {

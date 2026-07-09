@@ -287,6 +287,34 @@ class GangOf8Service:
                 out[role_name] = model.strip()
         return out
 
+    def resolved_model(self, role: str, agent: str) -> Optional[str]:
+        """The model a (role, agent) pair actually runs, by the SAME precedence
+        the adapters use — role pin › seat pin › the seat's own default (None ⇒
+        the CLI/vendor default). The council roster is labelled with this so a
+        seat that fills two roles shows each role's real model: the claude LEAD
+        runs sonnet via its role pin while the claude PANELIST runs the opus seat
+        pin, and a per-agent label can't show both (it showed whichever call
+        reported last, mislabelling the other)."""
+        if not agent:
+            return None
+        pin = self._role_pins_for(agent).get(role)
+        if pin:
+            return pin
+        if agent in config.OPENROUTER_SEATS:
+            return self._openrouter_slug(agent)
+        return (self.settings.cli_models or {}).get(agent) or None
+
+    def annotate_council_models(self, data: Optional[dict]) -> Optional[dict]:
+        """Enrich a serialized session's council members with the model each will
+        run (resolved_model). Mutates + returns the dict. Deliberately kept OUT of
+        stored session state — it's a live view of the CURRENT settings, recomputed
+        per request, so re-pinning a model relabels the roster without a rerun."""
+        members = ((data or {}).get("council") or {}).get("members") or []
+        for m in members:
+            if isinstance(m, dict) and m.get("agent") and not m.get("model"):
+                m["model"] = self.resolved_model(m.get("role") or "", m["agent"])
+        return data
+
     # role_agents/budgets are the COMPLETE intended set (the dashboard sends all
     # non-default picks each save), so replace them wholesale — merging would
     # make stale entries linger and break "reset to backend default". Nested

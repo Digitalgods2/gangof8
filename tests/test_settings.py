@@ -381,3 +381,45 @@ def test_reveal_returns_full_key_only_on_explicit_request(tmp_path, monkeypatch)
     # the plain status endpoint STILL never returns the full key
     assert "AIza-full-key-5555" not in json.dumps(client.get("/settings/api-keys/gemini").json())
     assert client.get("/settings/api-keys/stripe/reveal").status_code == 404
+
+
+# ---- roster model labels: one seat, two roles, two models --------------------
+
+
+def test_resolved_model_distinguishes_two_roles_on_one_seat(tmp_path):
+    """The dashboard-mislabel fix: a seat filling two roles runs two models — the
+    claude LEAD on its sonnet role pin, the claude PANELIST on the opus seat pin.
+    resolved_model reports each role's real model, not one per-seat guess (which
+    showed whichever call reported last, mislabelling the other)."""
+    svc = GangOf8Service(data_dir=tmp_path)
+    svc.update_settings({
+        "backend": "cli",
+        "role_agents": {"lead": "claude", "panelist": "codex", "architect": "claude"},
+        "cli_models": {"claude": "claude-opus-4.8", "codex": "gpt-5.5"},
+        "role_models": {"lead": "claude-sonnet-5", "architect": "claude-opus-4.8"},
+    })
+    assert svc.resolved_model("lead", "claude") == "claude-sonnet-5"       # role pin wins
+    assert svc.resolved_model("panelist", "claude") == "claude-opus-4.8"   # seat pin (no claude panelist pin)
+    assert svc.resolved_model("architect", "claude") == "claude-opus-4.8"  # role pin
+    assert svc.resolved_model("panelist", "codex") == "gpt-5.5"            # seat pin
+
+
+def test_annotate_council_models_labels_each_member(tmp_path):
+    """The serialized roster gets a per-member `model` so the lead chip shows
+    sonnet and the same-seat panelist chip shows opus — instead of both inheriting
+    whichever claude call reported last."""
+    svc = GangOf8Service(data_dir=tmp_path)
+    svc.update_settings({
+        "backend": "cli",
+        "role_agents": {"lead": "claude", "panelist": "codex"},
+        "cli_models": {"claude": "claude-opus-4.8"},
+        "role_models": {"lead": "claude-sonnet-5"},
+    })
+    data = {"council": {"members": [
+        {"role": "lead", "agent": "claude", "active": True},
+        {"role": "panelist", "agent": "claude", "active": True},
+    ]}}
+    svc.annotate_council_models(data)
+    models = {m["role"]: m["model"] for m in data["council"]["members"]}
+    assert models["lead"] == "claude-sonnet-5"      # the sonnet lead is labelled sonnet
+    assert models["panelist"] == "claude-opus-4.8"  # the opus panelist is labelled opus

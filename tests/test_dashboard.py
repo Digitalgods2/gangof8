@@ -77,6 +77,18 @@ def test_dashboard_page_served(client):
     assert "human authority preserved" in r.text
 
 
+def test_logo_served_and_referenced(client):
+    """The emblem is served at /logo.png (real PNG), shown in the header before the
+    'Gang of 8' text, and reused as the browser-tab favicon."""
+    r = client.get("/logo.png")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/png"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n" and len(r.content) > 500  # a real PNG
+    page = client.get("/").text
+    assert '<img src="/logo.png" class="brand-logo"' in page  # header logo
+    assert 'rel="icon"' in page                                # favicon
+
+
 def test_health_reports_backend(client):
     h = client.get("/health").json()
     assert h["ok"] is True
