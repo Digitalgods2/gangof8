@@ -25,8 +25,8 @@ _QUOTED = re.compile(r"""(?P<q>["'`])(?P<p>(?:(?!(?P=q)).)*[\\/](?:(?!(?P=q)).)*
 _WIN = re.compile(r"(?P<p>[A-Za-z]:[\\/][^\n\"`<>|]+)")
 # A UNC path (\\server\share\...).
 _UNC = re.compile(r"(?P<p>\\\\[^\s\"`<>|]+)")
-# A posix-rooted path (/abs/... or ~/...). Lower confidence — only accepted when
-# it actually exists on disk, to avoid grabbing stray slashes in prose.
+# A posix-rooted path (/abs/... or ~/...). Existing paths are accepted directly;
+# a new leaf is accepted only when its parent exists (see _resolve_root).
 _POSIX = re.compile(r"(?<![\w])(?P<p>(?:~|/)[\w./\- ']+)")
 
 
@@ -135,10 +135,13 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
             except OSError:
                 continue
 
-    # (2) Still nothing on disk — a brand-new target. Accept only an unambiguous
-    #     drive/UNC path, and keep just the FIRST word of the final path segment
-    #     as the new dir/file name; anything after it is prose, not path.
-    if rx in (_WIN, _UNC) or re.match(r"^[A-Za-z]:[\\/]|^\\\\", cand):
+    # (2) Still nothing on disk: a brand-new target. Keep just the FIRST word
+    # of the final path segment as the new dir/file name; anything after it is
+    # prose, not path. POSIX targets need an existing parent, which makes a
+    # bare slash in prose insufficient to create a delivery root.
+    is_windows = rx in (_WIN, _UNC) or bool(re.match(r"^[A-Za-z]:[\\/]|^\\\\", cand))
+    is_posix = rx is _POSIX or cand.startswith(("/", "~/"))
+    if is_windows or is_posix:
         sep = max(cand.rfind("\\"), cand.rfind("/"))
         if sep <= 0:
             return None
@@ -146,7 +149,9 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
         if not seg:
             return None
         try:
-            target = Path(cand[:sep + 1] + seg[0])
+            target = Path(cand[:sep + 1] + seg[0]).expanduser()
+            if is_posix and not target.parent.is_dir():
+                return None
             return _nonroot(target.parent if target.suffix else target)
         except OSError:
             return None
