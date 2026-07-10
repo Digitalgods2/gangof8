@@ -29,6 +29,7 @@ from .executor import (
     space_root,
 )
 from .models import ProposedAction, Risk, Role, Session
+from .paths import extract_delivery_target
 
 # Directories never worth searching (vendored / generated / VCS noise).
 _SEARCH_SKIP_DIRS = {
@@ -352,8 +353,12 @@ def _promote_dest(session: Session, data_dir: Path, raw_name: str) -> Path:
     it in <X>") WINS over the established source folder, so a "read from A, save
     to B" task delivers to B and never overwrites the source A. Falls back to the
     established folder (the historical in-place promote target)."""
-    if session.delivery_root:
-        root = Path(session.delivery_root)
+    # Re-evaluate explicit task wording at delivery time. This repairs a session
+    # persisted before a target-parser fix and protects the read source when a
+    # later, unambiguous "save to <path>" instruction was present.
+    delivery_root = extract_delivery_target(session.task.text) or session.delivery_root
+    if delivery_root:
+        root = Path(delivery_root)
         root.mkdir(parents=True, exist_ok=True)
         return resolve_in_workspace(root, raw_name)
     return resolve_space(session, data_dir, ESTABLISHED, raw_name)
