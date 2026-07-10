@@ -167,7 +167,8 @@ final answer says exactly why it couldn't.
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install pydantic fastapi uvicorn pytest httpx pypdf google-genai Pillow
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\python -m pip install -e ".[dev]"
 ```
 
 - `pypdf` — extract text from attached PDFs.
@@ -176,6 +177,10 @@ python -m venv .venv
 
 The `cli` backend uses your locally-installed agent CLIs (`claude`, `codex`,
 `gemini` on PATH), each with its own auth — there is no external service.
+
+The editable install provides the `gangof8` command as an alternative to
+`python cli.py`. Development commands and module ownership are documented in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ### How Gang of 8 detects your CLIs
 
@@ -283,11 +288,35 @@ dashboard at `http://127.0.0.1:8790/`:
   activate / use-sandbox), governance / composer tunables, and UI prefs, each
   with a hover tooltip explaining its purpose.
 
+## Operations and Audit
+
+Each session response includes a compact run audit: accumulated model execution
+time, contribution counts by agent and model, repair attempts, action statuses,
+and SHA-256 fingerprints for files written during the run. The dashboard summary
+shows the key execution numbers; `GET /sessions/{id}` returns the full view.
+
+The header's `Diag` control opens a redacted setup report with storage/sandbox
+availability, configured seats and timeouts, the active workspace, API-key
+presence (never key values), web capability, and remote-access mode.
+
+## Local-only service
+
+Gang of 8 is a desktop-local service by design. It can browse local folders,
+open a delivered file with the OS, and reveal locally stored API keys, so it
+binds and accepts requests only from loopback addresses by default.
+
+To bind beyond localhost, pass `--allow-remote` and set
+`GANGOF8_ALLOW_REMOTE=1`; do this only behind an authenticated reverse proxy.
+Key reveal and OS file-open requests remain local-only even in that mode.
+
 ## Test
 
 ```powershell
+.venv\Scripts\python -m ruff check gangof8 tests
 .venv\Scripts\python -m pytest tests -q
 ```
+
+GitHub Actions runs the same checks for pull requests and pushes to `main`.
 
 ## Skills & permission kernel
 

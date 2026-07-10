@@ -12,8 +12,33 @@ dependencies = [
     "pypdf>=4",             # PDF attachment text extraction (uploads)
 ]
 
+[project.scripts]
+gangof8 = "cli:main"
+
 [project.optional-dependencies]
-dev = ["pytest>=8"]         # httpx is a runtime dep above; TestClient uses it transitively
+dev = ["pytest>=8", "ruff>=0.6", "pillow>=10"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["gangof8", "gangof8.adapters"]
+py-modules = ["cli"]
+
+[tool.setuptools.package-data]
+gangof8 = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest_tmp_run"
+cache_dir = ".pytest_tmp_run/.pytest_cache"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# Start with correctness diagnostics. Formatting and broader style enforcement
+# can be introduced incrementally after the existing large modules are split.
+select = ["F"]

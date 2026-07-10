@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import config, executor, rounds, skills, smoke
+from .artifacts import (
+    ARTIFACT_MARKER as _ARTIFACT_MARKER,
+    BLOCK_START as _BLOCK_START,
+    basename as _basename,
+    clean_artifact_body as _clean_artifact_body,
+    html_doc_end as _html_doc_end,
+    parse_proposals as _parse_proposals_impl,
+    strip_code_fence as _strip_code_fence,
+)
 from .classifier import classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
@@ -36,11 +45,11 @@ from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegist
 from .roles import build_council
 from .rounds import (
     _GOVERNANCE_CONTEXT,
-    _output_contract,
+    _output_contract,  # noqa: F401 - retained as a tested loop compatibility export
     _recent_context,
-    _skill_hints,
-    delegation_contract,
-    lead_prompt,
+    _skill_hints,  # noqa: F401 - retained as a tested loop compatibility export
+    delegation_contract,  # noqa: F401 - retained as a tested loop compatibility export
+    lead_prompt,  # noqa: F401 - retained as a tested loop compatibility export
     role_instruction,
 )
 from .sessions import SessionManager
@@ -1462,85 +1471,9 @@ def _deliberate(
     return session
 
 
-# 'ARTIFACT: <filename>' heading the implementer's draft proposes saving the
-# rest of the draft as that file. Plain-text contract — survives protocol
-# envelopes (markdown bold tolerated, both styles).
-_ARTIFACT_MARKER = re.compile(
-    r"^\s*(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*(?:\*\*)?\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# 'EDIT: <filename>' + a git-conflict-style OLD/NEW block proposes a surgical
-# replace in an existing file. Self-delimited (>>>>>>> ends it). The conflict
-# markers require 7+ chars (the emitted contract uses exactly 7) so ordinary
-# content — a Python doctest '>>> f()', an RST '======' heading rule — inside
-# OLD/NEW does NOT prematurely terminate the capture.
-_EDIT_MARKER = re.compile(
-    r"^[ \t]*(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
-    r"[ \t]*<{7,}[^\n]*\n(?P<old>.*?)\n[ \t]*={7,}[^\n]*\n(?P<new>.*?)\n[ \t]*>{7,}[^\n]*",
-    re.IGNORECASE | re.DOTALL | re.MULTILINE,
-)
-
-# 'RUNTESTS: <command>' proposes a (free) test run; command optional.
-_RUNTESTS_MARKER = re.compile(
-    r"^[ \t]*(?:\*\*)?RUN_?TESTS(?:\*\*)?[ \t]*:[ \t]*(?P<cmd>.*?)[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# 'PROMOTE: <filename>' proposes copying a council file into the established
-# folder — the ONE approval-gated boundary that touches real user code.
-_PROMOTE_MARKER = re.compile(
-    r"^[ \t]*(?:\*\*)?PROMOTE(?:\*\*)?[ \t]*:[ \t]*(?:\*\*)?\s*(?P<file>.+?)\s*(?:\*\*)?[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# any block start — bounds ARTIFACT content so a following EDIT/RUNTESTS/PROMOTE
-# isn't swallowed into the file body. A COLON is required so ordinary prose inside
-# a file body ("Edit the .env file", "Run tests before shipping") is NOT mistaken
-# for a block boundary (which silently truncated the file at that line).
-_BLOCK_START = re.compile(
-    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
-    re.IGNORECASE | re.MULTILINE,
-)
-
 
 def _parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[ProposedAction]:
-    """Parse a draft's ARTIFACT/EDIT/RUNTESTS/PROMOTE blocks into ProposedActions,
-    in document order (so writes/edits precede a test run). `role` stamps who
-    authored the blocks — the lead's draft parses as implementer (historical
-    default); a DELEGATED talent's reply parses as that talent, so governance
-    and attribution both see the real author."""
-    starts = sorted(m.start() for m in _BLOCK_START.finditer(text))
-
-    def _content_end(after: int) -> int:
-        return next((s for s in starts if s > after), len(text))
-
-    found: list[tuple[int, ProposedAction]] = []
-    for m in _ARTIFACT_MARKER.finditer(text):
-        fn = m.group(1).strip()
-        body = _clean_artifact_body(text[m.end():_content_end(m.end())], fn)
-        found.append((m.start(), ProposedAction(
-            session_id=sid, kind="write_file", role=role,
-            filename=fn, content=body, args={"filename": fn, "content": body})))
-    for m in _EDIT_MARKER.finditer(text):
-        fn = m.group("file").strip()
-        found.append((m.start(), ProposedAction(
-            session_id=sid, kind="edit_file", role=role, filename=fn,
-            args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
-    for m in _RUNTESTS_MARKER.finditer(text):
-        cmd = (m.group("cmd") or "").strip()
-        found.append((m.start(), ProposedAction(
-            session_id=sid, kind="run_tests", role=role,
-            filename=cmd or "pytest -q", args={"command": cmd})))
-    # PROMOTE is collected even without an established folder: the missing
-    # delivery target is asked for at execution time (_execute_actions), not
-    # assumed — and never asked up front when there may be nothing to deliver.
-    for m in _PROMOTE_MARKER.finditer(text):
-        fn = m.group("file").strip()
-        found.append((m.start(), ProposedAction(
-            session_id=sid, kind="promote", role=Role.implementer,
-            filename=fn, args={"filename": fn})))
-    return [action for _, action in sorted(found, key=lambda t: t[0])]
+    return _parse_proposals_impl(sid, text, role)
 
 
 def _append_proposals(session: Session, store: LogStore, actions: list[ProposedAction]) -> None:
@@ -1627,66 +1560,6 @@ def materialize_prompt(session: Session, filename: str) -> str:
     )
 
 
-def _strip_code_fence(text: str) -> str:
-    """Drop a single wrapping ``` / ```lang fence if the agent added one despite
-    being asked for the raw body."""
-    t = text.strip()
-    if not t.startswith("```"):
-        return t
-    lines = t.splitlines()
-    lines = lines[1:]  # opening fence (``` or ```lang)
-    if lines and lines[-1].strip().startswith("```"):
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-def _html_doc_end(low: str) -> int:
-    """Index just past the STRUCTURAL </html> in a lowercased HTML string, or -1.
-    The structural close is the FIRST </html> that sits after </body>, so:
-      - a </html> appearing earlier inside a <script> string isn't mistaken for it
-        (that one precedes </body> → fall back to the last </html>), and
-      - a </html> in TRAILING PROSE after the real document is NOT picked up
-        (we take the first structural one and drop everything after it)."""
-    first = low.find("</html>")
-    if first == -1:
-        return -1
-    body_close = low.rfind("</body>")
-    idx = low.rfind("</html>") if (body_close != -1 and first < body_close) else first
-    return idx + len("</html>")
-
-
-def _clean_artifact_body(raw: str, filename: str = "") -> str:
-    """Extract the real file body from an agent's ARTIFACT content. Agents often
-    (a) wrap the file in a ```fence and (b) append an explanation; a naive strip
-    leaves the closing ``` + prose IN the file (it renders as junk after the
-    document — the bug the owner hit). Strategy:
-      - HTML/SVG: slice exactly the document by its own opening/closing tags
-        (structural close, not a mention in trailing prose or a JS string).
-      - A whole-file ``` wrap (EXACTLY one opening fence at the top + one closing
-        fence, nothing more) is stripped. A body with MORE fences is its own
-        content (e.g. a README documenting code blocks) — left untouched so it is
-        never mangled.
-      - Else: returned as-is (the prompt forbids fences/trailing prose at source)."""
-    t = raw.strip()
-    name = filename.lower()
-    low = t.lower()
-    if name.endswith((".html", ".htm")):
-        starts = [i for i in (low.find("<!doctype"), low.find("<html")) if i != -1]
-        e = _html_doc_end(low)
-        if starts and e != -1 and e > min(starts):
-            return t[min(starts):e].strip()
-    elif name.endswith(".svg"):
-        s = low.find("<svg")
-        e = low.rfind("</svg>")
-        if s != -1 and e != -1 and e + len("</svg>") > s:
-            return t[s:e + len("</svg>")].strip()
-    if t.startswith("```"):
-        lines = t.splitlines()
-        fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
-        if len(fences) == 2 and fences[0] == 0:  # a clean whole-file wrapper
-            return "\n".join(lines[1:fences[1]]).strip()
-    return t
-
 
 def _intended_filenames(session: Session) -> list[str]:
     """The files this task means to produce: explicit ARTIFACT names first, then
@@ -1725,9 +1598,6 @@ def _intended_filenames(session: Session) -> list[str]:
 # ARTIFACT blocks — only the lead materializes). This recovers that body.
 _FENCE_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)\n?```", re.S)
 
-
-def _basename(name: str) -> str:
-    return name.replace("\\", "/").split("/")[-1].strip()
 
 
 def _salvage_filename(session: Session, block: str, full_text: str) -> str:

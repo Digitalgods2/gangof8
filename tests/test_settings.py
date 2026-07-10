@@ -11,7 +11,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gangof8 import config
+from gangof8.models import SESSION_SCHEMA_VERSION
 from gangof8.service import GangOf8Service
+from gangof8.sessions import migrate_session_data
 from gangof8.settings import Settings, load_settings, save_settings
 
 
@@ -20,6 +22,7 @@ from gangof8.settings import Settings, load_settings, save_settings
 
 def test_defaults_when_no_file(tmp_path):
     s = load_settings(tmp_path)
+    assert s.settings_version == 1
     assert s.backend == config.BACKEND
     assert s.role_agents == {}
     assert s.risk_boundary == config.RISK_BOUNDARY.value
@@ -78,6 +81,16 @@ def test_corrupt_file_falls_back(tmp_path):
     (tmp_path / "settings.json").write_text("{ not json", encoding="utf-8")
     s = load_settings(tmp_path)
     assert s.backend == config.BACKEND
+
+
+def test_settings_migration_stamps_current_version(tmp_path):
+    (tmp_path / "settings.json").write_text('{"backend":"mock"}', encoding="utf-8")
+    assert load_settings(tmp_path).settings_version == 1
+
+
+def test_session_migration_stamps_current_version():
+    data = {"session_id": "s_1", "task": {"task_id": "t_1", "session_id": "s_1", "text": "x"}}
+    assert migrate_session_data(data)["schema_version"] == SESSION_SCHEMA_VERSION
 
 
 # ---- Service consumption -----------------------------------------------------

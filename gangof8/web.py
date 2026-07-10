@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import html as _html
 import ipaddress
-import os
 import re
 import socket
 import urllib.request

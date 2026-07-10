@@ -8,7 +8,6 @@ disallowed roles are fed back as errors rather than crashing, and a contribution
 with no marker is left untouched (no extra agent call).
 """
 
-from pathlib import Path
 
 import pytest
 

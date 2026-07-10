@@ -10,6 +10,11 @@ from .models import Budgets, Complexity, Risk, Role
 
 DATA_DIR = Path(os.environ.get("GANGOF8_DATA", str(Path(__file__).resolve().parent.parent / "data")))
 
+# The dashboard can read local files, reveal locally stored API keys, and ask
+# the OS to open delivered files. It is therefore localhost-only by default.
+# Set GANGOF8_ALLOW_REMOTE=1 only behind an authenticated reverse proxy.
+ALLOW_REMOTE_ENV = "GANGOF8_ALLOW_REMOTE"
+
 
 def _default_sandbox_root() -> Path:
     """A NEUTRAL scratch location, deliberately OUTSIDE any project/source folder

@@ -34,6 +34,7 @@ from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
 from .paths import extract_delivery_target, extract_established_root, prior_deliverable_files
 from .registry import AgentError
 from .registry import AgentRegistry
+from .runtime_diagnostics import collect_runtime_diagnostics
 from .sessions import SessionManager
 from .settings import Settings, budgets_overrides, load_settings, save_settings
 from .uploads import UploadStore, attachment_context
@@ -540,7 +541,8 @@ class GangOf8Service:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
         session = self._open(text, source, budgets, attachments)
-        self._pool.submit(self._safely, session, self._run_full)
+        worker_session = self.manager.load(session.session_id) or session
+        self._pool.submit(self._safely, worker_session, self._run_full)
         return session
 
     def save_upload(self, name: str, content_b64: str) -> dict:
@@ -956,6 +958,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 items.append({"label": label, "icon": icon, "path": str(p)})
         items.append({"label": "This PC", "icon": "💻", "path": ""})
         return {"shortcuts": items}
+
+    def diagnostics(self) -> dict:
+        """Redaction-safe runtime diagnostics for setup/debugging."""
+        return collect_runtime_diagnostics(
+            data_dir=self._data_dir,
+            backend=self.backend,
+            settings=self.settings,
+            active_workspace=self.workspaces.active(),
+            workspace_count=len(self.workspaces.list()),
+            panel=self.panel,
+            role_agents=self.role_agents,
+            api_key_status=self.api_key_status,
+            api_key_names=self.KNOWN_API_KEYS,
+        )
 
     def make_dir(self, path: str, name: str) -> dict:
         """Create a sub-folder for the in-page browser's New-folder button, then

@@ -4,7 +4,6 @@ exactly why not. Test commands really run (subprocess in the sandbox)."""
 
 import json
 
-import pytest
 
 from gangof8 import config
 from gangof8.adapters.mock import MockAdapter

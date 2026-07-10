@@ -6,11 +6,10 @@ import json
 import threading
 import time
 
-import pytest
 
 from gangof8 import config, rounds
 from gangof8.adapters.mock import MockAdapter
-from gangof8.models import Role, Session, SessionStatus, Task
+from gangof8.models import Role, Session, SessionStatus
 from gangof8.registry import AdapterResult, AgentError
 from gangof8.service import GangOf8Service
 

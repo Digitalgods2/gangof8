@@ -407,7 +407,7 @@ def test_promote_falls_back_to_sandbox_source(governance, session, tmp_path):
     approval = governance.authorize_action(session, action)
     assert approval is not None and approval.category == "promote"
     governance.resolve(session, approval.approval_id, approved=True)
-    result = execute(session, action, tmp_path)
+    execute(session, action, tmp_path)
     assert (est / "y.py").read_text(encoding="utf-8") == "scratch body\n"
 
 

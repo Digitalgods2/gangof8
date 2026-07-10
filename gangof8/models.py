@@ -9,6 +9,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+SESSION_SCHEMA_VERSION = 1
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -266,6 +268,7 @@ class FinalAnswer(BaseModel):
 
 
 class Session(BaseModel):
+    schema_version: int = SESSION_SCHEMA_VERSION
     session_id: str
     status: SessionStatus = SessionStatus.received
     backend: str = "mock"  # which adapter family this session runs on; resume must match

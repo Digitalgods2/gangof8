@@ -7,7 +7,6 @@ output. The implementer proposes them via EDIT / RUNTESTS blocks in its draft,
 parsed alongside ARTIFACT.
 """
 
-from pathlib import Path
 
 import pytest
 

@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 _SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.S | re.I)
 _WEB_SUFFIXES = (".html", ".htm", ".js", ".mjs")
