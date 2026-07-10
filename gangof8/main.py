@@ -119,17 +119,26 @@ def logo() -> FileResponse:
 
 @app.get("/app.css")
 def dashboard_css() -> FileResponse:
-    return FileResponse(_STATIC / "app.css", media_type="text/css")
+    return FileResponse(
+        _STATIC / "app.css", media_type="text/css",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/app.js")
 def dashboard_js() -> FileResponse:
-    return FileResponse(_STATIC / "app.js", media_type="text/javascript")
+    return FileResponse(
+        _STATIC / "app.js", media_type="text/javascript",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/dashboard-utils.js")
 def dashboard_utils_js() -> FileResponse:
-    return FileResponse(_STATIC / "dashboard-utils.js", media_type="text/javascript")
+    return FileResponse(
+        _STATIC / "dashboard-utils.js", media_type="text/javascript",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/health")
