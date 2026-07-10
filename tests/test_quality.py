@@ -1,6 +1,5 @@
 """Composer polish for the lead-driven model."""
 
-import pytest
 
 from gangof8.adapters.mock import FINAL_JSON, MockAdapter
 from gangof8.models import (

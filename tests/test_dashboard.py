@@ -89,10 +89,31 @@ def test_logo_served_and_referenced(client):
     assert 'rel="icon"' in page                                # favicon
 
 
+def test_dashboard_assets_served(client):
+    page = client.get("/").text
+    assert 'src="/dashboard-utils.js"' in page
+    assert 'href="/app.css"' in page
+    assert 'src="/app.js"' in page
+    assert client.get("/dashboard-utils.js").headers["content-type"].startswith("text/javascript")
+    assert client.get("/app.css").headers["content-type"].startswith("text/css")
+    assert client.get("/app.js").headers["content-type"].startswith("text/javascript")
+
+
 def test_health_reports_backend(client):
     h = client.get("/health").json()
     assert h["ok"] is True
     assert h["backend"] == "mock"
+
+
+def test_diagnostics_reports_runtime_without_raw_secrets(client, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-secret-1234")
+    d = client.get("/diagnostics").json()
+    assert d["backend"] == "mock"
+    assert d["settings_version"] == 1
+    assert "data_dir" in d and "sandbox_root" in d
+    assert set(d["cli"]) == {"claude", "codex", "gemini"}
+    assert d["api_keys"]["openrouter"]["present"] is True
+    assert "sk-or-secret-1234" not in str(d)
 
 
 def test_delete_session_removes_it(client):

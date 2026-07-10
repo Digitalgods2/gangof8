@@ -17,7 +17,8 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from . import config
-from .models import Budgets
+
+SETTINGS_SCHEMA_VERSION = 1
 
 
 class ComposerSettings(BaseModel):
@@ -40,6 +41,7 @@ class Settings(BaseModel):
     BUDGETS_BY_COMPLEXITY.
     """
 
+    settings_version: int = SETTINGS_SCHEMA_VERSION
     backend: str = Field(default_factory=lambda: config.BACKEND)
     role_agents: dict[str, str] = {}
     budgets: dict[str, dict] = {}
@@ -86,6 +88,17 @@ def _settings_path(data_dir: Optional[Path] = None) -> Path:
     return (Path(data_dir) if data_dir else config.DATA_DIR) / "settings.json"
 
 
+def migrate_settings_data(data: dict) -> dict:
+    """Normalize persisted settings before validation.
+
+    Version 1 only stamps the version field. Future migrations should be added
+    here as ordered transforms from older shapes to the current Settings model.
+    """
+    out = dict(data)
+    out["settings_version"] = SETTINGS_SCHEMA_VERSION
+    return out
+
+
 def load_settings(data_dir: Optional[Path] = None) -> Settings:
     """Return the effective settings: config/env defaults overlaid with any
     values present in settings.json. Absent or partial files are tolerated —
@@ -103,6 +116,7 @@ def load_settings(data_dir: Optional[Path] = None) -> Settings:
     # Overlay only the keys actually present, so partial files keep defaults
     # for everything else (validation re-fills nested model defaults).
     merged = settings.model_dump()
+    stored = migrate_settings_data(stored)
     for key, value in stored.items():
         if key not in merged:
             continue

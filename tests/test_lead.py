@@ -1,7 +1,6 @@
 """Lead-driven model: the lead drives a task directly, pulls in talents only on
 demand, and finishes a cut-off file by continuing it instead of re-drafting."""
 
-from pathlib import Path
 
 import pytest
 

@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+from pathlib import Path
+from typing import Any
 
 _DROP_RE = re.compile(r"(\w+) seat \(([\w.\-]+)\) dropped: (.*)", re.IGNORECASE)
 _SUB_RE = re.compile(r"summarizer '([\w.\-]+)' failed.*recomposed with '([\w.\-]+)'", re.IGNORECASE)
@@ -40,6 +43,54 @@ def council_health(unresolved: list[str]) -> dict:
         "dropped": dropped,
         "substitutions": substitutions,
         "notes": notes,
+    }
+
+
+def run_summary(session: Any) -> dict:
+    """Return an audit-friendly, compact summary for the dashboard/API.
+
+    Session records intentionally keep the complete execution trail. This
+    derived view makes the facts a user needs while deciding whether to promote
+    or inspect output available without making the browser parse every event.
+    """
+    data = session.model_dump() if hasattr(session, "model_dump") else dict(session or {})
+    contributions = data.get("contributions") or []
+    actions = data.get("proposed_actions") or []
+    by_agent: dict[str, int] = {}
+    by_model: dict[str, int] = {}
+    duration_ms = 0
+    for contribution in contributions:
+        agent = contribution.get("agent") or "unknown"
+        by_agent[agent] = by_agent.get(agent, 0) + 1
+        model = contribution.get("model")
+        if model:
+            by_model[model] = by_model.get(model, 0) + 1
+        duration_ms += int(contribution.get("duration_ms") or 0)
+    action_statuses: dict[str, int] = {}
+    for action in actions:
+        status = action.get("status") or "unknown"
+        action_statuses[status] = action_statuses.get(status, 0) + 1
+
+    files: list[dict] = []
+    for raw_path in data.get("files_changed") or []:
+        path = Path(raw_path)
+        item = {"path": str(path), "exists": path.is_file()}
+        if path.is_file():
+            try:
+                item["bytes"] = path.stat().st_size
+                item["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                item["exists"] = False
+        files.append(item)
+
+    return {
+        "agent_calls": data.get("agent_calls", len(contributions)),
+        "contribution_duration_ms": duration_ms,
+        "contributions_by_agent": by_agent,
+        "contributions_by_model": by_model,
+        "actions_by_status": action_statuses,
+        "test_fix_attempts": data.get("test_fix_attempts", 0),
+        "files": files,
     }
 
 

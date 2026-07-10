@@ -11,11 +11,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import __version__, config, reporting
+from . import __version__, config, reporting, security
 from .models import Role
 from .service import GangOf8Service
 
@@ -33,6 +33,18 @@ app = FastAPI(title="Gang of 8 — Coordinator", version=__version__)
 service = GangOf8Service(backend=os.environ.get("GANGOF8_BACKEND"))
 
 _STATIC = Path(__file__).parent / "static"
+
+
+@app.middleware("http")
+async def localhost_only(request: Request, call_next):
+    """Keep the local-control API off the network unless explicitly enabled."""
+    client_host = request.client.host if request.client else None
+    if not security.local_request_allowed(client_host):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Gang of 8 accepts local requests only"},
+        )
+    return await call_next(request)
 
 
 class TaskIn(BaseModel):
@@ -82,6 +94,7 @@ def _summary(session) -> dict:
         "established_root": session.established_root,
         "attachments": session.attachments,
         "council_health": reporting.council_health(session.unresolved),
+        "run_summary": reporting.run_summary(session),
     }
 
 
@@ -101,9 +114,29 @@ def logo() -> FileResponse:
                         headers={"Cache-Control": "max-age=86400"})
 
 
+@app.get("/app.css")
+def dashboard_css() -> FileResponse:
+    return FileResponse(_STATIC / "app.css", media_type="text/css")
+
+
+@app.get("/app.js")
+def dashboard_js() -> FileResponse:
+    return FileResponse(_STATIC / "app.js", media_type="text/javascript")
+
+
+@app.get("/dashboard-utils.js")
+def dashboard_utils_js() -> FileResponse:
+    return FileResponse(_STATIC / "dashboard-utils.js", media_type="text/javascript")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "version": __version__, "backend": service.backend}
+
+
+@app.get("/diagnostics")
+def diagnostics() -> dict:
+    return service.diagnostics()
 
 
 @app.post("/tasks")
@@ -184,6 +217,7 @@ def get_session(session_id: str) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
     service.annotate_council_models(data)  # label each member with the model it runs
     data["council_health"] = reporting.council_health(data.get("unresolved", []))
+    data["run_summary"] = reporting.run_summary(data)
     return data
 
 
@@ -231,10 +265,13 @@ def _os_open(path: str) -> None:
 
 
 @app.post("/files/open")
-def open_file(body: OpenFileIn) -> dict:
+def open_file(body: OpenFileIn, request: Request) -> dict:
     """Open one of a session's written files with the OS default app. Guarded:
     the path MUST be one of the files the session actually wrote (its
     files_changed list), so this can never open an arbitrary file on disk."""
+    client_host = request.client.host if request.client else None
+    if not security.sensitive_local_action_allowed(client_host):
+        raise HTTPException(status_code=403, detail="opening local files requires a local request")
     data = service.get(body.session_id)
     if data is None:
         raise HTTPException(status_code=404, detail="session not found")
@@ -358,9 +395,12 @@ def get_api_key(name: str) -> dict:
 
 
 @app.get("/settings/api-keys/{name}/reveal")
-def reveal_api_key(name: str) -> dict:
+def reveal_api_key(name: str, request: Request) -> dict:
     """The full key value, fetched on demand by the dashboard's eye-reveal
     (the app is localhost-only and the key is stored locally anyway)."""
+    client_host = request.client.host if request.client else None
+    if not security.sensitive_local_action_allowed(client_host):
+        raise HTTPException(status_code=403, detail="revealing API keys requires a local request")
     try:
         return service.reveal_api_key(name)
     except KeyError as e:

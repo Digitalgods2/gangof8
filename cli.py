@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from gangof8.service import GangOf8Service
+from gangof8 import security
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -33,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8790)
     p_serve.add_argument("--backend", default=None, choices=["mock", "cli"])
+    p_serve.add_argument(
+        "--allow-remote", action="store_true",
+        help="allow non-local clients; use only behind authenticated access",
+    )
     sub.add_parser("pending", help="list pending approvals across sessions")
 
     p_approve = sub.add_parser("approve", help="approve a pending approval (resumes the session)")
@@ -82,12 +88,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "serve":
-        import os
-
         import uvicorn
 
         if args.backend:
             os.environ["GANGOF8_BACKEND"] = args.backend
+        if args.allow_remote:
+            os.environ["GANGOF8_ALLOW_REMOTE"] = "1"
+        try:
+            security.validate_bind_host(args.host)
+        except ValueError as e:
+            parser.error(str(e))
         print(f"Gang of 8 dashboard: http://{args.host}:{args.port}/")
         uvicorn.run("gangof8.main:app", host=args.host, port=args.port)
         return 0

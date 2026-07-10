@@ -15,7 +15,6 @@ from fastapi.testclient import TestClient
 from gangof8 import executor
 from gangof8.adapters.mock import MockAdapter
 from gangof8.executor import ExecutionError, execute, resolve_in_workspace
-from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import ProposedAction, Role, SessionStatus
 from gangof8.registry import AdapterResult

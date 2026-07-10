@@ -9,6 +9,16 @@ receives a user task, decides which AI agents or tools should participate, assig
 roles, manages the discussion, prevents runaway loops, records the reasoning trail,
 and returns a final answer to the user. The human always has final authority.
 
+## Implementation status
+
+This document records the product rationale and the original loop sketch. The
+implemented architecture has advanced beyond parts of that historical sketch;
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is the current component map and
+[`README.md`](README.md) is the current operator guide. In particular, current
+sessions use persisted schema versions, panel rounds, artifact best-of-N and
+repair flows, derived run summaries, and a localhost-only API boundary with an
+explicit remote opt-in.
+
 ## Current model (2026-07-01): panel rounds + a single hard gate
 
 Deliberation is an automatic round loop built for **diversity of intelligence**:
