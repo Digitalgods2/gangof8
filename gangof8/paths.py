@@ -52,20 +52,24 @@ def extract_established_root(text: str) -> Optional[str]:
     return None
 
 
-# An explicit OUTPUT-destination instruction: a save/write/output verb, then
-# (closely) a destination preposition, then a path. This is the DELIVERY target —
-# distinct from a READ source the task may ALSO name. "read from A, save to B"
-# must deliver to B and never overwrite the source A. The lookahead requires the
-# preposition to be followed by something that actually starts a path (quote,
-# drive, UNC, posix root, ~), so "save it to disk" / "write to the user" do NOT
-# match — only a real destination path does.
-_SAVE_VERB = (
-    r"(?:sav(?:e|ed|ing)|writ(?:e|ing|ten)|output|export(?:ed|ing)?|"
-    r"put|plac(?:e|ed|ing)|stor(?:e|ed|ing)|deliver(?:ed|ing)?|drop)"
+# Delivery parsing gives an explicit save/output instruction priority over a
+# generic "write" instruction. This avoids treating "write a sequel located at
+# <source>" as a request to overwrite the source when a later sentence says
+# "save the final file to <destination>".
+_EXPLICIT_DELIVERY_VERB = (
+    r"(?:sav(?:e|ed|ing)|output|export(?:ed|ing)?|plac(?:e|ed|ing)|"
+    r"stor(?:e|ed|ing)|deliver(?:ed|ing)?|drop)"
 )
-_DELIVERY_RE = re.compile(
-    r"\b" + _SAVE_VERB + r"\b[^\n]{0,70}?\b(?:in|into|to|under|at|inside)\b\s*:?\s*"
-    r"(?=[\"'`/~]|[A-Za-z]:[\\/]|\\\\)",
+_WRITE_DELIVERY_VERB = r"(?:writ(?:e|ing|ten)|put)"
+_PATH_START = r"(?=[\"'`/~]|[A-Za-z]:[\\/]|\\\\)"
+_EXPLICIT_DELIVERY_RE = re.compile(
+    r"\b" + _EXPLICIT_DELIVERY_VERB
+    + r"\b[^\n]{0,120}?\b(?:in|into|to|under|at|inside)\b\s*:?\s*" + _PATH_START,
+    re.IGNORECASE,
+)
+_WRITE_DELIVERY_RE = re.compile(
+    r"\b" + _WRITE_DELIVERY_VERB
+    + r"\b[^\n]{0,70}?\b(?:in|into|to|under|inside)\b\s*:?\s*" + _PATH_START,
     re.IGNORECASE,
 )
 
@@ -78,12 +82,15 @@ def extract_delivery_target(text: str) -> Optional[str]:
     and states where to save, this is the destination promote should use, so the
     source folder is never silently overwritten."""
     text = text or ""
-    for m in _DELIVERY_RE.finditer(text):
-        # resolve the path that begins right after the preposition (bounded window
-        # so we don't wander into a later sentence's path)
-        root = extract_established_root(text[m.end(): m.end() + 400])
-        if root:
-            return root
+    for pattern in (_EXPLICIT_DELIVERY_RE, _WRITE_DELIVERY_RE):
+        # A task can name more than one destination while it narrows the request;
+        # the last explicit instruction is the final user intent.
+        for m in reversed(list(pattern.finditer(text))):
+            # Resolve the path that begins right after the preposition (bounded
+            # window so we don't wander into a later sentence's path).
+            root = extract_established_root(text[m.end(): m.end() + 400])
+            if root:
+                return root
     return None
 
 

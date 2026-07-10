@@ -139,6 +139,20 @@ def test_delivery_target_distinguishes_save_dest_from_read_source(tmp_path):
     assert extract_delivery_target(text) == str(out_dir.resolve()), "save target"
 
 
+def test_delivery_target_prefers_explicit_save_over_written_source(tmp_path):
+    source = tmp_path / "Benny"
+    source.mkdir()
+    source_file = source / "Benny's Splash.txt"
+    source_file.write_text("canon", encoding="utf-8")
+    destination = tmp_path / "tmp"
+    text = (
+        f"Write a sequel to the children's book located at: {source_file}. "
+        f"Save the final output file to: {destination}"
+    )
+    assert extract_established_root(text) == str(source.resolve())
+    assert extract_delivery_target(text) == str(destination.resolve())
+
+
 def test_delivery_target_none_without_explicit_save_dest(tmp_path):
     d = tmp_path / "proj"
     d.mkdir()
@@ -176,6 +190,40 @@ def test_promote_delivers_to_declared_target_not_source(tmp_path):
 
     assert (dest / "story.txt").read_text(encoding="utf-8") == "NEW STORY"
     assert (source / "story.txt").read_text(encoding="utf-8") == "ORIGINAL CANON — do not touch"
+
+
+def test_promote_rechecks_explicit_destination_for_stale_session(tmp_path):
+    """A session that persisted the source as delivery_root must still honor a
+    later explicit save target when the promote happens."""
+    from gangof8 import executor
+    from gangof8.logstore import LogStore
+    from gangof8.models import ProposedAction
+    from gangof8.sessions import SessionManager
+    from gangof8.skills import _promote
+
+    source = tmp_path / "Benny"
+    source.mkdir()
+    source_file = source / "Benny's Splash.txt"
+    source_file.write_text("ORIGINAL CANON", encoding="utf-8")
+    destination = tmp_path / "tmp"
+    task = (
+        f"Write a sequel to the children's book located at: {source_file}. "
+        f"Save the final output file to: {destination}"
+    )
+    store = LogStore(tmp_path / "data")
+    session = SessionManager(store).create(task, source="test")
+    session.established_root = str(source)
+    session.delivery_root = str(source)  # persisted by the old parser
+    sandbox = executor.artifacts_dir(store.data_dir, session.session_id)
+    sandbox.mkdir(parents=True, exist_ok=True)
+    (sandbox / "story.txt").write_text("NEW STORY", encoding="utf-8")
+
+    action = ProposedAction(session_id=session.session_id, kind="promote",
+                            filename="story.txt", args={"filename": "story.txt"})
+    _promote(session, action, store.data_dir)
+
+    assert (destination / "story.txt").read_text(encoding="utf-8") == "NEW STORY"
+    assert not (source / "story.txt").exists()
 
 
 def test_promote_approval_flags_overwrite_vs_new(tmp_path):
