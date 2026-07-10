@@ -1341,7 +1341,6 @@ async function activateWorkspace(id) {
 
 // ---- in-page folder browser ----
 let fsCurrent = "";  // "" = drive roots
-const escAttr = s => esc(s).replaceAll('"', "&quot;");
 
 async function refreshModelCatalog(btn) {
   if (btn) btn.textContent = "↻ fetching…";
