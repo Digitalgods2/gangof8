@@ -97,6 +97,8 @@ def test_dashboard_assets_served(client):
     assert client.get("/dashboard-utils.js").headers["content-type"].startswith("text/javascript")
     assert client.get("/app.css").headers["content-type"].startswith("text/css")
     assert client.get("/app.js").headers["content-type"].startswith("text/javascript")
+    assert "no-store" in client.get("/app.js").headers["cache-control"]
+    assert "function enhancePrompt" in client.get("/app.js").text
 
 
 def test_health_reports_backend(client):
