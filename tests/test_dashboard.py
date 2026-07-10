@@ -96,9 +96,11 @@ def test_dashboard_assets_served(client):
     assert 'src="/app.js"' in page
     assert client.get("/dashboard-utils.js").headers["content-type"].startswith("text/javascript")
     assert client.get("/app.css").headers["content-type"].startswith("text/css")
-    assert client.get("/app.js").headers["content-type"].startswith("text/javascript")
-    assert "no-store" in client.get("/app.js").headers["cache-control"]
-    assert "function enhancePrompt" in client.get("/app.js").text
+    app_js = client.get("/app.js")
+    assert app_js.headers["content-type"].startswith("text/javascript")
+    assert "no-store" in app_js.headers["cache-control"]
+    assert "function enhancePrompt" in app_js.text
+    assert "const escAttr =" not in app_js.text, "shared helper must not be redeclared"
 
 
 def test_health_reports_backend(client):
