@@ -6,6 +6,8 @@ runs freely in the sandbox; only when it wants to DELIVER (PROMOTE) does the
 coordinator ask WHERE — at delivery time, never up front.
 """
 
+import os
+
 import pytest
 
 from gangof8.classifier import classify
@@ -56,6 +58,13 @@ def test_extract_new_target_drops_trailing_prose(tmp_path):
     # A brand-new folder inside an existing parent, followed by prose: keep only
     # the new folder name, not the sentence.
     target = tmp_path / "newgame"
+    text = f"build it into {target} and then run it in a browser please"
+    assert extract_established_root(text) == str(target.resolve())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="exercise POSIX new-target parsing")
+def test_extract_new_posix_target_drops_trailing_prose(tmp_path):
+    target = tmp_path / "new_posix_target"
     text = f"build it into {target} and then run it in a browser please"
     assert extract_established_root(text) == str(target.resolve())
 
