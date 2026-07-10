@@ -267,6 +267,16 @@ class FinalAnswer(BaseModel):
     next_action: Optional[str] = None
 
 
+class IntegrationProposal(BaseModel):
+    """A validated, optional merge of complementary panel candidates."""
+
+    filename: str
+    content: str
+    rationale: str
+    source_candidates: list[str] = []
+    status: str = "pending"  # pending | adopted | kept_winner
+
+
 class Session(BaseModel):
     schema_version: int = SESSION_SCHEMA_VERSION
     session_id: str
@@ -282,6 +292,8 @@ class Session(BaseModel):
     #                                      overwrites its source. None ⇒ deliver to established_root.
     panel: list[str] = []  # seat names convened for this session (resume-stable)
     cli_timeouts: dict[str, int] = {}  # per-seat call timeout (s), from Settings; {} ⇒ config defaults
+    integration_review_enabled: bool = False
+    integration_proposal: Optional[IntegrationProposal] = None
     # Approval categories the human granted a session-wide standing approval for
     # (e.g. "promote" via 'Approve all'): one deliberate grant instead of N
     # identical clicks. Session-scoped — a new task starts clean.

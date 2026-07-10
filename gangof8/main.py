@@ -93,6 +93,9 @@ def _summary(session) -> dict:
         "workspace_root": session.workspace_root,
         "established_root": session.established_root,
         "attachments": session.attachments,
+        "integration_proposal": (
+            session.integration_proposal.model_dump() if session.integration_proposal else None
+        ),
         "council_health": reporting.council_health(session.unresolved),
         "run_summary": reporting.run_summary(session),
     }

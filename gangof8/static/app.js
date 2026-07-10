@@ -661,13 +661,20 @@ function renderDetail(s) {
 
     ${inputs.map(i => `
       <div class="card needs">
-        <h3>Agent question — ${esc(i.role)}@${esc(i.agent)}</h3>
+        <h3>${i.purpose === "integration_decision" ? "Council integration decision" : "Agent question - " + esc(i.role) + "@" + esc(i.agent)}</h3>
         <div>${esc(i.question)}</div>
-        <textarea id="ans_${i.input_id}" placeholder="Your answer…"></textarea>
-        <div class="row">
-          <button onclick="answerInput('${i.input_id}')">Answer</button>
-          <button class="deny" onclick="declineInput('${i.input_id}')">Decline</button>
-        </div>
+        ${i.purpose === "integration_decision" && s.integration_proposal ? `
+          <div class="sub" style="margin-top:8px">Integrated candidate: <span class="mono">${esc(s.integration_proposal.filename)}</span> - ${esc((s.integration_proposal.source_candidates || []).join(", ") || "council review")}</div>
+          <pre>${esc(s.integration_proposal.content)}</pre>
+          <div class="row">
+            <button onclick="chooseIntegration('${i.input_id}', 'use integration')">Use integration</button>
+            <button class="ghost" onclick="chooseIntegration('${i.input_id}', 'keep winner')">Keep voted winner</button>
+          </div>` : `
+          <textarea id="ans_${i.input_id}" placeholder="Your answer…"></textarea>
+          <div class="row">
+            <button onclick="answerInput('${i.input_id}')">Answer</button>
+            <button class="deny" onclick="declineInput('${i.input_id}')">Decline</button>
+          </div>`}
       </div>`).join("")}
 
     ${final && (final.assumptions?.length || final.risks_unresolved?.length || final.next_action) ? `
@@ -752,6 +759,13 @@ async function answerInput(iid) {
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({answer: text, background:true})});
   pollLoop();  // deliberation resumes → return to fast polling
+}
+
+async function chooseIntegration(iid, choice) {
+  await api(`/sessions/${current}/inputs/${iid}`, {method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({answer: choice, background:true})});
+  pollLoop();
 }
 
 async function declineInput(iid) {
@@ -1115,6 +1129,9 @@ function renderSettings(s, seats) {
         <input type="number" id="set_reserved" value="${esc(c.reserved_calls)}"></div>
       <div class="field">${lbl("Max critic tests", "critic_tests")}
         <input type="number" id="set_critic" value="${esc(c.max_critic_tests)}"></div>
+      <div class="field">${lbl("Council integration review", "integration_review")}
+        <input type="checkbox" id="set_integration_review" ${s.integration_review_enabled ? "checked" : ""}></div>
+      <div class="sub">After a best-of-N build vote, the codifier may offer a separately validated merge when candidates have complementary strengths. The voted winner remains the default, and the human chooses whether to use the integration.</div>
     </div>
 
     <div class="sset s-ui">
@@ -1211,6 +1228,7 @@ async function saveSettings() {
     cli_models,
     cli_enabled,
     cli_timeouts,
+    integration_review_enabled: document.getElementById("set_integration_review").checked,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),

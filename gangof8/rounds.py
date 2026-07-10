@@ -703,6 +703,50 @@ def chair_recover_prompt(session: Session, filename: str, body: str, error: str)
     )
 
 
+def integration_prompt(session: Session, filename: str, candidates: list[dict]) -> str:
+    """Ask the codifier whether a real micro-level merge is worth offering.
+
+    This is deliberately an offer, not an automatic rewrite: only a concrete,
+    materially better integration earns a human decision point.
+    """
+    labeled = "\n\n".join(
+        f"----- Candidate {c['label']} ({c['role']}; score {c['score']}, "
+        f"{c['votes']} first-place votes) -----\n{c['content']}"
+        for c in candidates
+    )
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        "You are the council's integration reviewer. The blind vote has chosen "
+        "a default winner, but independently authored candidates can contain "
+        "complementary strengths at a fine-grained level. Evaluate EVERY "
+        "candidate below against the task and each other.\n"
+        "Offer an integration only when it makes a concrete, testable improvement "
+        "over the voted winner without mixing incompatible designs. Do not offer "
+        "one merely to average preferences. The human will decide whether to use it.\n"
+        "If no meaningful integration exists, emit exactly:\n"
+        "SYNERGY: NO - <brief reason>\n"
+        "If it does, emit exactly this structure, with a COMPLETE replacement "
+        "file and no PROMOTE line:\n"
+        "SYNERGY: YES\n"
+        "RATIONALE: <which specific strengths from which candidates are combined>\n"
+        f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
+        "<complete integrated file contents>\n\n"
+        f"CANDIDATES:\n{labeled}"
+    )
+
+
+def parse_integration_decision(text: str) -> tuple[bool, str, list[str]]:
+    """Return (offered, rationale, source labels) from a codifier reply."""
+    offered = bool(re.search(r"^\s*SYNERGY\s*:\s*YES\b", text or "", re.I | re.M))
+    if not offered:
+        return False, "", []
+    rationale = re.search(r"^\s*RATIONALE\s*:\s*(.+)$", text or "", re.I | re.M)
+    sources = re.search(r"^\s*SOURCES\s*:\s*(.+)$", text or "", re.I | re.M)
+    labels = re.findall(r"Candidate\s+\d+", sources.group(1) if sources else "", re.I)
+    return True, (rationale.group(1).strip() if rationale else ""), labels
+
+
 def synthesis_prompt(
     session: Session, council: "Council", role_agents: dict[Role, str] | None,
     round_idx: int, panel_results: list[Contribution],
