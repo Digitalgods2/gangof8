@@ -82,7 +82,7 @@
     <textarea id="task" rows="1" placeholder="Describe a task for the council…  (Enter to send, Shift+Enter for a new line)"
               oninput="autoGrow(this)" onkeydown="composerKey(event)"></textarea>
     <button class="ghost" onclick="clearComposer()">Clear</button>
-    <button id="enhanceBtn" class="ghost" onclick="enhancePrompt()"
+    <button id="enhanceBtn" type="button" class="ghost"
             title="Rewrite your prompt into a sharper, more effective version using your strong codifier model (the Summarizer seat). Click again to Undo.">✨ Enhance</button>
     <button id="cancelBtn" class="deny" style="display:none" onclick="cancelCurrent()">Cancel run</button>
     <button onclick="submitTask()">Send</button>
