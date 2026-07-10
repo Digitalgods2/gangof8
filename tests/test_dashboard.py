@@ -94,12 +94,15 @@ def test_dashboard_assets_served(client):
     assert 'src="/dashboard-utils.js"' in page
     assert 'href="/app.css"' in page
     assert 'src="/app.js"' in page
+    assert 'id="enhanceBtn" type="button"' in page
+    assert 'onclick="enhancePrompt()"' not in page
     assert client.get("/dashboard-utils.js").headers["content-type"].startswith("text/javascript")
     assert client.get("/app.css").headers["content-type"].startswith("text/css")
     app_js = client.get("/app.js")
     assert app_js.headers["content-type"].startswith("text/javascript")
     assert "no-store" in app_js.headers["cache-control"]
     assert "function enhancePrompt" in app_js.text
+    assert "void enhancePrompt();" in app_js.text
     assert "const escAttr =" not in app_js.text, "shared helper must not be redeclared"
 
 

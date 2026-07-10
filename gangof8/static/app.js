@@ -275,6 +275,16 @@ async function enhancePrompt() {
   }
 }
 
+function bindComposerControls() {
+  const enhance = document.getElementById("enhanceBtn");
+  if (enhance) {
+    enhance.addEventListener("click", event => {
+      event.preventDefault();
+      void enhancePrompt();
+    });
+  }
+}
+
 // ---- respond-to-council attachments — multi-modal like the main composer ----
 let fuAttachments = [];  // [{id, name, kind}]
 const fuChips = () => fuAttachments.map(a => `
@@ -1459,6 +1469,7 @@ async function emptyWorkspace() {
 
 loadHealth();
 loadWorkspace();
+bindComposerControls();
 pollLoop();
 setInterval(tickElapsed, 1000);
 // when a task is submitted or an action resolved, jump back to fast polling
