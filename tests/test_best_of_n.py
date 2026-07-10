@@ -218,6 +218,52 @@ def test_too_few_candidates_falls_back(session, store):
     assert not any(a.role == Role.implementer for a in session.proposed_actions)
 
 
+def test_integration_proposal_is_optional_and_runtime_validated(session, store):
+    """A merge is an offered alternative, not an automatic replacement."""
+    session.integration_review_enabled = True
+    winner = STRONG
+    ordered = [
+        {"content": WEAK, "agent": "aaa"},
+        {"content": winner, "agent": "zzz"},
+    ]
+    session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
+    seen = {}
+
+    def call(member, prompt):
+        seen["prompt"] = prompt
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content=("SYNERGY: YES\nRATIONALE: keep the winner's stable loop and "
+                     "adopt Candidate 1's clearer controls\nSOURCES: Candidate 1, Candidate 2\n"
+                     "ARTIFACT: game.html\n" + STRONG.replace("extra=2", "extra=3")),
+        )
+
+    proposal = loop._propose_integration(
+        session, "game.html", winner, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, call, store,
+    )
+    assert proposal is not None
+    assert proposal.content != winner
+    assert proposal.source_candidates == ["Candidate 1", "Candidate 2"]
+    assert "Evaluate EVERY candidate" in seen["prompt"]
+
+
+def test_integration_rejects_a_broken_merge(session, store):
+    session.integration_review_enabled = True
+    ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
+    session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
+
+    def call(member, prompt):
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content=("SYNERGY: YES\nRATIONALE: unsafe merge\nSOURCES: Candidate 1\n"
+                     "ARTIFACT: game.html\n" + BROKEN),
+        )
+
+    assert loop._propose_integration(
+        session, "game.html", STRONG, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, call, store,
+    ) is None
+
+
 def test_all_judges_failing_falls_back(session, store):
     _candidate(session, "aaa", "game.html", WEAK)
     _candidate(session, "zzz", "game.html", STRONG)

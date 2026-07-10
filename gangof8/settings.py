@@ -82,6 +82,9 @@ class Settings(BaseModel):
     cli_enabled: dict[str, bool] = {}
     # Automatic rounds between "continue another n rounds?" consent checks.
     rounds_per_consent: int = Field(default_factory=lambda: config.ROUNDS_PER_CONSENT)
+    # The codifier may offer a validated merge after best-of-N selection. The
+    # voted winner remains the default until the human explicitly chooses it.
+    integration_review_enabled: bool = True
 
 
 def _settings_path(data_dir: Optional[Path] = None) -> Path:

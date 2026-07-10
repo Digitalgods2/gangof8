@@ -430,6 +430,7 @@ class GangOf8Service:
         session.backend = self.backend
         session.panel = list(self.panel)
         session.cli_timeouts = dict(self.settings.cli_timeouts or {})
+        session.integration_review_enabled = self.settings.integration_review_enabled
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
         # Established folder is PER TASK: interpret a path the user referenced in
@@ -1210,8 +1211,45 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     _WORKSPACE_ANSWERS = {"workspace", "sandbox", "none", "skip", "no", "keep", "here"}
     # answers that end the rotation and compose from the work done so far
     _STOP_ANSWERS = {"no", "n", "stop", "finish", "done", "compose", "wrap up", "enough"}
+    _USE_INTEGRATION_ANSWERS = {"use integration", "use", "integrate", "merge", "yes", "y"}
 
     def _answer_continue(self, session: Session, req) -> Session:
+        # A best-of-N vote can surface a separately validated integration when
+        # the codifier found concrete complementary strengths. This is a human
+        # product decision, not a governance approval: either choice keeps the
+        # existing delivery gate intact.
+        if req.agent == "system" and req.purpose == "integration_decision":
+            proposal = session.integration_proposal
+            use_integration = (req.answer or "").strip().lower() in self._USE_INTEGRATION_ANSWERS
+            if proposal is None:
+                session.unresolved.append("integration decision was requested without a proposal")
+            elif use_integration:
+                write = next(
+                    (a for a in reversed(session.proposed_actions)
+                     if a.kind == "write_file" and a.role == Role.implementer
+                     and a.filename == proposal.filename and a.status == "proposed"),
+                    None,
+                )
+                if write is None:
+                    session.unresolved.append("chosen integration could not replace the voted winner")
+                    proposal.status = "kept_winner"
+                else:
+                    write.content = proposal.content
+                    write.args["content"] = proposal.content
+                    proposal.status = "adopted"
+            else:
+                proposal.status = "kept_winner"
+            session.stop_reason = None
+            self.store.log_event(
+                session.session_id, "integration_decided",
+                {"decision": proposal.status if proposal else "unavailable"},
+            )
+            self.store.save_session(session)
+            return resume_deliberation(
+                session, self.manager, self.registry, self.governance,
+                self.store, role_agents=self.role_agents,
+            )
+
         # Round-consent question: 'yes' (or anything unrecognized) grants another
         # block of rounds, a number grants exactly that many, 'no'/'stop' composes
         # the final answer from the work so far.

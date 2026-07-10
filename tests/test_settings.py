@@ -11,7 +11,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gangof8 import config
-from gangof8.models import SESSION_SCHEMA_VERSION
+from gangof8.models import (
+    IntegrationProposal,
+    ProposedAction,
+    Role,
+    SESSION_SCHEMA_VERSION,
+    SessionStatus,
+)
 from gangof8.service import GangOf8Service
 from gangof8.sessions import migrate_session_data
 from gangof8.settings import Settings, load_settings, save_settings
@@ -101,6 +107,39 @@ def test_service_unchanged_without_settings_file(tmp_path):
     assert svc.backend == config.BACKEND
     assert svc.role_agents == config.ROLE_AGENTS_BY_BACKEND[config.BACKEND]
     assert "mock" in svc.registry.names()
+
+
+def test_integration_review_defaults_on_and_is_stamped_on_new_sessions(tmp_path):
+    svc = GangOf8Service(data_dir=tmp_path)
+    assert svc.settings.integration_review_enabled is True
+    assert svc._open("build a thing", "test", None).integration_review_enabled is True
+
+
+def test_human_can_adopt_or_keep_the_voted_winner(tmp_path, monkeypatch):
+    """The integration proposal cannot replace the winner without this choice."""
+    from gangof8 import loop
+    import gangof8.service as service_mod
+
+    svc = GangOf8Service(data_dir=tmp_path)
+    session = svc._open("build a thing", "test", None)
+    svc.manager.transition(session, SessionStatus.classified)
+    svc.manager.transition(session, SessionStatus.deliberating)
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="game.html", content="voted winner", args={"filename": "game.html", "content": "voted winner"},
+    ))
+    proposal = IntegrationProposal(
+        filename="game.html", content="integrated candidate", rationale="combines the best details",
+        source_candidates=["Candidate 1", "Candidate 2"],
+    )
+    loop._pause_for_integration_decision(session, svc.manager, svc.store, proposal)
+    req = session.input_requests[-1]
+    monkeypatch.setattr(service_mod, "resume_deliberation", lambda session, *_args, **_kwargs: session)
+
+    decided = svc.answer(session.session_id, req.input_id, "use integration")
+    write = next(a for a in decided.proposed_actions if a.kind == "write_file")
+    assert write.content == "integrated candidate"
+    assert decided.integration_proposal.status == "adopted"
 
 
 def test_service_consumes_settings_file(tmp_path):

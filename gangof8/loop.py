@@ -33,6 +33,7 @@ from .models import (
     Council,
     CouncilMember,
     FinalAnswer,
+    IntegrationProposal,
     InputRequest,
     ProposedAction,
     RoundSpec,
@@ -1009,6 +1010,29 @@ def _pause_for_consent(session: Session, manager: SessionManager, store: LogStor
     manager.transition(session, SessionStatus.awaiting_input)
 
 
+def _pause_for_integration_decision(
+    session: Session, manager: SessionManager, store: LogStore, proposal: IntegrationProposal,
+) -> None:
+    """Let the human choose an optional, validated merge over the vote winner."""
+    session.integration_proposal = proposal
+    req = InputRequest(
+        session_id=session.session_id, agent="system", role=Role.coordinator,
+        round=session.current_round, purpose="integration_decision", resume_token="",
+        question=(
+            "The council found complementary strengths worth integrating after the "
+            "blind vote. The voted winner remains the default. Choose 'use integration' "
+            "to replace it with the validated merged candidate, or 'keep winner' to "
+            "deliver the vote winner unchanged.\n\n"
+            f"Rationale: {proposal.rationale}\nSources: {', '.join(proposal.source_candidates) or 'council review'}"
+        ),
+    )
+    session.input_requests.append(req)
+    session.compose_now = True
+    session.stop_reason = "waiting for human choice on council integration"
+    store.log_event(session.session_id, "input_requested", req.model_dump())
+    manager.transition(session, SessionStatus.awaiting_input)
+
+
 def _run_panel_rounds(
     session: Session,
     manager: SessionManager,
@@ -1107,6 +1131,9 @@ def _run_panel_rounds(
         if produces:
             bon = _run_best_of_n(session, council, panel, call, codifier_call or lead_call, store)
             if bon is not None:
+                if bon.get("integration"):
+                    _pause_for_integration_decision(session, manager, store, bon["integration"])
+                    return True
                 chair = bon.get("chair", "")
                 if bon["judges"]:
                     how = (f"the highest-scoring of {bon['candidates']} candidate "
@@ -1942,6 +1969,57 @@ def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
     return {"agent": target["agent"] + " (chair-repaired)", "base": base, "content": content}
 
 
+def _propose_integration(
+    session: Session, filename: str, winner_content: str, winner_index: int, ordered: list[dict],
+    agg: dict[int, int], votes: dict[int, int], call: AgentCall, store: LogStore,
+) -> Optional[IntegrationProposal]:
+    """Return a separately validated merge proposal, never an automatic rewrite."""
+    if not session.integration_review_enabled or len(ordered) < 2:
+        return None
+    codifier = _codifier(session)
+    if not (codifier and codifier.active):
+        return None
+    candidates = [
+        {
+            "label": i + 1,
+            "role": "VOTE WINNER" if i == winner_index else "alternative",
+            "score": agg[i + 1],
+            "votes": votes[i + 1],
+            "content": winner_content if i == winner_index else c["content"],
+        }
+        for i, c in enumerate(ordered)
+    ]
+    try:
+        answer = call(codifier, rounds.integration_prompt(session, filename, candidates))
+    except (AgentError, BudgetExceeded):
+        return None
+    offered, rationale, sources = rounds.parse_integration_decision(answer.content)
+    if not offered:
+        store.log_event(session.session_id, "integration_not_offered", {})
+        return None
+    writes = [a for a in _parse_proposals(session.session_id, answer.content)
+              if a.kind == "write_file" and _basename(a.filename) == filename and a.content.strip()]
+    if len(writes) != 1 or writes[0].content == winner_content:
+        store.log_event(session.session_id, "integration_rejected", {"reason": "missing or unchanged artifact"})
+        return None
+    content = writes[0].content
+    ran, testable, detail, _dynamic = smoke.smoke_source(content, Path(filename).suffix or ".html")
+    if testable and not ran:
+        store.log_event(session.session_id, "integration_rejected", {"reason": "runtime failure", "detail": detail})
+        return None
+    proposal = IntegrationProposal(
+        filename=filename,
+        content=content,
+        rationale=rationale or "The codifier identified complementary implementation details.",
+        source_candidates=sources,
+    )
+    store.log_event(
+        session.session_id, "integration_offered",
+        {"file": filename, "sources": sources, "chars": len(content), "runtime_checked": testable},
+    )
+    return proposal
+
+
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
                    call: AgentCall, codifier_call: AgentCall, store: LogStore) -> Optional[dict]:
     """The full best-of-N pipeline: gate candidates on whether they RUN, panel
@@ -2070,10 +2148,13 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                     {"agent": winner["agent"], "file": base, "score": agg[label],
                      "votes": votes[label], "judges": judged, "candidates": len(group),
                      "chair": chair_action})
+    integration = _propose_integration(
+        session, base, content, wi, ordered, agg, votes, codifier_call, store
+    )
     _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
             "votes": votes[label], "judges": judged, "candidates": len(group),
-            "fixes": fixes, "chair": chair_action}
+            "fixes": fixes, "chair": chair_action, "integration": integration}
 
 
 def _materialize_artifacts(session: Session, call: AgentCall, store: LogStore) -> None:

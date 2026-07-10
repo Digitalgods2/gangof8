@@ -59,6 +59,13 @@ screenshots) — all detailed below.
 
 ## How a deliberation works (the panel model)
 
+For output tasks, **Council integration review** is available in Settings. After
+the blind best-of-N vote, the codifier examines every scored candidate for
+concrete complementary strengths. It may offer a separately runtime-validated
+integrated candidate, but that proposal never replaces the voted winner
+automatically: the dashboard shows its full content and the human chooses **Use
+integration** or **Keep voted winner**.
+
 When a session starts, the council roster shows one chip per seat — and each
 seat is a **different origin model**. Here is what each is doing:
 
@@ -83,10 +90,15 @@ seat is a **different origin model**. Here is what each is doing:
   blindly by independent judge seats** (author identity stripped — each judge
   sees "Candidate 1…N", scores every one on completeness / correctness /
   fidelity / robustness, and names a winner). The highest-scoring file is
-  shipped to you **byte-for-byte**, credited to the model that wrote it — with
+  shipped as the default, credited to the model that wrote it — with
   an optional pass of *surgical* fixes for concrete defects the judges flagged
   (re-executed afterward; if a fix breaks the file, the original winner ships
-  instead). If only one candidate runs, it wins without a vote; if none run,
+  instead). When **Council integration review** is enabled in Settings, the
+  codifier also evaluates every scored candidate for concrete complementary
+  strengths. It can offer a separately runtime-validated integrated candidate,
+  but the proposal never replaces the vote winner automatically: the human
+  chooses **Use integration** or **Keep voted winner** in the dashboard.
+  If only one candidate runs, it wins without a vote; if none run,
   no winner is declared. The dashboard shows it: 🗳️ candidates, 💥 crashers
   rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements never cost a
   candidate: when each seat wrote a single file — even under different names (a
@@ -253,7 +265,7 @@ no OpenRouter key ⇒ the panel is simply CLI-only.
 .venv\Scripts\python cli.py workspace use <workspace_id>
 .venv\Scripts\python cli.py workspace none                         # back to the sandbox
 
-# API
+# Selected API routes (the dashboard uses additional internal routes)
 .venv\Scripts\uvicorn gangof8.main:app --port 8790
 # POST /tasks {"text": "...", "attachments": ["up_..."]} · GET /sessions · GET /sessions/{id}
 # POST /uploads {"name": "...", "content_base64": "..."}  → {id, kind, ...}
@@ -264,8 +276,8 @@ no OpenRouter key ⇒ the panel is simply CLI-only.
 
 ## Web dashboard
 
-`python cli.py serve --backend cli` (or `--backend mock`) opens a single-page
-dashboard at `http://127.0.0.1:8790/`:
+`python cli.py serve --backend cli` (or `--backend mock`) starts the single-page
+dashboard service and prints its address: `http://127.0.0.1:8790/`.
 
 - **Bottom-center chat composer** — auto-growing text box (Enter sends,
   Shift+Enter for a newline), a **Clear** button, and a **+** menu to attach a

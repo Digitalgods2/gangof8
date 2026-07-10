@@ -63,8 +63,12 @@ delivery folder requires an approval with a diff preview.
 
 For output-producing tasks, panel seats can author candidates independently.
 The coordinator captures namespaced candidate files, smoke-tests runnable web
-artifacts, asks judges to score candidates blindly, lets the codifier ratify or
-repair the winner, and then proposes write/promote actions.
+artifacts, asks judges to score candidates blindly, and lets the codifier ratify
+or repair the winner. With Council integration review enabled, the codifier may
+also produce a complete merged candidate when it finds concrete complementary
+strengths across the scored outputs. The merge is runtime-validated and shown to
+the human beside the voted winner; only an explicit "Use integration" decision
+replaces the default winner before write/promote actions are executed.
 
 `gangof8/artifacts.py` owns marker parsing and cleanup of model-emitted file
 bodies. `gangof8/smoke.py` owns the headless runtime check for web files.
