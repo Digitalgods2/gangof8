@@ -87,6 +87,21 @@ _MATCH_INTENT = (
     "match the source", "match the style", "same style", "same format",
     "same structure", "match exactly", "exactly the same", "mirror the",
     "in the same style", "consistent with the series", "feel like a matched",
+    "formatted exactly like", "format exactly like", "format it exactly like",
+)
+
+# Generic words such as "build" occur in prose briefs ("build tension").
+# These are the signals that still make a prose-document request a software task.
+_PROGRAMMING_SIGNALS = [
+    "code", "script", "function", "implement", "refactor", "compile",
+    "program", "bug", "fix", "app", "application", "api", "module",
+    "package", "library", "cli", "endpoint", "backend", "frontend",
+    "class", "webpage", "web page", "website", "web app", "html", "css",
+]
+_EXECUTABLE_ARTIFACT = re.compile(
+    r"\b[\w\-]+\.(py|js|ts|tsx|jsx|go|rs|java|rb|php|c|cpp|h|hpp|cs|"
+    r"json|ya?ml|toml|ini|cfg|csv|html|css|scss|sh|bat|ps1|sql)\b",
+    re.IGNORECASE,
 )
 
 
@@ -157,8 +172,9 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     # it out of the game/runtime judging framing while still producing the file
     # (content is a produces_output type).
     if (content and task_type == TaskType.code
-            and not _any(CODE_WORDS, lower)
-            and _DOC_ARTIFACT.search(text)):
+            and _DOC_ARTIFACT.search(text)
+            and not _any(_PROGRAMMING_SIGNALS, lower)
+            and not _EXECUTABLE_ARTIFACT.search(text)):
         task_type = TaskType.content
         notes.append("writing task producing a prose document — treated as content")
 

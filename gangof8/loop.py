@@ -231,6 +231,12 @@ def _read_established(session: Session, data_dir, name: str) -> str:
 
 
 _SOURCE_DIGEST_MAX_CHARS = 8000
+_HEADING_LINE = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", re.MULTILINE)
+_SPREAD_HEADING = re.compile(r"\b(?:spread|page)\s*(?:#\s*)?\d+\b", re.IGNORECASE)
+_LEADING_ARTIFACT_HEADER = re.compile(
+    r"^\s*(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*[^\r\n]+(?:\r?\n|$)",
+    re.IGNORECASE,
+)
 
 
 def _task_named_paths(session: Session) -> list[Path]:
@@ -268,6 +274,8 @@ def _source_digest(session: Session) -> str:
         return ""
     root = Path(session.established_root)
     parts: list[str] = []
+    matched = bool(session.classification and session.classification.match_source)
+    limit = config.MATCHED_SOURCE_MAX_CHARS if matched else _SOURCE_DIGEST_MAX_CHARS
     for p in named[:2]:
         try:
             body = p.read_text(encoding="utf-8", errors="replace")
@@ -275,8 +283,80 @@ def _source_digest(session: Session) -> str:
             continue
         if body.strip():
             parts.append(f"----- SOURCE: {p.relative_to(root).as_posix()} -----\n"
-                         f"{body[:_SOURCE_DIGEST_MAX_CHARS]}")
+                         f"{body[:limit]}")
+    contract = _matched_source_contract(session)
+    if contract:
+        parts.append(contract)
     return "\n\n".join(parts)
+
+
+def _normalize_heading(title: str) -> str:
+    """Canonicalize presentation-only Markdown around a source heading."""
+    text = re.sub(r"[*`_]+", "", title or "")
+    return re.sub(r"\s+", " ", text).strip().upper()
+
+
+def _heading_signature(text: str) -> list[tuple[int, str]]:
+    """A title-agnostic structure signature for a matched prose source."""
+    out: list[tuple[int, str]] = []
+    for match in _HEADING_LINE.finditer(text or ""):
+        level = len(match.group("marks"))
+        title = _normalize_heading(match.group("title"))
+        if level == 1:
+            kind = "TITLE"  # A sequel title should differ while its shape matches.
+        elif _SPREAD_HEADING.search(title):
+            kind = "SPREAD"
+        else:
+            kind = title
+        out.append((level, kind))
+    return out
+
+
+def _source_signature(session: Session) -> tuple[str, list[tuple[int, str]]]:
+    """Return the first task-named source and its heading structure."""
+    if not (session.classification and session.classification.match_source):
+        return "", []
+    for path in _task_named_paths(session):
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        signature = _heading_signature(body)
+        if signature:
+            return path.name, signature
+    return "", []
+
+
+def _matched_source_contract(session: Session) -> str:
+    """A compact hard format contract placed beside a matched source."""
+    source_name, signature = _source_signature(session)
+    if not signature:
+        return ""
+    labels = " -> ".join(f"h{level} {kind}" for level, kind in signature)
+    return (
+        "MATCHED-SOURCE FORMAT CONTRACT (hard delivery requirement):\n"
+        f"Source: {source_name}\n"
+        f"Heading/spread sequence: {labels}\n"
+        "The sequel may change TITLE text, but must preserve this complete heading "
+        "and spread structure."
+    )
+
+
+def _matched_source_structure_failures(session: Session, output: str) -> list[str]:
+    """Return hard failures when a requested matched set loses source format."""
+    source_name, expected = _source_signature(session)
+    if not expected:
+        return []
+    actual = _heading_signature(output)
+    if actual == expected:
+        return []
+    expected_spreads = sum(kind == "SPREAD" for _, kind in expected)
+    actual_spreads = sum(kind == "SPREAD" for _, kind in actual)
+    return [
+        f"does not preserve the matched-source structure from {source_name} "
+        f"(expected {len(expected)} headings/{expected_spreads} spreads; found "
+        f"{len(actual)} headings/{actual_spreads} spreads)"
+    ]
 
 
 def _established_overview(session: Session, data_dir) -> str:
@@ -322,13 +402,16 @@ def _established_overview(session: Session, data_dir) -> str:
     # material and is read here, prose or code, near the front of the overview.
     named = _task_named_paths(session)
     for p in named[:3]:
+        limit = (config.MATCHED_SOURCE_MAX_CHARS
+                 if session.classification and session.classification.match_source
+                 else _SOURCE_DIGEST_MAX_CHARS)
         try:
             body = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         if body.strip():
             parts.append(f"--- {p.relative_to(root).as_posix()} "
-                         f"(source the task named — read in full) ---\n{body[:8000]}")
+                         f"(source the task named — read in full) ---\n{body[:limit]}")
 
     # 3. ACTUAL SOURCE — entry points + architecturally CENTRAL files (registry/
     # protocol/config/models/…) + the largest code files, excluding tests/vendored.
@@ -883,6 +966,15 @@ def _resolve_skill_requests(
     return authored or contribution
 
 
+def _council_confidence(session: Session) -> str:
+    """High confidence requires every scheduled council voice to stay available."""
+    for item in session.unresolved:
+        lower = item.lower()
+        if "dropped" in lower and ("panel seat" in lower or "judge" in lower):
+            return "medium"
+    return "high"
+
+
 def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
     """The lead's final synthesis as the FinalAnswer, when it can stand as one:
     substantial, not a stub, and declared DONE (a CONTINUE synthesis is
@@ -902,7 +994,7 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
     had_panel = any(c.role == Role.panelist for c in session.contributions)
     return FinalAnswer(
         answer=text,
-        confidence="high" if had_panel else "medium",
+        confidence=_council_confidence(session) if had_panel else "medium",
         assumptions=[],
         risks_unresolved=list(session.unresolved),
     )
@@ -1129,7 +1221,10 @@ def _run_panel_rounds(
         governance.check(session, "generate_text")
         produces = bool(session.classification and session.classification.produces_output)
         if produces:
-            bon = _run_best_of_n(session, council, panel, call, codifier_call or lead_call, store)
+            bon = _run_best_of_n(
+                session, council, panel, call, codifier_call or lead_call, store,
+                governance=governance,
+            )
             if bon is not None:
                 if bon.get("integration"):
                     _pause_for_integration_decision(session, manager, store, bon["integration"])
@@ -1823,6 +1918,7 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
             ans = call(j, prompt)
         except (AgentError, BudgetExceeded) as e:
             store.log_event(sid, "judge_dropped", {"agent": j.agent, "error": str(e)[:120]})
+            session.unresolved.append(f"judge '{j.agent}' dropped during best-of-N scoring: {e}")
             continue
         scores, winner, defs = rounds.parse_candidate_scores(ans.content, n)
         if not scores and winner is None:
@@ -1865,6 +1961,10 @@ def _apply_targeted_fixes(session: Session, filename: str, content: str,
         if old and norm.count(old) == 1:
             content = norm.replace(old, new, 1)
             applied += 1
+    cleaned = _clean_artifact_body(content, filename)
+    if cleaned != content:
+        content = cleaned
+        store.log_event(session.session_id, "winner_protocol_header_stripped", {"file": filename})
     if applied:
         store.log_event(session.session_id, "winner_fixes_applied",
                         {"file": filename, "applied": applied})
@@ -1885,6 +1985,7 @@ def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> 
     """Propose write+promote of the chosen file (delivery still gated by the
     human approval and the runtime verification)."""
     sid = session.session_id
+    content = _clean_artifact_body(content, base)
     _append_proposals(session, store, [
         ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
                        filename=base, content=content, args={"filename": base, "content": content}),
@@ -1972,6 +2073,7 @@ def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
 def _propose_integration(
     session: Session, filename: str, winner_content: str, winner_index: int, ordered: list[dict],
     agg: dict[int, int], votes: dict[int, int], call: AgentCall, store: LogStore,
+    governance: Optional[Governance] = None, source: str = "",
 ) -> Optional[IntegrationProposal]:
     """Return a separately validated merge proposal, never an automatic rewrite."""
     if not session.integration_review_enabled or len(ordered) < 2:
@@ -1990,9 +2092,14 @@ def _propose_integration(
         for i, c in enumerate(ordered)
     ]
     try:
-        answer = call(codifier, rounds.integration_prompt(session, filename, candidates))
+        prompt = rounds.integration_prompt(session, filename, candidates, source)
+        answer = call(codifier, prompt)
     except (AgentError, BudgetExceeded):
         return None
+    if governance is not None:
+        answer = _resolve_skill_requests(
+            session, codifier, prompt, answer, call, governance, store, recall=call,
+        )
     offered, rationale, sources = rounds.parse_integration_decision(answer.content)
     if not offered:
         store.log_event(session.session_id, "integration_not_offered", {})
@@ -2021,7 +2128,8 @@ def _propose_integration(
 
 
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
-                   call: AgentCall, codifier_call: AgentCall, store: LogStore) -> Optional[dict]:
+                   call: AgentCall, codifier_call: AgentCall, store: LogStore,
+                   governance: Optional[Governance] = None) -> Optional[dict]:
     """The full best-of-N pipeline: gate candidates on whether they RUN, panel
     judges score the survivors blindly (`call`), then the strong CODIFIER
     (`codifier_call` — the summarizer seat) ratifies or overrides the vote,
@@ -2149,7 +2257,8 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
                      "votes": votes[label], "judges": judged, "candidates": len(group),
                      "chair": chair_action})
     integration = _propose_integration(
-        session, base, content, wi, ordered, agg, votes, codifier_call, store
+        session, base, content, wi, ordered, agg, votes, codifier_call, store,
+        governance=governance, source=source,
     )
     _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
@@ -2523,7 +2632,12 @@ def _build_summary_final(session: Session, delivered: list[ProposedAction]) -> F
     answer = (f"{preamble}\n\n{manifest}{hint}" if preamble else f"{manifest}{hint}").strip()
     # don't surface the (passed) verification chatter as a risk
     risks = [u for u in session.unresolved if "verification" not in u.lower()]
-    return FinalAnswer(answer=answer, confidence="high", assumptions=[], risks_unresolved=risks)
+    return FinalAnswer(
+        answer=answer,
+        confidence=_council_confidence(session),
+        assumptions=[],
+        risks_unresolved=risks,
+    )
 
 
 def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bool = False) -> bool:
@@ -2555,6 +2669,12 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
             if not text.strip():
                 failures.append(f"{action.filename}: file is empty/blank")
                 continue
+            if action.role != Role.panelist:
+                if _LEADING_ARTIFACT_HEADER.match(text):
+                    failures.append(f"{action.filename}: leaked ARTIFACT protocol header into delivered content")
+                    continue
+                for failure in _matched_source_structure_failures(session, text):
+                    failures.append(f"{action.filename}: {failure}")
             if path.suffix.lower() in {".html", ".htm"}:
                 low = text.lower()
                 has_open = "<!doctype" in low or "<html" in low

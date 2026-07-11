@@ -137,6 +137,18 @@ def test_write_essay_to_markdown_is_content():
     assert cls.task_type == TaskType.content
 
 
+def test_story_brief_building_tension_stays_content():
+    """"Build gentle tension" is story direction, not a request to build software."""
+    task = (
+        "Act as a children's book author. Read Benny's Splash.txt, write a sequel, "
+        "build gentle age-appropriate tension, format it exactly like the first book, "
+        "and save it as a .txt file in C:\\tmp"
+    )
+    cls = classify(task)
+    assert cls.task_type == TaskType.content
+    assert cls.match_source is True
+
+
 def test_script_over_csv_stays_code():
     """A real code word ('script') keeps a file-producing task as code even
     though it names a data file — the content-override must not swallow it."""

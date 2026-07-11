@@ -9,6 +9,7 @@ defects.
 import pytest
 
 from gangof8 import config, loop, rounds, smoke
+from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (Classification, Complexity, Council,
                                 CouncilMember, Contribution, ProposedAction,
@@ -262,6 +263,47 @@ def test_integration_rejects_a_broken_merge(session, store):
     assert loop._propose_integration(
         session, "game.html", STRONG, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, call, store,
     ) is None
+
+
+def test_integration_resolves_a_read_skill_before_deciding(session, store, tmp_path):
+    """A SKILL request is an intermediate step, not an automatic no-synergy vote."""
+    session.integration_review_enabled = True
+    session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
+    session.established_root = str(tmp_path)
+    (tmp_path / "source.txt").write_text("source continuity", encoding="utf-8")
+    ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
+    calls = []
+
+    def call(member, prompt):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return Contribution(round=0, role=member.role, agent=member.agent,
+                                content="SKILL: read_file source.txt")
+        assert "source continuity" in prompt
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content=("SYNERGY: YES\nRATIONALE: preserve source continuity\n"
+                     "SOURCES: Candidate 1, Candidate 2\nARTIFACT: game.html\n"
+                     + STRONG.replace("extra=2", "extra=3")),
+        )
+
+    proposal = loop._propose_integration(
+        session, "game.html", STRONG, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2},
+        call, store, governance=Governance(store),
+    )
+    assert proposal is not None
+    assert len(calls) == 2
+
+
+def test_build_summary_uses_medium_confidence_after_council_drop(session, store, tmp_path):
+    delivered = tmp_path / "out.txt"
+    delivered.write_text("done", encoding="utf-8")
+    session.unresolved.append("panel seat 'claude' dropped this round: not logged in")
+    final = loop._build_summary_final(session, [ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="out.txt", status="executed", result_path=str(delivered),
+    )])
+    assert final.confidence == "medium"
 
 
 def test_all_judges_failing_falls_back(session, store):

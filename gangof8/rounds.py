@@ -703,7 +703,7 @@ def chair_recover_prompt(session: Session, filename: str, body: str, error: str)
     )
 
 
-def integration_prompt(session: Session, filename: str, candidates: list[dict]) -> str:
+def integration_prompt(session: Session, filename: str, candidates: list[dict], source: str = "") -> str:
     """Ask the codifier whether a real micro-level merge is worth offering.
 
     This is deliberately an offer, not an automatic rewrite: only a concrete,
@@ -726,6 +726,8 @@ def integration_prompt(session: Session, filename: str, candidates: list[dict]) 
         "one merely to average preferences. The human will decide whether to use it.\n"
         "If no meaningful integration exists, emit exactly:\n"
         "SYNERGY: NO - <brief reason>\n"
+        "If a source reference is supplied below, use it directly and do not request "
+        "a SKILL to read it again.\n"
         "If it does, emit exactly this structure, with a COMPLETE replacement "
         "file and no PROMOTE line:\n"
         "SYNERGY: YES\n"
@@ -733,6 +735,7 @@ def integration_prompt(session: Session, filename: str, candidates: list[dict]) 
         f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
         "<complete integrated file contents>\n\n"
         f"CANDIDATES:\n{labeled}"
+        + (f"\n\nSOURCE REFERENCE:\n{source}" if source else "")
     )
 
 
