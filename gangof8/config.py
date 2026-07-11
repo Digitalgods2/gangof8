@@ -319,6 +319,9 @@ SKILL_RESULT_MAX_CHARS = 2000
 # live run showed the lead reasoning to a wrong conclusion from exactly that
 # truncation (it "read" a test file whose decisive test sat past the cap).
 SKILL_RESULT_ANALYSIS_MAX_CHARS = 8000
+# A user who asks to match a named source needs the whole source whenever it
+# fits a normal model prompt. This is larger than a discovery read but bounded.
+MATCHED_SOURCE_MAX_CHARS = 40000
 # Council-authored SANDBOX files (panel drafts, delegate artifacts) read whole:
 # a live run generated eight complete ~25KB game drafts and then starved the
 # lead with the 2000-char window — it paid to produce them and couldn't review

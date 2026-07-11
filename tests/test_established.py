@@ -667,6 +667,53 @@ def test_source_digest_returns_named_source_not_prior_deliverable(tmp_path):
     assert "A PRIOR ANSWER" not in digest      # the prior deliverable is NOT source
 
 
+def test_matched_source_uses_full_text_and_enforces_heading_structure(tmp_path):
+    """A matched sequel cannot silently drop the source's later back matter."""
+    from gangof8 import loop
+    from gangof8.logstore import LogStore
+    from gangof8.models import Classification, Complexity, ProposedAction, Risk, Role, TaskType
+    from gangof8.sessions import SessionManager
+
+    est = tmp_path / "Benny"
+    est.mkdir()
+    source = est / "Benny's Splash.txt"
+    source.write_text(
+        "# Benny's Big Splash\n\n## STORY BLUEPRINT\n\n## THE FULL TEXT\n\n"
+        "### SPREAD 1\n\nSplash text.\n\n### SPREAD 2\n\nMore splash text.\n\n"
+        "## BACK MATTER / FINAL PAGE\n\n" + "x" * 9000 +
+        "\n\n## STORY EVALUATION\n",
+        encoding="utf-8",
+    )
+    store = LogStore(tmp_path / "data")
+    session = SessionManager(store).create(
+        "Read Benny's Splash.txt and write a sequel formatted exactly like it.", source="test")
+    session.established_root = str(est)
+    session.classification = Classification(
+        task_type=TaskType.content, complexity=Complexity.complex, risk=Risk.none,
+        produces_output=True, match_source=True,
+    )
+
+    digest = loop._source_digest(session)
+    assert "STORY EVALUATION" in digest
+    assert "MATCHED-SOURCE FORMAT CONTRACT" in digest
+
+    matching = (
+        "# Benny's Big Ride\n\n## STORY BLUEPRINT\n\n## THE FULL TEXT\n\n"
+        "### SPREAD 1\n\nRide text.\n\n### SPREAD 2\n\nMore ride text.\n\n"
+        "## BACK MATTER / FINAL PAGE\n\nFinal page.\n\n## STORY EVALUATION\n"
+    )
+    assert loop._matched_source_structure_failures(session, matching) == []
+
+    output = tmp_path / "sequel.txt"
+    output.write_text("# Benny's Big Ride\n\nA short story only.\n", encoding="utf-8")
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="sequel.txt", status="executed", result_path=str(output),
+    ))
+    assert loop._verify_artifact_outputs(session, store, require_file=True) is False
+    assert any("matched-source structure" in item for item in session.unresolved)
+
+
 def test_prior_deliverable_files_flags_title_match_only(tmp_path):
     """Fix 5: a file referenced by TITLE (stem in task) but not as a named input
     (full name not in task) is a prior/existing version of the deliverable; the

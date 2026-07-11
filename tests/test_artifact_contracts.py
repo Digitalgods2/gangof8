@@ -47,6 +47,11 @@ def test_clean_artifact_body_strips_single_whole_file_fence():
     assert artifacts.clean_artifact_body("```python\nprint(1)\n```", "app.py") == "print(1)"
 
 
+def test_clean_artifact_body_strips_a_leaked_leading_artifact_header():
+    body = artifacts.clean_artifact_body("ARTIFACT: sequel.txt\nOnce upon a time.\n", "sequel.txt")
+    assert body == "Once upon a time."
+
+
 def test_docs_and_static_do_not_contain_common_mojibake():
     bad = ("â", "ð", "Ã", "Â", "\ufffd")
     paths = [Path("README.md"), Path("DESIGN.md"), Path("ARCHITECTURE.md")]

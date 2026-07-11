@@ -66,6 +66,12 @@ integrated candidate, but that proposal never replaces the voted winner
 automatically: the dashboard shows its full content and the human chooses **Use
 integration** or **Keep voted winner**.
 
+When a task explicitly asks to match a named source, Gang of 8 gives authors,
+judges, finishers, and the integration reviewer the complete named source within
+the configured bound. Its heading and spread structure becomes a hard delivery
+contract: a sequel may change its title, but an output that drops required
+sections cannot pass artifact verification or be promoted.
+
 When a session starts, the council roster shows one chip per seat — and each
 seat is a **different origin model**. Here is what each is doing:
 

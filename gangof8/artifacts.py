@@ -46,6 +46,14 @@ BLOCK_START = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# A codifier can return an ARTIFACT header inside the replacement side of an
+# EDIT block. That header is protocol, never document content. Strip it only
+# when it is the first line, so ordinary references later in a document remain.
+_LEADING_ARTIFACT_HEADER = re.compile(
+    r"^\s*(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*[^\r\n]+(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
 
 def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[ProposedAction]:
     """Parse marker blocks into ProposedActions in document order."""
@@ -104,6 +112,8 @@ def html_doc_end(low: str) -> int:
 def clean_artifact_body(raw: str, filename: str = "") -> str:
     """Extract the real file body from an agent's ARTIFACT content."""
     t = raw.strip()
+    while (match := _LEADING_ARTIFACT_HEADER.match(t)):
+        t = t[match.end():].lstrip()
     name = filename.lower()
     low = t.lower()
     if name.endswith((".html", ".htm")):
