@@ -440,6 +440,7 @@ class GangOf8Service:
         # the task also names) — promote delivers HERE, so "read from A, save to
         # B" lands in B and never overwrites A.
         session.delivery_root = extract_delivery_target(text or "")
+        self._preflight_panel(session)
         # If the SOURCE folder already holds a file matching this task's deliverable
         # by title, it is a prior/existing version (not an authorized input) — seats
         # can read it and a shipped copy would go unnoticed. Surface it up front.
@@ -545,6 +546,29 @@ class GangOf8Service:
         worker_session = self.manager.load(session.session_id) or session
         self._pool.submit(self._safely, worker_session, self._run_full)
         return session
+
+    def _preflight_panel(self, session: Session) -> None:
+        """Remove locally unauthenticated CLI seats before panel fan-out.
+
+        Only adapters exposing a non-generative auth status command are checked;
+        custom test adapters, Gemini CLI, and remote seats remain available under
+        their existing runtime handling.
+        """
+        healthy: list[str] = []
+        for seat in session.panel:
+            status = getattr(self.registry.get(seat), "auth_status", None)
+            if not callable(status):
+                healthy.append(seat)
+                continue
+            available, detail = status()
+            if available is False:
+                note = f"panel seat '{seat}' unavailable before run: {detail}"
+                session.unresolved.append(note)
+                self.store.log_event(session.session_id, "panel_seat_preflight_failed",
+                                     {"agent": seat, "error": detail[:300]})
+                continue
+            healthy.append(seat)
+        session.panel = healthy
 
     def save_upload(self, name: str, content_b64: str) -> dict:
         return self.uploads.save(name, content_b64)

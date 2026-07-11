@@ -17,6 +17,7 @@ _SUB_RE = re.compile(r"summarizer '([\w.\-]+)' failed.*recomposed with '([\w.\-]
 _DEGRADE_HINTS = (
     "composer skipped", "stopped refining", "budget exhausted", "agent error",
     "could not build diff", "refinement cap", "refinement time limit",
+    "unavailable before run",
 )
 
 
@@ -96,6 +97,9 @@ def run_summary(session: Any) -> dict:
 
 # event name -> (icon, friendly label)
 _TIMELINE = {
+    "panel_artifact_rejected": ("!", "Panel draft rejected"),
+    "integration_decided": ("+", "Integration decision"),
+    "panel_seat_preflight_failed": ("!", "Panel seat unavailable before run"),
     "task_received": ("📥", "Task received"),
     "classified": ("🏷️", "Classified"),
     "council_formed": ("👥", "Council formed"),
@@ -174,6 +178,14 @@ def _detail(event: str, p: dict) -> str:
     """A short human detail for an event, pulled from its payload."""
     if not isinstance(p, dict):
         return ""
+    if event == "panel_artifact_rejected":
+        return f"{p.get('agent','')}/{p.get('file','')}: {p.get('reason','')}"[:110]
+    if event == "panel_seat_preflight_failed":
+        return f"{p.get('agent','')}: {p.get('error','')}"[:110]
+    if event == "integration_decided":
+        decision = str(p.get("decision", "unavailable"))
+        return {"adopted": "used the integrated candidate",
+                "kept_winner": "kept the voted winner"}.get(decision, decision)
     if event == "classified":
         return " · ".join(x for x in (p.get("task_type"), p.get("complexity"), f"risk {p.get('risk')}" if p.get("risk") else "") if x)
     if event == "round_start":

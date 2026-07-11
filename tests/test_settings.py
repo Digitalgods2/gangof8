@@ -23,6 +23,16 @@ from gangof8.sessions import migrate_session_data
 from gangof8.settings import Settings, load_settings, save_settings
 
 
+class _UnauthenticatedPanelAdapter:
+    name = "authless"
+
+    def auth_status(self):
+        return False, "not logged in"
+
+    def call(self, role, prompt, timeout_s, images=None):
+        raise AssertionError("preflight must remove this seat before it is called")
+
+
 # ---- Settings model + persistence + precedence -------------------------------
 
 
@@ -35,6 +45,18 @@ def test_defaults_when_no_file(tmp_path):
     assert s.composer.prose_min_chars == config.COMPOSER_PROSE_MIN_CHARS
     assert s.ui.poll_interval_ms == 3000
     assert s.ui.collapse_finished is True
+
+
+def test_preflight_removes_unauthenticated_panel_seat(tmp_path):
+    svc = GangOf8Service(data_dir=tmp_path, panel=["authless", "mock"])
+    svc.registry.register(_UnauthenticatedPanelAdapter())
+    session = svc._open("Explain SQLite.", source="test", budgets=None)
+
+    assert session.panel == ["mock"]
+    assert any("authless" in note and "unavailable before run" in note
+               for note in session.unresolved)
+    timeline = svc.timeline(session.session_id)["events"]
+    assert any(event["event"] == "panel_seat_preflight_failed" for event in timeline)
 
 
 def test_round_trip(tmp_path):

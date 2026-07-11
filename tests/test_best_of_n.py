@@ -306,6 +306,17 @@ def test_build_summary_uses_medium_confidence_after_council_drop(session, store,
     assert final.confidence == "medium"
 
 
+def test_build_summary_uses_medium_confidence_after_preflight_exclusion(session, store, tmp_path):
+    delivered = tmp_path / "out.txt"
+    delivered.write_text("done", encoding="utf-8")
+    session.unresolved.append("panel seat 'claude' unavailable before run: not logged in")
+    final = loop._build_summary_final(session, [ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="out.txt", status="executed", result_path=str(delivered),
+    )])
+    assert final.confidence == "medium"
+
+
 def test_all_judges_failing_falls_back(session, store):
     _candidate(session, "aaa", "game.html", WEAK)
     _candidate(session, "zzz", "game.html", STRONG)

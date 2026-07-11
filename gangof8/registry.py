@@ -55,6 +55,10 @@ class AgentRegistry:
     def names(self) -> list[str]:
         return sorted(self._adapters)
 
+    def get(self, agent: str) -> Optional[Adapter]:
+        """Return a registered adapter for optional capability checks."""
+        return self._adapters.get(agent)
+
     def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 120,
              images: list[dict] | None = None) -> AdapterResult:
         if agent not in self._adapters:

@@ -68,6 +68,33 @@ class CliAdapter:
         # (injected by the service) — an env var must not be the only way in.
         self._api_key_getter = api_key_getter
 
+    def auth_status(self, timeout_s: int = 15) -> tuple[Optional[bool], str]:
+        """Check local CLI authentication without spending an inference call.
+
+        ``None`` means the CLI has no stable non-generative status command, so
+        the caller should leave that seat available and let normal execution
+        report any later failure.
+        """
+        try:
+            if self.agent == "claude":
+                out, err, rc = self._exec_raw(
+                    ["claude", "auth", "status", "--json"], "", timeout_s)
+                if rc != 0:
+                    return False, _err_tail(err.strip() or out.strip())
+                try:
+                    logged_in = bool(json.loads(out).get("loggedIn"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return False, "claude auth status returned invalid JSON"
+                return logged_in, "logged in" if logged_in else "not logged in"
+            if self.agent == "codex":
+                out, err, rc = self._exec_raw(["codex", "login", "status"], "", timeout_s)
+                if rc != 0:
+                    return False, _err_tail(err.strip() or out.strip())
+                return True, "logged in"
+        except AgentError as e:
+            return False, str(e)
+        return None, "no non-generative authentication status command"
+
     def call(self, role: Role, prompt: str, timeout_s: int,
              images: list[dict] | None = None) -> AdapterResult:
         pinned = self.role_models.get(getattr(role, "value", str(role)))

@@ -52,6 +52,16 @@ def test_unknown_event_gets_a_friendly_label():
     assert rows[0]["label"] == "Some New Event"
 
 
+def test_timeline_makes_integration_choice_explicit():
+    rows = format_timeline([
+        {"ts": "", "event": "integration_decided", "payload": {"decision": "adopted"}},
+        {"ts": "", "event": "integration_decided", "payload": {"decision": "kept_winner"}},
+    ])
+    assert rows[0]["label"] == "Integration decision"
+    assert rows[0]["detail"] == "used the integrated candidate"
+    assert rows[1]["detail"] == "kept the voted winner"
+
+
 # --- end to end via the service ----------------------------------------------
 
 
