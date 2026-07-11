@@ -714,6 +714,32 @@ def test_matched_source_uses_full_text_and_enforces_heading_structure(tmp_path):
     assert any("matched-source structure" in item for item in session.unresolved)
 
 
+def test_matched_source_author_context_and_reads_bypass_generic_cap(tmp_path):
+    """The author must see a matched source's ending, not a 14k overview slice."""
+    from gangof8 import config, loop
+    from gangof8.logstore import LogStore
+    from gangof8.models import Classification, Complexity, Risk
+    from gangof8.sessions import SessionManager
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "reference.txt"
+    source.write_text("# Start\n" + "x" * 14500 + "\n## REQUIRED FINAL SECTION\n", encoding="utf-8")
+    store = LogStore(tmp_path / "data")
+    session = SessionManager(store).create(
+        "Read reference.txt and format the sequel exactly like it.", source="test")
+    session.established_root = str(source_dir)
+    session.classification = Classification(
+        task_type=TaskType.content, complexity=Complexity.complex, risk=Risk.none,
+        produces_output=True, match_source=True,
+    )
+
+    overview = loop._established_overview(session, store.data_dir)
+    assert "REQUIRED FINAL SECTION" in overview
+    assert len(overview) > 14000
+    assert loop._skill_result_cap(session) == config.MATCHED_SOURCE_MAX_CHARS
+
+
 def test_prior_deliverable_files_flags_title_match_only(tmp_path):
     """Fix 5: a file referenced by TITLE (stem in task) but not as a named input
     (full name not in task) is a prior/existing version of the deliverable; the

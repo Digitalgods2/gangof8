@@ -491,9 +491,14 @@ def _established_overview(session: Session, data_dir) -> str:
         "unless the code visibly lacks it and you point to where.\n"
         "4. Prefer concrete, app-specific improvements a developer could start today."
     )
-    return ("ESTABLISHED FOLDER (real content the coordinator read for you from "
+    overview = ("ESTABLISHED FOLDER (real content the coordinator read for you from "
             f"{session.established_root} — analyze THIS, not assumptions):\n"
-            + "\n\n".join(parts))[:14000] + directive
+            + "\n\n".join(parts))
+    # Matched-source files are individually bounded above. Do not silently cut
+    # their endings again with the generic project-overview cap.
+    if cls and cls.match_source:
+        return overview + directive
+    return overview[:14000] + directive
 
 
 def _conversation_overview(session: Session) -> str:
@@ -852,6 +857,9 @@ def _skill_result_cap(session: Session) -> int:
     """How much of each skill result is fed back. Analysis tasks get deeper
     reads — a 2000-char window on a large source file is a truncation the
     agent can't see, and it reasons wrongly from the fragment."""
+    cls = session.classification
+    if cls and cls.match_source:
+        return config.MATCHED_SOURCE_MAX_CHARS
     return config.SKILL_RESULT_ANALYSIS_MAX_CHARS if _is_analysis_task(session) \
         else config.SKILL_RESULT_MAX_CHARS
 
@@ -970,7 +978,8 @@ def _council_confidence(session: Session) -> str:
     """High confidence requires every scheduled council voice to stay available."""
     for item in session.unresolved:
         lower = item.lower()
-        if "dropped" in lower and ("panel seat" in lower or "judge" in lower):
+        if (("dropped" in lower or "unavailable before run" in lower)
+                and ("panel seat" in lower or "judge" in lower)):
             return "medium"
     return "high"
 
@@ -1000,6 +1009,24 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
     )
 
 
+def _candidate_artifact_problem(session: Session, filename: str) -> str:
+    """Return why a panel ARTIFACT name cannot be a deliverable candidate."""
+    base = _basename(filename)
+    if not base or base in {".", ".."}:
+        return "artifact did not name a file"
+    if session.delivery_root and base.casefold() == Path(session.delivery_root).name.casefold():
+        return "artifact named the delivery folder instead of a file"
+    task = session.task.text or ""
+    named_suffixes = {Path(m.group(1)).suffix.lower() for m in _FILENAME_RE.finditer(task)}
+    direct_suffixes = {f".{ext.lower()}" for ext in re.findall(
+        r"(?<![\w.])\.([a-z0-9]{1,10})\b", task, re.IGNORECASE)}
+    expected_suffixes = {s for s in named_suffixes | direct_suffixes if s and s != "."}
+    suffix = Path(base).suffix.lower()
+    if expected_suffixes and suffix not in expected_suffixes:
+        return f"artifact filename does not match requested extension(s): {', '.join(sorted(expected_suffixes))}"
+    return ""
+
+
 def _capture_panel_artifacts(
     session: Session, member: CouncilMember, content: str,
     governance: Governance, store: LogStore,
@@ -1013,6 +1040,11 @@ def _capture_panel_artifacts(
     for a in _parse_proposals(session.session_id, content, role=Role.panelist):
         if a.kind != "write_file":
             continue  # edits/tests/promotes in a panel take are advice, not actions
+        problem = _candidate_artifact_problem(session, a.filename)
+        if problem:
+            store.log_event(session.session_id, "panel_artifact_rejected",
+                            {"agent": member.agent, "file": a.filename, "reason": problem})
+            continue
         fn = f"{member.agent}__{_basename(a.filename)}"
         a.filename = fn
         a.args["filename"] = fn

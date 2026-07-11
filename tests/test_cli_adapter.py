@@ -29,6 +29,17 @@ def test_claude_model_id_normalizes_openrouter_dotted_slug():
     assert CliAdapter("claude", model=None)._claude_model_id() is None
 
 
+def test_auth_status_uses_non_generative_claude_and_codex_commands(stub_run):
+    stub_run(_Proc(stdout=json.dumps({"loggedIn": True})))
+    assert CliAdapter("claude").auth_status() == (True, "logged in")
+
+    stub_run(_Proc(returncode=1, stdout="Not logged in"))
+    available, detail = CliAdapter("codex").auth_status()
+    assert available is False and "Not logged in" in detail
+
+    assert CliAdapter("gemini").auth_status()[0] is None
+
+
 class _Proc:
     """Fake subprocess.Popen — _exec now uses Popen().communicate()."""
 

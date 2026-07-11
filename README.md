@@ -72,6 +72,13 @@ the configured bound. Its heading and spread structure becomes a hard delivery
 contract: a sequel may change its title, but an output that drops required
 sections cannot pass artifact verification or be promoted.
 
+Before a CLI-backed run starts, Gang of 8 checks the non-generative
+authentication-status commands supported by local seats. An unauthenticated
+Claude or Codex seat is removed from that session's panel and judge roster,
+recorded as a degraded council, and never consumes a deliberation call. The
+timeline also records whether an offered integration was adopted or the voted
+winner was kept.
+
 When a session starts, the council roster shows one chip per seat — and each
 seat is a **different origin model**. Here is what each is doing:
 

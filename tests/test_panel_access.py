@@ -144,6 +144,18 @@ def test_two_seats_same_filename_do_not_clobber(tmp_path, store, governance, ses
     assert "run()" in (d / "gemini__index.html").read_text(encoding="utf-8")
 
 
+def test_panel_artifact_rejects_delivery_folder_as_a_filename(tmp_path, store, governance, session):
+    """ARTIFACT: tmp is a destination-folder mix-up, never a best-of-N draft."""
+    session.task.text = "Write a story and save it as a .txt file."
+    session.delivery_root = str(tmp_path / "tmp")
+    member = CouncilMember(role=Role.panelist, agent="gemini", active=True)
+
+    loop._capture_panel_artifacts(
+        session, member, "ARTIFACT: tmp\nThis must not become a candidate.", governance, store)
+
+    assert not session.proposed_actions
+
+
 def test_council_drafts_read_whole_not_truncated(tmp_path, store, governance, session):
     """The 2k skill window starved the lead on its own ~25KB drafts (live:
     'every draft is truncated mid-file', looping on re-reads). A file the
