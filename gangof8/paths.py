@@ -18,7 +18,7 @@ from typing import Optional
 # (e.g. "C:\Users\me\Benny's Splash.txt"). The closing delimiter must MATCH the
 # opening one (backreference), so an apostrophe inside a double-quoted path no
 # longer ends the match early.
-_QUOTED = re.compile(r"""(?P<q>["'`])(?P<p>(?:(?!(?P=q)).)*[\\/](?:(?!(?P=q)).)*)(?P=q)""")
+_QUOTED = re.compile(r"""(?<![\w])(?P<q>["'`])(?P<p>(?:(?!(?P=q)).)*[\\/](?:(?!(?P=q)).)*)(?P=q)""")
 # A bare Windows drive path (C:\... or C:/...). Apostrophes are allowed — real
 # filenames contain them ("Benny's Splash.txt"); excluding "'" truncated the
 # path there, pointing the established folder at the wrong directory.
