@@ -153,6 +153,15 @@ def test_delivery_target_prefers_explicit_save_over_written_source(tmp_path):
     assert extract_delivery_target(text) == str(destination.resolve())
 
 
+def test_posix_apostrophes_do_not_start_a_fake_quoted_path():
+    """An apostrophe in "children's" or "Benny's" is not a quote delimiter."""
+    from gangof8 import paths
+
+    text = "Write a children's book located at: /tmp/Benny/Benny's Splash.txt."
+    candidates = list(paths._candidates(text))
+    assert candidates == [(paths._POSIX, "/tmp/Benny/Benny's Splash.txt.")]
+
+
 def test_delivery_target_none_without_explicit_save_dest(tmp_path):
     d = tmp_path / "proj"
     d.mkdir()
