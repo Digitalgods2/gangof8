@@ -74,7 +74,8 @@ def test_dashboard_page_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Gang of 8" in r.text
-    assert "human authority preserved" in r.text
+    # the header tagline: the human-approval guarantee stays on screen
+    assert "nothing executes without your approval" in r.text
 
 
 def test_logo_served_and_referenced(client):

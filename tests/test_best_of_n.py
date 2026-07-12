@@ -135,7 +135,7 @@ def _bon(session, judges, judge_reply, lead=None):
     council = Council(members=[lead or CouncilMember(role=Role.lead, agent="claude", active=True)] + judges)
     session.council = council
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         # judges see blind labels, never agent names
         assert "codex__" not in prompt and "gemini__" not in prompt
         return Contribution(round=0, role=member.role, agent=member.agent, content=judge_reply)
@@ -230,7 +230,7 @@ def test_integration_proposal_is_optional_and_runtime_validated(session, store):
     session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
     seen = {}
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         seen["prompt"] = prompt
         return Contribution(
             round=0, role=member.role, agent=member.agent,
@@ -253,7 +253,7 @@ def test_integration_rejects_a_broken_merge(session, store):
     ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
     session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         return Contribution(
             round=0, role=member.role, agent=member.agent,
             content=("SYNERGY: YES\nRATIONALE: unsafe merge\nSOURCES: Candidate 1\n"
@@ -274,7 +274,7 @@ def test_integration_resolves_a_read_skill_before_deciding(session, store, tmp_p
     ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
     calls = []
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         calls.append(prompt)
         if len(calls) == 1:
             return Contribution(round=0, role=member.role, agent=member.agent,
@@ -324,7 +324,7 @@ def test_all_judges_failing_falls_back(session, store):
     council, _, lead_call = _bon(session, judges, "no scores here at all")
     council.members[0].active = True
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         return Contribution(round=0, role=member.role, agent=member.agent, content="garbage")
 
     assert loop._run_best_of_n(session, council, judges, call, lead_call, store) is None
@@ -337,7 +337,7 @@ def _chaired(session, judges, judge_reply, chair_reply, lead_agent="claude"):
     council = Council(members=[lead] + judges)
     session.council = council
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         return Contribution(round=0, role=member.role, agent=member.agent, content=judge_reply)
 
     def lead_call(member, prompt):
@@ -358,7 +358,7 @@ def test_judges_are_shown_runtime_evidence(session, store):
     session.council = council
     seen = {}
 
-    def call(m, p):
+    def call(m, p, timeout_s=None):
         seen["prompt"] = p
         return Contribution(round=0, role=m.role, agent=m.agent,
                             content="SCORE Candidate 1: 5\nSCORE Candidate 2: 9\nWINNER: Candidate 2")
@@ -383,7 +383,7 @@ def test_chair_work_runs_on_the_codifier_summarizer(session, store):
     session.council = council
     codifier_agents = []
 
-    def call(m, p):  # judges pick a winner and flag a fixable defect
+    def call(m, p, timeout_s=None):  # judges pick a winner and flag a fixable defect
         return Contribution(round=0, role=m.role, agent=m.agent,
                             content="SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
                                     "DEFECT: rename extra to reviewed")
@@ -458,7 +458,7 @@ def test_chair_recovers_when_every_candidate_crashes(session, store):
     council = Council(members=[lead])
     session.council = council
 
-    def call(member, prompt):  # judges never reached (nothing runs)
+    def call(member, prompt, timeout_s=None):  # judges never reached (nothing runs)
         raise AssertionError("no judging when all candidates crash")
 
     def lead_call(member, prompt):
@@ -515,7 +515,7 @@ def test_winner_gets_surgical_fixes_when_defects_flagged(session, store):
     reply = ("SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
              "DEFECT: rename extra to reviewed")
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         return Contribution(round=0, role=member.role, agent=member.agent, content=reply)
 
     def lead_call(member, prompt):
@@ -577,7 +577,7 @@ def test_finish_pass_with_no_edits_surfaces_unaddressed_defects(session, store):
     reply = ("SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
              "DEFECT: strip the orphan scaffolding line")
 
-    def call(member, prompt):
+    def call(member, prompt, timeout_s=None):
         return Contribution(round=0, role=member.role, agent=member.agent, content=reply)
 
     def codifier_call(member, prompt):

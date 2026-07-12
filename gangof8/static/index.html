@@ -5,14 +5,21 @@
 <title>Gang of 8</title>
 <link rel="icon" type="image/png" href="/logo.png">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+<div class="bg-fx" aria-hidden="true">
+  <div class="grid-lines"></div>
+  <div class="blob a"></div><div class="blob b"></div><div class="blob c"></div>
+</div>
 <header>
-  <span class="brand"><img src="/logo.png" class="brand-logo" alt="Gang of 8 logo"><h1>Gang of 8</h1></span>
-  <span class="sub" id="backend">backend: …</span>
-  <span class="sub" id="workspace">workspace: …</span>
-  <span class="sub">human authority preserved — nothing executes without your approval</span>
+  <span class="brand"><img src="/logo.png" class="brand-logo" alt="Gang of 8 logo">
+    <span class="brand-name"><h1>Gang of 8</h1><small>Coordinator OS · Type 1</small></span>
+  </span>
+  <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
+  <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
+  <span class="bpill tagline">🔒 nothing executes without your approval</span>
   <div class="hgroup">
     <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
     <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
@@ -70,6 +77,9 @@
 </main>
 
 <div id="composer">
+  <div class="term-bar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
+    <span class="path">council composer — one question, every AI you have</span></div>
+  <div class="cbody">
   <div id="attachments"></div>
   <div class="crow">
     <div class="plusw">
@@ -89,6 +99,7 @@
   </div>
   <input type="file" id="fileInput" style="display:none" onchange="onFilePicked(event)">
   <div class="sub" id="submitNote" style="margin-top:6px"></div>
+  </div>
 </div>
 <script src="/dashboard-utils.js"></script>
 <script src="/app.js"></script>
