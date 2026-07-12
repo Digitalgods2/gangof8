@@ -75,12 +75,19 @@ LEAD_TIMEOUT = 600
 # 240s" dropped one of the most important voices every build). Give panel
 # authoring production-grade headroom on produces_output tasks. (OpenRouter seats
 # already run effectively unbounded, so this also levels the field.)
-PANEL_AUTHOR_TIMEOUT = 600
+# 600s was STILL too short: a strong seat authoring a rich game needs longer
+# ("claude CLI timed out after 600s" — one of the most capable models never got
+# to submit, defeating the whole diversity bet). Losing a finished candidate
+# costs more than waiting out a slow one; the human can always Cancel a stuck
+# run. A seat's per-call ⏱ setting can raise this further (max wins), never
+# lower it below this floor.
+PANEL_AUTHOR_TIMEOUT = 1800
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom
-# than the lead's fast coordination path.
-CODIFIER_TIMEOUT = 900
+# than the lead's fast coordination path. (Raised with the removal of the
+# judging char caps: the chair now reads both finalists genuinely in full.)
+CODIFIER_TIMEOUT = 1200
 
 # Talent menu advertised to the lead: each specialist role and what it is good
 # for, so the lead knows what it can reach for (its origin model is filled in
@@ -337,8 +344,19 @@ ESCALATION_RESULT_MAX_CHARS = 2500
 # 2026-07-05 ("I want true best-of-N selection").
 BEST_OF_N_MIN_CANDIDATES = 2      # fewer than this ⇒ fall back to author path
 MAX_JUDGES = 5                    # independent scoring seats (cost bound)
-CANDIDATE_SCORE_MAX_CHARS = 24000 # per-candidate body shown to each judge
+# Judges and the chair see every candidate IN FULL — no per-candidate char cap.
+# The old 24000-char window made the vote measure "which file fit under the
+# cap": every larger candidate read as cut off mid-file, and the prompt orders
+# judges to score truncation LOW (live: a 23KB game unanimously beat three
+# richer 38-53KB ones whose code the judges saw only 45-63% of). Owner
+# directive 2026-07-12: judges examine each member's complete output. A judge
+# whose context can't hold the material drops (judge_dropped) — an honest
+# abstention instead of a systematically biased score.
 JUDGE_SCORE_MAX = 10              # score scale a judge gives each candidate
+# Scoring calls carry every candidate's full body, so give judges reading
+# headroom over the quick per-seat default (claude 240s would be the binding
+# timeout otherwise, with far more to read than before).
+JUDGE_TIMEOUT = 900
 
 # Per-file artifact materialization: an agent sometimes describes multi-file
 # output in one draft instead of emitting it. When an output task yields no full

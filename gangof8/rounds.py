@@ -529,7 +529,11 @@ def score_candidates_prompt(session: Session, labeled: list[tuple], source: str 
         label, body = item[0], item[1]
         runtime = item[2] if len(item) > 2 else ""
         head = f"===== {label} =====" + (f"\n[RUNTIME (headless execution): {runtime}]" if runtime else "")
-        blocks.append(f"{head}\n{body[:config.CANDIDATE_SCORE_MAX_CHARS]}")
+        # the WHOLE body, never truncated — judging a capped window scored
+        # "which candidate fit under the cap", not which was best (live: a 23KB
+        # game beat three richer 38-53KB ones because only it fit in 24000 chars
+        # and the rest read as cut off mid-file)
+        blocks.append(f"{head}\n{body}")
     n = len(labeled)
     # The runtime-weighing instruction is RIGHT for executable candidates (a game
     # that reads clean but crashes must lose) and WRONG for prose — a .txt story
@@ -614,7 +618,8 @@ def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[
         "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
         "If a flagged defect is not real or not safely fixable in isolation, skip "
         "it. Emit nothing but EDIT blocks.\n\n"
-        f"----- {filename} -----\n{body[:config.SKILL_RESULT_SANDBOX_MAX_CHARS]}"
+        # full body: EDIT OLD-snippets must be verifiably unique in the WHOLE file
+        f"----- {filename} -----\n{body}"
     )
 
 
@@ -649,7 +654,7 @@ def chair_review_prompt(session: Session, top: list[dict], source: str = "") -> 
         blocks.append(
             f"===== Candidate {c['label']} ({c['role']} — score {c['score']}, "
             f"{c['votes']} first-place vote(s)) =====\n"
-            f"{c['content'][:config.CANDIDATE_SCORE_MAX_CHARS]}")
+            f"{c['content']}")  # in full — "read BOTH in full" must be literally true
     win, run = top[0]["label"], top[1]["label"]
     return (
         f"Task the candidates implement: {session.task.text}\n"
@@ -699,7 +704,8 @@ def chair_recover_prompt(session: Session, filename: str, body: str, error: str)
         "EDIT: " + filename + "\n"
         "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
         "Emit nothing but EDIT blocks.\n\n"
-        f"----- {filename} -----\n{body[:config.SKILL_RESULT_SANDBOX_MAX_CHARS]}"
+        # full body: EDIT OLD-snippets must be verifiably unique in the WHOLE file
+        f"----- {filename} -----\n{body}"
     )
 
 

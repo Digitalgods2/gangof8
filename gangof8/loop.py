@@ -1144,9 +1144,10 @@ def _pause_for_integration_decision(
         round=session.current_round, purpose="integration_decision", resume_token="",
         question=(
             "The council found complementary strengths worth integrating after the "
-            "blind vote. The voted winner remains the default. Choose 'use integration' "
-            "to replace it with the validated merged candidate, or 'keep winner' to "
-            "deliver the vote winner unchanged.\n\n"
+            f"blind vote. The voted winner{f' — {proposal.winner_agent}' if proposal.winner_agent else ''} "
+            "remains the default. Choose 'use integration' to replace it with the "
+            "validated merged candidate, or 'keep winner' to deliver the vote "
+            "winner unchanged.\n\n"
             f"Rationale: {proposal.rationale}\nSources: {', '.join(proposal.source_candidates) or 'council review'}"
         ),
     )
@@ -1947,7 +1948,9 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
     judged = 0
     for j in judges:
         try:
-            ans = call(j, prompt)
+            # judges read every candidate in full now — reading headroom, not
+            # the quick per-seat default
+            ans = call(j, prompt, config.JUDGE_TIMEOUT)
         except (AgentError, BudgetExceeded) as e:
             store.log_event(sid, "judge_dropped", {"agent": j.agent, "error": str(e)[:120]})
             session.unresolved.append(f"judge '{j.agent}' dropped during best-of-N scoring: {e}")
@@ -2151,6 +2154,10 @@ def _propose_integration(
         content=content,
         rationale=rationale or "The codifier identified complementary implementation details.",
         source_candidates=sources,
+        winner_agent=ordered[winner_index].get("agent", ""),
+        winner_score=agg.get(winner_index + 1),
+        winner_votes=votes.get(winner_index + 1),
+        runtime_checked=bool(testable),
     )
     store.log_event(
         session.session_id, "integration_offered",
@@ -2292,6 +2299,11 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         session, base, content, wi, ordered, agg, votes, codifier_call, store,
         governance=governance, source=source,
     )
+    if integration is not None:
+        # vote context only known here — the human's decision card names the
+        # winner and its credentials instead of an anonymous "voted winner"
+        integration.judges = judged
+        integration.chair = chair_action
     _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
             "votes": votes[label], "judges": judged, "candidates": len(group),

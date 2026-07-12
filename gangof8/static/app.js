@@ -52,8 +52,11 @@ function collapsible(key, summary, body, defaultOpen) {
 function hardRefresh() {
   // Reload bypassing cache, like Ctrl/Cmd+F5 (a cache-bust param forces a fresh
   // fetch even when the browser would otherwise serve a stale index.html).
+  // Drops the #session deep link too, so the page comes back exactly as if
+  // the program was freshly launched — no session open, hero showing.
   const u = new URL(location.href);
   u.searchParams.set("_", Date.now());
+  u.hash = "";
   location.replace(u.toString());
 }
 
@@ -142,6 +145,65 @@ async function openFile(path) {
       alert("Could not open the file: " + (e.detail || ("HTTP " + r.status)));
     }
   } catch (e) { alert("Could not open the file: " + e); }
+}
+
+// ---- empty-state hero: the site's headline + a typed mock deliberation ------
+const HERO_TERM_SCRIPT = [
+  {c: "tprompt", t: "PS> ", same: true}, {c: "tcmd", t: "convene \"something hard\" --panel 8\n"},
+  {c: "tdim",   t: "◦ convening panel — every seat a different origin model\n"},
+  {c: "tpanel", t: "● claude · codex · gemini + DeepSeek/GLM/Qwen/Kimi writing in parallel…\n"},
+  {c: "tdim",   t: "🗳️ 8 candidates · 💥 1 crashed on load — disqualified\n"},
+  {c: "tdim",   t: "⚖️ judges scoring blindly…\n"},
+  {c: "tlead",  t: "🏆 winner shipped byte-for-byte\n"},
+  {c: "tsumm",  t: "✔ RUNTESTS passed · repaired 0 failures\n"},
+  {c: "tok",    t: "🔒 promote → awaiting your approval\n"},
+];
+
+function renderEmptyHero() {
+  document.getElementById("right").innerHTML = `
+    <div class="hero-empty">
+      <div class="badge-row">
+        <span class="bpill"><span class="dot"></span>Runs entirely on your desk</span>
+        <span class="bpill">🔒 One hard approval gate</span>
+        <span class="bpill">🧾 Full audit trail</span>
+      </div>
+      <h1>One question.<br><span class="grad-text">Every AI you have.</span><br>One answer you can trust.</h1>
+      <p>Pick a session on the left — or give the council something hard in the box below.</p>
+      <div class="term">
+        <div class="term-bar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
+          <span class="path">gang of 8 — deliberation</span></div>
+        <div class="term-body" id="heroTerm"></div>
+      </div>
+    </div>`;
+  typeHeroTerm();
+}
+
+// Types the mock deliberation into #heroTerm. Stops cleanly the moment the
+// pane is re-rendered for a real session (the node leaves the document).
+function typeHeroTerm() {
+  const term = document.getElementById("heroTerm");
+  if (!term) return;
+  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  term.innerHTML = "";
+  let i = 0, line = null;
+  (function next() {
+    if (!term.isConnected) return;
+    if (i >= HERO_TERM_SCRIPT.length) {
+      const cur = document.createElement("span");
+      cur.className = "cursor"; term.appendChild(cur); return;
+    }
+    const seg = HERO_TERM_SCRIPT[i], span = document.createElement("span");
+    span.className = "tline " + seg.c;
+    if (seg.same && line) line.appendChild(span); else term.appendChild(span);
+    const full = seg.t; let j = 0;
+    (function ch() {
+      if (!term.isConnected) return;
+      if (reduce) { span.textContent = full; i++; setTimeout(next, 80); return; }
+      span.textContent = full.slice(0, j++);
+      if (j <= full.length) setTimeout(ch, 14);
+      else { line = seg.same ? line : span; i++; setTimeout(next, 240); }
+    })();
+  })();
 }
 
 async function loadHealth() {
@@ -406,29 +468,37 @@ async function refresh() {
 // lingering selection one time. Otherwise leftover highlighted text freezes the
 // detail pane on its last "deliberating" render, and the elapsed ticker (which
 // keys off liveSince, only cleared inside renderDetail) counts up forever.
-// The latest talent pull still awaiting its answer, read from the event log —
-// a CONSULT/DELEGATE happens INSIDE the lead's call, so the session JSON alone
-// never shows it while it's happening. Returns e.g. "critic ← codex (consult):
-// verify the tunnel math", or "" when nothing is in flight.
-async function _talentInFlight(sid) {
+// One timeline fetch powers the whole live picture: the latest talent pull
+// still awaiting its answer (a CONSULT/DELEGATE happens INSIDE the lead's
+// call, so the session JSON alone never shows it while it's happening) AND a
+// rolling activity feed — what the council is actually doing right now, not
+// just a timer. Returns the talent line; fills _liveFeed as a side effect.
+let _liveTalent = "";
+let _liveFeed = [];  // recent {ts, icon, label, detail} rows for the live card
+
+async function _liveActivity(sid) {
   const d = await api(`/sessions/${encodeURIComponent(sid)}/timeline`);
+  const events = d.events || [];
   let open = "";
-  for (const e of (d.events || [])) {
+  for (const e of events) {
     if (e.event === "delegation_granted") open = e.detail || "talent";
     else if (["delegation_resolved", "delegation_failed", "delegation_denied",
               "round_synthesized", "final_composed"].includes(e.event)) open = "";
   }
+  _liveFeed = events.filter(e => e.event !== "status_change").slice(-8);
   return open.slice(0, 90);
 }
-let _liveTalent = "";
 
 async function _refreshDetail() {
   const detail = await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null);
   const workingNow = detail &&
     ["received", "classified", "deliberating", "composing"].includes(detail.status);
-  _liveTalent = workingNow ? await _talentInFlight(detail.session_id).catch(() => "") : "";
+  _liveTalent = workingNow ? await _liveActivity(detail.session_id).catch(() => "") : "";
+  if (!workingNow) _liveFeed = [];
   const right = document.getElementById("right");
-  const sig = JSON.stringify(detail) + "|talent:" + _liveTalent;
+  const feedKey = _liveFeed.length
+    ? _liveFeed[_liveFeed.length - 1].ts + ":" + _liveFeed.length : "";
+  const sig = JSON.stringify(detail) + "|talent:" + _liveTalent + "|feed:" + feedKey;
   if (sig === _lastDetailSig) return;
   const terminal = detail && TERMINAL_STATES.has(detail.status);
   if (!terminal && _hasSelectionIn(right)) return;
@@ -460,12 +530,22 @@ async function deleteSession(id, ev) {
   if (!confirm("Delete this session permanently? Its transcript and log will be removed.")) return;
   const r = await fetch("/sessions/" + encodeURIComponent(id), {method: "DELETE"});
   if (r.ok) {
-    if (current === id) { current = null; document.getElementById("right").innerHTML = '<div class="empty">Select a session</div>'; }
+    if (current === id) {
+      current = null;
+      history.replaceState(null, "", location.pathname + location.search);
+      renderEmptyHero();
+    }
     await refresh();
   }
 }
 
-function select(id) { current = id; _lastDetailSig = ""; _lastListSig = ""; refresh(); }
+function select(id) {
+  current = id; _lastDetailSig = ""; _lastListSig = "";
+  // deep link: keep the open session in the URL so a refresh (or a shared
+  // link) lands back on it instead of the empty state
+  if (location.hash !== "#" + id) history.replaceState(null, "", "#" + id);
+  refresh();
+}
 
 function renderDetail(s) {
   if (!s) return;
@@ -609,11 +689,20 @@ function renderDetail(s) {
 
     ${working ? `
       <div class="card live">
-        <span class="dot"></span>
-        <div>
-          <div class="what">${esc(s.status)}<span class="ell"></span></div>
-          <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""}${_liveTalent ? ` · 🤝 ${esc(_liveTalent)}` : ""} · <span id="elapsed">0:00</span></div>
+        <div class="livehead">
+          <span class="dot"></span>
+          <div>
+            <div class="what">${esc(s.status)}<span class="ell"></span></div>
+            <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""}${_liveTalent ? ` · 🤝 ${esc(_liveTalent)}` : ""} · <span id="elapsed">0:00</span></div>
+          </div>
         </div>
+        ${_liveFeed.length ? `<div class="livefeed">${_liveFeed.map(e => `
+          <div class="lfrow">
+            <span class="lfts">${esc((e.ts || "").slice(11, 19))}</span>
+            <span class="lfic">${e.icon || "•"}</span>
+            <span class="lflabel">${esc(e.label)}</span>
+            ${e.detail ? `<span class="lfdetail">${esc(e.detail)}</span>` : ""}
+          </div>`).join("")}</div>` : ""}
       </div>` : ""}
 
     ${roster.length ? `
@@ -669,23 +758,62 @@ function renderDetail(s) {
         </div>
       </div>`).join("")}
 
-    ${inputs.map(i => `
+    ${inputs.map(i => {
+      const ip = i.purpose === "integration_decision" ? s.integration_proposal : null;
+      if (ip) {
+        // Decision-first layout: the two NAMED options and their buttons are
+        // immediately visible; the merged file is behind a dropdown, never a
+        // wall of code between the question and the choice.
+        const wAgent = ip.winner_agent || "";
+        const wModel = wAgent ? (contribModel[modelKey("panelist", wAgent)] || "") : "";
+        const wMeta = [
+          ip.winner_score != null ? `score ${ip.winner_score}` : "",
+          ip.winner_votes != null ? `${ip.winner_votes}/${ip.judges ?? "?"} first-place votes` : "",
+          ip.chair || "",
+        ].filter(Boolean).join(" · ");
+        const iMeta = [
+          `merges: ${(ip.source_candidates || []).join(", ") || "council review"}`,
+          // tri-state: null = pre-upgrade session, runtime status unknown — say nothing
+          ip.runtime_checked === true ? "runtime-checked ✓"
+            : ip.runtime_checked === false ? "⚠ not runtime-checked" : "",
+        ].filter(Boolean).join(" · ");
+        const peekKey = "integ_" + i.input_id;
+        return `
+      <div class="card needs">
+        <h3>🧬 Council integration decision</h3>
+        <div class="sub">The council found complementary strengths worth merging after the blind vote. The voted winner stays the default — pick which file ships.</div>
+        <div class="duel">
+          <div class="opt winner">
+            <div class="opt-h">🏆 Voted winner${wAgent ? ` — ${esc(wAgent)}${wModel ? ` · ${esc(shortModel(wModel))}` : ""}` : ""}</div>
+            ${wMeta ? `<div class="opt-meta">${esc(wMeta)}</div>` : ""}
+            <div class="opt-why">One model's coherent code, exactly as it won the blind vote and passed the runtime gate — ships byte-for-byte, no merge risk.</div>
+            <button class="ghost" onclick="chooseIntegration('${i.input_id}', 'keep winner')">Keep voted winner</button>
+          </div>
+          <div class="opt integ">
+            <div class="opt-h">🧬 Integration — <span class="mono">${esc(ip.filename)}</span></div>
+            <div class="opt-meta">${esc(iMeta)}</div>
+            <div class="opt-why">${esc(ip.rationale)}</div>
+            <button onclick="chooseIntegration('${i.input_id}', 'use integration')">Use integration</button>
+          </div>
+        </div>
+        <details class="codepeek" ${openSections[peekKey] ? "open" : ""}
+                 ontoggle="openSections['${peekKey}']=this.open">
+          <summary>view the integrated file (${((ip.content || "").length).toLocaleString()} chars)</summary>
+          <pre>${esc(ip.content)}</pre>
+        </details>
+      </div>`;
+      }
+      return `
       <div class="card needs">
         <h3>${i.purpose === "integration_decision" ? "Council integration decision" : "Agent question - " + esc(i.role) + "@" + esc(i.agent)}</h3>
         <div>${esc(i.question)}</div>
-        ${i.purpose === "integration_decision" && s.integration_proposal ? `
-          <div class="sub" style="margin-top:8px">Integrated candidate: <span class="mono">${esc(s.integration_proposal.filename)}</span> - ${esc((s.integration_proposal.source_candidates || []).join(", ") || "council review")}</div>
-          <pre>${esc(s.integration_proposal.content)}</pre>
-          <div class="row">
-            <button onclick="chooseIntegration('${i.input_id}', 'use integration')">Use integration</button>
-            <button class="ghost" onclick="chooseIntegration('${i.input_id}', 'keep winner')">Keep voted winner</button>
-          </div>` : `
-          <textarea id="ans_${i.input_id}" placeholder="Your answer…"></textarea>
-          <div class="row">
-            <button onclick="answerInput('${i.input_id}')">Answer</button>
-            <button class="deny" onclick="declineInput('${i.input_id}')">Decline</button>
-          </div>`}
-      </div>`).join("")}
+        <textarea id="ans_${i.input_id}" placeholder="Your answer…"></textarea>
+        <div class="row">
+          <button onclick="answerInput('${i.input_id}')">Answer</button>
+          <button class="deny" onclick="declineInput('${i.input_id}')">Decline</button>
+        </div>
+      </div>`;
+    }).join("")}
 
     ${final && (final.assumptions?.length || final.risks_unresolved?.length || final.next_action) ? `
       <div class="card">
@@ -1470,6 +1598,9 @@ async function emptyWorkspace() {
 loadHealth();
 loadWorkspace();
 bindComposerControls();
+// deep link: /#<session_id> re-opens that session; otherwise the hero greets
+if (location.hash.length > 1) select(decodeURIComponent(location.hash.slice(1)));
+else renderEmptyHero();
 pollLoop();
 setInterval(tickElapsed, 1000);
 // when a task is submitted or an action resolved, jump back to fast polling

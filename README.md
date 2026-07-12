@@ -188,20 +188,102 @@ blocks or file re-writes), and the tests re-run — up to 3 attempts, all
 *before* anything is promoted. A build ships passing its own tests, or the
 final answer says exactly why it couldn't.
 
-## Setup
+## Installation
+
+**Prerequisites (all platforms)**
+
+- **Python 3.12+** — the only hard requirement.
+- **Git** — to clone the repository.
+- **Node.js** *(optional, recommended)* — powers the headless runtime gate that
+  executes build candidates and disqualifies crashers before judging. Without
+  it, files are judged on content alone.
+- **Agent CLIs** *(optional)* — `claude`, `codex`, and/or `gemini` on PATH for
+  the real `cli` backend. Any subset works; the default `mock` backend needs
+  none at all, so you can try Gang of 8 with zero accounts or keys.
+
+> The examples in this README use the Windows venv path
+> (`.venv\Scripts\python`). On **macOS/Linux** the equivalent is
+> `.venv/bin/python` — everything else is identical.
+
+### Windows
 
 ```powershell
+# PowerShell — Python from python.org, or: winget install Python.Python.3.12
+git clone https://github.com/Digitalgods2/gangof8.git
+cd gangof8
 python -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -e ".[dev]"
+
+# try it now — free, offline, no keys:
+.venv\Scripts\python cli.py serve --backend mock
+# real agents (uses your installed CLIs):
+.venv\Scripts\python cli.py serve --backend cli
 ```
+
+Convenience launchers ship in the repo root: double-click
+**`Launch Gang of 8.bat`** to start the server and open the dashboard
+(**`Launch Gang of 8 (no window).vbs`** does the same with no console window);
+**`Stop Gang of 8.bat`** shuts it down. Edit the `BACKEND` line at the top of
+the `.bat` to switch between `cli` and `mock`.
+
+### macOS
+
+```bash
+# Python via Homebrew if needed: brew install python@3.12   (node: brew install node)
+git clone https://github.com/Digitalgods2/gangof8.git
+cd gangof8
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e ".[dev]"
+
+# try it now — free, offline, no keys:
+.venv/bin/python cli.py serve --backend mock
+# real agents (uses your installed CLIs):
+.venv/bin/python cli.py serve --backend cli
+```
+
+### Linux
+
+```bash
+# Debian/Ubuntu: sudo apt install python3 python3-venv python3-pip git
+# Fedora:        sudo dnf install python3 git
+git clone https://github.com/Digitalgods2/gangof8.git
+cd gangof8
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e ".[dev]"
+
+# try it now — free, offline, no keys:
+.venv/bin/python cli.py serve --backend mock
+# real agents (uses your installed CLIs):
+.venv/bin/python cli.py serve --backend cli
+```
+
+On every platform the dashboard prints and serves at
+`http://127.0.0.1:8790/`.
+
+### Installing the agent CLIs (optional, any platform)
+
+The `cli` backend convenes whatever is installed — each CLI manages its own
+login, and anything absent is simply skipped:
+
+```bash
+npm install -g @anthropic-ai/claude-code   # claude
+npm install -g @openai/codex               # codex
+npm install -g @google/gemini-cli          # gemini
+```
+
+Run each once (`claude`, `codex`, `gemini`) to complete its auth flow before
+the first `--backend cli` session. There is no external service — Gang of 8
+invokes these CLIs locally, with tools disabled, and its own governance is the
+only path to side effects.
+
+**What the Python dependencies are for:**
 
 - `pypdf` — extract text from attached PDFs.
 - `google-genai` — gemini image vision (inline-image inference; needs `GEMINI_API_KEY`).
 - `Pillow` — used only by the test suite to generate images.
-
-The `cli` backend uses your locally-installed agent CLIs (`claude`, `codex`,
-`gemini` on PATH), each with its own auth — there is no external service.
 
 The editable install provides the `gangof8` command as an alternative to
 `python cli.py`. Development commands and module ownership are documented in

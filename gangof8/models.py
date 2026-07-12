@@ -275,6 +275,16 @@ class IntegrationProposal(BaseModel):
     rationale: str
     source_candidates: list[str] = []
     status: str = "pending"  # pending | adopted | kept_winner
+    # Who the merge competes against — so the human decides between two NAMED
+    # options with their credentials, not "winner vs integration" in the abstract.
+    winner_agent: str = ""
+    winner_score: Optional[int] = None   # aggregate blind-vote score
+    winner_votes: Optional[int] = None   # first-place votes received
+    judges: Optional[int] = None         # judges that scored (votes/judges)
+    chair: str = ""                      # e.g. "chair ratified the vote"
+    # tri-state: True/False = verified/not; None = unknown (pre-upgrade session),
+    # so the UI omits the claim instead of mis-stating "not checked"
+    runtime_checked: Optional[bool] = None
 
 
 class Session(BaseModel):
