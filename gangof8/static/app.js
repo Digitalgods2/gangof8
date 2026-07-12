@@ -147,18 +147,7 @@ async function openFile(path) {
   } catch (e) { alert("Could not open the file: " + e); }
 }
 
-// ---- empty-state hero: the site's headline + a typed mock deliberation ------
-const HERO_TERM_SCRIPT = [
-  {c: "tprompt", t: "PS> ", same: true}, {c: "tcmd", t: "convene \"something hard\" --panel 8\n"},
-  {c: "tdim",   t: "◦ convening panel — every seat a different origin model\n"},
-  {c: "tpanel", t: "● claude · codex · gemini + DeepSeek/GLM/Qwen/Kimi writing in parallel…\n"},
-  {c: "tdim",   t: "🗳️ 8 candidates · 💥 1 crashed on load — disqualified\n"},
-  {c: "tdim",   t: "⚖️ judges scoring blindly…\n"},
-  {c: "tlead",  t: "🏆 winner shipped byte-for-byte\n"},
-  {c: "tsumm",  t: "✔ RUNTESTS passed · repaired 0 failures\n"},
-  {c: "tok",    t: "🔒 promote → awaiting your approval\n"},
-];
-
+// ---- empty-state hero: just the site's headline, no animated terminal ------
 function renderEmptyHero() {
   document.getElementById("right").innerHTML = `
     <div class="hero-empty">
@@ -169,41 +158,7 @@ function renderEmptyHero() {
       </div>
       <h1>One question.<br><span class="grad-text">Every AI you have.</span><br>One answer you can trust.</h1>
       <p>Pick a session on the left — or give the council something hard in the box below.</p>
-      <div class="term">
-        <div class="term-bar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
-          <span class="path">gang of 8 — deliberation</span></div>
-        <div class="term-body" id="heroTerm"></div>
-      </div>
     </div>`;
-  typeHeroTerm();
-}
-
-// Types the mock deliberation into #heroTerm. Stops cleanly the moment the
-// pane is re-rendered for a real session (the node leaves the document).
-function typeHeroTerm() {
-  const term = document.getElementById("heroTerm");
-  if (!term) return;
-  const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  term.innerHTML = "";
-  let i = 0, line = null;
-  (function next() {
-    if (!term.isConnected) return;
-    if (i >= HERO_TERM_SCRIPT.length) {
-      const cur = document.createElement("span");
-      cur.className = "cursor"; term.appendChild(cur); return;
-    }
-    const seg = HERO_TERM_SCRIPT[i], span = document.createElement("span");
-    span.className = "tline " + seg.c;
-    if (seg.same && line) line.appendChild(span); else term.appendChild(span);
-    const full = seg.t; let j = 0;
-    (function ch() {
-      if (!term.isConnected) return;
-      if (reduce) { span.textContent = full; i++; setTimeout(next, 80); return; }
-      span.textContent = full.slice(0, j++);
-      if (j <= full.length) setTimeout(ch, 14);
-      else { line = seg.same ? line : span; i++; setTimeout(next, 240); }
-    })();
-  })();
 }
 
 async function loadHealth() {
@@ -345,6 +300,62 @@ function bindComposerControls() {
       void enhancePrompt();
     });
   }
+}
+
+// ---- floatable composer: drag it by the terminal bar out of the way of
+// on-screen text; position survives reloads; double-click the bar to re-dock ----
+const COMPOSER_POS_KEY = "g8ComposerPos";
+function _savedComposerPos() {
+  try { return JSON.parse(localStorage.getItem(COMPOSER_POS_KEY)); }
+  catch { return null; }
+}
+function _placeComposer(box, bar, x, y) {
+  // partial off-screen is allowed (that's how you shove it out of the way),
+  // but at least 140px of the drag bar stays reachable, and the bar can never
+  // leave the viewport vertically — a lost composer is unrecoverable
+  const w = box.offsetWidth, barH = bar.offsetHeight || 34;
+  x = Math.max(140 - w, Math.min(x, window.innerWidth - 140));
+  y = Math.max(0, Math.min(y, window.innerHeight - barH));
+  box.style.left = x + "px"; box.style.top = y + "px";
+  box.style.right = "auto"; box.style.bottom = "auto"; box.style.margin = "0";
+}
+function bindComposerDrag() {
+  const box = document.getElementById("composer");
+  const bar = box ? box.querySelector(".term-bar") : null;
+  if (!bar) return;
+  bar.title = "drag to move · double-click to snap back";
+  const saved = _savedComposerPos();
+  if (saved) _placeComposer(box, bar, saved.x, saved.y);
+  let drag = null;  // pointer offset inside the box while dragging
+  bar.addEventListener("pointerdown", e => {
+    if (e.button !== 0) return;
+    const r = box.getBoundingClientRect();
+    drag = {dx: e.clientX - r.left, dy: e.clientY - r.top};
+    box.classList.add("dragging");
+    bar.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  bar.addEventListener("pointermove", e => {
+    if (drag) _placeComposer(box, bar, e.clientX - drag.dx, e.clientY - drag.dy);
+  });
+  const endDrag = () => {
+    if (!drag) return;
+    drag = null;
+    box.classList.remove("dragging");
+    const r = box.getBoundingClientRect();
+    localStorage.setItem(COMPOSER_POS_KEY, JSON.stringify({x: r.left, y: r.top}));
+  };
+  bar.addEventListener("pointerup", endDrag);
+  bar.addEventListener("pointercancel", endDrag);
+  bar.addEventListener("dblclick", () => {
+    localStorage.removeItem(COMPOSER_POS_KEY);
+    box.style.left = box.style.top = box.style.right = "";
+    box.style.bottom = box.style.margin = "";
+  });
+  window.addEventListener("resize", () => {
+    const p = _savedComposerPos();
+    if (p) _placeComposer(box, bar, p.x, p.y);
+  });
 }
 
 // ---- respond-to-council attachments — multi-modal like the main composer ----
@@ -1598,6 +1609,7 @@ async function emptyWorkspace() {
 loadHealth();
 loadWorkspace();
 bindComposerControls();
+bindComposerDrag();
 // deep link: /#<session_id> re-opens that session; otherwise the hero greets
 if (location.hash.length > 1) select(decodeURIComponent(location.hash.slice(1)));
 else renderEmptyHero();
