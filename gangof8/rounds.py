@@ -8,6 +8,7 @@ reverse), so the prompt layer stays cycle-free and independently testable.
 from __future__ import annotations
 
 import re
+from typing import Optional
 
 from .models import Contribution, Council, CouncilMember, Role, Session
 from . import config
@@ -53,8 +54,9 @@ DELEGATE_FILE_CONTRACT = (
     "If your assignment is to AUTHOR a file, emit it literally and COMPLETELY:\n"
     "ARTIFACT: <filename>\n"
     "<full file contents>\n"
-    "Raw bytes right after the ARTIFACT line — no ``` fences, and no commentary "
-    "after the content (the file must end at its real final byte). Your "
+    "END_ARTIFACT\n"
+    "Raw bytes go between the ARTIFACT and END_ARTIFACT lines — no ``` fences. "
+    "Any explanation must come after END_ARTIFACT. Your "
     "ARTIFACT/EDIT blocks are captured directly as real files in the council "
     "space. Do NOT emit PROMOTE lines — delivery is the lead's decision.\n"
 )
@@ -207,14 +209,14 @@ def _output_contract(session: Session) -> str:
         "would contain:\n"
         "ARTIFACT: <filename>\n"
         "<full file contents>\n"
+        "END_ARTIFACT\n"
         "Use one ARTIFACT block per file and include EVERY file the task asks for. Do "
         "not describe the files in prose — write them out in full.\n"
-        "Write each file's RAW bytes immediately after its ARTIFACT line. Do NOT wrap "
-        "file contents in ``` markdown code fences, and do NOT add ANY commentary, "
-        "notes, or explanation AFTER the last file's content — the file must end at "
-        "its real final byte. A short rationale BEFORE the first ARTIFACT line is "
-        "welcome (it is shown to the user); everything after the first ARTIFACT line "
-        "must be only file contents and ARTIFACT/EDIT/PROMOTE/RUNTESTS lines.\n"
+        "Write each file's RAW bytes immediately after its ARTIFACT line and terminate "
+        "that file with a line containing exactly END_ARTIFACT. Do NOT wrap file "
+        "contents in ``` markdown code fences. A short rationale before the first "
+        "ARTIFACT or an explanation after END_ARTIFACT is safe; neither becomes file "
+        "content.\n"
         f"{promote}"
         "To MODIFY an existing file instead of overwriting it, emit a surgical edit "
         "(the OLD snippet must be unique in the file):\n"
@@ -549,17 +551,16 @@ def _panel_file_contract(session: Session) -> str:
             f"You are the SOLE OWNER of this build package, not a candidate in a "
             f"contest. Produce the substantive implementation now. Required staged "
             f"outputs: {required}. Emit every file as —\n"
-            "ARTIFACT: <exact relative filename>\n<full file contents>\n"
-            "— raw bytes after the ARTIFACT line, with no fences. Do not emit "
+            "ARTIFACT: <exact relative filename>\n<full file contents>\nEND_ARTIFACT\n"
+            "— raw bytes inside that envelope, with no fences. Do not emit "
             "PROMOTE: package files remain in shared staging until one final batch "
             "release. Honor other owners' interfaces and do not recreate their files.\n"
         )
     return (
         "This is a BEST-OF-N build: emit YOUR COMPLETE candidate implementation "
         "as a block —\n"
-        "ARTIFACT: <filename>\n<full file contents>\n"
-        "— raw bytes right after the ARTIFACT line (no ``` fences, no commentary "
-        "after the content; the file must end at its real final byte). Every "
+        "ARTIFACT: <filename>\n<full file contents>\nEND_ARTIFACT\n"
+        "— raw bytes inside that envelope (no ``` fences). Every "
         "seat's candidate is saved and then SCORED by independent judges; the "
         "single highest-scoring file is shipped to the user UNCHANGED, so make "
         "yours complete, correct, and the one you'd want to win — not a sketch. "
@@ -740,7 +741,7 @@ def chair_finish_prompt(session: Session, candidates: list[dict], filename: str,
             "SYNERGY: YES\n"
             "RATIONALE: <which specific strengths from which candidates are combined>\n"
             f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
-            "<complete integrated file contents>\n")
+            "<complete integrated file contents>\nEND_ARTIFACT\n")
     return (
         f"Task the candidates implement: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"

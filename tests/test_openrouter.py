@@ -5,6 +5,7 @@ enable→register wiring that lets a role be assigned to an OpenRouter model.
 import pytest
 from fastapi.testclient import TestClient
 
+from gangof8 import cancellation
 from gangof8.adapters import openrouter as orm
 from gangof8.adapters.openrouter import OpenRouterAdapter
 from gangof8.models import Role
@@ -136,6 +137,119 @@ def test_adapter_call_interrupted_by_cancel(monkeypatch):
         assert isinstance(result.get("exc"), SessionCancelled)
     finally:
         cancellation.clear(sid)
+
+
+def test_productive_stream_can_run_longer_than_stall_window(monkeypatch):
+    """Coding has no total wall clock: each real output chunk refreshes liveness."""
+    import time
+
+    class _StreamResponse:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_lines(self):
+            yield 'data: {"model":"qwen/test","choices":[{"delta":{"content":"hello "}}]}'
+            time.sleep(0.6)
+            yield 'data: {"choices":[{"delta":{"content":"world"}}]}'
+            time.sleep(0.6)
+            yield "data: [DONE]"
+
+    class _StreamingClient:
+        def __init__(self, timeout=None):
+            pass
+
+        def stream(self, *args, **kwargs):
+            return _StreamResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(orm.httpx, "Client", _StreamingClient)
+    cancellation.set_call_kind("coding")
+    try:
+        out = OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key").call(
+            Role.code_generator, "write it", timeout_s=1)
+    finally:
+        cancellation.set_call_kind(None)
+    assert out.content == "hello world"
+    assert out.duration_ms >= 1100  # total exceeded 1s; no output gap did
+
+
+def test_routine_stream_uses_total_wall_clock_deadline(monkeypatch):
+    import time
+
+    class _Response:
+        status_code = 200
+
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"one"}}]}'
+            time.sleep(0.6)
+            yield 'data: {"choices":[{"delta":{"content":"two"}}]}'
+            time.sleep(0.6)
+            yield "data: [DONE]"
+
+    class _Client:
+        def __init__(self, timeout=None): pass
+        def stream(self, *args, **kwargs): return _Response()
+        def close(self): pass
+
+    monkeypatch.setattr(orm.httpx, "Client", _Client)
+    cancellation.set_call_kind("routine")
+    try:
+        with pytest.raises(AgentError, match="timed out after 1s"):
+            OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key").call(
+                Role.researcher, "summarize", timeout_s=1)
+    finally:
+        cancellation.set_call_kind(None)
+
+
+def test_silent_stream_is_closed_by_model_progress_watchdog(monkeypatch):
+    import threading
+
+    closed = threading.Event()
+
+    class _StalledResponse:
+        status_code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_lines(self):
+            if closed.wait(5):
+                raise orm.httpx.ReadError("closed by watchdog")
+            return
+            yield  # pragma: no cover - make this a generator
+
+    class _StalledClient:
+        def __init__(self, timeout=None):
+            pass
+
+        def stream(self, *args, **kwargs):
+            return _StalledResponse()
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(orm.httpx, "Client", _StalledClient)
+    adapter = OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key")
+    cancellation.set_call_kind("coding")
+    try:
+        with pytest.raises(AgentError, match="stalled: no model output for 1s"):
+            adapter.call(Role.code_generator, "write it", timeout_s=1)
+    finally:
+        cancellation.set_call_kind(None)
+    assert closed.is_set()
 
 
 # --- secret store -------------------------------------------------------------

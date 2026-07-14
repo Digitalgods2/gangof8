@@ -127,6 +127,8 @@ button.deny:hover { background:rgba(255,93,108,.12); box-shadow:none; }
 .gms .gtitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .pill.g-running, .pill.g-planning { background:rgba(57,208,255,.12); color:var(--brand-2);
                                     border-color:rgba(57,208,255,.25); }
+.pill.g-draining { background:rgba(245,197,66,.12); color:var(--lead);
+                   border-color:rgba(245,197,66,.25); }
 .pill.g-completed { background:rgba(61,220,151,.12); color:var(--ok);
                     border-color:rgba(61,220,151,.25); }
 .pill.g-paused { background:rgba(245,197,66,.12); color:var(--lead);

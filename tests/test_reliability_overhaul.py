@@ -230,6 +230,37 @@ def test_runtime_prelude_reads_current_session_sandbox_and_checks_hash(tmp_path,
     assert loop._runtime_prelude(session, "src/feature.js") == ""
 
 
+def test_dependency_collision_is_deferred_not_blamed_on_current_package(tmp_path):
+    store = LogStore(tmp_path / "data")
+    workspace = tmp_path / "stage"
+    sound = workspace / "src" / "core" / "soundfx.js"
+    menu = workspace / "src" / "ui" / "menu.js"
+    sound.parent.mkdir(parents=True)
+    menu.parent.mkdir(parents=True)
+    sound.write_text(
+        "const _global = globalThis; const ARC = _global.ARC || (_global.ARC = {});\n",
+        encoding="utf-8")
+    menu.write_text(
+        "const _global = globalThis; const ARC = _global.ARC || (_global.ARC = {});\n",
+        encoding="utf-8")
+    target = tmp_path / "asteroids.js"
+    target.write_text(
+        "globalThis.Asteroids = function Asteroids() {};\n", encoding="utf-8")
+    session = SessionManager(store).create("build Asteroids", source="goal")
+    session.workspace_root = str(workspace)
+    session.required_files = ["src/games/asteroids.js"]
+    session.runtime_dependencies = ["src/core/soundfx.js", "src/ui/menu.js"]
+    session.acceptance_commands = ["node --check src/games/asteroids.js"]
+    session.proposed_actions = [ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="src/games/asteroids.js", status="executed", result_path=str(target),
+    )]
+
+    assert loop._verify_artifact_outputs(session, store, require_file=True)
+    assert any("integration runtime deferred" in item for item in session.unresolved)
+    assert not any("asteroids.js: does not run" in item for item in session.unresolved)
+
+
 def test_acceptance_stage_preserves_nested_paths(tmp_path):
     store = LogStore(tmp_path / "data")
     session = SessionManager(store).create("compile nested file", source="goal")

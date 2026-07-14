@@ -18,6 +18,15 @@ ARTIFACT_MARKER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Explicit terminator for the v2 artifact envelope.  The older protocol relied
+# on the next action marker (or end-of-response), so a model's friendly closing
+# explanation became JavaScript bytes.  The terminator makes file boundaries
+# independent of whatever the model says afterwards.
+ARTIFACT_END_MARKER = re.compile(
+    r"^[ \t]*(?:<<<\s*)?END_ARTIFACT(?:\s*>>>)?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # 'EDIT: <filename>' with conflict-marker-like OLD/NEW blocks.
 EDIT_MARKER = re.compile(
     r"^[ \t]*(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
@@ -90,8 +99,12 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
     """Parse marker blocks into ProposedActions in document order."""
     starts = sorted(m.start() for m in BLOCK_START.finditer(text))
 
+    ends = sorted(m.start() for m in ARTIFACT_END_MARKER.finditer(text))
+
     def content_end(after: int) -> int:
-        return next((s for s in starts if s > after), len(text))
+        boundaries = [s for s in starts if s > after]
+        boundaries.extend(e for e in ends if e > after)
+        return min(boundaries) if boundaries else len(text)
 
     found: list[tuple[int, ProposedAction]] = []
     for m in ARTIFACT_MARKER.finditer(text):
@@ -168,6 +181,25 @@ def clean_artifact_body(raw: str, filename: str = "") -> str:
         fences = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
         if len(fences) == 2 and fences[0] == 0:
             return "\n".join(lines[1:fences[1]]).strip()
+    # Legacy/raw source fallback.  Some coding CLIs obeyed ARTIFACT but omitted
+    # the requested fence/end marker, then appended Markdown release notes.  Do
+    # not broadly guess where arbitrary prose begins; trim only unmistakable
+    # presentation headings after a plausible complete source statement.  The
+    # normal syntax/acceptance gate still validates the resulting candidate.
+    if name.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".css", ".py")):
+        lines = t.splitlines()
+        presentation = re.compile(
+            r"^\s*(?:#{1,6}\s+|\*\*(?:what|summary|implementation|features?|"
+            r"changes?|notes?|files?|how\b)[^*]*\*\*)",
+            re.IGNORECASE,
+        )
+        for i, line in enumerate(lines):
+            if i < 4 or not presentation.match(line):
+                continue
+            candidate = "\n".join(lines[:i]).rstrip()
+            previous = next((ln.strip() for ln in reversed(lines[:i]) if ln.strip()), "")
+            if candidate and previous.endswith((";", "}", ")", "]")):
+                return candidate
     return t
 
 

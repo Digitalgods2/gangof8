@@ -486,6 +486,37 @@ def test_failed_verification_is_terminal_and_never_reported_as_done(svc):
     assert "failed" in parked.last_error
 
 
+def test_parallel_failure_drains_live_sibling_before_parent_pauses(svc):
+    goal = Goal(text="parallel", status="running", milestones=[
+        GoalMilestone(index=0, package_id="wp_1", owner="claude", title="failed",
+                      task_text="one", status="running", session_id="s_failed",
+                      contract_declared=True),
+        GoalMilestone(index=1, package_id="wp_2", owner="qwen", title="healthy",
+                      task_text="two", status="running", session_id="s_healthy",
+                      contract_declared=True),
+    ])
+    svc.goals.save(goal)
+    failed = Session(
+        session_id="s_failed", status=SessionStatus.failed, outcome="failed_verification",
+        stop_reason="artifact failed", goal_id=goal.goal_id, goal_milestone=0,
+        task=Task(task_id="t1", session_id="s_failed", text="one"),
+    )
+    svc._maybe_advance_goal(failed)
+    draining = svc.goals.get(goal.goal_id)
+    assert draining.status == "draining"
+    assert [m.status for m in draining.milestones] == ["failed", "running"]
+
+    healthy = Session(
+        session_id="s_healthy", status=SessionStatus.done, outcome="succeeded",
+        goal_id=goal.goal_id, goal_milestone=1,
+        task=Task(task_id="t2", session_id="s_healthy", text="two"),
+    )
+    svc._maybe_advance_goal(healthy)
+    parked = svc.goals.get(goal.goal_id)
+    assert parked.status == "paused"
+    assert [m.status for m in parked.milestones] == ["failed", "done"]
+
+
 def test_goal_context_uses_only_promoted_accepted_files(svc, tmp_path):
     goal = Goal(text="g", status="running", milestones=[
         GoalMilestone(index=0, title="core", task_text="build core", status="running",

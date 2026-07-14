@@ -13,6 +13,8 @@ local secrets store).
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from typing import Callable, Optional
 
@@ -64,6 +66,11 @@ class OpenRouterAdapter:
             "model": slug,
             "messages": [{"role": "user", "content": prompt}],
             "provider": {"data_collection": self.data_collection},
+            # Streaming is correctness infrastructure, not cosmetic output. It
+            # lets the coordinator distinguish a long productive coding call
+            # from an open socket that has stopped producing model tokens.
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         headers = {
             "Authorization": f"Bearer {key}",
@@ -80,7 +87,26 @@ class OpenRouterAdapter:
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
         t0 = time.monotonic()
-        client = httpx.Client(timeout=max(30, timeout_s))
+        # httpx's scalar timeout is per socket operation. A provider can keep a
+        # request alive forever with transport-level trickles, which is exactly
+        # how the live Qwen call ran for 16 minutes under a nominal 360-second
+        # limit. Reads are therefore unbounded here and the token-progress
+        # watchdog below owns the real stall policy. timeout_s == 0 remains the
+        # explicit no-deadline frontier-author mode.
+        transport_timeout = httpx.Timeout(
+            None,
+            connect=30.0,
+            write=30.0,
+            pool=30.0,
+        )
+        client = httpx.Client(timeout=transport_timeout)
+        finished = threading.Event()
+        stalled = threading.Event()
+        deadline_reason = ["stalled"]
+        progress_lock = threading.Lock()
+        last_progress = [time.monotonic()]
+        output_chars = [0]
+        coding_call = cancellation.current_call_kind() == "coding"
 
         def _abort() -> None:
             try:
@@ -88,42 +114,163 @@ class OpenRouterAdapter:
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
 
+        def _model_progress(chars: int) -> None:
+            with progress_lock:
+                last_progress[0] = time.monotonic()
+                output_chars[0] = max(output_chars[0], chars)
+            cancellation.report_progress(output_chars[0], "model output streaming")
+
+        def _watch_stall() -> None:
+            if timeout_s <= 0:
+                return
+            stall_s = max(1.0, float(timeout_s))
+            while not finished.wait(0.5):
+                with progress_lock:
+                    quiet_for = time.monotonic() - last_progress[0]
+                elapsed = time.monotonic() - t0
+                if (quiet_for if coding_call else elapsed) >= stall_s:
+                    deadline_reason[0] = "stalled" if coding_call else "timed out"
+                    stalled.set()
+                    _abort()
+                    return
+
+        def _deadline_error() -> str:
+            if deadline_reason[0] == "timed out":
+                return f"{self.name} (OpenRouter) timed out after {timeout_s}s"
+            return f"{self.name} (OpenRouter) stalled: no model output for {timeout_s}s"
+
+        watchdog = threading.Thread(
+            target=_watch_stall,
+            name=f"gangof8-{self.name}-stall-watch",
+            daemon=True,
+        )
         cancellation.register_canceler(sid, _abort)
+        watchdog.start()
         try:
-            resp = client.post(f"{self.endpoint}/chat/completions",
-                               headers=headers, json=payload)
+            content_parts: list[str] = []
+            usage: dict = {}
+            response_model = slug
+            status_code = 200
+            error_text = ""
+
+            # Old tests and third-party client doubles may expose only .post().
+            # Keep that compatibility path, while real httpx clients use SSE.
+            if callable(getattr(client, "stream", None)):
+                with client.stream(
+                    "POST", f"{self.endpoint}/chat/completions",
+                    headers=headers, json=payload,
+                ) as resp:
+                    status_code = resp.status_code
+                    if status_code != 200:
+                        try:
+                            error_text = resp.read().decode("utf-8", errors="replace")
+                        except Exception:  # noqa: BLE001 - error reporting only
+                            error_text = getattr(resp, "text", "") or ""
+                    else:
+                        for raw_line in resp.iter_lines():
+                            if sid and cancellation.is_requested(sid):
+                                raise SessionCancelled()
+                            line = (raw_line.decode("utf-8", errors="replace")
+                                    if isinstance(raw_line, bytes) else str(raw_line or ""))
+                            if not line.startswith("data:"):
+                                continue  # comments/keep-alives are not model progress
+                            data = line[5:].strip()
+                            if not data or data == "[DONE]":
+                                continue
+                            try:
+                                chunk = json.loads(data)
+                            except ValueError:
+                                continue
+                            if chunk.get("error"):
+                                err = chunk["error"]
+                                msg = err.get("message") if isinstance(err, dict) else err
+                                raise AgentError(f"{self.name} (OpenRouter) error: {msg}")
+                            response_model = chunk.get("model") or response_model
+                            if isinstance(chunk.get("usage"), dict):
+                                usage = chunk["usage"]
+                            choices = chunk.get("choices") or []
+                            if choices and isinstance(choices[0], dict):
+                                delta_obj = choices[0].get("delta") or {}
+                                # Reasoning models can spend minutes streaming
+                                # private reasoning before the first answer token.
+                                # It proves model progress but is deliberately not
+                                # copied into the delivered response.
+                                reasoning = (delta_obj.get("reasoning")
+                                             or delta_obj.get("reasoning_details"))
+                                if isinstance(reasoning, str) and reasoning:
+                                    _model_progress(output_chars[0] + len(reasoning))
+                                elif isinstance(reasoning, list) and reasoning:
+                                    _model_progress(
+                                        output_chars[0] + len(json.dumps(reasoning)))
+                                delta = delta_obj.get("content")
+                                if isinstance(delta, str) and delta:
+                                    content_parts.append(delta)
+                                    _model_progress(output_chars[0] + len(delta))
+            else:
+                fallback_payload = dict(payload)
+                fallback_payload.pop("stream", None)
+                fallback_payload.pop("stream_options", None)
+                resp = client.post(
+                    f"{self.endpoint}/chat/completions",
+                    headers=headers, json=fallback_payload,
+                )
+                status_code = resp.status_code
+                error_text = getattr(resp, "text", "") or ""
+                if status_code == 200:
+                    try:
+                        body = resp.json()
+                    except ValueError as e:
+                        raise AgentError(
+                            f"{self.name} (OpenRouter) returned non-JSON: {error_text[:200]!r}"
+                        ) from e
+                    if body.get("error"):
+                        err = body["error"]
+                        msg = err.get("message") if isinstance(err, dict) else err
+                        raise AgentError(f"{self.name} (OpenRouter) error: {msg}")
+                    choices = body.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        value = ((choices[0].get("message") or {}).get("content") or "")
+                        if value:
+                            content_parts.append(value)
+                            _model_progress(len(value))
+                    usage = body.get("usage") or {}
+                    response_model = body.get("model") or response_model
         except httpx.TimeoutException as e:
-            raise AgentError(f"{self.name} (OpenRouter) timed out after {timeout_s}s") from e
+            raise AgentError(
+                f"{self.name} (OpenRouter) transport timed out after {timeout_s}s"
+            ) from e
         except httpx.HTTPError as e:
             # A cancel that closed the client surfaces here as a transport error;
             # report it as cancellation, not a generic failure.
             if sid and cancellation.is_requested(sid):
                 raise SessionCancelled() from e
+            if stalled.is_set():
+                raise AgentError(_deadline_error()) from e
+            raise AgentError(f"{self.name} (OpenRouter) request failed: {e}") from e
+        except (AgentError, SessionCancelled):
+            raise
+        except Exception as e:  # a cross-thread client.close may surface as RuntimeError
+            if sid and cancellation.is_requested(sid):
+                raise SessionCancelled() from e
+            if stalled.is_set():
+                raise AgentError(_deadline_error()) from e
             raise AgentError(f"{self.name} (OpenRouter) request failed: {e}") from e
         finally:
+            finished.set()
             cancellation.unregister_canceler(sid, _abort)
             client.close()
+            watchdog.join(timeout=0.2)
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
-        if resp.status_code != 200:
-            detail = (resp.text or "").strip()[:300]
-            raise AgentError(f"{self.name} (OpenRouter) HTTP {resp.status_code}: {detail}")
-        try:
-            body = resp.json()
-        except ValueError as e:
-            raise AgentError(f"{self.name} (OpenRouter) returned non-JSON: {resp.text[:200]!r}") from e
-        if body.get("error"):
-            err = body["error"]
-            msg = err.get("message") if isinstance(err, dict) else err
-            raise AgentError(f"{self.name} (OpenRouter) error: {msg}")
-        choices = body.get("choices") or []
-        if not choices or not isinstance(choices[0], dict):
-            raise AgentError(f"{self.name} (OpenRouter) returned no choices")
-        content = ((choices[0].get("message") or {}).get("content") or "").strip()
+        if stalled.is_set():
+            raise AgentError(_deadline_error())
+        if status_code != 200:
+            detail = (error_text or "").strip()[:300]
+            raise AgentError(f"{self.name} (OpenRouter) HTTP {status_code}: {detail}")
+        content = "".join(content_parts).strip()
         if not content:
             raise AgentError(f"{self.name} (OpenRouter) returned empty output")
-        usage = body.get("usage") or {}
         tokens = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
         return AdapterResult(content=content, tokens=tokens,
                              duration_ms=int((time.monotonic() - t0) * 1000),
-                             model=body.get("model") or slug)
+                             model=response_model)

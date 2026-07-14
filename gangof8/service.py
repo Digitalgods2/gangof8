@@ -1888,11 +1888,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             # for the other completion transaction instead of dropping this
             # package's terminal event on a busy goal lease.
             for _ in range(100):
-                goal = self.goals.claim_worker_lease(session.goal_id, {"running", "paused"})
+                goal = self.goals.claim_worker_lease(
+                    session.goal_id, {"running", "draining", "paused"})
                 if goal is not None:
                     break
                 current = self.goals.get(session.goal_id)
-                if current is None or current.status not in ("running", "paused"):
+                if current is None or current.status not in ("running", "draining", "paused"):
                     return
                 time.sleep(0.02)
             if goal is None:
@@ -1911,7 +1912,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     milestone.acceptance_detail = detail
                     if not accepted:
                         milestone.status = "failed"
-                        goal.status = "paused"
+                        sibling_running = any(
+                            item.status == "running" and item.index != idx
+                            for item in goal.milestones
+                        )
+                        goal.status = "draining" if sibling_running else "paused"
                         goal.last_error = detail[:300]
                         self.goals.save_owned(goal, token)
                         self.store.log_event(session.session_id, "goal_milestone_rejected",
@@ -1936,6 +1941,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                          {"goal_id": goal.goal_id, "milestone": idx + 1,
                                           "of": len(goal.milestones)})
                     remaining = [m.index for m in goal.milestones if m.status != "done"]
+                    if goal.status == "draining":
+                        if not any(m.status == "running" for m in goal.milestones):
+                            goal.status = "paused"
+                            failed = [m.index for m in goal.milestones if m.status == "failed"]
+                            goal.current_index = min(failed or remaining or [len(goal.milestones)])
+                            self.store.log_event(
+                                "-", "goal_drained",
+                                {"goal_id": goal.goal_id, "reason": goal.last_error},
+                            )
+                        self.goals.save_owned(goal, token)
+                        return
                     if not remaining:
                         if goal.delivery_mode == "final_batch" and goal.status == "running":
                             self._prepare_goal_release(goal)
@@ -1949,18 +1965,30 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             schedule_ready = goal.status == "running"
                 elif session.status == SessionStatus.failed:
                     milestone.status = "failed"
-                    goal.status = "paused"
+                    sibling_running = any(
+                        item.status == "running" and item.index != idx
+                        for item in goal.milestones
+                    )
+                    goal.status = "draining" if sibling_running else "paused"
                     goal.last_error = (session.stop_reason or f"milestone {idx + 1} failed")[:300]
                     self.goals.save_owned(goal, token)
-                    self.store.log_event("-", "goal_paused",
-                                         {"goal_id": goal.goal_id, "reason": goal.last_error})
+                    self.store.log_event(
+                        "-", "goal_draining" if sibling_running else "goal_paused",
+                        {"goal_id": goal.goal_id, "reason": goal.last_error},
+                    )
                 elif session.status == SessionStatus.cancelled:
                     milestone.status = "pending"
-                    goal.status = "paused"
+                    sibling_running = any(
+                        item.status == "running" and item.index != idx
+                        for item in goal.milestones
+                    )
+                    goal.status = "draining" if sibling_running else "paused"
                     goal.last_error = f"milestone {idx + 1} was cancelled"
                     self.goals.save_owned(goal, token)
-                    self.store.log_event("-", "goal_paused",
-                                         {"goal_id": goal.goal_id, "reason": goal.last_error})
+                    self.store.log_event(
+                        "-", "goal_draining" if sibling_running else "goal_paused",
+                        {"goal_id": goal.goal_id, "reason": goal.last_error},
+                    )
             finally:
                 self.goals.release_worker_lease(goal.goal_id, token)
             if schedule_ready:
@@ -2204,7 +2232,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     if changed:
                         self.goals.save(goal)
                     continue
-                if goal.status not in ("planning", "running"):
+                if goal.status not in ("planning", "running", "draining"):
                     continue
                 parked = self.goals.park_active(goal.goal_id, "interrupted by a server restart")
                 if parked is not None:
@@ -2270,33 +2298,42 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event(sid, "session_cancelled", {"from": "restart_reconcile"})
 
     def cancel_session(self, session_id: str) -> dict:
-        """Cancel a session. If it's paused (awaiting approval/input) no worker is
-        running, so cancel it immediately. If it's mid-run, request cooperative
-        cancellation — the worker stops at the next agent-call checkpoint (an
-        in-flight CLI call finishes first)."""
+        """Cancel immediately and revoke the worker's write authority.
+
+        The adapter abort signal tears down HTTP/CLI work; revoking the lease
+        prevents a late worker from resurrecting the session. Persisting the
+        terminal snapshot here keeps the UI truthful instead of showing a
+        cancelled goal whose selected session still says Deliberating.
+        """
         session = self.manager.load(session_id)
         if session is None:
             raise KeyError(f"session {session_id} not found")
         if session.status in self._TERMINAL:
             return {"session_id": session_id, "status": session.status.value, "note": "already finished"}
-        if session.status in self._PAUSED:
-            for a in session.approvals:
-                if a.status == "pending":
-                    a.status = "denied"
-            for r in session.input_requests:
-                if r.status == "pending":
-                    r.status = "declined"
-            session.stop_reason = "cancelled by user"
-            session.outcome = "cancelled"
-            cancellation.clear(session_id)
-            self.manager.transition(session, SessionStatus.cancelled)
-            self.store.log_event(session_id, "session_cancelled", {"from": "paused"})
-            self._maybe_advance_goal(session, background=True)
-            return {"session_id": session_id, "status": "cancelled"}
-        # running — flag it; the worker finalizes to cancelled at the next checkpoint
+        previous = session.status.value
+        # Signal first so registered clients/processes are torn down while their
+        # cancellation callback is still present.
         cancellation.request(session_id)
         self.store.log_event(session_id, "cancel_requested", {})
-        return {"session_id": session_id, "status": "cancelling"}
+        self.store.revoke_worker_lease(session_id)
+        for approval in session.approvals:
+            if approval.status == "pending":
+                approval.status = "denied"
+        for request in session.input_requests:
+            if request.status == "pending":
+                request.status = "declined"
+        session.worker_lease = ""
+        session.active_agent_calls = []
+        session.stop_reason = "cancelled by user"
+        session.outcome = "cancelled"
+        try:
+            self.manager.transition(session, SessionStatus.cancelled)
+        except ValueError:
+            session.status = SessionStatus.cancelled
+            self.store.save_session(session)
+        self.store.log_event(session_id, "session_cancelled", {"from": previous})
+        self._maybe_advance_goal(session, background=True)
+        return {"session_id": session_id, "status": "cancelled"}
 
     def list(self) -> list[dict]:
         return self.store.list_sessions()

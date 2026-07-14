@@ -100,13 +100,17 @@ def test_startup_reconciles_orphaned_live_session(tmp_path):
 
 
 def test_cancel_running_session_sets_flag(service):
-    # a 'running' (not-yet-finished) session: cancel_session flags it for the worker
+    # A running session is made durably terminal immediately; the cancellation
+    # flag still tears down any adapter work owned by the revoked worker.
     s = service._open("examine and report", "test", None)
     s.status = SessionStatus.deliberating
     service.store.save_session(s)
     out = service.cancel_session(s.session_id)
-    assert out["status"] == "cancelling"
+    assert out["status"] == "cancelled"
     assert cancellation.is_requested(s.session_id)
+    persisted = service.manager.load(s.session_id)
+    assert persisted.status == SessionStatus.cancelled
+    assert persisted.active_agent_calls == []
     cancellation.clear(s.session_id)
 
 

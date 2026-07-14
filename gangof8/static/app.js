@@ -481,7 +481,7 @@ function _hasSelectionIn(el) {
 let _lastListSig = "", _lastDetailSig = "";
 
 // ---- goals rail: long-horizon objectives above the session list -------------
-const GOAL_LIVE = new Set(["planning", "running", "awaiting_release"]);
+const GOAL_LIVE = new Set(["planning", "running", "draining", "awaiting_release"]);
 let _goalsCache = [], _lastGoalsSig = "";
 let _sessionsCache = [];
 
@@ -548,7 +548,7 @@ function goalCard(g) {
   const owners = new Set(ms.map(m => m.owner).filter(Boolean)).size;
   const displayStatus = g.display_status || g.status;
   const icons = {done: "✓", running: "▶", pending: "○", failed: "×",
-    awaiting_approval: "!", awaiting_input: "?", cancelled: "×"};
+    awaiting_approval: "!", awaiting_input: "?", cancelled: "×", draining: "◌"};
   const rows = ms.map(m => {
     const hard = (m.depends_on || []).filter(i => ms[i] && ms[i].status !== "done");
     const contracts = m.contract_depends_on || [];
@@ -559,7 +559,10 @@ function goalCard(g) {
       : m.pending_inputs ? "awaiting_input" : m.status;
     const attempts = m.attempt_count > 1 ? ` · ${m.attempt_count} attempts` : "";
     const working = (m.active_agent_calls || []).length
-      ? ` · ${m.active_agent_calls.map(c => c.agent).join(", ")} working` : "";
+      ? ` · ${m.active_agent_calls.map(c => {
+          const chars = c.progress_chars || 0;
+          return `${c.agent} ${chars ? `streaming ${chars.toLocaleString()} chars` : "waiting for output"}`;
+        }).join(", ")}` : "";
     const title = `${m.title}${m.owner ? ` — owner ${m.owner}` : ""}${edge}${attempts}${working}`;
     return `
       <div class="gms ${esc(rowStatus)}" title="${esc(title)}"
@@ -859,9 +862,13 @@ function renderDetail(s) {
     waitRole = activeCall.role || waitRole;
     waitAgent = activeCall.agent || waitAgent;
     const deadline = activeCall.timeout_s === 0
-      ? "no coordinator deadline"
-      : `${activeCall.timeout_s || "?"}s limit`;
-    liveGoal = `${packageMode ? "package owner" : "model"} working · ${deadline}`;
+      ? "no coding deadline"
+      : `${activeCall.timeout_s || "?"}s no-output watchdog`;
+    const chars = activeCall.progress_chars || 0;
+    const progress = chars
+      ? `streamed ${chars.toLocaleString()} chars`
+      : "waiting for first model output";
+    liveGoal = `${packageMode ? "package owner" : "model"} working · ${progress} · ${deadline}`;
   }
   // reset the elapsed clock whenever the live situation actually changes
   const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${activeCall?.call_id || waitRole}` : null;

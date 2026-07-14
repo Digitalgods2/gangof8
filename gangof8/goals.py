@@ -203,7 +203,7 @@ class GoalStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT json FROM goals WHERE goal_id = ?", (goal_id,)).fetchone()
             goal = self._decode(row[0]) if row else None
-            if goal is None or goal.status not in ("planning", "running"):
+            if goal is None or goal.status not in ("planning", "running", "draining"):
                 return goal
             goal.status = "paused"
             goal.last_error = reason

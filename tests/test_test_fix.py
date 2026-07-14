@@ -85,7 +85,8 @@ def test_unfixable_failure_gives_up_with_the_reason(tmp_path):
     svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
-    assert session.status == SessionStatus.done, "an honest failure still completes"
+    assert session.status == SessionStatus.failed, "a broken artifact must not look successful"
+    assert session.outcome == "failed_verification"
     assert lead.fix_calls == 1, "no pointless retries after an explicit give-up"
     assert any("offered no fix" in u for u in session.unresolved)
 
@@ -95,7 +96,8 @@ def test_fix_attempts_are_bounded_and_reported(tmp_path):
     svc = GangOf8Service(data_dir=tmp_path, panel=[])
     svc.registry.register(lead)
     session = svc.run(TASK, source="test")
-    assert session.status == SessionStatus.done
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
     assert session.test_fix_attempts == config.MAX_TEST_FIX_ATTEMPTS
     assert lead.fix_calls == config.MAX_TEST_FIX_ATTEMPTS
     assert any("still failing after" in u for u in session.unresolved)

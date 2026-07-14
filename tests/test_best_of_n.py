@@ -607,6 +607,41 @@ def test_verification_failure_enters_bounded_artifact_repair(session, store):
                and a.status == "executed" for a in session.proposed_actions)
 
 
+def test_package_repair_stays_with_owner_and_exact_contract_path(session, store):
+    session.collaboration_mode = "build_team"
+    session.work_package_owner = "claude"
+    session.required_files = ["src/games/asteroids.js"]
+    owner = CouncilMember(role=Role.panelist, agent="claude", active=True)
+    validator = CouncilMember(role=Role.summarizer, agent="gemini", active=True)
+    session.council = Council(members=[owner, validator])
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename="src/games/asteroids.js", content="broken source",
+    ))
+    session.unresolved.append(
+        "artifact verification failed: src/games/asteroids.js: invalid token")
+    seen = {}
+
+    def repair_call(member, prompt):
+        seen["agent"] = member.agent
+        seen["prompt"] = prompt
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content=("ARTIFACT: src/games/asteroids.js\n"
+                     "globalThis.Asteroids = function Asteroids() {};\n"
+                     "END_ARTIFACT\n"),
+        )
+
+    assert loop._repair_artifact_failure(
+        session, SessionManager(store), Governance(store), store, repair_call)
+    assert seen["agent"] == "claude"
+    assert "Target file: src/games/asteroids.js" in seen["prompt"]
+    executed = [a for a in session.proposed_actions
+                if a.kind == "write_file" and a.status == "executed"]
+    assert executed and executed[-1].filename == "src/games/asteroids.js"
+    assert not any(a.filename == "asteroids.js" for a in session.proposed_actions)
+
+
 def test_broken_candidate_disqualified_sole_runner_wins(session, store):
     """THE fix: a candidate that crashes on load is disqualified before judging;
     when it leaves one runner, that runner ships without a vote. (Live: 5 judges
