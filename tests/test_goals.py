@@ -1,0 +1,742 @@
+"""Goal layer (/goal): long-horizon objectives run milestone by milestone.
+
+The architect plans milestone-sized deliverables once; each milestone runs as a
+normal session and completing one auto-advances to the next. Failure/cancel
+pauses the goal; the human resumes with a fresh attempt. A server restart parks
+in-flight goals as paused (their workers died with the process).
+"""
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from gangof8 import goals as goals_mod
+from gangof8.adapters.mock import MockAdapter
+from gangof8.models import Goal, GoalMilestone, Role, Session, SessionStatus, Task
+from gangof8.registry import AdapterResult
+from gangof8.service import GangOf8Service
+
+PLAN = (
+    "MILESTONE 1: Storage decision\n"
+    "TASK: Compare SQLite vs plain JSON for session logs and recommend one.\n"
+    "OUTPUTS: NONE\n"
+    "MILESTONE 2: Retention decision\n"
+    "TASK: Recommend a retention policy for the store chosen in milestone 1.\n"
+    "OUTPUTS: NONE\n"
+)
+
+PROMOTE_DRAFT = (
+    "ARTIFACT: report.md\n"
+    "# Storage Recommendation\n\nUse SQLite.\n"
+    "PROMOTE: report.md\n"
+)
+
+
+class _PlannerSeat:
+    """Mock seat that answers the goal-planning prompt with a parseable plan
+    (and optionally promotes on 'delivered into' tasks); everything else
+    falls through to the stock MockAdapter."""
+
+    name = "mock"
+
+    def __init__(self, plan=PLAN, promoting=False):
+        self._inner = MockAdapter()
+        self._plan = plan
+        self._promoting = promoting
+
+    def call(self, role, prompt, timeout_s, images=None):
+        from gangof8.models import Role
+        if "MILESTONE 1:" in prompt and "GOAL:" in prompt:
+            return AdapterResult(content=self._plan, duration_ms=1)
+        if self._promoting and role in (Role.lead, Role.panelist) and "delivered into" in prompt:
+            return AdapterResult(content=PROMOTE_DRAFT, duration_ms=1)
+        return self._inner.call(role, prompt, timeout_s)
+
+
+@pytest.fixture()
+def svc(tmp_path):
+    s = GangOf8Service(data_dir=tmp_path / "data")
+    s.registry.register(_PlannerSeat())
+    return s
+
+
+# ---- plan parsing ------------------------------------------------------------
+
+
+def test_parse_milestones_strict_format():
+    ms = goals_mod.parse_milestones(PLAN)
+    assert [m.title for m in ms] == ["Storage decision", "Retention decision"]
+    assert ms[0].index == 0 and ms[1].index == 1
+    assert "recommend one" in ms[0].task_text
+
+
+def test_parse_milestones_tolerates_prose_fences_and_multiline_tasks():
+    text = (
+        "Here is my plan:\n```\nMILESTONE 1: Core\nTASK: Build the core.\n"
+        "It should include a config file.\n\nMILESTONE 2: Polish\n"
+        "TASK: Polish everything.\n```\nGood luck!"
+    )
+    ms = goals_mod.parse_milestones(text)
+    assert [m.title for m in ms] == ["Core", "Polish"]
+    assert "config file" in ms[0].task_text  # TASK continues across lines
+
+
+def test_parse_milestones_unparseable_returns_empty():
+    assert goals_mod.parse_milestones("I would start with the backend.") == []
+    assert goals_mod.parse_milestones("") == []
+
+
+def test_parse_milestones_caps_at_config_max():
+    text = "".join(f"MILESTONE {i}: Step {i}\nTASK: do {i}\n" for i in range(1, 20))
+    from gangof8 import config
+    assert len(goals_mod.parse_milestones(text)) == config.GOAL_MAX_MILESTONES
+
+
+def test_parse_milestones_records_explicit_acceptance_contract():
+    plan = (
+        "MILESTONE 1: Core\n"
+        "TASK: Build the base.\n"
+        "OUTPUTS: shell.html, core.js\n"
+        "REQUIRES: package.json\n"
+        "CHECK: node --check core.js\n"
+    )
+    ms = goals_mod.parse_milestones(plan)
+    assert ms[0].required_files == ["shell.html", "core.js"]
+    assert ms[0].dependencies == ["package.json"]
+    assert ms[0].acceptance_commands == ["node --check core.js"]
+    assert ms[0].contract_declared and ms[0].requires_delivery
+
+
+def test_parse_release_manifest_is_separate_from_staging_outputs():
+    plan = (
+        "PACKAGE 1: Integrate\nOWNER: claude\nAFTER: NONE\nCONTRACTS: NONE\n"
+        "TASK: Assemble the app.\n"
+        "OUTPUTS: arcade.html, tools/build.mjs, README.md\n"
+        "RELEASE: arcade.html\nREQUIRES: NONE\n"
+        "INTERFACE: PROVIDES the final app\n"
+    )
+    package = goals_mod.parse_milestones(plan)[0]
+    assert package.required_files == ["arcade.html", "tools/build.mjs", "README.md"]
+    assert package.release_files == ["arcade.html"]
+    assert package.release_declared is True
+
+
+def test_parse_owned_package_graph():
+    plan = (
+        "PACKAGE 1: Contract\nOWNER: claude\nAFTER: NONE\n"
+        "TASK: Define the engine contract.\nOUTPUTS: src/contract.js\n"
+        "REQUIRES: NONE\nINTERFACE: export createEngine()\n"
+        "PACKAGE 2: Renderer\nOWNER: gemini\nAFTER: 1\n"
+        "TASK: Implement the renderer.\nOUTPUTS: src/render.js\n"
+        "REQUIRES: src/contract.js\nINTERFACE: consume createEngine()\n"
+    )
+    packages = goals_mod.parse_milestones(plan)
+    assert [p.owner for p in packages] == ["claude", "gemini"]
+    assert packages[1].depends_on == [0]
+    assert packages[0].interface_contract == "export createEngine()"
+
+
+def test_parse_contract_dependencies_as_non_blocking_edges():
+    plan = (
+        "PACKAGE 1: Runtime\nOWNER: claude\nAFTER: NONE\nCONTRACTS: NONE\n"
+        "TASK: Define the runtime.\nOUTPUTS: src/core.js\nREQUIRES: NONE\n"
+        "INTERFACE: PROVIDES ARC.Game and ARC.registerGame\n"
+        "PACKAGE 2: Game\nOWNER: codex\nAFTER: NONE\nCONTRACTS: 1\n"
+        "TASK: Implement against the runtime contract.\nOUTPUTS: src/game.js\n"
+        "REQUIRES: NONE\nINTERFACE: CONSUMES ARC.Game and ARC.registerGame\n"
+    )
+    packages = goals_mod.parse_milestones(plan)
+    assert packages[1].depends_on == []
+    assert packages[1].contract_depends_on == [0]
+
+
+def test_plan_prompt_reserves_after_for_real_bytes():
+    prompt = goals_mod.plan_prompt("Build an app", ["claude", "codex"])
+    assert "CONTRACTS never blocks scheduling" in prompt
+    assert "Use AFTER only when actual verified bytes are indispensable" in prompt
+    assert "A broad build should normally start most owners in the first wave" in prompt
+
+
+def test_build_team_assigns_distinct_enabled_owners(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["claude", "codex", "gemini"])
+    packages = [
+        GoalMilestone(index=i, title=f"p{i}", task_text="work", contract_declared=True)
+        for i in range(3)
+    ]
+    normalized, errors = service._normalize_work_packages(packages)
+    assert not errors
+    assert [p.owner for p in normalized] == ["claude", "codex", "gemini"]
+
+
+def test_single_file_goal_infers_only_final_html_when_planner_omits_release(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["claude"])
+    packages = [
+        GoalMilestone(
+            index=0, title="integrate", task_text="assemble", owner="claude",
+            required_files=["arcade.html", "tools/build.mjs", "README.md"],
+            contract_declared=True,
+        )
+    ]
+    normalized, errors = service._normalize_work_packages(
+        packages, "Build one complete single-file HTML application")
+    assert not errors
+    assert normalized[0].release_files == ["arcade.html"]
+
+
+def test_release_manifest_never_includes_internal_package_outputs(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(text="single file", milestones=[
+        GoalMilestone(
+            index=0, title="source", task_text="build modules",
+            required_files=["src/core.js", "tools/build.mjs"], release_files=[]),
+        GoalMilestone(
+            index=1, title="integrate", task_text="assemble",
+            required_files=["arcade.html", "qa/report.txt"],
+            release_files=["arcade.html"], release_declared=True),
+    ])
+    assert service._goal_release_files(goal) == ["arcade.html"]
+
+
+def test_release_file_must_be_owned_by_the_same_package(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    packages = [GoalMilestone(
+        index=0, package_id="wp_1", owner="claude", title="bad", task_text="bad",
+        required_files=["internal.js"], release_files=["arcade.html"],
+        release_declared=True, contract_declared=True)]
+    _normalized, errors = service._normalize_work_packages(packages)
+    assert errors == ["wp_1 RELEASE is not owned by OUTPUTS: arcade.html"]
+
+
+def test_build_plan_cannot_explicitly_release_nothing(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    packages = [GoalMilestone(
+        index=0, package_id="wp_1", owner="claude", title="internal", task_text="build",
+        required_files=["internal.js"], release_files=[], release_declared=True,
+        contract_declared=True)]
+    _normalized, errors = service._normalize_work_packages(
+        packages, "Build a complete JavaScript application")
+    assert errors == ["build plan declares no final RELEASE files"]
+
+
+def test_package_scheduler_starts_every_ready_branch(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="parallel build", status="running", collaboration_mode="build_team",
+        delivery_mode="final_batch", epoch=1,
+        milestones=[
+            GoalMilestone(index=0, title="a", task_text="a", contract_declared=True),
+            GoalMilestone(index=1, title="b", task_text="b", contract_declared=True,
+                          depends_on=[0]),
+            GoalMilestone(index=2, title="c", task_text="c", contract_declared=True),
+        ])
+    service.goals.save(goal)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_milestone",
+        lambda current, index, background: started.append(index))
+    service._start_ready_packages(goal, background=True)
+    assert started == [0, 2]
+
+
+def test_contract_linked_packages_start_before_provider_finishes(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="parallel contract build", status="running", collaboration_mode="build_team",
+        delivery_mode="final_batch", epoch=1,
+        milestones=[
+            GoalMilestone(index=0, package_id="wp_1", owner="claude", title="runtime",
+                          task_text="runtime", contract_declared=True),
+            GoalMilestone(index=1, package_id="wp_2", owner="codex", title="client",
+                          task_text="client", contract_declared=True,
+                          contract_depends_on=[0]),
+            GoalMilestone(index=2, package_id="wp_3", owner="gemini", title="integration",
+                          task_text="integration", contract_declared=True, depends_on=[0, 1]),
+        ])
+    service.goals.save(goal)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_milestone",
+        lambda current, index, background: started.append(index))
+    service._start_ready_packages(goal, background=True)
+    assert started == [0, 1]
+
+
+def test_hard_file_requirement_still_infers_blocking_provider(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["claude", "codex"])
+    packages = [
+        GoalMilestone(index=0, title="schema", task_text="schema", owner="claude",
+                      required_files=["generated/schema.json"], contract_declared=True),
+        GoalMilestone(index=1, title="migration", task_text="migration", owner="codex",
+                      dependencies=["generated/schema.json"], contract_depends_on=[0],
+                      contract_declared=True),
+    ]
+    normalized, errors = service._normalize_work_packages(packages)
+    assert not errors
+    assert normalized[1].depends_on == [0]
+    assert normalized[1].contract_depends_on == []
+
+
+def test_contract_linked_owner_receives_pending_interface_without_future_bytes():
+    goal = Goal(text="Build an arcade", collaboration_mode="build_team", milestones=[
+        GoalMilestone(index=0, title="Runtime", task_text="Build runtime", owner="claude",
+                      status="running", required_files=["src/core.js"],
+                      interface_contract="PROVIDES ARC.Game and ARC.registerGame"),
+        GoalMilestone(index=1, title="Invaders", task_text="Build game", owner="codex",
+                      contract_depends_on=[0], required_files=["src/invaders.js"],
+                      interface_contract="CONSUMES ARC.Game"),
+    ])
+    text = goals_mod.compose_milestone_task(goal, 1)
+    assert "NON-BLOCKING INTERFACE INPUTS" in text
+    assert "PROVIDES ARC.Game and ARC.registerGame" in text
+    assert "may still be working" in text
+    assert "OTHER OWNED PACKAGES" in text
+
+
+def test_compose_milestone_task_frames_scope():
+    goal = Goal(text="Build the whole thing", milestones=[
+        GoalMilestone(index=0, title="Data layer", task_text="Build storage.",
+                      status="done", files=["C:/ws/storage.py"], summary="Shipped storage."),
+        GoalMilestone(index=1, title="API", task_text="Build the API."),
+        GoalMilestone(index=2, title="UI", task_text="Build the UI."),
+    ])
+    text = goals_mod.compose_milestone_task(goal, 1)
+    assert "[GOAL MILESTONE 2/3] API" in text
+    assert "Build the whole thing" in text            # overall goal
+    assert "Data layer" in text and "storage.py" in text  # completed work
+    assert "Shipped storage." in text                 # prior outcome
+    assert "Build the API." in text                   # the actual task
+    assert "UI" in text and "OUT of scope" in text    # later work fenced off
+
+
+# ---- the full loop on the mock backend ----------------------------------------
+
+
+def test_goal_runs_all_milestones_and_completes(svc):
+    goal = svc.create_goal("/goal Decide storage and retention for session logs")
+    assert goal.status == "completed"
+    assert goal.planned_by == "mock"
+    assert [m.status for m in goal.milestones] == ["done", "done"]
+    # each milestone ran as a REAL session tagged back to the goal
+    for i, m in enumerate(goal.milestones):
+        data = svc.get(m.session_id)
+        assert data is not None
+        assert data["status"] == "done"
+        assert data["goal_id"] == goal.goal_id
+        assert data["goal_milestone"] == i
+        assert m.summary  # the final answer flowed into the milestone record
+    # milestone 2's session was framed with milestone 1's outcome
+    second = svc.get(goal.milestones[1].session_id)
+    assert "AVAILABLE IN THE SHARED GOAL STAGING WORKSPACE" in second["task"]["text"]
+    assert "Storage decision" in second["task"]["text"]
+
+
+def test_build_package_round_names_owner_instead_of_claiming_full_panel(svc):
+    goal = svc.create_goal("/goal Decide storage and retention for session logs")
+    first = svc.manager.load(goal.milestones[0].session_id)
+    assert first is not None and first.rounds
+    assert "build package" in first.rounds[0].goal
+    assert "owner mock" in first.rounds[0].goal
+    assert first.rounds[0].agents == [Role.panelist]
+    assert "every seat contributes" not in first.rounds[0].goal
+
+
+def test_unparseable_plan_degrades_to_single_milestone(tmp_path):
+    svc = GangOf8Service(data_dir=tmp_path / "data")
+    svc.registry.register(_PlannerSeat(plan="I would start with the backend."))
+    goal = svc.create_goal("Compare SQLite vs JSON and recommend one")
+    assert goal.status == "completed"
+    assert len(goal.milestones) == 1
+    assert "analysis-only milestone" in goal.plan_rationale
+
+
+def test_cancelled_milestone_pauses_goal_and_resume_retries(svc):
+    # a goal mid-flight whose current milestone session got cancelled
+    goal = Goal(text="Decide storage and retention", status="running", milestones=[
+        GoalMilestone(index=0, title="Storage decision",
+                      task_text="Compare SQLite vs plain JSON and recommend one.",
+                      status="running", session_id="s_dead", contract_declared=True),
+        GoalMilestone(index=1, title="Retention decision",
+                      task_text="Recommend a retention policy.", contract_declared=True),
+    ])
+    svc.goals.save(goal)
+    dead = Session(session_id="s_dead", status=SessionStatus.cancelled,
+                   goal_id=goal.goal_id, goal_milestone=0,
+                   task=Task(task_id="t", session_id="s_dead", text="x"))
+    svc._maybe_advance_goal(dead)
+    paused = svc.goals.get(goal.goal_id)
+    assert paused.status == "paused"
+    assert "cancelled" in paused.last_error
+    assert paused.milestones[0].status == "pending"  # retryable
+    # resume retries milestone 1 with a FRESH session and runs to completion
+    out = svc.resume_goal(goal.goal_id, background=False)
+    assert out["status"] == "completed"
+    assert out["milestones"][0]["session_id"] != "s_dead"
+    assert [m["status"] for m in out["milestones"]] == ["done", "done"]
+
+
+def test_resume_preserves_epoch_and_live_siblings_and_starts_every_ready_retry(
+        tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="parallel", status="paused", epoch=7,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        milestones=[
+            GoalMilestone(index=0, package_id="wp_1", owner="claude", title="failed",
+                          task_text="retry", status="failed", session_id="s_failed",
+                          contract_declared=True),
+            GoalMilestone(index=1, package_id="wp_2", owner="codex", title="healthy",
+                          task_text="continue", status="running", session_id="s_live",
+                          contract_declared=True),
+            GoalMilestone(index=2, package_id="wp_3", owner="gemini", title="ready",
+                          task_text="start", status="pending", contract_declared=True),
+        ],
+    )
+    service.goals.save(goal)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_milestone",
+        lambda current, index, background: started.append(index))
+    out = service.resume_goal(goal.goal_id)
+    assert out["epoch"] == 7
+    assert out["milestones"][1]["session_id"] == "s_live"
+    assert out["milestones"][1]["status"] == "running"
+    assert started == [0, 2]
+
+
+def test_resume_adopts_verified_completed_attempt_before_spending_again(
+        tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    goal = Goal(
+        text="recover", status="paused", epoch=4, staging_root=str(stage),
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        milestones=[
+            GoalMilestone(index=0, package_id="wp_1", owner="qwen", title="audio",
+                          task_text="audio", status="failed", session_id="s_lost",
+                          required_files=["src/audio.js"], contract_declared=True,
+                          requires_delivery=True),
+            GoalMilestone(index=1, package_id="wp_2", owner="claude", title="integrate",
+                          task_text="integrate", status="pending", depends_on=[0],
+                          contract_declared=True),
+        ],
+    )
+    service.goals.save(goal)
+    source = tmp_path / "recovered.js"
+    source.write_text("globalThis.audio = true;\n", encoding="utf-8")
+    from gangof8.models import FinalAnswer, ProposedAction
+    prior = Session(
+        session_id="s_verified", status=SessionStatus.done, outcome="succeeded",
+        goal_id=goal.goal_id, goal_epoch=1, goal_milestone=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        work_package_id="wp_1", work_package_owner="qwen",
+        required_files=["src/audio.js"],
+        task=Task(task_id="t", session_id="s_verified", text="audio"),
+        final=FinalAnswer(answer="audio complete", confidence="high"),
+        proposed_actions=[ProposedAction(
+            session_id="s_verified", kind="write_file", role=Role.implementer,
+            filename="src/audio.js", status="executed", result_path=str(source))],
+    )
+    service.store.save_session(prior)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_milestone",
+        lambda current, index, background: started.append(index))
+    out = service.resume_goal(goal.goal_id)
+    assert out["milestones"][0]["status"] == "done"
+    assert out["milestones"][0]["session_id"] == "s_verified"
+    assert (stage / "src" / "audio.js").read_text(encoding="utf-8").startswith("globalThis")
+    assert started == [1]
+
+
+def test_stale_session_from_retried_milestone_cannot_advance(svc):
+    goal = Goal(text="g", status="running", milestones=[
+        GoalMilestone(index=0, title="only", task_text="t",
+                      status="running", session_id="s_new", contract_declared=True),
+    ])
+    svc.goals.save(goal)
+    stale = Session(session_id="s_old", status=SessionStatus.done,
+                    goal_id=goal.goal_id, goal_milestone=0,
+                    task=Task(task_id="t", session_id="s_old", text="x"))
+    svc._maybe_advance_goal(stale)
+    assert svc.goals.get(goal.goal_id).status == "running"  # untouched
+
+
+def test_failed_verification_is_terminal_and_never_reported_as_done(svc):
+    """Regression for the live run: validation failure is not success."""
+    goal = Goal(text="g", status="running", milestones=[
+        GoalMilestone(index=0, title="core", task_text="build core", status="running",
+                      session_id="s_failed", required_files=["core.js"],
+                      contract_declared=True, requires_delivery=True),
+        GoalMilestone(index=1, title="next", task_text="build next", contract_declared=True),
+    ])
+    svc.goals.save(goal)
+    failed = Session(
+        session_id="s_failed", status=SessionStatus.failed, outcome="failed_verification",
+        goal_id=goal.goal_id, goal_milestone=0,
+        task=Task(task_id="t", session_id="s_failed", text="build core"),
+    )
+    svc._maybe_advance_goal(failed)
+    parked = svc.goals.get(goal.goal_id)
+    assert parked.status == "paused"
+    assert parked.current_index == 0
+    assert parked.milestones[0].status == "failed"
+    assert "failed" in parked.last_error
+
+
+def test_goal_context_uses_only_promoted_accepted_files(svc, tmp_path):
+    goal = Goal(text="g", status="running", milestones=[
+        GoalMilestone(index=0, title="core", task_text="build core", status="running",
+                      session_id="s_ok", required_files=["core.js"],
+                      contract_declared=True, requires_delivery=True),
+        GoalMilestone(index=1, title="next", task_text="build next", contract_declared=True),
+    ])
+    svc.goals.save(goal)
+    delivered = tmp_path / "core.js"
+    delivered.write_text("export const core = true;\n", encoding="utf-8")
+    finished = Session(
+        session_id="s_ok", status=SessionStatus.done, outcome="succeeded",
+        goal_id=goal.goal_id, goal_milestone=0,
+        task=Task(task_id="t", session_id="s_ok", text="build core"),
+    )
+    from gangof8.models import ProposedAction, Role
+    # Scratch panel paths are intentionally present but must never become goal context.
+    finished.files_changed = ["C:/sandbox/codex__core.js", str(delivered)]
+    finished.proposed_actions = [
+        ProposedAction(session_id="s_ok", kind="write_file", role=Role.panelist,
+                       filename="codex__core.js", content="draft", status="executed"),
+        ProposedAction(session_id="s_ok", kind="promote", role=Role.implementer,
+                       filename="core.js", status="executed", result_path=str(delivered)),
+    ]
+    svc._maybe_advance_goal(finished)
+    updated = svc.goals.get(goal.goal_id)
+    assert updated.milestones[0].accepted_files == [str(delivered)]
+    assert updated.milestones[0].files == [str(delivered)]
+    assert "codex__core.js" not in goals_mod.compose_milestone_task(updated, 1)
+
+
+def test_restart_parks_inflight_goals_as_paused(tmp_path):
+    data = tmp_path / "data"
+    svc1 = GangOf8Service(data_dir=data)
+    goal = Goal(text="long build", status="running", milestones=[
+        GoalMilestone(index=0, title="m1", task_text="t", status="running",
+                      session_id="s_gone", contract_declared=True),
+        GoalMilestone(index=1, title="m2", task_text="t", status="running",
+                      session_id="s_also_gone", contract_declared=True),
+    ])
+    svc1.goals.save(goal)
+    svc2 = GangOf8Service(data_dir=data)  # simulated restart
+    parked = svc2.goals.get(goal.goal_id)
+    assert parked.status == "paused"
+    assert "restart" in parked.last_error
+    assert [m.status for m in parked.milestones] == ["pending", "pending"]
+    assert [m.session_id for m in parked.milestones] == [None, None]
+
+
+def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
+    from gangof8.models import ApprovalRequest
+
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="build", status="running", collaboration_mode="build_team",
+        delivery_mode="final_batch", milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="core", task_text="core",
+            status="running", session_id="s_active", contract_declared=True)])
+    service.goals.save(goal)
+    session = Session(
+        session_id="s_active", status=SessionStatus.awaiting_approval,
+        goal_id=goal.goal_id, work_package_id="wp_1", work_package_owner="claude",
+        active_agent_calls=[{
+            "call_id": "call_1", "agent": "claude", "role": "panelist",
+            "started_at": "2026-07-13T22:00:00Z", "timeout_s": 320,
+        }],
+        approvals=[ApprovalRequest(
+            session_id="s_active", action="release", category="file_write")],
+        task=Task(task_id="t", session_id="s_active", text="core"),
+    )
+    service.store.save_session(session)
+    view = service.get_goal(goal.goal_id)
+    assert view["display_status"] == "awaiting_approval"
+    assert view["pending_approvals"] == 1
+    assert view["active_agent_calls"] == 1
+    assert view["actionable_session_id"] == "s_active"
+    assert view["milestones"][0]["attempt_count"] == 1
+
+
+def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="cancel", status="cancelled", milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="core", task_text="core",
+            status="running", session_id="s_old", contract_declared=True)])
+    service.goals.save(goal)
+    session = Session(
+        session_id="s_old", status=SessionStatus.deliberating,
+        goal_id=goal.goal_id, work_package_id="wp_1", work_package_owner="claude",
+        active_agent_calls=[{"call_id": "stale"}],
+        task=Task(task_id="t", session_id="s_old", text="core"))
+    service.store.save_session(session)
+    view = service.get_goal(goal.goal_id)
+    assert view["display_status"] == "cancelled"
+    assert view["milestones"][0]["status"] == "cancelled"
+    assert view["active_packages"] == 0
+    assert view["active_agent_calls"] == 0
+    assert view["actionable_session_id"] is None
+
+
+def test_revoked_worker_lease_rejects_stale_session_write(svc):
+    """A hot-reload's old worker cannot resurrect a cancelled session."""
+    session = svc.manager.create("write a report", source="test")
+    token = svc.store.claim_worker_lease(session.session_id)
+    assert token
+    stale = svc.manager.load(session.session_id)
+    stale.worker_lease = token
+    svc.store.revoke_worker_lease(session.session_id)
+    stale.stop_reason = "old worker finished late"
+    assert svc.store.save_session(stale) is False
+    fresh = svc.manager.load(session.session_id)
+    assert fresh.stop_reason is None
+    assert fresh.worker_lease == ""
+
+
+# ---- promote gate inside a goal ------------------------------------------------
+
+
+def test_goal_stages_every_package_then_uses_one_final_batch_approval(tmp_path):
+    """Package writes never interrupt; the complete manifest has one gate."""
+    est = tmp_path / "established"
+    est.mkdir()
+    plan = (
+        f"MILESTONE 1: Ship the report\n"
+        f"TASK: Write a short report recommending SQLite, delivered into {est}\n"
+        "OUTPUTS: report.md\n"
+        "RELEASE: report.md\n"
+        f"MILESTONE 2: Retention decision\n"
+        f"TASK: Recommend a retention policy for session logs.\n"
+        "OUTPUTS: NONE\n"
+        "RELEASE: NONE\n"
+    )
+    svc = GangOf8Service(data_dir=tmp_path / "data")
+    svc.registry.register(_PlannerSeat(plan=plan, promoting=True))
+    goal = svc.create_goal(f"Ship a storage report into {est}, then a retention policy")
+    assert goal.status == "awaiting_release"
+    ms1 = goal.milestones[0]
+    sess = svc.manager.load(ms1.session_id)
+    assert sess.status == SessionStatus.done
+    assert not [a for a in sess.approvals if a.status == "pending"]
+    assert not (est / "report.md").exists()
+    assert (Path(goal.staging_root) / "report.md").exists()
+
+    release = svc.manager.load(goal.release_session_id)
+    assert release.status == SessionStatus.awaiting_approval
+    pending = [a for a in release.approvals if a.status == "pending"]
+    assert len(pending) == 1
+    assert [a.kind for a in release.proposed_actions] == ["promote_batch"]
+    svc.approve(release.session_id, pending[0].approval_id, True)
+    g = svc.goals.get(goal.goal_id)
+    assert g.status == "completed"
+    assert [m.status for m in g.milestones] == ["done", "done"]
+    assert (est / "report.md").exists()
+
+
+def test_final_batch_detects_destination_drift_before_writing(tmp_path):
+    from gangof8 import executor
+    from gangof8.models import ProposedAction, Role, Session, Task
+
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "a.txt").write_text("new", encoding="utf-8")
+    (dest / "a.txt").write_text("old", encoding="utf-8")
+    baseline = hashlib.sha256(b"old").hexdigest()
+    session = Session(
+        session_id="s_batch", workspace_root=str(stage), established_root=str(dest),
+        task=Task(task_id="t", session_id="s_batch", text="release"))
+    action = ProposedAction(
+        session_id="s_batch", kind="promote_batch", role=Role.implementer,
+        args={"files": json.dumps(["a.txt"]),
+              "baselines": json.dumps({"a.txt": baseline})})
+    (dest / "a.txt").write_text("someone else's change", encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="project changed after final review"):
+        executor.execute(session, action, tmp_path / "data")
+    assert (dest / "a.txt").read_text(encoding="utf-8") == "someone else's change"
+
+
+def test_final_batch_rolls_back_if_a_later_replace_fails(tmp_path, monkeypatch):
+    from gangof8 import executor, skills
+    from gangof8.models import ProposedAction, Role, Session, Task
+
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    for name in ("a.txt", "b.txt"):
+        (stage / name).write_text(f"new-{name}", encoding="utf-8")
+        (dest / name).write_text(f"old-{name}", encoding="utf-8")
+    baselines = {
+        name: hashlib.sha256(f"old-{name}".encode()).hexdigest()
+        for name in ("a.txt", "b.txt")}
+    session = Session(
+        session_id="s_rollback", workspace_root=str(stage), established_root=str(dest),
+        task=Task(task_id="t", session_id="s_rollback", text="release"))
+    action = ProposedAction(
+        session_id="s_rollback", kind="promote_batch", role=Role.implementer,
+        args={"files": json.dumps(["a.txt", "b.txt"]),
+              "baselines": json.dumps(baselines)})
+    real_replace = skills.os.replace
+    calls = 0
+
+    def fail_second(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second-file failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(skills.os, "replace", fail_second)
+    with pytest.raises(executor.ExecutionError, match="rolled back"):
+        executor.execute(session, action, tmp_path / "data")
+    assert (dest / "a.txt").read_text(encoding="utf-8") == "old-a.txt"
+    assert (dest / "b.txt").read_text(encoding="utf-8") == "old-b.txt"
+
+
+# ---- HTTP surface ---------------------------------------------------------------
+
+
+@pytest.fixture()
+def client(tmp_path):
+    from gangof8 import main as main_mod
+
+    main_mod.service = GangOf8Service(data_dir=tmp_path / "data")
+    main_mod.service.registry.register(_PlannerSeat())
+    return TestClient(main_mod.app)
+
+
+def test_goal_api_lifecycle(client):
+    r = client.post("/goals", json={"text": "/goal Decide storage and retention"})
+    assert r.status_code == 200
+    goal = r.json()
+    assert goal["status"] == "completed"
+    assert len(goal["milestones"]) == 2
+
+    listed = client.get("/goals").json()
+    assert [g["goal_id"] for g in listed] == [goal["goal_id"]]
+
+    got = client.get(f"/goals/{goal['goal_id']}").json()
+    assert got["text"] == "Decide storage and retention"
+
+    # resume on a settled goal is a conflict, not a crash
+    r = client.post(f"/goals/{goal['goal_id']}/resume")
+    assert r.status_code == 409
+
+    r = client.delete(f"/goals/{goal['goal_id']}")
+    assert r.status_code == 200
+    assert client.get(f"/goals/{goal['goal_id']}").status_code == 404
+
+
+def test_goal_api_rejects_empty_text(client):
+    assert client.post("/goals", json={"text": "  /goal   "}).status_code == 422
+
+
+def test_goal_composer_hint_served(client):
+    page = client.get("/").text
+    assert "/goal" in page  # the composer advertises the command

@@ -7,13 +7,14 @@ budgets; exceeding any cap force-stops with a partial answer.
 from __future__ import annotations
 
 import re
+import hashlib
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor, rounds, skills, smoke
+from . import config, executor, rounds, skills, smoke, validation
 from .artifacts import (
     ARTIFACT_MARKER as _ARTIFACT_MARKER,
     BLOCK_START as _BLOCK_START,
@@ -41,6 +42,7 @@ from .models import (
     SessionStatus,
     Role,
     TaskType,
+    utcnow,
 )
 from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegistry
 from .roles import build_council
@@ -79,12 +81,55 @@ def _has_proposals(session: Session) -> bool:
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
+
+class QualityGateFailed(Exception):
+    """A required implementation or release-quality quorum was not satisfied."""
+
 # Guards mutable session state (budget counter, contributions, unresolved,
 # council roster, log writes) so parallel sibling consults can't race. Held only
 # for tiny bookkeeping critical sections — NEVER across an agent call.
 _SESSION_LOCK = threading.Lock()
-# Bounds concurrent agent subprocesses machine-wide (see config.MAX_PARALLEL_AGENTS).
-_AGENT_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_AGENTS)
+# Two machine-wide concurrency bounds: heavy local CLI subprocesses share the
+# tight one; HTTP-backed seats (OpenRouter) share a larger one so a 7-seat panel
+# isn't forced into waves by a subprocess limit only 3 of its seats actually
+# load (adapters declare local_process; unknown adapters count as local).
+_CLI_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_AGENTS)
+_API_SEMAPHORE = threading.Semaphore(config.MAX_PARALLEL_API_AGENTS)
+# The widest a fan-out pool ever needs to be — the semaphores do the real gating.
+_MAX_FANOUT_WORKERS = config.MAX_PARALLEL_AGENTS + config.MAX_PARALLEL_API_AGENTS
+
+
+def _agent_semaphore(registry: AgentRegistry, agent: str) -> threading.Semaphore:
+    # duck-typed registry doubles (tests) may not expose .get — treat their
+    # agents as local, the conservative side
+    getter = getattr(registry, "get", None)
+    adapter = getter(agent) if callable(getter) else None
+    return _CLI_SEMAPHORE if getattr(adapter, "local_process", True) else _API_SEMAPHORE
+
+
+def _effective_agent_timeout(
+    session: Session, agent: str, requested: Optional[int] = None,
+) -> int:
+    """Resolve one timeout; Settings caps never govern coding sessions.
+
+    Code work uses the stage policy supplied by the coordinator (author, judge,
+    lead, codifier, repair, or the explicit frontier no-deadline value). The
+    per-seat Settings value is solely a routine/non-code guardrail.
+    """
+    if requested is not None and int(requested) <= 0:
+        return 0
+    configured = (getattr(session, "cli_timeouts", None) or {}).get(agent)
+    classification = getattr(session, "classification", None)
+    coding = bool(classification and classification.task_type == TaskType.code)
+    if coding:
+        if requested is None:
+            return max(1, int(config.agent_timeout(agent)))
+        return max(1, int(requested))
+    if requested is None:
+        return int(configured or config.agent_timeout(agent))
+    if configured:
+        return max(1, min(int(requested), int(configured)))
+    return max(1, int(requested))
 
 
 def _codifier(session: Session) -> Optional[CouncilMember]:
@@ -107,7 +152,9 @@ def _agent_call(
 ) -> Contribution:
     # Cooperative cancellation: every agent call passes through here, so this is
     # the one checkpoint that aborts a run the human cancelled mid-flight.
-    if cancellation.is_requested(session.session_id):
+    if (cancellation.is_requested(session.session_id)
+            or (session.worker_lease
+                and not store.lease_is_current(session.session_id, session.worker_lease))):
         raise SessionCancelled()
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
@@ -123,35 +170,62 @@ def _agent_call(
                 + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
             )
         session.agent_calls += 1
-    # Per-seat timeout: the Settings override (session.cli_timeouts) wins over the
-    # config.AGENT_TIMEOUTS default. It's the seat's BASE budget — an explicit
-    # heavy-work timeout (lead/panel authoring/codifier) still applies as a floor,
-    # so raising a seat's setting also raises its authoring headroom, while a small
-    # setting can't starve authoring below the built-in minimum.
-    seat_base = (getattr(session, "cli_timeouts", None) or {}).get(member.agent) \
-        or config.agent_timeout(member.agent)
-    timeout_s = seat_base if timeout_s is None else max(timeout_s, seat_base)
+    # Per-seat Settings values cap ordinary calls. An explicit zero is the
+    # frontier author/verifier no-deadline mode; cancellation remains active.
+    timeout_s = _effective_agent_timeout(session, member.agent, timeout_s)
+    call_id = f"call_{threading.get_ident()}_{time.monotonic_ns()}"
+    store.log_event(
+        session.session_id, "agent_call_queued",
+        {"call_id": call_id, "agent": member.agent, "role": member.role.value,
+         "timeout_s": timeout_s},
+    )
     # Tag this worker thread with the session so the CLI adapter can register its
     # subprocess for hard cancellation (kill on request). current_session is
     # thread-local, so each parallel worker tags itself independently.
     cancellation.set_current_session(session.session_id)
     try:
-        # The semaphore bounds how many CLI subprocesses run at once (never held
-        # across the budget lock, so bookkeeping never blocks on a slow call).
-        with _AGENT_SEMAPHORE:
-            result = registry.call(member.agent, member.role, prompt, timeout_s, images=images)
+        # The semaphore bounds concurrency per adapter kind (never held across
+        # the budget lock, so bookkeeping never blocks on a slow call).
+        with _agent_semaphore(registry, member.agent):
+            activity = {
+                "call_id": call_id, "agent": member.agent, "role": member.role.value,
+                "started_at": utcnow(), "timeout_s": timeout_s,
+            }
+            with _SESSION_LOCK:
+                session.active_agent_calls.append(activity)
+                store.log_event(session.session_id, "agent_call_started", activity)
+                store.save_session(session)
+            try:
+                result = registry.call(
+                    member.agent, member.role, prompt, timeout_s, images=images)
+            finally:
+                with _SESSION_LOCK:
+                    session.active_agent_calls = [
+                        item for item in session.active_agent_calls
+                        if item.get("call_id") != call_id
+                    ]
+                    store.save_session(session)
     except AgentInputRequired as e:
         e.role = member.role  # enrich with call-site context for the InputRequest
         e.agent_name = member.agent
         with _SESSION_LOCK:
             session.agent_calls -= 1  # paused, not completed — resume re-counts it
         raise
-    except Exception:
+    except Exception as exc:
         with _SESSION_LOCK:
+            store.log_event(
+                session.session_id, "agent_call_failed",
+                {"call_id": call_id, "agent": member.agent,
+                 "role": member.role.value, "error": str(exc)[:300]},
+            )
             session.agent_calls -= 1  # failed — release the reserved slot
         raise
     finally:
         cancellation.set_current_session(None)
+    if (cancellation.is_requested(session.session_id)
+            or (session.worker_lease
+                and not store.lease_is_current(session.session_id, session.worker_lease))):
+        raise SessionCancelled()
     contribution = Contribution(
         round=session.current_round,
         role=member.role,
@@ -162,6 +236,11 @@ def _agent_call(
         duration_ms=result.duration_ms,
     )
     with _SESSION_LOCK:
+        store.log_event(
+            session.session_id, "agent_call_finished",
+            {"call_id": call_id, "agent": member.agent,
+             "role": member.role.value, "duration_ms": result.duration_ms},
+        )
         session.contributions.append(contribution)
         store.log_event(
             session.session_id,
@@ -186,6 +265,190 @@ def _readable_files(session: Session, data_dir) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_file())
 
 
+def _runtime_prelude(session: Session, filename: str) -> str:
+    """Load declared runtime dependencies in their real project order.
+
+    A JavaScript module that extends ``Game`` is not a standalone page.  The
+    old smoke check ran that file by itself and rejected correct candidates with
+    ``Game is not defined``.  Goal milestones now carry their dependency list;
+    legacy JS module tasks get the conservative ``core.js`` convention.
+    """
+    if Path(filename).suffix.lower() not in {".js", ".mjs"}:
+        return ""
+    names = list(session.runtime_dependencies)
+    if not names and Path(filename).name != "core.js":
+        names = ["core.js"]
+    # Verification happens before promotion, so dependencies produced alongside
+    # the current artifact exist only in this session sandbox.  It must be the
+    # first lookup root, followed by previously accepted project locations.
+    roots = [executor.artifacts_dir(config.DATA_DIR, session.session_id),
+             session.workspace_root, session.delivery_root, session.established_root]
+    chunks: list[str] = []
+    for name in names:
+        rel = str(name or "").strip().replace("\\", "/")
+        if not rel or rel == Path(filename).name:
+            continue
+        for root in roots:
+            if not root:
+                continue
+            try:
+                path = executor.resolve_in_workspace(Path(root), rel)
+            except ExecutionError:
+                continue
+            try:
+                if path.is_file():
+                    expected = session.dependency_hashes.get(rel)
+                    if expected:
+                        try:
+                            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                        except OSError:
+                            continue
+                        if actual != expected:
+                            continue
+                    chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+                    break
+            except OSError:
+                continue
+    return "\n\n".join(chunks)
+
+
+def _normalized_paths(names: list[str]) -> list[str]:
+    """Normalize only separators; path validity was enforced by Goal parsing."""
+    out: list[str] = []
+    for raw in names:
+        name = (raw or "").strip().replace("\\", "/")
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _revision_targets(session: Session) -> list[str]:
+    """Outputs that intentionally replace an input in the same project path."""
+    explicit = _normalized_paths(session.revision_targets)
+    if explicit:
+        return explicit
+    required = set(_normalized_paths(session.required_files))
+    return [name for name in _normalized_paths(session.runtime_dependencies)
+            if name in required]
+
+
+def _is_in_place_revision(session: Session) -> bool:
+    return bool(_revision_targets(session))
+
+
+_REVISION_WINDOW_EXPORT_RE = re.compile(r"\bwindow\.([A-Za-z_$][\w$]*)\s*=", re.MULTILINE)
+_REVISION_CLASS_RE = re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)\b")
+_REVISION_EXTENDS_RE = re.compile(
+    r"\b([A-Za-z_$][\w$]*)\s+extends\s+([A-Za-z_$][\w$]*)\b")
+_REVISION_REGISTER_RE = re.compile(
+    r"ArcadePortal\.register\(\s*['\"](?P<id>[^'\"]+)['\"]\s*,\s*"
+    r"['\"](?P<title>[^'\"]+)['\"]\s*,\s*(?P<klass>[A-Za-z_$][\w$]*)\s*\)")
+
+
+def _revision_public_contract(source: str) -> list[str]:
+    """Stable surface a surgical revision must retain, not a whole-file diff."""
+    exports = [f"window:{name}" for name in _REVISION_WINDOW_EXPORT_RE.findall(source or "")]
+    classes = [f"class:{name}" for name in _REVISION_CLASS_RE.findall(source or "")]
+    return list(dict.fromkeys(exports + classes))
+
+
+def _revision_assertions(session: Session, source: str) -> list[str]:
+    """Derive small behavior-facing checks from the task and current portal."""
+    assertions: list[str] = []
+    task = session.task.text or ""
+    for sub, base in _REVISION_EXTENDS_RE.findall(task):
+        if sub not in {"Game", "class"}:
+            assertions.append(f"extends:{sub}:{base}")
+            # If an existing Placeholder registration has the same game title,
+            # require its replacement to point at the requested concrete class.
+            wanted = re.sub(r"[^a-z0-9]", "", sub.lower())
+            for reg in _REVISION_REGISTER_RE.finditer(source or ""):
+                title = re.sub(r"[^a-z0-9]", "", reg.group("title").lower())
+                if title == wanted and reg.group("klass") == "PlaceholderGame":
+                    assertions.append(f"registry:{reg.group('id')}:{sub}")
+    return list(dict.fromkeys(assertions))
+
+
+def _revision_source_for(session: Session, data_dir, name: str) -> Optional[Path]:
+    """Find the pre-edit source without accidentally selecting this session's copy."""
+    for root in (session.workspace_root, session.delivery_root, session.established_root):
+        if not root:
+            continue
+        try:
+            candidate = executor.resolve_in_workspace(Path(root), name)
+        except ExecutionError:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _prepare_in_place_revision(session: Session, store: LogStore) -> bool:
+    """Seed exact existing targets into sandbox and capture their public contract.
+
+    ``EDIT`` is only reliable if it works against the actual current bytes.  The
+    old path showed the model a truncated overview, then demanded a full rewrite
+    of a 44 KB file.  This copies the real source once and lets every edit apply
+    against that copy.
+    """
+    targets = _revision_targets(session)
+    if not targets:
+        return True
+    sandbox = executor.artifacts_dir(store.data_dir, session.session_id)
+    for name in targets:
+        source = _revision_source_for(session, store.data_dir, name)
+        if source is None:
+            session.unresolved.append(f"revision target is missing from the project: {name}")
+            return False
+        try:
+            body = source.read_bytes()
+        except OSError as e:
+            session.unresolved.append(f"could not read revision target {name}: {e}")
+            return False
+        actual = hashlib.sha256(body).hexdigest()
+        expected = session.revision_base_hashes.get(name)
+        if expected and actual != expected:
+            session.unresolved.append(
+                f"revision base changed before authoring: {name}; refusing to overwrite a newer file")
+            return False
+        try:
+            destination = executor.resolve_in_workspace(sandbox, name)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(body)
+            text = body.decode("utf-8", errors="replace")
+        except (OSError, ExecutionError) as e:
+            session.unresolved.append(f"could not seed revision target {name}: {e}")
+            return False
+        session.revision_base_hashes[name] = actual
+        session.revision_api_contract[name] = _revision_public_contract(text)
+        session.revision_assertions[name] = _revision_assertions(session, text)
+    session.revision_targets = targets
+    store.log_event(session.session_id, "revision_seeded",
+                    {"targets": targets, "bytes": [
+                        executor.resolve_in_workspace(sandbox, name).stat().st_size for name in targets
+                    ]})
+    store.save_session(session)
+    return True
+
+
+def _revision_source_context(session: Session, store: LogStore) -> str:
+    """Exact source for the primary author, bounded only at a generous ceiling."""
+    sandbox = executor.artifacts_dir(store.data_dir, session.session_id)
+    chunks: list[str] = []
+    for name in _revision_targets(session):
+        try:
+            path = executor.resolve_in_workspace(sandbox, name)
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ExecutionError):
+            continue
+        if len(body) > config.REVISION_SOURCE_MAX_CHARS:
+            head = body[: config.REVISION_SOURCE_MAX_CHARS // 2]
+            tail = body[-config.REVISION_SOURCE_MAX_CHARS // 2:]
+            body = head + "\n\n/* SOURCE OMITTED IN THE MIDDLE — use SKILL: read_file for exact bytes */\n\n" + tail
+        chunks.append(f"===== {name} =====\n{body}")
+    return "\n\n".join(chunks)
+
+
 # README / manifests give the app's self-description; source files give how it
 # ACTUALLY works. The council needs BOTH or it produces README-grade advice.
 _OVERVIEW_DOC_FILES = (
@@ -199,7 +462,7 @@ _OVERVIEW_ENTRY_FILES = (
 )
 _OVERVIEW_CODE_EXTS = {
     ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".java", ".rb", ".php",
-    ".c", ".cpp", ".cs", ".svelte", ".vue", ".kt", ".swift",
+    ".c", ".cpp", ".cs", ".svelte", ".vue", ".kt", ".swift", ".html", ".htm",
 }
 _OVERVIEW_SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env", "__pycache__",
@@ -228,6 +491,42 @@ def _read_established(session: Session, data_dir, name: str) -> str:
             Path(data_dir))
     except Exception:  # noqa: BLE001 — absent/unreadable: skip
         return ""
+
+
+# Declarations that define a file's CONTRACT: classes, functions, prototype
+# methods, registration calls, exported bindings. Extracted from the WHOLE body
+# whenever the overview's head excerpt truncates a file, so seats bind to the
+# real API instead of burning SKILL chains rediscovering it (live: the overview
+# cut a 37KB shell.html off right at the engine namespace and every seat's
+# first act was re-reading the file to find ARCADE.register / the Game class).
+_API_DECL_RE = re.compile(
+    r"^[ \t]*(?:export\s+(?:default\s+)?)?"
+    r"(?:public\s+|private\s+|protected\s+|static\s+)*(?:async\s+)?(?:"
+    r"class\s+\w+[^\r\n{]*"
+    r"|(?:def|function)\s+[\w$]+\s*\([^\r\n]*"
+    r"|[\w$][\w$.]*\.prototype\.[\w$]+\s*=[^\r\n]*"
+    r"|(?:const|let|var)\s+[\w$]+\s*=\s*(?:async\s*)?(?:function\b|\()[^\r\n]*"
+    r"|(?:this|[\w$][\w$.]*)\.[\w$]+\s*=\s*(?:async\s*)?function[^\r\n]*"
+    r"|[\w$][\w$.]*\.register\s*[=(][^\r\n]*"
+    r")",
+    re.MULTILINE,
+)
+
+
+def _api_surface(body: str) -> str:
+    """One line per declaration found in the WHOLE body, deduped, bounded.
+    Returns '' when there's too little to be a real surface (the head excerpt
+    already covers a file that small)."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for m in _API_DECL_RE.finditer(body or ""):
+        line = " ".join(m.group(0).split())
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    if len(lines) < 3:
+        return ""
+    return "\n".join(lines)[:config.OVERVIEW_API_SURFACE_MAX_CHARS]
 
 
 _SOURCE_DIGEST_MAX_CHARS = 8000
@@ -412,6 +711,14 @@ def _established_overview(session: Session, data_dir) -> str:
         if body.strip():
             parts.append(f"--- {p.relative_to(root).as_posix()} "
                          f"(source the task named — read in full) ---\n{body[:limit]}")
+            if len(body) > limit:
+                surface = _api_surface(body)
+                if surface:
+                    parts.append(
+                        f"--- {p.relative_to(root).as_posix()} (API SURFACE — the file "
+                        "above was truncated; these are ALL its declarations, extracted "
+                        "from the whole file. Bind to these exact signatures instead of "
+                        f"re-reading it) ---\n{surface}")
 
     # 3. ACTUAL SOURCE — entry points + architecturally CENTRAL files (registry/
     # protocol/config/models/…) + the largest code files, excluding tests/vendored.
@@ -467,6 +774,11 @@ def _established_overview(session: Session, data_dir) -> str:
             continue
         if body.strip():
             parts.append(f"--- {p.relative_to(root).as_posix()} (source, head) ---\n{body[:1500]}")
+            if len(body) > 1500:
+                surface = _api_surface(body)
+                if surface:
+                    parts.append(f"--- {p.relative_to(root).as_posix()} (API surface — "
+                                 f"declarations from the whole file) ---\n{surface}")
 
     if not parts:
         return ""
@@ -768,8 +1080,9 @@ def _run_delegations(
     A single consult (the common case) skips the pool. Every consulted specialist's
     OWN answer is re-scanned one level deeper (up to budgets.max_delegation_depth,
     scaled by task complexity) — the primary lead → specialist → sub-agent
-    hierarchy. Concurrency is bounded by _AGENT_SEMAPHORE (subprocess count) and
-    the session agent-call budget; fan-out by budgets.max_delegations per scan.
+    hierarchy. Concurrency is bounded by the per-kind semaphores (CLI subprocess
+    count / API request count) and the session agent-call budget; fan-out by
+    budgets.max_delegations per scan.
     Per-level pools keep parents from waiting on children in the same pool, so
     nested fan-out can't deadlock."""
     reqs = list(_DELEGATION_MARKER.finditer(content))
@@ -792,7 +1105,7 @@ def _run_delegations(
         if len(ms) == 1:
             return [_resolve_one_delegation(session, council, requester, ms[0],
                                             use_call, store, depth, can_subconsult, extra)]
-        workers = min(len(ms), config.MAX_PARALLEL_AGENTS)
+        workers = min(len(ms), _MAX_FANOUT_WORKERS)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="consult") as ex:
             futures = [ex.submit(_resolve_one_delegation, session, council, requester,
                                  m, use_call, store, depth, can_subconsult, extra)
@@ -1030,7 +1343,7 @@ def _candidate_artifact_problem(session: Session, filename: str) -> str:
 def _capture_panel_artifacts(
     session: Session, member: CouncilMember, content: str,
     governance: Governance, store: LogStore,
-) -> None:
+) -> bool:
     """A panel seat that wrote a COMPLETE file gets it saved into the council
     sandbox IMMEDIATELY, namespaced to the seat (codex__index.html) so seven
     parallel takes can never clobber one another or the deliverable. These are
@@ -1051,6 +1364,9 @@ def _capture_panel_artifacts(
         governance.authorize_action(session, a)
         if a.status != "denied":
             try:
+                if (session.worker_lease
+                        and not store.lease_is_current(session.session_id, session.worker_lease)):
+                    raise SessionCancelled()
                 path = executor.execute(session, a, store.data_dir)
                 a.status = "executed"
             except ExecutionError as e:
@@ -1074,25 +1390,32 @@ def _panel_one(
     call: AgentCall, governance: Governance, store: LogStore,
     timeout_s: Optional[int] = None,
 ) -> Optional[Contribution]:
-    """One panel seat's contribution, fan-out-safe: a failing seat is dropped
-    for the round (logged, noted), never fatal. A panel seat asking the human a
+    """One panel seat's contribution, fan-out-safe. Ordinary failures are
+    dropped for the round; frontier implementation failures are re-called as the
+    same author and later enforced as a hard quorum. A panel seat asking the human a
     question is also treated as a drop — pausing mid-fan-out with sibling
     threads in flight is not sound; only the lead's calls may pause the run.
     Panel seats have the same discovery skills as the lead (chained SKILL:
     resolution) and their complete files are saved to the sandbox, namespaced
     per seat."""
     dropped_contribution = None
+    budget_failure = False
     try:
         # authoring a whole candidate needs headroom; pass the timeout only when set
         # so plain 2-arg callers keep working
         c = call(member, prompt, timeout_s) if timeout_s is not None else call(member, prompt)
-        c = _resolve_skill_requests(session, member, prompt, c, call, governance, store)
+        # Preserve the authoring timeout across read/list/search follow-ups.  The
+        # old chain silently fell back to the ordinary 320-second CLI timeout
+        # after Claude requested source, dropping a healthy owner mid-package.
+        def recall(m: CouncilMember, p: str) -> Contribution:
+            return call(m, p, timeout_s) if timeout_s is not None else call(m, p)
+        c = _resolve_skill_requests(
+            session, member, prompt, c, call, governance, store, recall=recall)
         # A stub take (tool-call debris / announced-but-not-done work) would
         # only pollute the synthesis and later context windows — drop the seat
         # for this round AND remove its debris from the transcript (the
         # panel_seat_dropped event + unresolved note keep the audit trail). No
-        # retry: panel seats are best-effort voices, and the lead + composer
-        # still have every healthy take.
+        # retry below when this is a required frontier implementation author.
         if rounds.reply_is_stub(c.content, skills_resolved=True):
             reason = "stub reply (announced or attempted the work instead of doing it)"
             dropped_contribution = c
@@ -1101,8 +1424,35 @@ def _panel_one(
             return c
     except AgentInputRequired:
         reason = "asked for user input"
-    except (AgentError, BudgetExceeded) as e:
+    except BudgetExceeded as e:
+        budget_failure = True
         reason = str(e)
+    except AgentError as e:
+        reason = str(e)
+    frontier_author = bool(
+        timeout_s is not None and member.agent in config.FRONTIER_AUTHOR_SEATS
+    )
+    recoveries = session.frontier_author_recoveries.get(member.agent, 0)
+    if (frontier_author and not budget_failure
+            and recoveries < config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS):
+        with _SESSION_LOCK:
+            if dropped_contribution is not None and dropped_contribution in session.contributions:
+                session.contributions.remove(dropped_contribution)
+            session.frontier_author_recoveries[member.agent] = recoveries + 1
+            store.log_event(
+                session.session_id, "frontier_author_recovery_started",
+                {"agent": member.agent, "round": session.current_round,
+                 "attempt": recoveries + 2, "reason": reason[:300]},
+            )
+            store.save_session(session)
+        recovery_prompt = (
+            prompt
+            + "\n\nRECOVERY: your previous implementation attempt did not complete. "
+              "You remain the owner. Produce the complete required ARTIFACT block(s) "
+              "now; do not return a plan, status note, or judge commentary."
+        )
+        return _panel_one(
+            session, member, recovery_prompt, call, governance, store, timeout_s)
     with _SESSION_LOCK:
         if dropped_contribution is not None and dropped_contribution in session.contributions:
             session.contributions.remove(dropped_contribution)
@@ -1111,6 +1461,31 @@ def _panel_one(
                         {"agent": member.agent, "round": session.current_round,
                          "error": reason[:300]})
     return None
+
+
+def _fan_out(session: Session, items: list, fn, thread_name: str,
+             max_workers: Optional[int] = None) -> list:
+    """Run fn(item) concurrently for every item, cancel-aware, results in
+    submission order. A plain shutdown(wait=True)/f.result() blocks until the
+    SLOWEST worker returns — and API seats are HTTP calls that cancel can't
+    hard-kill the way it kills a CLI subprocess — so poll the cancel flag: the
+    moment the human cancels, stop waiting, abandon the in-flight workers
+    (their threads finish on their own timeouts) and raise. A single item skips
+    the pool. Worker exceptions (incl. SessionCancelled) re-raise on collect."""
+    if len(items) == 1:
+        return [fn(items[0])]
+    ex = ThreadPoolExecutor(max_workers=min(len(items), max_workers or _MAX_FANOUT_WORKERS),
+                            thread_name_prefix=thread_name)
+    try:
+        futures = [ex.submit(fn, it) for it in items]
+        pending = set(futures)
+        while pending:
+            if cancellation.is_requested(session.session_id):
+                raise SessionCancelled()
+            _done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+        return [f.result() for f in futures]
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 def _pause_for_consent(session: Session, manager: SessionManager, store: LogStore) -> None:
@@ -1158,6 +1533,149 @@ def _pause_for_integration_decision(
     manager.transition(session, SessionStatus.awaiting_input)
 
 
+def _revision_patch_summary(actions: list[ProposedAction]) -> str:
+    """Compact, auditable diff context for the one bounded reviewer call."""
+    parts: list[str] = []
+    for action in actions:
+        if action.kind != "edit_file":
+            continue
+        old = action.args.get("old", "")
+        new = action.args.get("new", "")
+        parts.append(
+            f"EDIT: {action.filename}\n<<<<<<< OLD\n{old}\n=======\n{new}\n>>>>>>> NEW")
+    return "\n\n".join(parts)[:16000]
+
+
+def _run_in_place_revision(
+    session: Session, manager: SessionManager, council: Council, lead: CouncilMember,
+    call: AgentCall, lead_call: AgentCall, governance: Governance, store: LogStore,
+) -> bool:
+    """Author one grounded patch, review it once, then re-enter normal gates.
+
+    Returns True only when a governed action paused the session.  This path is
+    intentionally absent from best-of-N: editing an existing file is a change
+    request, not a contest to reconstruct an entire application several times.
+    """
+    if not _prepare_in_place_revision(session, store):
+        raise AgentError("could not prepare the in-place revision target")
+    targets = _revision_targets(session)
+    if not targets:
+        return False
+    sid = session.session_id
+    owner = next(
+        (m for m in council.members if m.role == Role.panelist and m.active
+         and m.agent == session.work_package_owner), None)
+    author = owner or lead
+    if not session.rounds:
+        spec = RoundSpec(
+            round=0,
+            goal="single-author in-place patch, then bounded review",
+            agents=[Role.lead, Role.fact_validator],
+            stop_condition="patch applies and verification passes",
+            output_requirement="surgical EDIT blocks only",
+        )
+        session.rounds.append(spec)
+        session.current_round = 0
+        store.log_event(sid, "revision_patch_started", {"targets": targets})
+
+    source_context = _revision_source_context(session, store)
+    prompt = rounds.revision_patch_prompt(session, targets, source_context)
+    authored = lead_call(author, prompt)
+    authored = _resolve_skill_requests(session, author, prompt, authored, call, governance, store,
+                                       recall=lead_call)
+    actions = [a for a in _parse_proposals(sid, authored.content)
+               if a.kind == "edit_file" and a.filename.replace("\\", "/") in targets]
+    if not actions:
+        raise AgentError("revision author supplied no surgical EDIT for the declared target")
+    _append_proposals(session, store, actions)
+    if _execute_actions(session, manager, governance, store, promotes=False):
+        return True
+
+    assertions = list(dict.fromkeys(
+        item for target in targets for item in session.revision_assertions.get(target, [])))
+    reviewer = council.get(Role.fact_validator) or council.get(Role.critic)
+    review_failures: list[str] = []
+    if reviewer and reviewer.active and reviewer.agent and reviewer.agent != author.agent:
+        review_prompt = rounds.revision_review_prompt(
+            session, targets, _revision_patch_summary(actions), assertions)
+        try:
+            review = call(reviewer, review_prompt)
+            review_failures = rounds.revision_review_failures(review.content)
+            store.log_event(sid, "revision_reviewed",
+                            {"reviewer": reviewer.agent, "passed": not review_failures,
+                             "findings": review_failures})
+        except (AgentError, BudgetExceeded) as e:
+            session.unresolved.append(f"revision review skipped: {e}")
+            store.log_event(sid, "revision_review_skipped", {"detail": str(e)[:300]})
+
+    if review_failures:
+        session.unresolved.append("revision reviewer found: " + "; ".join(review_failures))
+        repair_prompt = rounds.revision_repair_prompt(
+            session, "; ".join(review_failures), _revision_source_context(session, store))
+        repaired = lead_call(author, repair_prompt)
+        repaired = _resolve_skill_requests(session, author, repair_prompt, repaired, call, governance,
+                                           store, recall=lead_call)
+        repair_actions = [a for a in _parse_proposals(sid, repaired.content)
+                          if a.kind == "edit_file" and a.filename.replace("\\", "/") in targets]
+        if not repair_actions:
+            raise AgentError("revision author did not address the review finding with an EDIT")
+        _append_proposals(session, store, repair_actions)
+        if _execute_actions(session, manager, governance, store, promotes=False):
+            return True
+        store.log_event(sid, "revision_repaired", {"targets": targets, "passes": 1})
+    return False
+
+
+def _adopt_owned_package_artifacts(
+    session: Session, owner: str, store: LogStore,
+) -> tuple[list[str], list[str]]:
+    """Turn one package owner's namespaced drafts into the real package outputs.
+
+    No lead re-authoring and no promote action is involved: these implementer
+    writes are verified in the session sandbox, then the goal service copies
+    the accepted bytes into shared staging.
+    """
+    required = [name.replace("\\", "/") for name in session.required_files]
+    existing = {
+        a.filename.replace("\\", "/") for a in session.proposed_actions
+        if a.kind == "write_file" and a.role != Role.panelist
+    }
+    adopted: list[str] = []
+    proposals: list[ProposedAction] = []
+    prefix = f"{owner}__"
+    for draft in session.proposed_actions:
+        if (draft.kind != "write_file" or draft.role != Role.panelist
+                or not draft.filename.startswith(prefix) or not (draft.content or "").strip()):
+            continue
+        base = draft.filename[len(prefix):]
+        matches = [name for name in required if _basename(name) == _basename(base)]
+        if len(matches) == 1:
+            filename = matches[0]
+        elif not required:
+            filename = _basename(base)
+        elif len(required) == 1 and Path(required[0]).suffix.lower() == Path(base).suffix.lower():
+            filename = required[0]
+        else:
+            continue
+        if filename in existing or filename in adopted:
+            continue
+        content = _clean_artifact_body(draft.content, filename)
+        if not content.strip():
+            continue
+        proposals.append(ProposedAction(
+            session_id=session.session_id, kind="write_file", role=Role.implementer,
+            filename=filename, content=content,
+            args={"filename": filename, "content": content},
+        ))
+        adopted.append(filename)
+    if proposals:
+        _append_proposals(session, store, proposals)
+        store.log_event(session.session_id, "work_package_outputs_adopted",
+                        {"owner": owner, "files": adopted})
+    present = existing | set(adopted)
+    return adopted, [name for name in required if name not in present]
+
+
 def _run_panel_rounds(
     session: Session,
     manager: SessionManager,
@@ -1193,12 +1711,36 @@ def _run_panel_rounds(
             session.unresolved.append("rounds stopped: wall-time budget reached")
             break
         session.current_round = r
+        build_package = (
+            session.collaboration_mode == "build_team" and session.work_package_owner
+        )
         spec = RoundSpec(
             round=r,
-            goal=f"panel round {r + 1}: every seat contributes; lead synthesizes",
-            agents=[Role.panelist, Role.lead] if panel else [Role.lead],
-            stop_condition="lead declares ROUND: DONE",
-            output_requirement="synthesis (and ARTIFACT/PROMOTE files when ready)",
+            goal=(
+                f"build package {session.work_package_id or r + 1}: owner "
+                f"{session.work_package_owner} authors the contracted outputs"
+                if build_package else
+                f"panel round {r + 1}: every seat contributes; lead synthesizes"
+            ),
+            agents=([Role.panelist] if build_package else
+                    ([Role.panelist, Role.lead] if panel else [Role.lead])),
+            stop_condition=(
+                "owner produces every contracted artifact"
+                if build_package else "lead declares ROUND: DONE"
+            ),
+            output_requirement=(
+                "owner-authored staged package artifacts"
+                if build_package else
+                "synthesis (and ARTIFACT/PROMOTE files when ready)"
+            ),
+            timeout_s=(
+                _effective_agent_timeout(
+                    session, session.work_package_owner,
+                    (config.FRONTIER_AUTHOR_TIMEOUT
+                     if session.work_package_owner in config.FRONTIER_AUTHOR_SEATS
+                     else config.PANEL_AUTHOR_TIMEOUT))
+                if build_package else config.AGENT_TIMEOUT_DEFAULT
+            ),
         )
         session.rounds.append(spec)
         store.log_event(sid, "round_start", spec.model_dump())
@@ -1209,42 +1751,69 @@ def _run_panel_rounds(
         ov = established_overview if r == 0 else ""
 
         # (a) FAN-OUT — every panel seat answers in parallel (bounded by the
-        # machine-wide semaphore inside _agent_call); a failing seat is dropped.
+        # per-kind semaphores inside _agent_call); a failing seat is dropped.
         results: list[Contribution] = []
         if panel:
-            ex = ThreadPoolExecutor(
-                max_workers=min(len(panel), config.MAX_PARALLEL_AGENTS),
-                thread_name_prefix="panel",
-            )
-            try:
-                # On a build, seats author whole candidate files — give them
-                # production-grade time so a thorough seat (claude/opus) isn't
-                # killed mid-authoring by the quick per-agent timeout.
-                _produces = bool(session.classification and session.classification.produces_output)
-                _panel_to = config.PANEL_AUTHOR_TIMEOUT if _produces else None
-                futures = [
-                    ex.submit(_panel_one, session, m,
-                              rounds.panel_prompt(session, m, r, ov, readable),
-                              call, governance, store, _panel_to)
-                    for m in panel
-                ]
-                # Wait cancel-aware. A plain shutdown(wait=True)/f.result() blocks
-                # until the SLOWEST seat returns — and API seats (kimi/qwen/glm/
-                # deepseek) are HTTP calls that cancel can't hard-kill the way it
-                # kills a CLI subprocess. So a stuck/slow seat made "Cancel run"
-                # hang the whole round. Poll the cancel flag instead: the moment
-                # the human cancels, stop waiting, abandon the in-flight seats
-                # (their threads finish on their own timeout) and abort the round.
-                pending = set(futures)
-                while pending:
-                    if cancellation.is_requested(sid):
-                        raise SessionCancelled()
-                    _done, pending = wait(pending, timeout=0.5,
-                                          return_when=FIRST_COMPLETED)
-                results = [f.result() for f in futures]
-            finally:
-                ex.shutdown(wait=False, cancel_futures=True)
+            # On a build, seats author whole candidate files — give them
+            # production-grade time so a thorough seat (claude/opus) isn't
+            # killed mid-authoring by the quick per-agent timeout.
+            _produces = bool(session.classification and session.classification.produces_output)
+            results = _fan_out(
+                session, panel,
+                lambda m: _panel_one(session, m,
+                                     rounds.panel_prompt(session, m, r, ov, readable),
+                                     call, governance, store,
+                                     ((config.FRONTIER_AUTHOR_TIMEOUT
+                                       if m.agent in config.FRONTIER_AUTHOR_SEATS
+                                       else config.PANEL_AUTHOR_TIMEOUT)
+                                      if _produces else None)),
+                "panel")
             results = [c for c in results if c]
+
+        # BUILD TEAM — the assigned owner authors this package once.  Adopt that
+        # owner's concrete files directly; the lead does not rewrite them and
+        # there is no duplicate best-of-N generation.  One focused retry recovers
+        # a protocol/filename miss without silently transferring ownership.
+        if session.collaboration_mode == "build_team" and session.work_package_owner:
+            adopted, missing = _adopt_owned_package_artifacts(
+                session, session.work_package_owner, store)
+            owner_member = next((m for m in panel if m.agent == session.work_package_owner), None)
+            if missing and owner_member is not None:
+                retry_prompt = (
+                    rounds.panel_prompt(session, owner_member, r, ov, readable)
+                    + "\n\nYour first response did not provide these exact required files: "
+                    + ", ".join(missing)
+                    + ". Emit those complete ARTIFACT blocks NOW; no plan, no PROMOTE."
+                )
+                owner_retry_timeout = (
+                    config.FRONTIER_AUTHOR_TIMEOUT
+                    if owner_member.agent in config.FRONTIER_AUTHOR_SEATS
+                    else config.PANEL_RETRY_TIMEOUT
+                )
+                retry = _panel_one(session, owner_member, retry_prompt, call,
+                                   governance, store, owner_retry_timeout)
+                if retry is not None:
+                    results.append(retry)
+                more, missing = _adopt_owned_package_artifacts(
+                    session, session.work_package_owner, store)
+                adopted.extend(more)
+            if missing:
+                failure = (
+                    f"package owner {session.work_package_owner} did not produce: "
+                    + ", ".join(missing))
+                if session.work_package_owner in config.FRONTIER_AUTHOR_SEATS:
+                    raise QualityGateFailed(failure)
+                raise AgentError(failure)
+            summary = (
+                f"Package {session.work_package_id or r + 1} was implemented by its "
+                f"owner {session.work_package_owner}. Staged outputs: "
+                f"{', '.join(adopted) if adopted else 'analysis/handoff only'}.\nROUND: DONE"
+            )
+            with _SESSION_LOCK:
+                session.contributions.append(Contribution(
+                    round=r, role=Role.lead, agent=lead.agent, content=summary))
+                store.save_session(session)
+            break
 
         # (b) BEST-OF-N — on a file build, the panel authored complete candidate
         # implementations; judges score them blindly and the winning FILE ships
@@ -1263,18 +1832,21 @@ def _run_panel_rounds(
                     _pause_for_integration_decision(session, manager, store, bon["integration"])
                     return True
                 chair = bon.get("chair", "")
+                authored = bon.get("authored", bon["candidates"])
+                runnable_count = bon.get("runnable", bon["candidates"])
                 if bon["judges"]:
-                    how = (f"the highest-scoring of {bon['candidates']} candidate "
+                    how = (f"the highest-scoring of {runnable_count} runnable candidate "
                            f"implementations (blind vote by {bon['judges']} judges, "
                            f"score {bon['score']}, {bon['votes']} first-place; {chair})")
                 elif chair.startswith("chair recovered"):
-                    how = (f"every one of {bon['candidates']} candidates crashed on "
+                    how = (f"every one of {authored} authored candidates crashed on "
                            "load, so the chair repaired the most complete attempt")
                 else:
-                    how = (f"the only one of {bon['candidates']} candidates that "
+                    how = (f"the only one of {authored} authored candidates that "
                            "actually runs (the others crashed on load)")
                 summary = (
-                    f"Best-of-{bon['candidates']}, codified by the summarizer: shipped "
+                    f"Candidate funnel: {authored} authored, {runnable_count} runnable. "
+                    "The summarizer shipped "
                     f"{bon['agent']}'s {bon['file']} — {how}"
                     + (f"; {bon['fixes']} surgical fix pass applied (re-verified to run)."
                        if bon['fixes'] else ", shipped unchanged. Every candidate was "
@@ -1399,6 +1971,16 @@ def resume_session(
     return _deliberate(session, manager, registry, governance, store, role_agents)
 
 
+def _select_panel_seats(session: Session, store: LogStore) -> list[str]:
+    """Convene the complete configured roster, in the user's declared order.
+
+    The panel is product intent, not a throughput knob.  Failed seats are
+    recorded honestly for the round, but neither task classification nor a
+    historical health counter can silently remove a configured council member.
+    """
+    return list(dict.fromkeys(seat for seat in session.panel if seat))
+
+
 def _deliberate(
     session: Session,
     manager: SessionManager,
@@ -1414,7 +1996,7 @@ def _deliberate(
     if session.council.members:
         council = session.council
     else:
-        council = build_council(cls, role_agents, panel=session.panel)
+        council = build_council(cls, role_agents, panel=_select_panel_seats(session, store))
         session.council = council
         store.log_event(sid, "council_formed", council.model_dump())
 
@@ -1433,11 +2015,17 @@ def _deliberate(
     if cancellation.is_requested(sid):
         raise SessionCancelled()
     established_overview = ""
+    overview_session = session
+    if session.delivery_mode == "final_batch" and session.workspace_root:
+        # Later package owners must see the integrated staging overlay, including
+        # earlier owners' real bytes, rather than a stale snapshot of the target.
+        overview_session = session.model_copy(
+            update={"established_root": session.workspace_root, "delivery_root": None})
     _ov_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overview")
     try:
         _ov_fut = _ov_ex.submit(lambda: "\n\n".join(p for p in (
             _conversation_overview(session),
-            _established_overview(session, store.data_dir),
+            _established_overview(overview_session, store.data_dir),
             _web_overview(session),
         ) if p))
         while True:
@@ -1478,15 +2066,22 @@ def _deliberate(
     lead = council.get(Role.lead)
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
-        # 5. Panel rounds: every enabled seat contributes in parallel, the lead
-        # synthesizes (pulling in talents on demand) and declares the round DONE
-        # or CONTINUE. After ROUNDS_PER_CONSENT rounds the human is asked before
-        # the council runs another block.
         if not _has_proposals(session) and lead and lead.active and not session.compose_now:
-            if _run_panel_rounds(session, manager, council, lead, call, lead_call,
-                                 governance, store, role_agents, established_overview,
-                                 start, codifier_call=codifier_call):
-                return session  # paused for round consent
+            if _is_in_place_revision(session):
+                # An existing-file change needs one author grounded in the exact
+                # source plus one patch review, not a panel of whole-file
+                # reconstructions that compete mostly on token budget.
+                if _run_in_place_revision(session, manager, council, lead, call, lead_call,
+                                          governance, store):
+                    return session
+            else:
+                # 5. Greenfield / independent-output work: panel authors can
+                # meaningfully compete, then the lead synthesizes or best-of-N
+                # selects a runnable implementation.
+                if _run_panel_rounds(session, manager, council, lead, call, lead_call,
+                                     governance, store, role_agents, established_overview,
+                                     start, codifier_call=codifier_call):
+                    return session  # paused for round consent
 
             # 7. Mid-flight approval gate (only trips if governance flagged something).
             if session.has_pending_approval:
@@ -1496,6 +2091,31 @@ def _deliberate(
 
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
+    except QualityGateFailed as e:
+        session.outcome = "failed_verification"
+        session.stop_reason = f"frontier implementation gate failed: {e}"
+        session.unresolved.append(session.stop_reason)
+        session.quality_gate = {
+            "verdict": "FAIL", "stage": "frontier_implementation",
+            "detail": str(e),
+        }
+        store.log_event(sid, "frontier_implementation_gate_failed", {"detail": str(e)})
+        manager.transition(session, SessionStatus.composing)
+        session.final = FinalAnswer(
+            answer=(
+                "The run was stopped because a required frontier implementation "
+                "did not complete or did not run. It was not silently replaced by "
+                "a weaker candidate or counted later as a judge. No file was delivered."
+            ),
+            confidence="low",
+            assumptions=[],
+            risks_unresolved=list(session.unresolved),
+            next_action="Resume or rerun so the named frontier owner can finish the code.",
+        )
+        manager.transition(session, SessionStatus.failed)
+        store.log_event(sid, "final_composed", session.final.model_dump())
+        store.save_session(session)
+        return session
     except BudgetExceeded as e:
         lead_failed = True
         session.stop_reason = f"budget exhausted: {e}"
@@ -1530,21 +2150,31 @@ def _deliberate(
             _salvage_from_panel(session, store)
     # Free council-space actions first (writes/edits/tests — never pause), so
     # the goal loop can repair failing tests BEFORE anything is delivered.
-    _execute_actions(session, manager, governance, store, promotes=False)
+    if _execute_actions(session, manager, governance, store, promotes=False):
+        return session
 
     # A large single-file artifact can exceed one model response and be cut off.
     # Finish it from where it stopped (append) instead of re-drafting — the old
     # failure mode that produced empty/partial HTML over and over.
-    if lead and lead.active:
-        _complete_truncated_artifacts(session, lead_call, lead, store)
-        # The goal loop: failing tests come back to the lead for bounded repair.
-        _run_test_fix_loop(session, manager, governance, store, lead, call, lead_call)
+    package_owner = next(
+        (m for m in council.members if m.role == Role.panelist and m.active
+         and m.agent == session.work_package_owner), None)
+    artifact_author = package_owner or lead
+    artifact_call = codifier_call if package_owner else lead_call
+    if artifact_author and artifact_author.active:
+        _complete_truncated_artifacts(session, artifact_call, artifact_author, store)
+        # Package failures return to the package owner; ordinary sessions retain
+        # the lead repair path.
+        if _run_test_fix_loop(session, manager, governance, store, artifact_author,
+                              call, artifact_call):
+            return session
 
     # Safety net: a follow-up that revised an already-delivered file but omitted
     # its PROMOTE line would otherwise strand the update in the sandbox (the
     # user's file keeps the old version). Fill in the missing promote — still
     # gated by the same approval — so 'modify this' follow-ups actually land.
     _ensure_redelivery_promotes(session, store)
+    _suppress_package_promotes(session, store)
 
     # DELIVERY GATE — verify BEFORE anything is promoted. Files are on disk in
     # the sandbox by now; this checks each one exists, is complete, AND actually
@@ -1553,12 +2183,36 @@ def _deliberate(
     # run reports honest failure instead of a false success. The old order
     # verified AFTER the promote already shipped — which let a black-screen file
     # be delivered and reported high-confidence. Never again.
-    _needs_file = cls.task_type == TaskType.code
+    _needs_file = (cls.task_type == TaskType.code
+                   and not (session.collaboration_mode == "build_team"
+                            and not session.required_files))
     _has_file_actions = any(a.kind in _FILE_OUTPUT_KINDS for a in session.proposed_actions)
-    if (_needs_file or _has_file_actions) and not _verify_artifact_outputs(
-        session, store, require_file=_needs_file
-    ):
+    verified = True
+    if _needs_file or _has_file_actions:
+        verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
+        # Coordinator-discovered failures get their own repair state machine.
+        # Do not send an author into a futile repair loop when the failure is an
+        # external immutable-input conflict; changing the artifact cannot repair
+        # a dependency that disappeared or was changed by somebody else.
+        external_conflict = any(
+            marker in issue.lower() for issue in session.unresolved
+            for marker in ("accepted dependency changed", "accepted dependency disappeared",
+                           "runtime dependency changed since acceptance")
+        )
+        if not verified and external_conflict:
+            session.unresolved.append(
+                "artifact repair skipped: verification failure is an external dependency conflict")
+            store.log_event(sid, "artifact_repair_skipped", {"reason": "external_dependency_conflict"})
+        while (not verified and not external_conflict and session.artifact_repair_attempts
+               < config.MAX_ARTIFACT_REPAIR_ATTEMPTS):
+            if not _repair_artifact_failure(
+                session, manager, governance, store, codifier_call):
+                break
+            verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
+    if not verified:
         session.proposed_actions = [a for a in session.proposed_actions if a.kind != "promote"]
+        session.outcome = "failed_verification"
+        session.stop_reason = "artifact verification failed; no file was delivered"
         manager.transition(session, SessionStatus.composing)
         session.final = FinalAnswer(
             answer=(
@@ -1575,7 +2229,9 @@ def _deliberate(
         if not session.turns:
             session.turns.append({"role": "user", "text": session.task.text})
         session.turns.append({"role": "council", "text": session.final.answer})
-        manager.transition(session, SessionStatus.done)
+        # ``done`` means a successful, usable result everywhere else in the UI
+        # and API.  A verified failure is terminal, but it is not done.
+        manager.transition(session, SessionStatus.failed)
         store.log_event(sid, "final_composed", session.final.model_dump())
         store.save_session(session)
         return session
@@ -1620,6 +2276,7 @@ def _deliberate(
     if not session.turns:
         session.turns.append({"role": "user", "text": session.task.text})
     session.turns.append({"role": "council", "text": session.final.answer})
+    session.outcome = "succeeded"
     manager.transition(session, SessionStatus.done)
     store.log_event(sid, "final_composed", session.final.model_dump())
     store.save_session(session)
@@ -1671,6 +2328,8 @@ def _ensure_redelivery_promotes(session: Session, store: LogStore) -> None:
     the promote; nothing lands without the approval click. Panel-seat drafts
     (advisory, namespaced) are never promoted. Idempotent — files already
     PROMOTED (or auto-filled on a prior resume) are skipped."""
+    if session.delivery_mode == "final_batch":
+        return
     if not (session.established_root or session.delivery_root):
         return
     authored = [a.filename for a in session.proposed_actions
@@ -1928,6 +2587,20 @@ def _candidate_pool(session: Session, candidates: list[dict]) -> tuple[list[dict
     return group, [c for c in candidates if c not in group]
 
 
+def _judge_one(judge: CouncilMember, prompt: str, call: AgentCall, n: int) -> tuple:
+    """One judge's blind read, fan-out-safe: (judge, scores, winner, defects,
+    error). Only agent/budget failures are folded into the tuple; cancellation
+    propagates."""
+    try:
+        # judges read every candidate in full — reading headroom, not the quick
+        # per-seat default
+        ans = call(judge, prompt, config.JUDGE_TIMEOUT)
+    except (AgentError, BudgetExceeded) as e:
+        return judge, {}, None, [], str(e)
+    scores, winner, defs = rounds.parse_candidate_scores(ans.content, n)
+    return judge, scores, winner, defs, None
+
+
 def _score_candidates(session: Session, judges: list[CouncilMember], group: list[dict],
                       call: AgentCall, store: LogStore, source: str = ""):
     """Blind scoring: each judge sees every candidate's full body labeled
@@ -1936,7 +2609,12 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
     must match — injected so judges can weigh structural fidelity instead of
     scoring prose in a vacuum. Returns (ordered, agg_score, first_place_votes,
     defects, judge_count). Deterministic candidate order (by namespaced name) →
-    blind but resume-stable, no RNG."""
+    blind but resume-stable, no RNG.
+
+    Judges run in PARALLEL waves (each call reads the entire candidate corpus,
+    so serial judging was the pipeline's single largest wall-clock block). A
+    unanimous first wave with at least JUDGE_EARLY_STOP_MIN_VOTES real votes
+    decides outright; only a split vote convenes the remaining judges."""
     ordered = sorted(group, key=lambda c: c["namespaced"])
     n = len(ordered)
     labeled = [(f"Candidate {i + 1}", c["content"], c.get("_runtime") or "") for i, c in enumerate(ordered)]
@@ -1946,48 +2624,45 @@ def _score_candidates(session: Session, judges: list[CouncilMember], group: list
     votes = {i + 1: 0 for i in range(n)}
     defects: dict[int, list[str]] = {i + 1: [] for i in range(n)}
     judged = 0
-    for j in judges:
-        try:
-            # judges read every candidate in full now — reading headroom, not
-            # the quick per-seat default
-            ans = call(j, prompt, config.JUDGE_TIMEOUT)
-        except (AgentError, BudgetExceeded) as e:
-            store.log_event(sid, "judge_dropped", {"agent": j.agent, "error": str(e)[:120]})
-            session.unresolved.append(f"judge '{j.agent}' dropped during best-of-N scoring: {e}")
-            continue
-        scores, winner, defs = rounds.parse_candidate_scores(ans.content, n)
-        if not scores and winner is None:
-            continue
-        judged += 1
-        for idx, s in scores.items():
-            agg[idx] += s
-        if winner:
-            votes[winner] += 1
-            defects[winner].extend(defs)
-        store.log_event(sid, "candidate_scored",
-                        {"judge": j.agent, "scores": scores, "winner": winner})
+
+    def tally(results: list[tuple]) -> None:
+        # runs on the coordinating thread after each wave — no locking needed
+        nonlocal judged
+        for judge, scores, winner, defs, error in results:
+            if error is not None:
+                store.log_event(sid, "judge_dropped", {"agent": judge.agent, "error": error[:120]})
+                session.unresolved.append(f"judge '{judge.agent}' dropped during best-of-N scoring: {error}")
+                continue
+            if not scores and winner is None:
+                continue
+            judged += 1
+            for idx, s in scores.items():
+                agg[idx] += s
+            if winner:
+                votes[winner] += 1
+                defects[winner].extend(defs)
+            store.log_event(sid, "candidate_scored",
+                            {"judge": judge.agent, "scores": scores, "winner": winner})
+
+    first, rest = judges[:config.JUDGE_FIRST_WAVE], judges[config.JUDGE_FIRST_WAVE:]
+    if first:
+        tally(_fan_out(session, first, lambda j: _judge_one(j, prompt, call, n), "judge"))
+    named = [i for i, v in votes.items() if v > 0]
+    unanimous = (len(named) == 1 and votes[named[0]] == judged
+                 and judged >= config.JUDGE_EARLY_STOP_MIN_VOTES)
+    if rest and unanimous:
+        store.log_event(sid, "judge_vote_early_stop",
+                        {"winner": named[0], "votes": judged, "skipped": len(rest)})
+    elif rest:
+        tally(_fan_out(session, rest, lambda j: _judge_one(j, prompt, call, n), "judge"))
     return ordered, agg, votes, defects, judged
 
 
-def _apply_targeted_fixes(session: Session, filename: str, content: str,
-                          defects: list[str], call: AgentCall, store: LogStore,
-                          source: str = "") -> str:
-    """Surgical fixes ONLY (best-of-N ships the winner's own code): ask for EDIT
-    blocks for the judge-flagged defects and apply them to the content string
-    in-memory (unique-OLD → NEW), never a rewrite. `source` (the reference to
-    match) is passed through so the finisher isn't blind to it — the live failure
-    was the codifier emitting `SKILL: read_file` to fetch the source it lacked
-    instead of edits, so the orphaned scaffolding shipped unfixed and SILENTLY.
-    Returns the (possibly) fixed content; degrades to the original on any error."""
-    who = _codifier(session)
-    if not (who and who.active):
-        return content
-    try:
-        ans = call(who, rounds.winner_fix_prompt(session, filename, content, defects, source))
-    except (AgentError, BudgetExceeded):
-        return content
+def _apply_reply_edits(content: str, reply: str, sid: str) -> tuple[str, int]:
+    """Apply a reply's surgical EDIT blocks to `content` in-memory (unique-OLD →
+    NEW), never a rewrite. Returns (content, edits_applied)."""
     applied = 0
-    for a in _parse_proposals(session.session_id, ans.content):
+    for a in _parse_proposals(sid, reply):
         if a.kind != "edit_file":
             continue
         old = (a.args.get("old") or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -1996,66 +2671,85 @@ def _apply_targeted_fixes(session: Session, filename: str, content: str,
         if old and norm.count(old) == 1:
             content = norm.replace(old, new, 1)
             applied += 1
-    cleaned = _clean_artifact_body(content, filename)
-    if cleaned != content:
-        content = cleaned
-        store.log_event(session.session_id, "winner_protocol_header_stripped", {"file": filename})
-    if applied:
-        store.log_event(session.session_id, "winner_fixes_applied",
-                        {"file": filename, "applied": applied})
-    elif defects:
-        # The finisher returned no usable edits (declined the defects, or — as seen
-        # live — answered with a skill request instead of EDIT blocks). Ship the
-        # winner, but SURFACE that its flagged defects are unaddressed rather than
-        # letting them ship silently.
-        store.log_event(session.session_id, "winner_fixes_none",
-                        {"file": filename, "defects": len(defects)})
-        session.unresolved.append(
-            f"{filename} shipped with {len(defects)} judge-flagged defect(s) the "
-            "finish pass did not apply: " + "; ".join(d[:90] for d in defects[:3]))
-    return content
+    return content, applied
 
 
 def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> None:
     """Propose write+promote of the chosen file (delivery still gated by the
-    human approval and the runtime verification)."""
+    human approval and the runtime verification).
+
+    Panel candidates deliberately use basename-only scratch names so competing
+    seats cannot create arbitrary directory trees.  A goal's accepted contract
+    is different: its one required output may be ``src/app.js``.  Restore that
+    exact, already-validated relative path for the final write/promote; otherwise
+    a candidate could visibly succeed while delivery silently landed at
+    ``app.js`` and the next milestone read the wrong file.
+    """
     sid = session.session_id
-    content = _clean_artifact_body(content, base)
+    filename = base
+    if len(session.required_files) == 1:
+        required = session.required_files[0]
+        if Path(required).suffix.lower() == Path(base).suffix.lower():
+            filename = required
+    content = _clean_artifact_body(content, filename)
     _append_proposals(session, store, [
         ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
-                       filename=base, content=content, args={"filename": base, "content": content}),
+                       filename=filename, content=content,
+                       args={"filename": filename, "content": content}),
         ProposedAction(session_id=sid, kind="promote", role=Role.implementer,
-                       filename=base, args={"filename": base}),
+                       filename=filename, args={"filename": filename}),
     ])
 
 
-def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
+def _chair_finish(session: Session, ordered: list[dict], agg: dict, votes: dict,
                   defects: dict, wi: int, call: AgentCall, store: LogStore,
-                  source: str = "") -> tuple[int, list[str], str]:
-    """The strong CODIFIER chairs the blind vote: it reviews the top two
-    candidates in full and RATIFIES the vote's winner or OVERRIDES to the
-    runner-up (judges score by reading and can miss a real bug), then names the
-    finishing defects. Returns (final_index, defect_list, action). Degrades to the
-    raw vote result if the codifier is absent or errs — the vote is never lost."""
-    fallback = (wi, list(dict.fromkeys(defects[wi + 1]))[:6], "vote (no chair)")
+                  source: str = "", governance: Optional[Governance] = None,
+                  ) -> tuple[int, str, int, str, Optional[IntegrationProposal]]:
+    """The strong CODIFIER's SINGLE finishing pass, replacing the old chair
+    review → fix pass → integration review chain (three serial calls, each
+    re-reading the same candidate bodies): in one reply it RATIFIES the vote's
+    winner or OVERRIDES to the runner-up, fixes the chosen file with surgical
+    EDIT blocks, and — when integration review is on — decides whether a
+    cross-candidate merge is worth offering. Returns (final_index, content,
+    edits_applied, action, integration). Degrades to the raw vote result if the
+    codifier is absent or errs — the vote is never lost."""
+    fallback = (wi, ordered[wi]["content"], 0, "vote (no chair)", None)
     who = _codifier(session)
     if not (who and who.active) or len(ordered) < 2:
         return fallback
+    sid = session.session_id
     order = sorted(range(len(ordered)),
                    key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])),
                    reverse=True)
     win_i, run_i = order[0], order[1]
-    top = [
-        {"label": win_i + 1, "score": agg[win_i + 1], "votes": votes[win_i + 1],
-         "content": ordered[win_i]["content"], "role": "VOTE WINNER"},
-        {"label": run_i + 1, "score": agg[run_i + 1], "votes": votes[run_i + 1],
-         "content": ordered[run_i]["content"], "role": "runner-up"},
-    ]
-    sid = session.session_id
+    # A goal milestone never pauses mid-goal for a human merge decision — the
+    # chosen winner ships and the run keeps moving (unattended goals used to
+    # stall up to once per milestone waiting on this choice).
+    offer_integration = bool(session.integration_review_enabled
+                             and len(ordered) >= 2
+                             and session.task.source != "goal")
+    if session.integration_review_enabled and not offer_integration:
+        store.log_event(sid, "integration_skipped_goal", {})
+    deliverable = _basename(ordered[win_i]["base"])
+
+    def block(i: int, role: str) -> dict:
+        judge_defs = list(dict.fromkeys(defects[i + 1]))[:20] if role != "alternative" else []
+        return {"label": i + 1, "role": role, "score": agg[i + 1], "votes": votes[i + 1],
+                "content": ordered[i]["content"], "judge_defects": judge_defs}
+
+    cands = [block(win_i, "VOTE WINNER"), block(run_i, "runner-up")]
+    if offer_integration:
+        cands += [block(i, "alternative") for i in range(len(ordered)) if i not in (win_i, run_i)]
+    prompt = rounds.chair_finish_prompt(session, cands, deliverable, offer_integration, source)
     try:
-        ans = call(who, rounds.chair_review_prompt(session, top, source))
+        ans = call(who, prompt)
     except (AgentError, BudgetExceeded):
         return fallback
+    if governance is not None:
+        # a chair that answers with a SKILL request (live: it asked to read the
+        # source instead of deciding) gets the read resolved and is re-called
+        ans = _resolve_skill_requests(session, who, prompt, ans, call, governance,
+                                      store, recall=call)
     chosen, overrode, chair_defects = rounds.parse_chair_decision(ans.content, win_i + 1, run_i + 1)
     final_i = run_i if (overrode and chosen == run_i + 1) else win_i
     if final_i != win_i:
@@ -2065,8 +2759,46 @@ def _chair_review(session: Session, ordered: list[dict], agg: dict, votes: dict,
     else:
         store.log_event(sid, "chair_ratified", {"winner": win_i + 1})
         action = "chair ratified the vote"
-    dl = list(dict.fromkeys(chair_defects or defects[final_i + 1]))[:6]
-    return final_i, dl, action
+    final_base = _basename(ordered[final_i]["base"])
+    content, applied = _apply_reply_edits(ordered[final_i]["content"], ans.content, sid)
+    cleaned = _clean_artifact_body(content, final_base)
+    if cleaned != content:
+        content = cleaned
+        store.log_event(sid, "winner_protocol_header_stripped", {"file": final_base})
+    registered = list(dict.fromkeys(defects[final_i + 1]))[:20]
+    resolutions = rounds.parse_defect_resolutions(ans.content)
+    missing_resolutions = [
+        f"D{i}" for i in range(1, len(registered) + 1)
+        if f"D{i}" not in resolutions
+    ]
+    all_defects = list(dict.fromkeys([*registered, *chair_defects]))[:20]
+    session.quality_gate.update({
+        "judge_defects": all_defects,
+        "chair_resolutions": resolutions,
+        "chair_missing_resolutions": missing_resolutions,
+    })
+    if missing_resolutions:
+        store.log_event(
+            sid, "chair_defect_closure_incomplete",
+            {"file": final_base, "missing": missing_resolutions},
+        )
+    flagged = list(dict.fromkeys(chair_defects or registered))[:20]
+    if applied:
+        store.log_event(sid, "winner_fixes_applied", {"file": final_base, "applied": applied})
+    elif flagged:
+        # The chair returned no usable edits for the flagged defects. Ship the
+        # winner, but SURFACE the unaddressed defects rather than shipping
+        # them silently.
+        store.log_event(sid, "winner_fixes_none", {"file": final_base, "defects": len(flagged)})
+        session.unresolved.append(
+            f"{final_base} has {len(flagged)} flagged defect(s) the chair did not apply; "
+            "they are pending the independent frontier release gate: "
+            + "; ".join(d[:90] for d in flagged[:3]))
+    integration = None
+    if offer_integration:
+        integration = _parse_integration_offer(
+            session, deliverable, content, final_i, ordered, agg, votes, ans.content, store)
+    return final_i, content, applied, action, integration
 
 
 def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
@@ -2085,19 +2817,11 @@ def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
             session, base, target["content"], target.get("_error", "unknown")))
     except (AgentError, BudgetExceeded):
         return None
-    content, applied = target["content"], 0
-    for a in _parse_proposals(sid, ans.content):
-        if a.kind != "edit_file":
-            continue
-        old = (a.args.get("old") or "").replace("\r\n", "\n").replace("\r", "\n")
-        new = (a.args.get("new") or "").replace("\r\n", "\n").replace("\r", "\n")
-        norm = content.replace("\r\n", "\n")
-        if old and norm.count(old) == 1:
-            content = norm.replace(old, new, 1)
-            applied += 1
+    content, applied = _apply_reply_edits(target["content"], ans.content, sid)
     if not applied:
         return None
-    ran, testable, detail, _dyn = smoke.smoke_source(content, Path(base).suffix or ".html")
+    ran, testable, detail, _dyn = smoke.smoke_source(
+        content, Path(base).suffix or ".html", prelude=_runtime_prelude(session, base))
     if not ran:
         store.log_event(sid, "chair_recover_failed", {"file": base, "detail": detail})
         return None
@@ -2105,47 +2829,26 @@ def _chair_recover(session: Session, crashers: list[dict], call: AgentCall,
     return {"agent": target["agent"] + " (chair-repaired)", "base": base, "content": content}
 
 
-def _propose_integration(
-    session: Session, filename: str, winner_content: str, winner_index: int, ordered: list[dict],
-    agg: dict[int, int], votes: dict[int, int], call: AgentCall, store: LogStore,
-    governance: Optional[Governance] = None, source: str = "",
+def _parse_integration_offer(
+    session: Session, filename: str, winner_content: str, winner_index: int,
+    ordered: list[dict], agg: dict[int, int], votes: dict[int, int],
+    reply: str, store: LogStore,
 ) -> Optional[IntegrationProposal]:
-    """Return a separately validated merge proposal, never an automatic rewrite."""
-    if not session.integration_review_enabled or len(ordered) < 2:
-        return None
-    codifier = _codifier(session)
-    if not (codifier and codifier.active):
-        return None
-    candidates = [
-        {
-            "label": i + 1,
-            "role": "VOTE WINNER" if i == winner_index else "alternative",
-            "score": agg[i + 1],
-            "votes": votes[i + 1],
-            "content": winner_content if i == winner_index else c["content"],
-        }
-        for i, c in enumerate(ordered)
-    ]
-    try:
-        prompt = rounds.integration_prompt(session, filename, candidates, source)
-        answer = call(codifier, prompt)
-    except (AgentError, BudgetExceeded):
-        return None
-    if governance is not None:
-        answer = _resolve_skill_requests(
-            session, codifier, prompt, answer, call, governance, store, recall=call,
-        )
-    offered, rationale, sources = rounds.parse_integration_decision(answer.content)
+    """Validate a merge the chair offered inside its finishing reply (SYNERGY:
+    YES + a complete ARTIFACT). A separately validated proposal for the human,
+    never an automatic rewrite; the chosen winner stays the default."""
+    offered, rationale, sources = rounds.parse_integration_decision(reply)
     if not offered:
         store.log_event(session.session_id, "integration_not_offered", {})
         return None
-    writes = [a for a in _parse_proposals(session.session_id, answer.content)
+    writes = [a for a in _parse_proposals(session.session_id, reply)
               if a.kind == "write_file" and _basename(a.filename) == filename and a.content.strip()]
     if len(writes) != 1 or writes[0].content == winner_content:
         store.log_event(session.session_id, "integration_rejected", {"reason": "missing or unchanged artifact"})
         return None
     content = writes[0].content
-    ran, testable, detail, _dynamic = smoke.smoke_source(content, Path(filename).suffix or ".html")
+    ran, testable, detail, _dynamic = smoke.smoke_source(
+        content, Path(filename).suffix or ".html", prelude=_runtime_prelude(session, filename))
     if testable and not ran:
         store.log_event(session.session_id, "integration_rejected", {"reason": "runtime failure", "detail": detail})
         return None
@@ -2166,6 +2869,107 @@ def _propose_integration(
     return proposal
 
 
+def _independent_frontier_release_gate(
+    session: Session, council: Council, winner_agent: str, filename: str,
+    content: str, call: AgentCall, store: LogStore,
+) -> tuple[str, int, str]:
+    """Require an independent frontier engineer to accept (and repair) code.
+
+    This is intentionally implementation-capable verification, not a late judge
+    cameo. A FAIL must include usable edits, those edits must still run, and a
+    second clean-room pass must explicitly confirm them before release.
+    """
+    if not session.required_frontier_authors:
+        return content, 0, "not required"
+    chair = _codifier(session)
+    excluded = {winner_agent}
+    if chair:
+        excluded.add(chair.agent)
+    unique: dict[str, CouncilMember] = {}
+    for member in council.members:
+        if (member.active and member.agent in config.FRONTIER_AUTHOR_SEATS
+                and member.agent not in unique):
+            unique[member.agent] = member
+    verifier = next(
+        (unique[agent] for agent in config.FRONTIER_AUTHOR_SEATS
+         if agent in unique and agent not in excluded),
+        None,
+    )
+    if verifier is None:
+        raise QualityGateFailed(
+            "no independent frontier release engineer remained after excluding "
+            f"winner {winner_agent!r} and chair {chair.agent if chair else 'none'!r}"
+        )
+    sid = session.session_id
+    defects = list(session.quality_gate.get("judge_defects") or [])
+    resolutions = dict(session.quality_gate.get("chair_resolutions") or {})
+    total_edits = 0
+    for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
+        prompt = rounds.frontier_release_prompt(
+            session, [(filename, content)], defects, resolutions,
+            repair_attempt=attempt,
+        )
+        try:
+            answer = call(verifier, prompt, config.FRONTIER_VERIFY_TIMEOUT)
+        except (AgentError, BudgetExceeded) as e:
+            raise QualityGateFailed(
+                f"independent verifier {verifier.agent} did not complete: {e}"
+            ) from e
+        verdict, checks, remaining = rounds.parse_frontier_verdict(answer.content)
+        expected = {
+            f"R{i}" for i in range(1, len(rounds.acceptance_requirements(session.task.text)) + 1)
+        }
+        checked = {item.get("id") for item in checks}
+        missing_checks = sorted(expected - checked)
+        if missing_checks:
+            verdict = "FAIL"
+            remaining.append(
+                "missing acceptance checks: " + ", ".join(missing_checks)
+            )
+        session.quality_gate.update({
+            "verifier": verifier.agent,
+            "verdict": verdict,
+            "checks": checks,
+            "remaining_defects": remaining,
+            "missing_checks": missing_checks,
+            "attempt": attempt + 1,
+        })
+        store.log_event(
+            sid, "frontier_release_verdict",
+            {"agent": verifier.agent, "verdict": verdict,
+             "checks": len(checks), "defects": len(remaining),
+             "attempt": attempt + 1},
+        )
+        if verdict == "PASS":
+            return content, total_edits, verifier.agent
+        if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
+            break
+        patched, applied = _apply_reply_edits(content, answer.content, sid)
+        if not applied or patched == content:
+            raise QualityGateFailed(
+                f"independent verifier {verifier.agent} rejected {filename} "
+                "without a usable implementation repair"
+            )
+        ran, testable, detail, _dynamic = smoke.smoke_source(
+            patched, Path(filename).suffix or ".html",
+            prelude=_runtime_prelude(session, filename),
+        )
+        if testable and not ran:
+            raise QualityGateFailed(
+                f"frontier repair broke {filename}: {detail}"
+            )
+        content = patched
+        total_edits += applied
+        store.log_event(
+            sid, "frontier_release_repair_applied",
+            {"agent": verifier.agent, "file": filename, "edits": applied},
+        )
+    raise QualityGateFailed(
+        f"independent verifier {verifier.agent} rejected {filename}: "
+        + "; ".join(item[:120] for item in session.quality_gate.get("remaining_defects", [])[:3])
+    )
+
+
 def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember],
                    call: AgentCall, codifier_call: AgentCall, store: LogStore,
                    governance: Optional[Governance] = None) -> Optional[dict]:
@@ -2177,6 +2981,22 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     candidates or the vote collapsed). The lead only orchestrated getting here;
     the codify + examine stage is the strong model's job."""
     candidates = _collect_candidates(session)
+    required_frontier = (
+        list(dict.fromkeys(session.required_frontier_authors))
+        if session.classification and session.classification.produces_output else []
+    )
+    authored_agents = {c["agent"] for c in candidates}
+    missing_authored = [agent for agent in required_frontier if agent not in authored_agents]
+    if missing_authored:
+        session.candidate_metrics = {
+            "authored": len(candidates), "runnable": 0,
+            "required_frontier": required_frontier,
+            "missing_frontier_authors": missing_authored,
+        }
+        raise QualityGateFailed(
+            "required frontier author(s) produced no candidate: "
+            + ", ".join(missing_authored)
+        )
     if len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
         return None
     sid = session.session_id
@@ -2199,8 +3019,17 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     runnable: list[dict] = []
     crashers: list[dict] = []
     frozen: list[dict] = []
-    for c in group:
-        ran, testable, detail, dynamic = smoke.smoke_source(c["content"], Path(_basename(c["base"])).suffix or ".html")
+    def probe_candidate(c: dict) -> tuple[dict, bool, bool, str, Optional[bool]]:
+        candidate_name = _basename(c["base"])
+        ran, testable, detail, dynamic = smoke.smoke_source(
+            c["content"], Path(candidate_name).suffix or ".html",
+            prelude=_runtime_prelude(session, candidate_name))
+        return c, ran, testable, detail, dynamic
+
+    probes = _fan_out(session, group, probe_candidate, "smoke", config.MAX_PARALLEL_SMOKE) if len(group) > 1 else [
+        probe_candidate(group[0])
+    ]
+    for c, ran, testable, detail, dynamic in probes:
         c["_dynamic"] = dynamic
         if not testable:
             # Not an executable web artifact (a prose .txt/.md, an unknown type,
@@ -2228,6 +3057,66 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
             session.unresolved.append(
                 f"candidate {c['agent']}/{_basename(c['base'])} rejected — does not run: {detail}")
 
+    # A required frontier implementation that fails runtime returns to its own
+    # author for coding repair before any judge is convened. It is never dropped
+    # and later counted as valuable merely because it supplied a vote.
+    for agent in required_frontier:
+        if any(c["agent"] == agent for c in runnable):
+            continue
+        target = next(
+            (c for c in [*crashers, *frozen] if c["agent"] == agent), None)
+        member = next((m for m in panel if m.agent == agent and m.active), None)
+        if target is None or member is None:
+            continue
+        try:
+            repair = call(
+                member,
+                rounds.frontier_runtime_repair_prompt(
+                    session, _basename(target["base"]), target["content"],
+                    target.get("_error", "runtime acceptance failed"),
+                ),
+                config.FRONTIER_AUTHOR_TIMEOUT,
+            )
+        except (AgentError, BudgetExceeded) as e:
+            store.log_event(
+                sid, "frontier_runtime_repair_failed",
+                {"agent": agent, "error": str(e)[:300]},
+            )
+            continue
+        patched, applied = _apply_reply_edits(target["content"], repair.content, sid)
+        if not applied:
+            store.log_event(
+                sid, "frontier_runtime_repair_failed",
+                {"agent": agent, "error": "no usable EDIT block"},
+            )
+            continue
+        candidate_name = _basename(target["base"])
+        ran, testable, detail, dynamic = smoke.smoke_source(
+            patched, Path(candidate_name).suffix or ".html",
+            prelude=_runtime_prelude(session, candidate_name),
+        )
+        if testable and (not ran or dynamic is False):
+            store.log_event(
+                sid, "frontier_runtime_repair_failed",
+                {"agent": agent, "error": detail[:300]},
+            )
+            continue
+        target["content"] = patched
+        target["_dynamic"] = dynamic
+        target["_runtime"] = "frontier author repaired and passed runtime"
+        if target in crashers:
+            crashers.remove(target)
+        if target in frozen:
+            frozen.remove(target)
+        runnable.append(target)
+        session.frontier_author_recoveries[agent] = (
+            session.frontier_author_recoveries.get(agent, 0) + 1
+        )
+        store.log_event(
+            sid, "frontier_runtime_repaired",
+            {"agent": agent, "file": candidate_name, "edits": applied},
+        )
+
     # A frozen/static candidate loses to a live one; but if EVERY candidate is
     # static, judge them anyway (best effort) rather than discard the panel's work.
     if runnable and frozen:
@@ -2242,6 +3131,26 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
             "but may be static — verify it is actually interactive/playable")
         runnable, frozen = frozen, []
 
+    session.candidate_metrics = {
+        "authored": len(group),
+        "runnable": len(runnable),
+        "runtime_rejected": len(crashers),
+        "static_rejected": len(frozen),
+        "filename_rejected": len(dropped),
+        "required_frontier": required_frontier,
+        "runnable_agents": [c["agent"] for c in runnable],
+    }
+    missing_runnable = [
+        agent for agent in required_frontier
+        if not any(c["agent"] == agent for c in runnable)
+    ]
+    if missing_runnable:
+        session.candidate_metrics["missing_frontier_runnable"] = missing_runnable
+        raise QualityGateFailed(
+            "required frontier candidate(s) failed the runtime gate: "
+            + ", ".join(missing_runnable)
+        )
+
     if not runnable:
         # CHAIR RECOVERY: the codifier repairs the most complete failed attempt
         # instead of throwing all the panel's work away.
@@ -2251,7 +3160,8 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
             return None
         _ship_winner(session, store, rec["base"], rec["content"])
         return {"agent": rec["agent"], "file": rec["base"], "score": None, "votes": 0,
-                "judges": 0, "candidates": len(group), "fixes": 1, "chair": "chair recovered a failed candidate"}
+                "judges": 0, "candidates": len(group), "authored": len(group),
+                "runnable": 1, "fixes": 1, "chair": "chair recovered a failed candidate"}
 
     store.log_event(sid, "candidates_collected",
                     {"n": len(runnable), "rejected": len(crashers),
@@ -2260,12 +3170,17 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
 
     if len(runnable) == 1:
         winner, base = runnable[0], _basename(runnable[0]["base"])
+        sole_content, frontier_edits, verifier_agent = _independent_frontier_release_gate(
+            session, council, winner["agent"], base, winner["content"], call, store)
         store.log_event(sid, "winner_selected",
                         {"agent": winner["agent"], "file": base, "score": None,
                          "votes": 0, "judges": 0, "candidates": len(group), "reason": "sole runner"})
-        _ship_winner(session, store, base, winner["content"])
+        _ship_winner(session, store, base, sole_content)
         return {"agent": winner["agent"], "file": base, "score": None, "votes": 0,
-                "judges": 0, "candidates": len(group), "fixes": 0, "chair": "sole runner"}
+                "judges": 0, "candidates": len(group), "authored": len(group),
+                "runnable": 1, "fixes": frontier_edits,
+                "chair": ("sole runner" if verifier_agent == "not required" else
+                          f"sole runner; independently release-verified by {verifier_agent}")}
 
     judges = panel[: config.MAX_JUDGES]
     ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store, source)
@@ -2273,32 +3188,39 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         return None  # scoring collapsed → author path (with its own nets) instead
     wi = max(range(len(ordered)),
              key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
-    # CHAIR: the codifier reviews the top two and ratifies or overrides the vote.
-    wi, fixlist, chair_action = _chair_review(session, ordered, agg, votes, defects, wi, codifier_call, store, source)
+    # CHAIR — ONE codifier pass ratifies/overrides the vote, applies surgical
+    # fixes, and (when enabled) makes the integration offer.
+    wi, content, applied, chair_action, integration = _chair_finish(
+        session, ordered, agg, votes, defects, wi, codifier_call, store,
+        source=source, governance=governance)
     winner, label = ordered[wi], wi + 1
     base = _basename(winner["base"])
-    content = winner["content"]
     fixes = 0
-    if fixlist:
-        fixed = _apply_targeted_fixes(session, base, content, fixlist, codifier_call, store, source)
-        if fixed != content:
-            # the fix pass must not break the winner — re-verify; keep the
-            # (already-passing) original if the "fixed" version no longer runs.
-            ran, testable, detail, _dyn = smoke.smoke_source(fixed, Path(base).suffix or ".html")
-            if ran:
-                content, fixes = fixed, 1
-            else:
-                store.log_event(sid, "winner_fixes_reverted", {"file": base, "detail": detail})
-                session.unresolved.append(
-                    f"winner fix pass broke {base} ({detail}); shipped the unmodified winner")
+    if applied and content != winner["content"]:
+        # the fix pass must not break the winner — re-verify; keep the
+        # (already-passing) original if the "fixed" version no longer runs.
+        ran, testable, detail, _dyn = smoke.smoke_source(
+            content, Path(base).suffix or ".html", prelude=_runtime_prelude(session, base))
+        if ran:
+            fixes = 1
+        else:
+            store.log_event(sid, "winner_fixes_reverted", {"file": base, "detail": detail})
+            session.unresolved.append(
+                f"winner fix pass broke {base} ({detail}); shipped the unmodified winner")
+            content = winner["content"]
+    else:
+        content = winner["content"]
+    content, frontier_edits, verifier_agent = _independent_frontier_release_gate(
+        session, council, winner["agent"], base, content, call, store)
+    if frontier_edits:
+        fixes += frontier_edits
+        integration = None  # any pre-repair merge offer is now stale
+    if verifier_agent != "not required":
+        chair_action += f"; independently release-verified by {verifier_agent}"
     store.log_event(sid, "winner_selected",
                     {"agent": winner["agent"], "file": base, "score": agg[label],
                      "votes": votes[label], "judges": judged, "candidates": len(group),
                      "chair": chair_action})
-    integration = _propose_integration(
-        session, base, content, wi, ordered, agg, votes, codifier_call, store,
-        governance=governance, source=source,
-    )
     if integration is not None:
         # vote context only known here — the human's decision card names the
         # winner and its credentials instead of an anonymous "voted winner"
@@ -2307,6 +3229,7 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
             "votes": votes[label], "judges": judged, "candidates": len(group),
+            "authored": len(group), "runnable": len(runnable),
             "fixes": fixes, "chair": chair_action, "integration": integration}
 
 
@@ -2438,6 +3361,35 @@ def _complete_truncated_artifacts(
                             {"file": action.filename, "added": len(addition)})
 
 
+def _suppress_package_promotes(session: Session, store: LogStore) -> list[str]:
+    """Enforce the final-batch boundary across every proposal code path."""
+    if not (session.delivery_mode == "final_batch" and session.work_package_id):
+        return []
+    suppressed: list[str] = []
+    for action in session.proposed_actions:
+        if action.kind != "promote" or action.status in ("denied", "executed"):
+            continue
+        suppressed.append(action.filename)
+        action.status = "denied"
+        action.error = "package output stays in goal staging; goal releases one aggregate batch"
+        if action.approval_id:
+            approval = next(
+                (item for item in session.approvals
+                 if item.approval_id == action.approval_id), None)
+            if approval is not None and approval.status == "pending":
+                approval.status = "denied"
+                approval.resolved_at = utcnow()
+                approval.resolved_by = "system"
+    if suppressed:
+        store.log_event(
+            session.session_id,
+            "package_promotes_suppressed",
+            {"files": suppressed, "reason": "goal releases one final batch"},
+        )
+        store.save_session(session)
+    return suppressed
+
+
 def _execute_actions(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     promotes: bool = True,
@@ -2449,6 +3401,10 @@ def _execute_actions(
     tests) — the pass the goal loop repairs against before anything is
     delivered; promotes (and the delivery-target question) wait for the final
     pass."""
+    # Final-batch package work is physically incapable of crossing the user
+    # boundary, even if a parser, salvage path, or repair path synthesizes a
+    # normal PROMOTE after the earlier suppression pass.
+    _suppress_package_promotes(session, store)
     sid = session.session_id
     # A promote with no delivery target: ask the human WHERE at delivery time
     # (never up front — there may have been nothing to deliver). One question,
@@ -2519,6 +3475,9 @@ def _execute_actions(
                 continue
         if action.status == "approved":
             try:
+                if (session.worker_lease
+                        and not store.lease_is_current(session.session_id, session.worker_lease)):
+                    raise SessionCancelled()
                 result = executor.execute(session, action, store.data_dir)
                 action.status = "executed"
                 action.result_path = result  # path for writes/edits/promote; output for run_tests
@@ -2564,7 +3523,7 @@ def _tests_failed(action: ProposedAction) -> Optional[str]:
 def _run_test_fix_loop(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     lead: CouncilMember, call: AgentCall, lead_call: AgentCall,
-) -> None:
+) -> bool:
     """The goal loop: while the latest test run fails, show the lead the real
     failure output and apply its EDIT/ARTIFACT repairs, re-running the tests
     after each attempt — bounded by MAX_TEST_FIX_ATTEMPTS (persisted on the
@@ -2575,15 +3534,15 @@ def _run_test_fix_loop(
         latest = next((a for a in reversed(session.proposed_actions)
                        if a.kind == "run_tests"), None)
         if latest is None:
-            return
+            return False
         failure = _tests_failed(latest)
         if failure is None:
-            return
+            return False
         remaining = (session.budgets.max_agent_calls - session.agent_calls
                      - config.COMPOSER_RESERVED_CALLS)
         if remaining < 1:
             session.unresolved.append("test-fix loop stopped: agent-call budget exhausted")
-            return
+            return False
         session.test_fix_attempts += 1
         attempt = session.test_fix_attempts
         store.log_event(sid, "test_fix_attempt",
@@ -2599,7 +3558,7 @@ def _run_test_fix_loop(
                                         recall=lead_call)
         except (AgentError, BudgetExceeded) as e:
             session.unresolved.append(f"test-fix attempt {attempt} failed: {e}")
-            return
+            return False
         new_actions = _parse_proposals(sid, c.content)
         fixes = [a for a in new_actions if a.kind in ("write_file", "edit_file")]
         reruns = [a for a in new_actions if a.kind == "run_tests"]
@@ -2607,20 +3566,120 @@ def _run_test_fix_loop(
             session.unresolved.append(
                 f"tests still failing; the lead offered no fix on attempt {attempt}: "
                 + " ".join(c.content.split())[:300])
-            return
+            return False
         # the same command re-runs unless the lead explicitly changed it
         if not reruns:
             reruns = [ProposedAction(session_id=sid, kind="run_tests",
                                      role=Role.implementer, filename=latest.filename,
                                      args=dict(latest.args))]
         _append_proposals(session, store, fixes + reruns)
-        _execute_actions(session, manager, governance, store, promotes=False)
+        if _execute_actions(session, manager, governance, store, promotes=False):
+            return True
     latest = next((a for a in reversed(session.proposed_actions)
                    if a.kind == "run_tests"), None)
     if latest is not None and _tests_failed(latest) is not None:
         note = f"tests still failing after {config.MAX_TEST_FIX_ATTEMPTS} fix attempts"
         if note not in session.unresolved:
             session.unresolved.append(note)
+    return False
+
+
+def _repair_artifact_failure(
+    session: Session, manager: SessionManager, governance: Governance, store: LogStore,
+    repair_call: AgentCall,
+) -> bool:
+    """Make bounded, auditable repairs after coordinator validation fails.
+
+    This is intentionally separate from ``RUNTESTS`` repair: runtime smoke and
+    milestone acceptance failures are discovered by Python after the model's
+    own test commands have finished.  Previously they went straight to a final
+    answer that looked terminally successful to goals.
+    """
+    who = _codifier(session)
+    if not (who and who.active):
+        return False
+    candidates = [a for a in session.proposed_actions
+                  if a.kind == "write_file" and (a.content or "").strip()]
+    delivered_names = {a.filename.replace("\\", "/") for a in candidates
+                       if a.role != Role.panelist and a.status == "executed"}
+    missing_required = [name for name in session.required_files
+                        if name not in delivered_names]
+    if missing_required:
+        filename = missing_required[0]
+        matches = [a for a in candidates
+                   if a.filename.replace("\\", "/") == filename
+                   or _basename(a.filename).split("__", 1)[-1] == _basename(filename)]
+        target = max(matches, key=lambda a: len(a.content or "")) if matches else None
+        original = target.content if target is not None else ""
+    elif candidates:
+        target = max(candidates, key=lambda a: len(a.content or ""))
+        filename = _basename(target.filename)
+        # Panel drafts are namespaced only in the sandbox; the repaired output
+        # must use the real deliverable name.
+        for agent in session.panel:
+            prefix = f"{agent}__"
+            if filename.startswith(prefix):
+                filename = filename[len(prefix):]
+                break
+        original = target.content
+    elif session.required_files:
+        filename, original = session.required_files[0], ""
+    else:
+        return False
+    failure = next((u for u in reversed(session.unresolved)
+                    if "verification failed" in u.lower() or "required artifact" in u.lower()),
+                   "coordinator validation failed")
+    while session.artifact_repair_attempts < config.MAX_ARTIFACT_REPAIR_ATTEMPTS:
+        session.artifact_repair_attempts += 1
+        attempt = session.artifact_repair_attempts
+        store.log_event(session.session_id, "artifact_repair_started",
+                        {"attempt": attempt, "file": filename, "failure": failure[:500]})
+        prompt = (
+            f"Repair the failed deliverable for this task:\n{session.task.text}\n\n"
+            f"Coordinator validation failure:\n{failure}\n\n"
+            f"Target file: {filename}\n"
+            "Return EXACTLY one complete replacement, with no analysis or fences:\n"
+            f"ARTIFACT: {filename}\n<raw complete file bytes>\n\n"
+            "The replacement must work with the declared dependencies already in the project.\n"
+            f"CURRENT FILE:\n-----\n{original}\n-----"
+        )
+        try:
+            reply = repair_call(who, prompt)
+        except (AgentError, BudgetExceeded) as e:
+            store.log_event(session.session_id, "artifact_repair_failed",
+                            {"attempt": attempt, "file": filename, "reason": str(e)[:300]})
+            continue
+        writes = [a for a in _parse_proposals(session.session_id, reply.content)
+                  if a.kind == "write_file"
+                  and a.filename.replace("\\", "/") == filename and a.content.strip()]
+        if len(writes) != 1:
+            store.log_event(session.session_id, "artifact_repair_failed",
+                            {"attempt": attempt, "file": filename,
+                             "reason": "repair did not return one complete artifact"})
+            continue
+        repaired = writes[0]
+        repaired.role = Role.implementer
+        repaired.filename = filename
+        repaired.args["filename"] = filename
+        repair_actions = [repaired]
+        if (session.delivery_mode != "final_batch"
+                and (session.established_root or session.delivery_root) and not any(
+            a.kind == "promote" and a.filename == filename for a in session.proposed_actions
+        )):
+            repair_actions.append(ProposedAction(
+                session_id=session.session_id, kind="promote", role=Role.implementer,
+                filename=filename, args={"filename": filename}))
+        _append_proposals(session, store, repair_actions)
+        if _execute_actions(session, manager, governance, store, promotes=False):
+            return True
+        if repaired.status == "executed":
+            store.log_event(session.session_id, "artifact_repair_written",
+                            {"attempt": attempt, "file": filename})
+            return True
+        store.log_event(session.session_id, "artifact_repair_failed",
+                        {"attempt": attempt, "file": filename,
+                         "reason": repaired.error or repaired.status})
+    return False
 
 
 def _lead_preamble(session: Session) -> str:
@@ -2684,6 +3743,99 @@ def _build_summary_final(session: Session, delivered: list[ProposedAction]) -> F
     )
 
 
+def _run_acceptance_checks(session: Session, store: LogStore,
+                           actions: list[ProposedAction]) -> list[str]:
+    """Stage an exact project tree and run static planner checks only."""
+    if not session.acceptance_commands:
+        return []
+    import shutil
+
+    stage = executor.artifacts_dir(store.data_dir, session.session_id) / ".acceptance"
+    roots = [executor.artifacts_dir(store.data_dir, session.session_id),
+             session.workspace_root, session.delivery_root, session.established_root]
+
+    def source_for(name: str) -> Optional[Path]:
+        for root in roots:
+            if not root:
+                continue
+            try:
+                candidate = executor.resolve_in_workspace(Path(root), name)
+            except ExecutionError:
+                continue
+            if candidate.is_file():
+                return candidate
+        return None
+
+    try:
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
+        for name in session.runtime_dependencies:
+            src = source_for(name)
+            if src is None:
+                return [f"required runtime dependency missing: {name}"]
+            expected = session.dependency_hashes.get(name)
+            if expected and hashlib.sha256(src.read_bytes()).hexdigest() != expected:
+                return [f"runtime dependency changed since acceptance: {name}"]
+            dst = executor.resolve_in_workspace(stage, name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        for action in actions:
+            src = Path(action.result_path or "")
+            if not src.is_file():
+                continue
+            dst = executor.resolve_in_workspace(stage, action.filename.replace("\\", "/"))
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        failures: list[str] = []
+        for command in session.acceptance_commands:
+            try:
+                argv = validation.static_check_argv(command, stage)
+                result = validation.run(argv, stage, config.RUN_TESTS_TIMEOUT,
+                                        config.RUN_TESTS_OUTPUT_MAX_CHARS)
+            except validation.ValidationCommandError as e:
+                failures.append(f"acceptance check rejected ({command}): {e}")
+                continue
+            if "[passed]" not in result:
+                failures.append(f"acceptance check failed ({command}): {result[-500:]}")
+            else:
+                store.log_event(session.session_id, "acceptance_check_passed", {"command": command})
+    except (OSError, ExecutionError) as e:
+        return [f"could not stage acceptance check: {e}"]
+    return failures
+
+
+def _revision_contract_failures(session: Session, filename: str, text: str) -> list[str]:
+    """Check that a patch kept the original public surface and wired new behavior.
+
+    This is deliberately stronger than "the page loaded": a revision that
+    deletes the portal's exported APIs or leaves a new game class unregistered
+    can survive a generic first-frame smoke test yet be unusable in the app.
+    """
+    name = filename.replace("\\", "/")
+    if name not in _revision_targets(session):
+        return []
+    failures: list[str] = []
+    for item in session.revision_api_contract.get(name, []):
+        kind, symbol = item.split(":", 1)
+        if kind == "window" and not re.search(rf"\bwindow\.{re.escape(symbol)}\s*=", text):
+            failures.append(f"revision removed public export window.{symbol}")
+        elif kind == "class" and not re.search(rf"\bclass\s+{re.escape(symbol)}\b", text):
+            failures.append(f"revision removed public class {symbol}")
+    for item in session.revision_assertions.get(name, []):
+        kind, *parts = item.split(":")
+        if kind == "extends" and len(parts) == 2:
+            sub, base = parts
+            if not re.search(rf"\bclass\s+{re.escape(sub)}\s+extends\s+{re.escape(base)}\b", text):
+                failures.append(f"requested behavior missing: class {sub} extends {base}")
+        elif kind == "registry" and len(parts) == 2:
+            game_id, klass = parts
+            pattern = (rf"ArcadePortal\.register\(\s*['\"]{re.escape(game_id)}['\"]\s*,"
+                       rf"\s*['\"][^'\"]+['\"]\s*,\s*{re.escape(klass)}\s*\)")
+            if not re.search(pattern, text):
+                failures.append(f"requested behavior missing: registry {game_id} uses {klass}")
+    return failures
+
+
 def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bool = False) -> bool:
     """Deterministic guardrail run whenever a task produced (or had to produce)
     file artifacts. Every executed file must exist and be real — non-empty after
@@ -2691,7 +3843,11 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
     attempted file output but landed nothing, or a task that was REQUIRED to
     produce a file (require_file) but produced none, fails. A pure-answer task
     with no file actions and no requirement has nothing to verify and passes."""
-    file_actions = [a for a in session.proposed_actions if a.kind in _FILE_OUTPUT_KINDS]
+    # Panel drafts are deliberately namespaced scratch evidence.  They must
+    # never satisfy (or fail) the final delivery verification; only the chosen
+    # implementation actions form the candidate deliverable.
+    file_actions = [a for a in session.proposed_actions
+                    if a.kind in _FILE_OUTPUT_KINDS and a.role != Role.panelist]
     executed = [a for a in file_actions if a.status == "executed" and a.result_path]
     failures: list[str] = []
     _smoke_checked: set[str] = set()  # smoke-test each filename once
@@ -2702,6 +3858,65 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
             failures.append("no file artifact was successfully written to disk")
         else:
             return True  # nothing was meant to be produced; nothing to verify
+
+    if session.required_files:
+        written = {a.filename.replace("\\", "/") for a in executed}
+        for required in session.required_files:
+            if required not in written:
+                failures.append(f"required artifact missing: {required}")
+
+    # A later milestone must not silently build against a changed predecessor.
+    # Only dependencies with an accepted delivery hash are constrained here;
+    # explicitly user-supplied/established inputs can remain intentionally live.
+    mutable_targets = set(_revision_targets(session))
+    # A revision's own target is intentionally mutable inside the sandbox, but
+    # the source it was based on must still be the same source at delivery time.
+    # Otherwise an unrelated edit made while the council was working could be
+    # silently overwritten by the later approved promote.
+    for name, expected in session.revision_base_hashes.items():
+        normalized = name.replace("\\", "/")
+        if normalized not in mutable_targets or not expected:
+            continue
+        source = _revision_source_for(session, store.data_dir, normalized)
+        if source is None:
+            failures.append(f"revision base disappeared before delivery: {normalized}")
+            continue
+        try:
+            actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        except OSError as e:
+            failures.append(f"could not hash revision base {normalized}: {e}")
+            continue
+        if actual != expected:
+            failures.append(
+                f"revision base changed externally before delivery: {normalized}; "
+                "refusing to overwrite it")
+    for name, expected in session.dependency_hashes.items():
+        # Defend old persisted sessions too: an output that deliberately edits
+        # the same path is never an immutable dependency after authoring.
+        if name.replace("\\", "/") in mutable_targets:
+            continue
+        found = None
+        for root in (executor.artifacts_dir(store.data_dir, session.session_id),
+                     session.workspace_root, session.delivery_root, session.established_root):
+            if not root:
+                continue
+            try:
+                candidate = executor.resolve_in_workspace(Path(root), name)
+            except ExecutionError:
+                continue
+            if candidate.is_file():
+                found = candidate
+                break
+        if found is None:
+            failures.append(f"accepted dependency disappeared: {name}")
+            continue
+        try:
+            actual = hashlib.sha256(found.read_bytes()).hexdigest()
+        except OSError as e:
+            failures.append(f"could not hash dependency {name}: {e}")
+            continue
+        if actual != expected:
+            failures.append(f"accepted dependency changed: {name}")
 
     for action in executed:
         path = Path(action.result_path)
@@ -2718,6 +3933,8 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                     failures.append(f"{action.filename}: leaked ARTIFACT protocol header into delivered content")
                     continue
                 for failure in _matched_source_structure_failures(session, text):
+                    failures.append(f"{action.filename}: {failure}")
+                for failure in _revision_contract_failures(session, action.filename, text):
                     failures.append(f"{action.filename}: {failure}")
             if path.suffix.lower() in {".html", ".htm"}:
                 low = text.lower()
@@ -2736,9 +3953,24 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
             # well-formed document — cannot catch a first-frame crash (live: a
             # blind 5-judge vote shipped a Centipede that threw on load and
             # showed a black screen). Execute it headless; a throw is a failure.
-            if smoke.is_web_file(path) and action.filename not in _smoke_checked:
+            deferred_module_runtime = (
+                path.suffix.lower() in {".js", ".mjs"}
+                and bool(session.deferred_runtime_dependencies)
+            )
+            if deferred_module_runtime:
+                store.log_event(
+                    session.session_id,
+                    "runtime_deferred",
+                    {
+                        "file": action.filename,
+                        "waiting_for": list(session.deferred_runtime_dependencies),
+                        "reason": "contract provider is still building; integration verifies assembled runtime",
+                    },
+                )
+            elif smoke.is_web_file(path) and action.filename not in _smoke_checked:
                 _smoke_checked.add(action.filename)
-                ran, testable, detail, dynamic = smoke.smoke_test(path)
+                ran, testable, detail, dynamic = smoke.smoke_test(
+                    path, prelude=_runtime_prelude(session, action.filename))
                 if not ran:
                     failures.append(f"{action.filename}: does not run — {detail}")
                 elif testable:
@@ -2754,6 +3986,9 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                             "verify it is actually interactive/playable")
         except OSError as e:
             failures.append(f"{action.filename}: verification error: {e}")
+
+    if not failures:
+        failures.extend(_run_acceptance_checks(session, store, executed))
 
     if failures:
         message = "artifact verification failed: " + "; ".join(failures)
@@ -2830,6 +4065,7 @@ def resume_with_input(
         session.final = parse_final(session, result.content) or fallback_final(
             session, "summarizer answer after user input was unparseable"
         )
+        session.outcome = "succeeded"
         manager.transition(session, SessionStatus.done)
         store.log_event(sid, "final_composed", session.final.model_dump())
         store.save_session(session)

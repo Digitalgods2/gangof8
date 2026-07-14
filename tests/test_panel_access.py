@@ -40,10 +40,9 @@ def session(store):
     return SessionManager(store).create("panel access test task", source="test")
 
 
-def test_agent_call_honors_per_seat_timeout_with_authoring_floor(session, store):
-    # The Settings per-seat timeout is the seat's base budget; an explicit heavy
-    # timeout (authoring) still applies as a floor. Raising the seat raises its
-    # authoring headroom too; lowering it can't starve authoring.
+def test_agent_call_honors_per_seat_timeout_as_an_upper_bound(session, store):
+    # The Settings value is an honest cap. A purpose-specific call may choose a
+    # shorter retry window, but a heavy authoring request cannot exceed the cap.
     from types import SimpleNamespace
     session.cli_timeouts = {"claude": 500}
     session.budgets.max_agent_calls = 50
@@ -57,11 +56,11 @@ def test_agent_call_honors_per_seat_timeout_with_authoring_floor(session, store)
     reg = Reg()
     claude = CouncilMember(role=Role.panelist, agent="claude")
     loop._agent_call(session, reg, store, claude, "p")                  # None → seat setting 500
-    loop._agent_call(session, reg, store, claude, "p", timeout_s=300)   # max(300, 500) = 500 (floor)
-    loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # max(800, 500) = 800 (explicit wins)
+    loop._agent_call(session, reg, store, claude, "p", timeout_s=300)   # focused call stays 300
+    loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # heavy call is capped at 500
     codex = CouncilMember(role=Role.panelist, agent="codex")
     loop._agent_call(session, reg, store, codex, "p")                   # no override → config default 300
-    assert seen == [500, 500, 800, 300]
+    assert seen == [500, 300, 500, 300]
 
 
 def test_panel_one_uses_the_authoring_timeout(session, governance, store):
@@ -77,6 +76,30 @@ def test_panel_one_uses_the_authoring_timeout(session, governance, store):
     member = CouncilMember(role=Role.panelist, agent="codex", active=True)
     loop._panel_one(session, member, "author the game", call, governance, store, timeout_s=600)
     assert seen["timeout"] == 600
+
+
+def test_panel_source_followup_preserves_the_authoring_timeout(
+    tmp_path, session, governance, store,
+):
+    """Regression: Claude's read-then-author recall used to fall back to 320s."""
+    d = executor.artifacts_dir(tmp_path, session.session_id)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "source.txt").write_text("real source", encoding="utf-8")
+    member = CouncilMember(role=Role.panelist, agent="claude", active=True)
+    replies = iter([
+        "SKILL: read_file source.txt",
+        "grounded implementation after reading the source",
+    ])
+    seen: list[int | None] = []
+
+    def call(m, prompt, timeout_s=None):
+        seen.append(timeout_s)
+        return _contribution(m.role, m.agent, next(replies))
+
+    out = loop._panel_one(
+        session, member, "author it", call, governance, store, timeout_s=900)
+    assert out is not None
+    assert seen == [900, 900]
 
 
 def _contribution(role: Role, agent: str, content: str) -> Contribution:

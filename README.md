@@ -1,674 +1,816 @@
-# Gang of 8 — Type 1: Coordinator OS
+# Gang of 8
 
-**One question. Every AI you have. One answer you can trust.**
+![Gang of 8](gangof8/static/gangof8-text.png)
 
-Ask a single AI something hard and you get one perspective — with that model's
-blind spots baked in. Gang of 8 asks **all of them at once**: every AI on
-your machine (the claude, codex, and gemini CLIs) plus any API seats you
-enable (DeepSeek, GLM, Qwen, Kimi) convenes as a *panel*, each writing its
-take **independently and in parallel** — nobody sees anyone else's answer
-while writing, so you get genuinely different perspectives instead of an echo
-chamber. Then a **lead** model reads them all and does what a good engineering
-manager does: verifies claims against the actual evidence before believing
-them, adopts what's right, overrules what's wrong *by name*, and **assigns the
-substantive work to specialist talents** — the coder codes, the researcher
-researches, the critic checks — then integrates what they produce. Every
-contribution is tagged with the exact model that wrote it.
+Gang of 8 is a local, human-governed coordinator for multiple LLMs. It can
+convene the whole configured council to compare independent solutions, or turn
+the same council into a build team whose members own different parts of a
+larger job. The application runs the models, captures their work as real
+artifacts, verifies it, keeps an audit trail, and requires approval before
+moving finished work into a real project.
 
-It doesn't just talk — it **builds**. Ask for working software and the
-council designs it, the lead delegates the authoring to its coder talent
-(whose ARTIFACT output is captured directly as real files), runs the tests,
-and **fixes its own failures** before anything ships. Deliberation rotates
-automatically, pausing to ask *you* only when it wants more rounds; work
-happens freely in a sandboxed scratch space; and exactly **one hard gate**
-stands between the council and your real files — a diff-carrying approval
-that nothing crosses without your click. Everything is bounded (budgets,
-wall-clock, depth caps), everything is logged, and a run that fails says so
-honestly instead of dressing up a failure as an answer.
+The name describes the intended full roster: one coordinator plus seven model
+seats. The bundled roster can combine three local CLI seats (Claude, Codex, and
+Gemini) with four optional OpenRouter seats (DeepSeek, GLM, Qwen, and Kimi).
+Seats can be enabled, disabled, remapped, and model-pinned in Settings. New
+runs snapshot the enabled roster; disabling seats is the supported way to use a
+smaller council.
 
-The result: the diversity of a committee, the decisiveness of a single owner,
-and the receipts of an audit trail — running entirely on your desk. See
-[How a deliberation works](#how-a-deliberation-works-the-panel-model) below;
-full design in [DESIGN.md](DESIGN.md).
+Gang of 8 is currently version `0.1.0` and under active development. It is a
+single-user desktop service, not a hosted multi-tenant system.
 
-Gang of 8 is **fully self-contained**: it runs the local agent CLIs itself.
-Two backends sit behind one adapter interface — `mock` (offline, deterministic,
-default) and `cli` (the real backend: Gang of 8 invokes the local `claude` /
-`codex` / `gemini` CLIs directly, in plain non-interactive generation mode,
-e.g. `claude -p --output-format json --tools ""`). Tools are disabled /
-read-only in those calls, so agents perform **no** side effects themselves —
-Gang of 8 governance remains the only path to side effects.
+## The two collaboration modes
 
-```powershell
-# real agents — nothing else to start; the CLIs manage their own auth
-.venv\Scripts\python cli.py serve --backend cli
-# or one-shot: .venv\Scripts\python cli.py submit "your task" --backend cli
-# or: $env:GANGOF8_BACKEND = "cli"
+Gang of 8 deliberately uses different logic for a normal request and a large
+build goal.
+
+| | Ordinary task | Build-team goal |
+|---|---|---|
+| Start it with | Any normal prompt | `/goal <objective>`, or a substantial build brief auto-routed from `/tasks` |
+| Best for | Questions, research, reviews, designs, and bounded deliverables | Multi-file builds, overhauls, and long objectives |
+| Council behavior | Every enabled seat produces an independent take or candidate | The architect creates owned work packages with dependencies |
+| Model ownership | Competing whole solutions, followed by blind selection | One named model owns each package and its output paths |
+| Concurrency | Panel calls, smoke checks, and judge waves run in parallel | Contract-linked packages start together; only hard artifact dependencies wait |
+| Integration | Blind best-of-N plus a strong finishing/chair pass | Shared staging makes completed package files available downstream |
+| Delivery | A governed `promote` action for the session | One aggregate diff and one `Approve final batch` decision |
+
+This distinction preserves the reason for using several models. A tournament
+is useful when several independent answers improve selection. A build team is
+useful when seven models should contribute seven different pieces instead of
+rewriting the same file seven times.
+
+Substantial production briefs no longer depend on the user remembering the
+`/goal` command. The dashboard and `POST /tasks` conservatively recognize long,
+multi-surface implementation requests and return a goal response with
+`auto_routed: true`. Short fixes, questions, attachment-driven work, and bounded
+deliverables remain ordinary sessions.
+
+## Frontier implementation policy
+
+Claude and Codex are treated as implementation capacity first and evaluation
+capacity second when they are enabled:
+
+- each must author a substantive source-producing package in a broad build-team
+  goal; the coordinator repairs planner assignments that put them only on
+  review or documentation;
+- an ordinary code tournament requires a candidate from every enabled frontier
+  author, and each required candidate must pass the runtime gate;
+- a failed frontier candidate goes back to the same model for implementation
+  repair before judging; returning later only as a judge does not satisfy the
+  author quorum;
+- frontier authoring and release-verification calls have no coordinator wall
+  clock by default. They remain immediately cancellable by the user;
+- a selected implementation is checked against an explicit requirement list
+  and judge-defect register by a different frontier release engineer; and
+- a build team's assembled final batch receives the same independent frontier
+  inspection before the single approval card is created. A failed inspection
+  can apply surgical code repairs, but the repaired result must pass a second
+  confirmation inspection.
+
+Disabling Claude or Codex in Settings intentionally removes that seat from the
+required quorum. This is the supported way to request a smaller council.
+
+## How an ordinary task works
+
+An ordinary task uses the council as a panel:
+
+1. The coordinator classifies the request and captures its source, output, and
+   delivery context.
+2. Every configured and available panel seat is called. There is no automatic
+   four-seat cap and no latency-based benching.
+3. Seats work independently so the first answer does not anchor the others.
+   Discovery requests such as file reads, project searches, directory listings,
+   and web lookups are resolved through the governed skill layer.
+4. On a build task, each seat can author a complete namespaced candidate in the
+   council workspace.
+5. Candidate files are smoke-tested where supported. A required Claude/Codex
+   failure returns to its author for code repair; it cannot be silently dropped.
+6. Independent judges score anonymous candidates. Judges run in parallel waves;
+   a unanimous first wave can stop the remaining judge calls early.
+7. A strong codifier/chair ratifies or overrides the vote using evidence,
+   closes every numbered judge defect, applies bounded surgical fixes, and can offer a separately validated
+   integration candidate when Council integration review is enabled.
+8. An independent frontier release engineer checks every extracted acceptance
+   requirement, repairs failures when possible, and confirms repaired code in a
+   second pass. Candidate counts report authored and runnable totals separately.
+9. The chosen output remains in a council-controlled space until its governed
+   delivery action is approved.
+
+The panel roster is product intent, not a speed setting. Performance work is
+therefore concentrated in concurrency, early stopping, reduced serial model
+passes, and deterministic summaries. If a smaller panel is desired, disable
+the unwanted seats in Settings before starting the run.
+
+Ordinary deliberation proceeds automatically in bounded round blocks. If the
+lead wants more rounds after the configured consent interval, the app asks
+whether to continue, run a specific number of additional rounds, or compose
+from the work already completed. Agent-call, wall-clock, delegation-depth, and
+fan-out budgets remain hard limits.
+
+## How a build-team goal works
+
+Enter `/goal` in the dashboard composer for work that should be divided among
+the council. For example:
+
+```text
+/goal Overhaul the application in C:\Projects\ExampleApp. Split the work into
+owned frontend, backend, persistence, test, performance, and documentation
+packages. Preserve current behavior and deliver the verified result back to
+C:\Projects\ExampleApp.
 ```
 
-Default role mapping (edit `gangof8/config.py` → `ROLE_AGENTS_CLI`):
-lead→claude, researcher→gemini, critic→codex, summarizer→claude. Any role is
-remappable in settings. The **panel** roster is derived automatically: the
-installed CLI agents plus every OpenRouter seat you enable in Settings
-(DeepSeek, GLM, Qwen, Kimi — needs an API key).
+New goals use `collaboration_mode=build_team` and
+`delivery_mode=final_batch`.
 
-It ships a **web dashboard** with a chat composer, governs real-code delivery
-through the approval-gated **promote** skill, can operate on a real project
-directory (**workspaces**), and **reads attached images** (text, diagrams,
-screenshots) — all detailed below.
+### 1. The architect creates a package graph
 
-## How a deliberation works (the panel model)
+The planner defines each package with:
 
-For output tasks, **Council integration review** is available in Settings. After
-the blind best-of-N vote, the codifier examines every scored candidate for
-concrete complementary strengths. It may offer a separately runtime-validated
-integrated candidate, but that proposal never replaces the voted winner
-automatically: the dashboard shows its full content and the human chooses **Use
-integration** or **Keep voted winner**.
+- a unique package identifier and title;
+- one enabled model owner;
+- hard artifact dependencies and non-blocking interface dependencies;
+- exclusive output paths;
+- an explicit `RELEASE` subset that distinguishes user-facing deliverables
+  from internal modules, build scripts, and QA evidence;
+- required input files;
+- an interface contract; and
+- acceptance checks.
 
-When a task explicitly asks to match a named source, Gang of 8 gives authors,
-judges, finishers, and the integration reviewer the complete named source within
-the configured bound. Its heading and spread structure becomes a hard delivery
-contract: a sequel may change its title, but an output that drops required
-sections cannot pass artifact verification or be promoted.
+For a broad build, the planner is instructed to use the enabled council across
+distinct areas of responsibility. A small job may reasonably need fewer
+packages; the coordinator does not manufacture duplicate work solely to fill
+the roster. Claude and Codex are explicitly assigned source-producing packages
+when enabled, with a frontier seat preferred for final integration. Missing
+owners are normalized across enabled seats, inferred file
+dependencies are added, repeated output paths are sequenced, and cyclic hard
+dependency plans are rejected. A hard `AFTER`/`REQUIRES` edge means verified
+file bytes must exist before the owner can start. A `CONTRACTS` edge gives the
+owner the upstream API, DOM, or data contract immediately and does not block
+scheduling. Sibling modules should normally use contracts; final assembly,
+generated schemas, cross-package revisions, and integrated tests remain hard
+dependencies.
 
-Before a CLI-backed run starts, Gang of 8 checks the non-generative
-authentication-status commands supported by local seats. An unauthenticated
-Claude or Codex seat is removed from that session's panel and judge roster,
-recorded as a degraded council, and never consumes a deliberation call. The
-timeline also records whether an offered integration was adopted or the voted
-winner was kept.
+### 2. The source is copied into private staging
 
-When a session starts, the council roster shows one chip per seat — and each
-seat is a **different origin model**. Here is what each is doing:
+Each goal receives a persistent overlay at:
 
-- **The panelists** (orange chips) are the heart of the design. Every round,
-  ALL of them — the local claude/codex/gemini CLIs plus every enabled
-  OpenRouter seat — get the task (plus the pre-read project context) and write
-  their take **independently and in parallel**. None of them sees the others'
-  answers while writing, deliberately: you get N genuinely different
-  perspectives instead of N models agreeing with whoever spoke first. That is
-  the diversity-of-intelligence bet the whole system is built on. Panel seats
-  have real hands, not just voices: they pull the same governed discovery
-  skills as the lead (`SKILL: read_file/search_project/list_dir/web_search`,
-  resolved mid-fan-out) so takes are grounded in the actual files. **On a file
-  build, each seat authors its own COMPLETE candidate implementation** — saved
-  to the sandbox immediately, namespaced per seat (`codex__index.html`), never
-  clobbering each other.
-- **Best-of-N: the winning file is a real model's code, not a re-write.** On
-  any task that produces a file, every candidate is first **executed headless
-  and any that crash on load are disqualified** — because judging by *reading*
-  is blind to runtime failure (a file can read as complete and correct and
-  still show a black screen). Only files that actually run are then **scored
-  blindly by independent judge seats** (author identity stripped — each judge
-  sees "Candidate 1…N", scores every one on completeness / correctness /
-  fidelity / robustness, and names a winner). The highest-scoring file is
-  shipped as the default, credited to the model that wrote it — with
-  an optional pass of *surgical* fixes for concrete defects the judges flagged
-  (re-executed afterward; if a fix breaks the file, the original winner ships
-  instead). When **Council integration review** is enabled in Settings, the
-  codifier also evaluates every scored candidate for concrete complementary
-  strengths. It can offer a separately runtime-validated integrated candidate,
-  but the proposal never replaces the vote winner automatically: the human
-  chooses **Use integration** or **Keep voted winner** in the dashboard.
-  If only one candidate runs, it wins without a vote; if none run,
-  no winner is declared. The dashboard shows it: 🗳️ candidates, 💥 crashers
-  rejected, ⚖️ each scored, 🏆 the winner. Filename disagreements never cost a
-  candidate: when each seat wrote a single file — even under different names (a
-  task may invite an author-chosen title) — **all** of them are judged together
-  and the winner ships under its own name; only a genuine multi-file build
-  groups by the most-agreed name. Judging is scored purely on the content for a
-  prose deliverable — the "does it run / animate under play" weighting applies
-  only to candidates that actually carry headless-runtime evidence, never to a
-  `.txt` story.
-- **The lead** (yellow chip) is the **orchestrator** — it kicks the task off,
-  feeds the jobs to the panel, and while they work can pull in talents
-  (`CONSULT:` for advice, `DELEGATE:` for production, captured as real files) or
-  a critic as needed. It stays on a **fast** model on purpose: it's on the
-  serial critical path, so a slow, heavy model there stalls or times out the
-  whole run. It ends each round with `ROUND: DONE` or `ROUND: CONTINUE`, and
-  delivery (`PROMOTE:`) is always gated by your approval.
-- **The codifier does the strong post-panel work.** Once the panel returns its
-  candidates, *examining and finishing* them wants a **strong** model — the
-  opposite of the lead's fast one. That job belongs to the **Summarizer seat**:
-  set it to a strong model in Settings → Role mapping and it becomes the
-  council's codifier. On a file build it **chairs best-of-N** — ratifies or
-  overrides the blind vote (reading the top two in full, since judges score by
-  reading and can miss a real bug), **finishes** the winner with surgical fixes,
-  and when *every* candidate crashes it **recovers** the most complete attempt
-  rather than discarding the panel's work. On a plain-answer task it composes the
-  answer. Same seat, both jobs — and it runs with a longer timeout because the
-  examine-and-finish step is meant to think hard. So a run reads as: a fast lead
-  orchestrating, then the strong summarizer codifying.
-- **Why the lead's model also appears as a panelist:** same model, two
-  different jobs. As a panelist it authors one candidate among many; as the
-  lead it judges/orchestrates — a separate call with a separate charter. (Remap
-  the lead in Settings if you'd rather a different model arbitrate.)
-- **The summarizer** (purple chip) composes the final answer card for
-  question/research tasks. Build tasks usually skip it entirely — they get a
-  fast, deterministic file-manifest summary instead.
-- **The specialist talents** (critic, red_team, fact_validator, …) sit dormant
-  until the lead recruits one — then the dashboard shows it live: the status
-  banner reads `🤝 code_generator ← claude (delegate): …` the moment the
-  assignment is made, a dashed 🤝 chip joins the roster, and a plain-language
-  recruitment row appears under the Council card ("claude · opus called in as
-  Code Generator — answered in round 2"). Each role can pin its own model
-  (Settings → Role mapping → agent · model; role pin › seat pin › CLI
-  default), so a rarely-called coder talent can run a heavyweight model while
-  the seat's everyday default stays fast. A delegation that fails is retried
-  once before the lead falls back to doing the work itself.
+```text
+data/goal-workspaces/<goal-id>/stage/
+```
 
-**Rotation is automatic but consent-gated.** Rounds proceed on their own; if
-the lead declares CONTINUE three times (`ROUNDS_PER_CONSENT`, settable), the
-run pauses and asks you: *continue another block, a specific number of rounds,
-or compose the final answer from the work so far?* Budgets (agent calls, wall
-time) remain the hard backstop underneath. A round costs `len(panel) + 1`
-model calls (every seat + the lead synthesis) — which is exactly why the
-consent gate exists.
+When an established source folder is known, it is copied into staging once.
+Large generated or vendor trees such as `.git`, `node_modules`, virtual
+environments, caches, `dist`, `build`, `vendor`, and `target` are skipped. The
+real project remains read-only during package work.
 
-**One hard gate.** Work happens freely in the council's own sandbox/workspace
-(writes, edits, test runs, staging, web lookups — no approvals), and
-council-space skills are open to **every seat**: a role being unable to land
-its work in the sandbox is treated as a design failure, so role-gating never
-blocks council work. The single approval in the whole pipeline — and the one
-place that stays role-gated (the lead decides delivery) — is **promote**:
-copying a finished file into your real folder, with a diff on the approval
-card that says whether it **creates a new file or OVERWRITES an existing one**.
-It lands where the task said to save it — an explicit *"save it in ‹folder›"*
-target is honored as the destination even when the task *reads* from a different
-folder, so a "read from A, save to B" job delivers to B and never overwrites the
-source A. A promote with no known destination asks you *where* at delivery time
-— never up front, never assumed.
-On any approval you can pick **Approve all** to grant that category for the
-whole session — one deliberate decision instead of N identical clicks.
+An active workspace is used as the source when the goal text does not name a
+project folder. Explicit source and delivery folders in the prompt take
+precedence.
 
-**Builds close their own loop.** When a build's `RUNTESTS:` command fails, the
-lead is shown the real failure output and repairs the code (surgical `EDIT:`
-blocks or file re-writes), and the tests re-run — up to 3 attempts, all
-*before* anything is promoted. A build ships passing its own tests, or the
-final answer says exactly why it couldn't.
+### 3. Owners build distinct pieces
+
+Every package whose hard dependencies are satisfied is scheduled. A package
+that only consumes another owner's declared interface can start immediately,
+even while that provider is still working. Dashboard goals run in the
+background, so a broad plan normally puts most or all enabled owners into its
+first execution wave. Each package session contains its named owner rather than
+convening another seven-way candidate tournament.
+
+The owner writes the package's declared artifacts directly. The coordinator
+adopts those artifacts into the package paths; a lead model does not silently
+rewrite the owner's implementation. If a required output is missing, the same
+owner receives one focused retry for that exact artifact. Existing-file
+revisions use the owner and a surgical edit path.
+
+Completed package files are hashed and accepted into shared staging. Hard
+downstream owners read the actual verified bytes produced by upstream owners.
+Contract-linked owners work in parallel from the declared interface; the final
+integration owner reconciles their staged implementations against those
+contracts.
+
+When a standalone JavaScript package intentionally consumes an upstream
+runtime that is still being built, Gang of 8 records its dynamic runtime check
+as deferred instead of executing the module in a false empty environment.
+Static checks and package acceptance checks still run immediately. The
+assembled HTML/integration package remains responsible for the real end-to-end
+runtime check.
+
+### 4. Packages are verified before release
+
+A package cannot complete when its planner contract is missing or malformed,
+a required file is absent or empty, a dependency changed unexpectedly, or an
+acceptance check fails. Static checks recognized by the coordinator can run
+automatically. Functional test commands remain separately approval-gated
+because they execute code.
+
+Validation and test repair loops are bounded. A failure is recorded honestly;
+it does not become a successful milestone merely because the model stopped.
+When a build package cannot recover, the goal pauses with the staging directory
+intact so the failure can be inspected and the goal resumed.
+
+### 5. The entire goal is released once
+
+No package emits an incremental file-promotion approval, including promotions
+suggested by a late repair or salvage response. After every package has passed,
+Gang of 8 creates one release session containing only the planner's explicit
+`RELEASE` manifest. Package `OUTPUTS` remain in staging unless they are also
+named in `RELEASE`; this is how a single-file app releases `arcade.html` without
+also moving its source modules, build scripts, and QA files. If no destination
+was provided, the app asks for one folder at this point. The dashboard then
+shows one aggregate diff and two decisions:
+
+- `Approve final batch`
+- `Deny`
+
+Approval performs a fresh preflight before touching the destination. Every
+staged file must still be present and non-empty, and every destination file
+must still match the existence/hash baseline shown during review. Gang of 8
+prepares the replacements and backups first, then replaces the files. If a
+later replacement fails, it attempts to restore the files already replaced.
+
+This is a rollback-protected multi-file transaction, not a claim that a normal
+filesystem can provide a truly atomic cross-file commit. Target drift, locked
+files, permissions, and rollback failures are surfaced rather than hidden.
+
+If the batch is denied, the goal is paused and its completed staging work is
+retained. Resuming it creates a fresh release review. The user can also choose
+to keep the final batch in staging instead of delivering it.
+
+## Council roster and model configuration
+
+The real `cli` backend can register these local seats when their commands are
+installed and authenticated:
+
+- `claude`
+- `codex`
+- `gemini`
+
+Settings can additionally enable these OpenRouter seats when an OpenRouter API
+key is present:
+
+- `deepseek`
+- `glm`
+- `qwen`
+- `kimi`
+
+The default CLI role mapping is:
+
+| Role | Default seat |
+|---|---|
+| Lead, architect, implementer, code generator, summarizer | Claude |
+| Knowledge retriever, researcher, red team | Gemini |
+| API integrator, critic, fact validator | Codex |
+
+Role mapping and panel membership are separate concepts. A model may be a
+panelist in the full council and also perform a specialist role in a different
+call. Settings supports:
+
+- enabling or disabling local CLI seats;
+- enabling or disabling OpenRouter seats;
+- choosing an explicit panel roster;
+- pinning a model per seat;
+- pinning a different model for a specific role;
+- setting per-CLI-seat timeouts;
+- changing the lead and specialist role mapping;
+- changing complexity budgets and round-consent cadence; and
+- enabling or disabling Council integration review.
+
+Backend and roster changes apply to new sessions. A running or paused session
+keeps the backend, panel, timeouts, and workflow version with which it started.
+Persisted goals created before the build-team overhaul keep their legacy
+tournament/milestone semantics; start a new `/goal` to use owned packages and
+final-batch delivery.
+
+## Timeouts, failures, and recovery
+
+The per-seat timeout shown in Settings is a routine/non-code guardrail and does
+not cap any session classified as code. Coding calls use their stage policies:
+current defaults include a 360-second non-frontier panel authoring budget, a
+180-second focused non-frontier retry budget, a 600-second lead timeout, a
+480-second judge timeout, and a 600-second codifier timeout. Claude/Codex implementation and independent
+release-verification calls are different: their default timeout is `0`, meaning
+no coordinator deadline. Their registered CLI process still stops immediately
+when the user cancels the session or goal. A provider, CLI, authentication, or
+machine failure can still end a call, but elapsed wall time alone does not
+discard frontier code.
+
+Gang of 8 handles failures as follows:
+
+- an unavailable local Claude or Codex login is detected before a CLI-backed
+  ordinary run and recorded as degraded council health;
+- an ordinary non-frontier seat that hits a hard timeout is recorded as dropped;
+- a frontier author returning a stub or transient error is re-called as the same
+  implementation owner; a missing or non-runnable required frontier candidate
+  stops delivery instead of degrading silently;
+- a missing build-package artifact gets a focused retry from its owner, with no
+  coordinator deadline when that owner is Claude or Codex;
+- bounded artifact and test repair loops re-run verification after changes;
+- exhausted recovery does not report success;
+- cancellation and worker leases prevent late background workers from
+  overwriting newer authoritative state; and
+- after a server restart, orphaned live sessions are cancelled and active goals
+  are parked as paused rather than left permanently `running` with no worker.
+
+Resume first scans the audit store for a successful, already-verified attempt
+from the same package owner. If its complete required manifest still exists,
+Gang of 8 adopts those exact files into staging and marks the package complete
+instead of paying the model to redo it. Failed packages are reset together,
+healthy sibling package bindings are preserved, and every ready branch is
+scheduled—not just the first package index. The goal epoch is preserved on
+resume so a healthy sibling cannot be invalidated merely because another
+package failed.
+
+Restart recovery does not resume an interrupted model subprocess in place. It
+parks every running package, not only the first one shown in the goal. Inspect
+the recorded error and explicitly resume the paused goal; completed verified
+work is then recovered as described above.
+
+The dashboard groups retry sessions under their parent goal. Each package row
+shows its owner, effective session state, attempt count, blockers, and active
+model call. The goal card aggregates approval/input blockers and selects the
+actionable session, so a cancelled goal cannot continue to look like an active
+deliberation and a release approval is not hidden behind an arbitrary package.
+
+## Workspaces, staging, and delivery boundaries
+
+Gang of 8 uses several intentionally different file spaces:
+
+| Space | Purpose | Direct model writes? | Human delivery approval? |
+|---|---|---:|---:|
+| Session sandbox | Disposable per-session scratch work | Yes | No |
+| Active workspace | Registered council work area captured by new sessions | Yes | No |
+| Goal staging | Persistent shared overlay for one build-team goal | Yes, through package ownership | No per-file approval |
+| Established/delivery folder | The user's real project or requested output folder | No | Yes |
+
+Paths are resolved inside their selected root. Attempts to escape a workspace
+with absolute-path tricks or `..` traversal are rejected. An explicit “read
+from A, save to B” request keeps the source and delivery roots separate, so a
+source is not overwritten merely because it was read.
+
+The active workspace can be selected in the dashboard or managed from the CLI:
+
+```powershell
+.\.venv\Scripts\python.exe cli.py workspace list
+.\.venv\Scripts\python.exe cli.py workspace add my-project C:\Projects\MyProject
+.\.venv\Scripts\python.exe cli.py workspace use WORKSPACE_ID
+.\.venv\Scripts\python.exe cli.py workspace none
+```
+
+`workspace empty` deletes the contents of the active council workspace. It does
+not empty an established delivery folder, but it is still destructive and
+should be used carefully.
+
+## Governed skills and approvals
+
+Models do not receive unrestricted native shell or filesystem access. They
+request named actions, which Gang of 8 validates and executes.
+
+| Skill | Purpose | Approval behavior |
+|---|---|---|
+| `read_file` | Read from an allowed space | No approval |
+| `search_project` | Search names and file contents | No approval |
+| `list_dir` | List an allowed directory | No approval |
+| `web_search`, `web_fetch` | Retrieve current public information | No approval |
+| `write_file` | Write a file in a council space | No approval |
+| `edit_file` | Replace a unique snippet in a council-space file | No approval |
+| `run_tests` | Run bounded verification in a council space | Recognized static checks can auto-run; functional execution requires approval |
+| `stage` | Move sandbox work into an active council workspace | No approval |
+| `promote` | Copy an ordinary session artifact to the real destination | Approval required |
+| `promote_batch` | Release a goal's complete verified manifest | One final-batch approval required |
+
+An ordinary session can grant a standing approval for a category with
+`approve_all`, avoiding repeated approvals of the same category in that
+session. Build-team goals do not rely on standing per-file promotion approval;
+they suppress intermediate promotions and create one `promote_batch` action.
 
 ## Installation
 
-**Prerequisites (all platforms)**
+### Requirements
 
-- **Python 3.12+** — the only hard requirement.
-- **Git** — to clone the repository.
-- **Node.js** *(optional, recommended)* — powers the headless runtime gate that
-  executes build candidates and disqualifies crashers before judging. Without
-  it, files are judged on content alone.
-- **Agent CLIs** *(optional)* — `claude`, `codex`, and/or `gemini` on PATH for
-  the real `cli` backend. Any subset works; the default `mock` backend needs
-  none at all, so you can try Gang of 8 with zero accounts or keys.
+- Python 3.12 or later
+- A modern browser
+- Node.js only if you want JavaScript syntax checks during development
+- For the real backend: one or more supported model CLIs installed on `PATH`
+  and authenticated
+- For optional API seats: an OpenRouter API key
 
-> The examples in this README use the Windows venv path
-> (`.venv\Scripts\python`). On **macOS/Linux** the equivalent is
-> `.venv/bin/python` — everything else is identical.
-
-### Windows
+Create a virtual environment and install the project:
 
 ```powershell
-# PowerShell — Python from python.org, or: winget install Python.Python.3.12
-git clone https://github.com/Digitalgods2/gangof8.git
-cd gangof8
-python -m venv .venv
-.venv\Scripts\python -m pip install --upgrade pip
-.venv\Scripts\python -m pip install -e ".[dev]"
-
-# try it now — free, offline, no keys:
-.venv\Scripts\python cli.py serve --backend mock
-# real agents (uses your installed CLIs):
-.venv\Scripts\python cli.py serve --backend cli
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-Convenience launchers ship in the repo root: double-click
-**`Launch Gang of 8.bat`** to start the server and open the dashboard
-(**`Launch Gang of 8 (no window).vbs`** does the same with no console window);
-**`Stop Gang of 8.bat`** shuts it down. Edit the `BACKEND` line at the top of
-the `.bat` to switch between `cli` and `mock`.
-
-### macOS
-
-```bash
-# Python via Homebrew if needed: brew install python@3.12   (node: brew install node)
-git clone https://github.com/Digitalgods2/gangof8.git
-cd gangof8
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e ".[dev]"
-
-# try it now — free, offline, no keys:
-.venv/bin/python cli.py serve --backend mock
-# real agents (uses your installed CLIs):
-.venv/bin/python cli.py serve --backend cli
-```
-
-### Linux
-
-```bash
-# Debian/Ubuntu: sudo apt install python3 python3-venv python3-pip git
-# Fedora:        sudo dnf install python3 git
-git clone https://github.com/Digitalgods2/gangof8.git
-cd gangof8
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e ".[dev]"
-
-# try it now — free, offline, no keys:
-.venv/bin/python cli.py serve --backend mock
-# real agents (uses your installed CLIs):
-.venv/bin/python cli.py serve --backend cli
-```
-
-On every platform the dashboard prints and serves at
-`http://127.0.0.1:8790/`.
-
-### Installing the agent CLIs (optional, any platform)
-
-The `cli` backend convenes whatever is installed — each CLI manages its own
-login, and anything absent is simply skipped:
-
-```bash
-npm install -g @anthropic-ai/claude-code   # claude
-npm install -g @openai/codex               # codex
-npm install -g @google/gemini-cli          # gemini
-```
-
-Run each once (`claude`, `codex`, `gemini`) to complete its auth flow before
-the first `--backend cli` session. There is no external service — Gang of 8
-invokes these CLIs locally, with tools disabled, and its own governance is the
-only path to side effects.
-
-**What the Python dependencies are for:**
-
-- `pypdf` — extract text from attached PDFs.
-- `google-genai` — gemini image vision (inline-image inference; needs `GEMINI_API_KEY`).
-- `Pillow` — used only by the test suite to generate images.
-
-The editable install provides the `gangof8` command as an alternative to
-`python cli.py`. Development commands and module ownership are documented in
-[DEVELOPMENT.md](DEVELOPMENT.md).
-
-### How Gang of 8 detects your CLIs
-
-There is no configuration file listing which AIs you have — detection is the
-same PATH lookup your terminal does when you type `claude` and press Enter:
-`shutil.which("claude")` (and likewise for `codex` and `gemini`). Anything
-installed and on PATH is found; anything absent is simply skipped. That one
-mechanism drives three behaviors:
-
-- **Settings → seats** shows each CLI with a live "ready ✓" / unavailable
-  badge — that's the `which` check, re-run on every load.
-- **The panel roster degrades gracefully**: only installed CLIs are convened,
-  so uninstalling one shrinks the panel instead of breaking runs (OpenRouter
-  seats join only when enabled *and* an API key is present).
-- **Windows gotcha, already handled**: npm installs `codex` and `gemini` as
-  `.cmd`/`.ps1` shims, not `.exe` files, and spawning them by bare name fails
-  with `WinError 2`. Gang of 8 resolves the shim's real path via
-  `shutil.which` before launching — if you ever add another npm-installed CLI,
-  that's the pattern to copy.
-
-To see for yourself what would be detected, run the same probe by hand:
+Install the development dependencies when working on the codebase:
 
 ```powershell
-Get-Command claude, codex, gemini -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-Each CLI manages its own login (`claude`, `codex`, and `gemini` all have their
-own auth flows) — Gang of 8 never sees or stores those credentials. Which
-underlying *model* each CLI runs is a separate question: pick it per seat in
-Settings → Local CLI models, or leave it empty to inherit that CLI's own
-default (every contribution displays the model that actually produced it).
+There is no separate `requirements.txt`; `pyproject.toml` is the dependency
+source of truth.
 
-### Which API keys do you need?
+## Starting and stopping the app
 
-Short answer: **none, to start.** The CLIs authenticate themselves, and the
-Settings model dropdowns are fed by a **public, no-key model catalog**
-(refreshed live, newest models first) — so the dynamic model list works out of
-the box. Keys only *add* capability, and both can be pasted in
-**Settings → API keys** (stored locally in gitignored `data/secrets.json`;
-an env var of the same name always wins) — no environment variables required:
-
-| Key | Required? | What it unlocks |
-|-----|-----------|-----------------|
-| *(none)* | — | Full core app: CLI seats, deliberation, builds, promote gate, model dropdowns via the public catalog |
-| **Gemini** (`GEMINI_API_KEY` / Settings) | Optional | The gemini seat runs through Google's SDK instead of its flaky headless CLI (faster, reliable on Windows); the gemini dropdown switches to **Google's own authoritative model list**; gemini image vision; `web_search` with Google Search grounding. Free at aistudio.google.com |
-| **OpenRouter** (`OPENROUTER_API_KEY` / Settings) | Optional | The pay-per-token OpenRouter panel seats (DeepSeek, GLM, Qwen, Kimi, …) |
-
-If a key is absent, the related features degrade gracefully rather than error:
-no Gemini key ⇒ gemini uses its CLI and the dropdown uses the public catalog;
-no OpenRouter key ⇒ the panel is simply CLI-only.
-
-## Use
+For real agents:
 
 ```powershell
-# CLI
-.venv\Scripts\python cli.py submit "Compare SQLite vs. plain JSON files for storing session logs in a local service, and recommend one."
-.venv\Scripts\python cli.py list
-.venv\Scripts\python cli.py status <session_id>
-.venv\Scripts\python cli.py log <session_id>          # JSONL reasoning trail
-.venv\Scripts\python cli.py pending                   # approvals waiting on you
-.venv\Scripts\python cli.py approve <session_id> <approval_id>   # resumes the session
-.venv\Scripts\python cli.py deny <session_id> <approval_id>      # cancels the session
-.venv\Scripts\python cli.py inputs                    # questions agents asked you
-.venv\Scripts\python cli.py answer <session_id> <input_id> your answer text
-.venv\Scripts\python cli.py decline <session_id> <input_id>      # cancels the session
-
-# Workspaces (allowed work areas — see below)
-.venv\Scripts\python cli.py workspace list
-.venv\Scripts\python cli.py workspace add <name> <absolute_path>   # registers + activates
-.venv\Scripts\python cli.py workspace use <workspace_id>
-.venv\Scripts\python cli.py workspace none                         # back to the sandbox
-
-# Selected API routes (the dashboard uses additional internal routes)
-.venv\Scripts\uvicorn gangof8.main:app --port 8790
-# POST /tasks {"text": "...", "attachments": ["up_..."]} · GET /sessions · GET /sessions/{id}
-# POST /uploads {"name": "...", "content_base64": "..."}  → {id, kind, ...}
-# GET /approvals · POST /sessions/{id}/approvals/{aid} {"approved": true|false}
-# GET /inputs · POST /sessions/{id}/inputs/{iid} {"answer": "..."} or {"decline": true}
-# GET/PUT /settings · GET /settings/seats · GET/POST /workspaces · PUT /workspaces/active
+.\.venv\Scripts\python.exe cli.py serve --backend cli
 ```
 
-## Web dashboard
-
-`python cli.py serve --backend cli` (or `--backend mock`) starts the single-page
-dashboard service and prints its address: `http://127.0.0.1:8790/`.
-
-- **Bottom-center chat composer** — auto-growing text box (Enter sends,
-  Shift+Enter for a newline), a **Clear** button, and a **+** menu to attach a
-  **document (text / PDF)** or **image**. Attachments show as removable chips.
-- **Live progress** — the session state persists at every step (each landed
-  contribution, round start, talent recruitment), so the poll sees work as it
-  happens: a pulsing status banner (current round goal, the seat being
-  awaited, in-flight talent pulls, a ticking elapsed timer) and a council
-  roster that green-checks each agent — with its exact model — as it
-  contributes, plus a plain-language recruitment feed under the roster.
-- **Rollups** — the final answer plus a one-line stats summary; contributions
-  and disagreements collapse to informative one-line summaries (expandable),
-  with open/closed state preserved across the 3 s refresh. Finished sessions
-  grow a **Respond to the council** box — multi-modal like the task composer
-  (attach documents/images) — that re-deliberates with the whole thread.
-- **Approvals & questions** — file-write gates surface **Approve / Deny**
-  buttons (naming the exact target path); agent questions surface an
-  **Answer / Decline** box.
-- **Settings gear** — backend, per-role agent mapping, workspaces (add /
-  activate / use-sandbox), governance / composer tunables, and UI prefs, each
-  with a hover tooltip explaining its purpose.
-
-## Operations and Audit
-
-Each session response includes a compact run audit: accumulated model execution
-time, contribution counts by agent and model, repair attempts, action statuses,
-and SHA-256 fingerprints for files written during the run. The dashboard summary
-shows the key execution numbers; `GET /sessions/{id}` returns the full view.
-
-The header's `Diag` control opens a redacted setup report with storage/sandbox
-availability, configured seats and timeouts, the active workspace, API-key
-presence (never key values), web capability, and remote-access mode.
-
-## Local-only service
-
-Gang of 8 is a desktop-local service by design. It can browse local folders,
-open a delivered file with the OS, and reveal locally stored API keys, so it
-binds and accepts requests only from loopback addresses by default.
-
-To bind beyond localhost, pass `--allow-remote` and set
-`GANGOF8_ALLOW_REMOTE=1`; do this only behind an authenticated reverse proxy.
-Key reveal and OS file-open requests remain local-only even in that mode.
-
-## Test
+For a free, deterministic offline smoke run:
 
 ```powershell
-.venv\Scripts\python -m ruff check gangof8 tests
-.venv\Scripts\python -m pytest tests -q
+.\.venv\Scripts\python.exe cli.py serve --backend mock
 ```
 
-GitHub Actions runs the same checks for pull requests and pushes to `main`.
+Then open [http://127.0.0.1:8790/](http://127.0.0.1:8790/).
 
-## Skills & permission kernel
+On Windows, the repository also includes:
 
-Side effects are governed by a data-driven **skill registry** (`skills.py`) and
-a **permission kernel** (`governance.authorize_action`). Each `Skill` declares
-its category, risk, `requires_approval`, allowed roles, and inputs; the kernel
-role-gates every action and decides on that metadata — never on hardcoded
-behaviour.
+- `Launch Gang of 8.bat` — starts the `cli` backend in a visible server window;
+- `Launch Gang of 8 (no window).vbs` — starts it hidden and opens the browser;
+- `Stop Gang of 8.bat` — terminates the process listening on port 8790.
 
-| Skill | Approval | Roles | What it does |
-|-------|----------|-------|--------------|
-| `write_file` / `edit_file` | none | **every seat** | Write/edit files in the council's own sandbox or workspace |
-| `run_tests` | none | lead, implementer, critic, code_generator | Run a test command inside the council's spaces (time/output-bounded) |
-| `read_file` / `search_project` / `list_dir` | none (read) | **every seat** | Read, grep, and list — sandbox, workspace, or the established folder |
-| `web_search` / `web_fetch` | none (read) | **every seat** | Governed live-web lookups via the coordinator |
-| `stage` | none | lead, implementer | Move a file up from sandbox into the permanent workspace |
-| `promote` | **required** (human, with diff) | lead, implementer | **The ONE gate** — copy a council file into your real (established) folder |
+Check the running service without opening the dashboard:
 
-- **Producing files**: an `ARTIFACT: <filename>` block (full contents after
-  the header) writes freely into the sandbox — from the lead, from a
-  **delegated talent** (captured directly, attributed to that talent and its
-  exact model), or from a **panel seat** (saved namespaced per seat as an
-  advisory draft). A `PROMOTE: <filename>` line — the lead's call — is what
-  proposes real delivery; that is where the approval (and, if unset, the
-  "where should this go?" question) happens. If an output task names files but
-  emits no full blocks, the coordinator **materializes** each with a focused
-  single-file call.
-- **Reading mid-deliberation**: any seat — panelists included — may emit a plain-text
-  `SKILL: read_file <path>` or `SKILL: search_project <query>` line; the kernel
-  authorizes it (reads need no approval) and the results are fed back on a
-  re-call. A follow-up reply may open a NEW request (read one file → the next
-  read depends on what it said) — those resolve too, as a bounded chain
-  (`MAX_SKILL_CHAIN_TURNS`, default 3 re-calls) with every result accumulated
-  and repeats never re-executed. A reply that is nothing but an unresolved
-  request is a stub, never a synthesis. The grammar is advertised to a seat
-  only when it's useful.
-- **No agent does I/O itself** — every write flows through the executor +
-  human approval; the only ungated capability is `generate_text`.
+```powershell
+Invoke-RestMethod http://127.0.0.1:8790/health
+Invoke-RestMethod http://127.0.0.1:8790/diagnostics
+```
 
-## Delivery resilience (the safety-net ladder)
+The default programmatic backend is `mock` unless `--backend`, persisted
+Settings, or `GANGOF8_BACKEND` selects `cli`. The Windows launchers explicitly
+select `cli`.
 
-A file-producing run must end in exactly one of two states: a real, complete
-file behind the promote gate, or an honest failure that says so. Between a
-flaky seat and an empty delivery stands a ladder of recoveries — each rung
-tried only when the one above produced nothing:
+## First-run checklist
 
-1. **The lead's own `ARTIFACT:` blocks** — the normal path.
-2. **Materialization** — the draft only *described* the files: each intended
-   file is fetched with its own focused single-file call (the lead's long
-   timeout, since it authors whole files). Intended names come from the draft
-   and the task text; when a revision follow-up ("slow the ghosts down")
-   names no file at all, the fallback is the established folder's files the
-   panel discussed by name (two-plus mentions, so a stray reference to an
-   unrelated file doesn't qualify).
-3. **Panel salvage** — the lead shipped nothing (timed out, errored, or
-   stubbed): the best **complete** file a panelist pasted inline is recovered
-   and proposed for write + promote, attributed to that seat. Snippets and
-   patches are rejected — an HTML target must be a whole document — so
-   revision *advice* is never shipped *as* a file (`test_salvage.py`).
-4. **Honest failure** — still nothing real on disk ⇒ the final answer reports
-   artifact verification failed, at low confidence, with the next action —
-   never a success card over a missing file.
+1. Open Settings and select the `cli` backend.
+2. Confirm Claude, Codex, and Gemini availability. Install/authenticate any
+   missing local CLI you intend to use.
+3. Add an OpenRouter key and enable the four optional API seats if you want the
+   full seven-model council.
+4. Review model pins, role assignments, and per-seat timeouts.
+5. Register an active workspace if you want new tasks/goals to use a default
+   project folder.
+6. Start with an ordinary question to verify the council, then use `/goal` for
+   work that should be decomposed into owned packages.
 
-Three more nets around the ladder:
+The Settings page shows the effective seat/model catalog. Its model list is
+refreshed from the public OpenRouter catalog with an offline fallback; Gemini's
+catalog can also use its configured API key.
 
-- **Truncation continuation** — a large single-file artifact cut off
-  mid-generation is finished from where it stopped (append), not re-drafted.
-- **Redelivery auto-promote** — a follow-up that revises an already-delivered
-  file but omits its `PROMOTE:` line gets the promote synthesized
-  automatically (behind the same approval gate), so "modify this" follow-ups
-  land in your folder instead of stranding the update in the sandbox. Whenever a
-  destination is declared — a folder the task referenced, or an explicit *"save
-  it in ‹folder›"* target — every authored deliverable is proposed for promote,
-  brand-new files included, so the run never reports success while your named
-  folder stays empty. With no declared destination, nothing is force-shipped.
-- **Stub detection** — a synthesis that merely announces the work, is blocked
-  tool-call debris, or ends on a dangling unresolved `SKILL:` request is never
-  accepted as a round's result: the lead is re-called once demanding the
-  result now, and if it stubs again the composer synthesizes from the panel
-  views instead.
+## Attachments and conversation follow-ups
 
-## Workspaces (allowed work areas)
+The dashboard accepts text, PDF, and image attachments. Uploads are stored
+locally and their extracted text or image references are folded into the task.
+After a session finishes, a follow-up continues the same conversation with the
+prior user/council turns as context. A follow-up is another deliberation, not an
+unlogged mutation of the earlier result.
 
-By default file skills are confined to a throwaway per-session sandbox
-(`data/artifacts/<session_id>/`). Register a **workspace** to let the council
-read and (with approval) write into a real project directory instead:
+## CLI reference
 
-- `cli.py workspace add <name> <path>` (or the dashboard Workspace panel)
-  registers + activates it; new sessions capture the active workspace.
-- Paths resolve **inside** the root — subdirectories like `src/main.py` are
-  allowed, but `..`, absolute, and drive-qualified paths are rejected
-  (`executor.resolve_in_workspace`). Approvals name the absolute target.
+The CLI supports ordinary sessions and workspace administration. Build-team
+goals are currently started through the dashboard or HTTP API.
 
-## Multi-modal input & vision
+```text
+python cli.py submit <text> [--source NAME] [--backend mock|cli]
+python cli.py serve [--host 127.0.0.1] [--port 8790] [--backend mock|cli]
+                    [--allow-remote]
+python cli.py list
+python cli.py status <session-id>
+python cli.py log <session-id>
+python cli.py pending
+python cli.py approve <session-id> <approval-id> [--by NAME] [--all]
+python cli.py deny <session-id> <approval-id> [--by NAME]
+python cli.py inputs
+python cli.py answer <session-id> <input-id> <text...> [--by NAME]
+python cli.py decline <session-id> <input-id> [--by NAME]
+python cli.py workspace list
+python cli.py workspace add <name> <root>
+python cli.py workspace use <workspace-id>
+python cli.py workspace none
+python cli.py workspace empty
+```
 
-Attach **text**, **PDF**, or **image** files in the dashboard composer (stored
-under `data/uploads/`):
+Examples:
 
-- **Text / PDF** — text is extracted (PDF via `pypdf`) and folded into the task
-  the council reads.
-- **Images** — **really seen** by the agents (reads text in screenshots/scans,
-  interprets diagrams), with no tools or filesystem access:
-  - **claude** — base64 image content blocks via `--input-format stream-json`.
-  - **codex** — `codex exec --image=<path>`.
-  - **gemini** — google-genai SDK inline image (`Part.from_bytes`), used when an
-    image is attached and `GEMINI_API_KEY` is set; gemini text calls stay on the
-    CLI. (The gemini CLI has no clean headless image input — see
-    [gemini-cli#3311](https://github.com/google-gemini/gemini-cli/issues/3311).)
+```powershell
+.\.venv\Scripts\python.exe cli.py submit "Review this architecture" --backend cli
+.\.venv\Scripts\python.exe cli.py pending
+.\.venv\Scripts\python.exe cli.py status s_20260713_ab12cd34
+.\.venv\Scripts\python.exe cli.py log s_20260713_ab12cd34
+```
 
-## Guarantees (enforced by tests)
+## HTTP API
 
-- Every loop is bounded — sessions always terminate; budget exhaustion yields
-  a partial low-confidence answer, never a spin (`test_budgets.py`); a lead
-  that declares CONTINUE past the consent block pauses for your go-ahead
-  (`test_rounds.py`).
-- One hard gate — work in the council's own spaces is free; nothing reaches
-  your real folder without an explicit, diff-carrying `promote` approval
-  (`test_actions.py`, `test_established.py`). Risk classification is
-  informational and never blocks a run (`test_governance.py`).
-- Cancel always lands — every blocking wait (panel fan-out, the up-front
-  context build, API-seat HTTP calls) polls the cancel flag instead of
-  blocking on the slowest seat, so "Cancel run" finalizes promptly even with
-  a stuck seat in flight (`test_cancel.py`).
-- No fabricated deliveries — a file-producing run either puts a real, complete
-  file behind the promote gate or reports the failure honestly; fragments and
-  advice snippets are never shipped as files (`test_salvage.py`,
-  `test_materialize.py`).
-- **Nothing that doesn't run ships** — every produced web file is executed
-  headless (stubbed DOM, via Node) *before* the promote, and a file that throws
-  on load fails verification: its promote is stripped and the run reports honest
-  low-confidence failure, never a false success. Judging a file by reading is
-  banned as the sole criterion (`test_smoke.py`, `test_best_of_n.py`). Scope: a
-  smoke test catches load/first-frame crashes — the "dead on arrival" class —
-  not post-gameplay logic bugs.
-- Full reasoning trail — every classification, council choice, round,
-  panel contribution, synthesis decision, and approval is in
-  `data/sessions/<id>.jsonl`, with session state in `data/gangof8.db`
-  (`test_loop_mock.py`).
+The dashboard uses the same FastAPI surface available to local automation.
+OpenAPI documentation is available at
+[http://127.0.0.1:8790/docs](http://127.0.0.1:8790/docs) while the app is
+running.
 
-## Validated against real agents
+### Core routes
 
-The full pipeline has been proven with real agents, not just mocks:
+| Method and route | Purpose |
+|---|---|
+| `GET /health` | Process health, version, and active backend |
+| `GET /diagnostics` | Redacted runtime and seat diagnostics |
+| `POST /tasks` | Submit a task; substantial unattached build briefs may return an auto-routed goal (`kind: goal`, `auto_routed: true`) |
+| `POST /uploads` | Store a base64 attachment and return its upload ID |
+| `GET /sessions` | List sessions |
+| `GET /sessions/{id}` | Full persisted session, health, and run summary |
+| `GET /sessions/{id}/timeline` | Readable event timeline |
+| `POST /sessions/{id}/followup` | Continue a completed conversation |
+| `POST /sessions/{id}/cancel` | Cancel a live session |
+| `POST /sessions/{id}/approvals/{approval_id}` | Approve or deny an action |
+| `POST /sessions/{id}/inputs/{input_id}` | Answer or decline a question |
+| `GET /approvals` | List pending approvals |
+| `GET /inputs` | List pending questions |
+| `POST /goals` | Create and optionally background a build-team goal |
+| `GET /goals`, `GET /goals/{id}` | List or inspect goals, including aggregate blockers, active calls, attempts, and the actionable session |
+| `POST /goals/{id}/resume` | Resume a paused goal |
+| `POST /goals/{id}/cancel` | Cancel a goal |
+| `GET /settings`, `PUT /settings` | Read or patch persisted settings |
+| `GET /settings/seats` | Inspect seat and model availability |
+| `PUT /settings/api-keys/{name}` | Store `openrouter` or `gemini` locally |
+| `GET /workspaces`, `POST /workspaces` | List or register workspaces |
+| `PUT /workspaces/active` | Select or clear the active workspace |
 
-- **Deliberation run** (`s_20260613_142ffb8d`): gemini researched, codex raised
-  disagreements that were critic-tested and ruled on evidence (one correctly
-  narrowed an overclaim), gemini reconciled, claude composed — ~3.5 min,
-  6 agent calls, 3 bounded rounds.
-- **Artifact run** (`s_20260613_689ece67`): three agent-question pause/resume
-  cycles (gemini and claude both asked clarifying questions answered via
-  `cli.py answer`), then claude proposed `ARTIFACT: README.md`, the
-  session paused on a `file_write` approval, and the file was written into the
-  session sandbox only after explicit `cli.py approve`.
+### Submit and poll an ordinary task
 
-Proven on the self-contained `cli` backend (2026-06-13):
+```powershell
+$body = @{
+  text = "Assess the current application architecture"
+  source = "automation"
+  background = $true
+} | ConvertTo-Json
 
-- **Build into a real workspace** — a "build a tiny FastAPI app (main.py,
-  README.md, requirements.txt, test_main.py)" task: classified as code, the
-  implementer drafted, each file paused on a `file_write` gate naming the
-  workspace path, and on approval **real, runnable code** was written into the
-  workspace — the generated `test_main.py` passes under pytest.
-- **Image vision, all three seats** — an attached PNG whose text existed only as
-  pixels was read correctly end to end by claude, by codex, and (with the whole
-  council mapped to it) by gemini.
+$request = @{
+  Method = "Post"
+  Uri = "http://127.0.0.1:8790/tasks"
+  ContentType = "application/json"
+  Body = $body
+}
+$run = Invoke-RestMethod @request
 
-Hard-won contract lesson encoded throughout: **plain-text output contracts
-(`DISAGREEMENT:`, `VERDICT:`, `ARTIFACT:`, labeled sections) parse reliably from
-CLI output; JSON-shaped contracts do not.** The composer accepts substantial
-prose at medium confidence rather than discarding good answers, and uses a wide
-compose window so the summarizer never pauses to ask for a result already in the
-transcript. `_GOVERNANCE_CONTEXT` is prepended to every role prompt so agents
-ignore `can_write_files` flags and never ask the human to "enable writes" —
-files are produced via `ARTIFACT:` + approval.
+Invoke-RestMethod "http://127.0.0.1:8790/sessions/$($run.session_id)"
+```
 
-## Known limitations
+### Start and poll a build-team goal
 
-- Agent framing prose can occasionally leak into an artifact around the
-  `ARTIFACT:` content — the human approval step is the review gate.
-- **gemini image vision needs `GEMINI_API_KEY`** (it uses the google-genai SDK,
-  since the gemini CLI lacks clean headless image input). Without a key, gemini
-  stays text-only and sees only the attachment note; claude/codex vision use the
-  local CLIs and need no key.
-- Each agent call re-sends an attached image, so vision adds token cost per call.
-- A session paused mid-round for an agent question skips that round's step 8 on
-  resume (a deliberate simplification — actions are governed Gang of 8-side).
+```powershell
+$body = @{
+  text = "Overhaul C:\Projects\ExampleApp and deliver the verified files there"
+  background = $true
+} | ConvertTo-Json
 
-## Utilities
+$request = @{
+  Method = "Post"
+  Uri = "http://127.0.0.1:8790/goals"
+  ContentType = "application/json"
+  Body = $body
+}
+$goal = Invoke-RestMethod @request
 
-- `scripts/inspect_session.py <sid>` — round/contribution overview
-- `scripts/show_contribution.py <sid> <role>` — full text of a role's contributions
+Invoke-RestMethod "http://127.0.0.1:8790/goals/$($goal.goal_id)"
+```
 
-## Status
+### Resolve the final batch approval
 
-- [x] Phase 0 — skeleton + MockAdapter
-- [x] Phase 1 — CliAdapter (Gang of 8 drives the local claude/codex/gemini
-      CLIs itself); agent failures degrade to a partial answer, never a crash.
-      Live integration tests auto-skip when a CLI is not on PATH.
-- [x] Phase 2 — approval resolution (API + CLI) with session resume: approving
-      the gate continues deliberation from where it paused (state reloaded
-      from SQLite); denying cancels the session before any agent runs.
-- [x] Phase 3 — agent-question passthrough: when an agent asks a clarifying
-      question it becomes a Gang of 8 input request (`awaiting_input` status);
-      the human's answer resumes the session and deliberation continues. Plus
-      richer disagreement detection (bullets, any case, multi-line claims, PASS,
-      claim-role attribution) and composer polish (one strict retry on
-      unparseable JSON, graceful fallbacks). Known simplification: step 8 of a
-      round paused mid-call is skipped on resume — actions are governed only on
-      the Gang of 8 side.
-- [x] Phase 4 — governed tool execution: the implementer can head its draft
-      with `ARTIFACT: <filename>` to propose saving it as a file. The proposal
-      becomes a `file_write` approval; only an explicit human approval executes
-      the write, confined to `data/artifacts/<session_id>/` (sanitized
-      filenames, no path escape). Denying the action skips the artifact but
-      the session still completes; denying a session gate still cancels.
-- [x] Phase 5 — service mode + web dashboard (`cli.py serve`): background
-      workers run long real-agent sessions while the dashboard submits-and-polls;
-      live progress, rollups, approvals/inputs in the browser.
-- [x] Milestone 6 — skill registry + permission kernel (`write_file`,
-      `read_file`, `search_project`), the `SKILL:` request grammar, per-file
-      artifact materialization, persisted **settings**, and dashboard rollups.
-- [x] Workspaces — operate on a real project directory (allowed work area) with
-      hard path containment; the first Type-2 module.
-- [x] Multi-modal input — text / PDF attachments folded in as context; **image
-      vision** for claude, codex, and gemini (no tools, governed).
-- [x] Orchestrator model — the lead organizes and integrates, never does the
-      substantive work itself: it assigns via `CONSULT:`/`DELEGATE:`, a
-      delegated talent's `ARTIFACT:` blocks are captured directly as real
-      files (attributed to that talent + its per-role pinned model), failed
-      delegations retry once, and delivery (`PROMOTE:`) stays the lead's call
-      behind the one human gate.
-- [x] Council-space access for every seat — read/write/discovery skills open
-      to ALL roles (a role unable to land its work in the sandbox is a design
-      failure); panel seats resolve `SKILL:` reads mid-fan-out and their
-      complete files save immediately, namespaced per seat, as advisory
-      drafts. Mid-run state persists at every step, so the dashboard shows
-      contributions, recruitments, and drafts live.
-- [x] Delivery resilience — the safety-net ladder (materialization with an
-      established-folder fallback for revision follow-ups, panel artifact
-      salvage, honest failure reporting), redelivery auto-promote, chained
-      `SKILL:` resolution with dangling-request stub detection, and
-      cancel-aware waits throughout the round loop.
-- [x] Best-of-N selection — every panel seat authors a complete candidate;
-      candidates are executed headless and crashers disqualified; survivors are
-      scored blindly by independent judges; the winning file ships byte-for-byte
-      (credited to its model), with an optional re-verified surgical fix pass.
-- [x] Runtime delivery gate — every produced web file is executed (stubbed-DOM
-      Node smoke test) *before* the promote; a file that throws on load is
-      blocked from delivery and the run reports honest failure. Verification was
-      moved ahead of the promote so nothing ships unverified.
+The goal record exposes `release_session_id`. Fetch that session, select its
+pending approval, and resolve it:
+
+```powershell
+$session = Invoke-RestMethod -Uri "http://127.0.0.1:8790/sessions/$($goal.release_session_id)"
+$approval = $session.approvals | Where-Object status -eq "pending" | Select-Object -First 1
+
+$decision = @{ approved = $true; by = "automation"; background = $true } |
+  ConvertTo-Json
+
+$request = @{
+  Method = "Post"
+  Uri = "http://127.0.0.1:8790/sessions/$($session.session_id)/approvals/$($approval.approval_id)"
+  ContentType = "application/json"
+  Body = $decision
+}
+Invoke-RestMethod @request
+```
+
+## Configuration and environment variables
+
+Editable non-secret settings are stored in `data/settings.json`. The effective
+precedence is persisted settings over environment/config defaults, except an
+explicit CLI backend argument takes precedence when constructing the service.
+API-key environment variables always override locally stored keys.
+
+Common environment variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GANGOF8_BACKEND` | `mock` or `cli` | `mock` |
+| `GANGOF8_DATA` | Persistent application-data directory | Repository `data/` |
+| `GANGOF8_SANDBOX` | Per-session scratch root | `%LOCALAPPDATA%\GangOf8\sandbox` on Windows |
+| `GANGOF8_SANDBOX_KEEP` | Recent inactive sandboxes retained | `25` |
+| `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
+| `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
+| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Default bounded package/panel authoring call, seconds | `360` |
+| `GANGOF8_PANEL_RETRY_TIMEOUT` | Focused package recovery call, seconds | `180` |
+| `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
+| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author deadline; `0` means cancellable/no coordinator deadline | `0` |
+| `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls after a stub/transient failure | `1` |
+| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Independent frontier release deadline; `0` means cancellable/no coordinator deadline | `0` |
+| `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
+| `GANGOF8_CODIFIER_TIMEOUT` | Strong finishing pass timeout, seconds | `600` |
+| `GANGOF8_JUDGE_TIMEOUT` | Candidate judge timeout, seconds | `480` |
+| `GANGOF8_MAX_JUDGES` | Maximum blind judges | `3` |
+| `GANGOF8_JUDGE_FIRST_WAVE` | Judges called before early-stop evaluation | `2` |
+| `GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS` | Aggregate final-batch diff display cap | `60000` |
+| `GANGOF8_ALLOW_REMOTE` | Explicitly allow non-loopback serving | unset |
+| `OPENROUTER_API_KEY` | OpenRouter key; overrides stored key | unset |
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Gemini key; override stored key | unset |
+
+Additional tuning defaults live in `gangof8/config.py`. Prefer the Settings UI
+for routine seat, model, role, timeout, budget, and interface configuration.
+
+## Data and audit trail
+
+With the default `GANGOF8_DATA`, persistent state lives under `data/`:
+
+```text
+data/
+  gangof8.db                 SQLite session and goal state (WAL mode)
+  sessions/<session>.jsonl   Append-only event trail per session
+  settings.json              Non-secret editable settings
+  secrets.json               Locally stored API keys
+  workspaces.json            Registered workspaces and active selection
+  uploads/                   Uploaded source material
+  goal-workspaces/<goal>/    Persistent shared goal staging
+```
+
+`secrets.json` is a local convenience store, not an operating-system vault.
+Keep the data directory private. Environment variables are preferable for
+managed or automated environments.
+
+Session and goal worker leases protect persisted state from stale background
+threads. JSONL logs record model calls, contributions, drops, skill requests,
+approvals, input requests, candidate selection, goal transitions, cancellation,
+and recovery events.
+
+## Local-only security model
+
+The service can browse local folders, reveal locally stored keys, and ask the
+operating system to open delivered files. It therefore binds to loopback by
+default and rejects non-local requests.
+
+Binding to a non-loopback host requires both `--allow-remote` and
+`GANGOF8_ALLOW_REMOTE=1`. Only do this behind authenticated access. Even when
+remote serving is enabled, revealing a key and opening a local file still
+require a loopback request. The API itself does not add user authentication.
+
+## Performance design
+
+Gang of 8 reduces wall-clock time without silently shrinking the configured
+council:
+
+- local CLI and API calls have separate concurrency limits;
+- ordinary panel seats fan out concurrently;
+- sibling specialist delegations fan out concurrently;
+- candidate smoke checks run concurrently;
+- blind judging uses parallel waves with a unanimous early stop;
+- build artifacts use deterministic summaries instead of another model call
+  where possible;
+- existing-file revisions use compact surgical edits rather than seven full
+  rewrites;
+- build-team goals eliminate duplicate whole-solution candidate generation;
+- all hard-dependency-ready work packages run concurrently;
+- contract-linked modules defer only their premature standalone runtime probe,
+  while integration owns the assembled runtime check;
+- explicit release manifests keep internal staging files out of delivery; and
+- quoted/backticked protocol filenames are canonicalized at parse and execution
+  boundaries, preventing presentation punctuation from becoming path bytes;
+- semantic release checks run only once after deterministic selection or final
+  package assembly, preserving author parallelism; and
+- source staging skips generated/vendor trees that add copy time but not useful
+  implementation context.
+
+The service background worker pool is wider than the provider limits so a
+waiting goal package does not block unrelated ready work. Provider-specific
+semaphores remain the actual resource controls.
+
+## Troubleshooting
+
+### I only see four council members
+
+Open Settings and inspect the enabled CLI and OpenRouter seats. An OpenRouter
+seat needs both an API key and its enabled toggle. A disabled or unavailable
+seat will not appear in a new run. Settings changes do not alter a session that
+has already started.
+
+For an ordinary task, every configured available seat should be convened. For
+a `/goal`, the center session has one accountable package owner by design. The
+Build team card shows every package, owner, state, hard blocker, and non-blocking
+contract link. Several package sessions should show `running` together when the
+graph permits it.
+
+### Claude timed out after reading a file
+
+Start a new session after updating/restarting the app. New Claude/Codex author
+and release-verifier calls show `no coordinator deadline`; source-read/search
+follow-ups retain that policy. A persisted session created by older code keeps
+its original timeout snapshot. User cancellation still terminates an in-flight
+CLI process.
+
+### I am being asked to approve every output file
+
+Use a new `/goal` for a multi-file build. Current build-team goals stage package
+outputs without promotion and present one final batch approval. Ordinary
+sessions still use their own governed `promote` action, and legacy goals retain
+the delivery semantics with which they were created. Functional code execution
+can still require a separate safety approval even when file promotion is
+batched.
+
+### A goal is paused after a restart
+
+This is intentional recovery behavior. The old model subprocess no longer
+exists, so the service parks the goal rather than pretending it is still
+running. Read `last_error`, inspect completed package/staging state, and use
+Resume.
+
+### A final batch fails because the target changed
+
+The destination no longer matches the baseline reviewed in the aggregate diff.
+Inspect the external changes, reconcile them with staging, and resume to create
+a fresh review. The app will not overwrite drift silently.
+
+### The dashboard will not start
+
+Check whether port 8790 is already occupied, then run:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8790 -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe cli.py serve --backend cli
+```
+
+Use `/health` and `/diagnostics` to distinguish a server problem from a missing
+or unauthenticated model CLI.
+
+## Development and verification
+
+Run the local checks from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check gangof8 tests
+.\.venv\Scripts\python.exe -m pytest tests -q
+node --check gangof8\static\dashboard-utils.js
+node --check gangof8\static\app.js
+```
+
+The current suite covers orchestration, governance, workspaces, settings,
+uploads, cancellation, panel access, best-of-N selection, artifact validation,
+test repair, throughput, hard versus contract-only package scheduling,
+final-batch approval, destination drift, rollback, and restart/lease recovery.
+The most recent full local verification count is reported with each completed
+change.
+
+## Repository map
+
+```text
+cli.py                         Command-line entry point
+gangof8/main.py                FastAPI service and dashboard routes
+gangof8/service.py             Service wiring, background work, goals, recovery
+gangof8/loop.py                Deliberation, delegation, selection, repair
+gangof8/goals.py               Goal planning, persistence, package contracts
+gangof8/skills.py              Governed file/web/test/delivery operations
+gangof8/governance.py          Approval policy and action authorization
+gangof8/models.py              Persisted domain models
+gangof8/settings.py            Settings schema, persistence, migration
+gangof8/logstore.py            SQLite sessions and JSONL audit logs
+gangof8/adapters/              Mock, local CLI, and OpenRouter adapters
+gangof8/static/                Dashboard HTML, CSS, JavaScript, and images
+tests/                         Automated test suite
+scripts/                       Session/contribution inspection helpers
+ARCHITECTURE.md                System architecture notes
+DESIGN.md                      Product and protocol design
+DEVELOPMENT.md                 Short contributor setup guide
+```
+
+## Known boundaries
+
+- Multi-model output is not automatically correct. The audit trail, execution
+  checks, dissent, and approval gates make errors more visible; they do not
+  remove the need for human judgment.
+- External CLIs and APIs can fail, hang, rate-limit, change model identifiers,
+  or require renewed authentication.
+- A timed-out ordinary non-frontier panel seat is not silently replaced with an
+  unconfigured model. A required frontier author cannot be bypassed at all.
+- A build-team goal is only as good as its package decomposition, contracts,
+  and acceptance checks. Review the generated package graph on important work.
+- Rollback protection cannot guarantee atomic replacement across multiple
+  ordinary filesystem files.
+- Functional test execution remains approval-gated and time/output bounded.
+- Old persisted goals are not automatically migrated into a different workflow
+  halfway through execution.
+
+For deeper implementation context, see [ARCHITECTURE.md](ARCHITECTURE.md),
+[DESIGN.md](DESIGN.md), and [DEVELOPMENT.md](DEVELOPMENT.md).

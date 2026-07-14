@@ -47,6 +47,19 @@ def collect_runtime_diagnostics(
             }
             for name in ("claude", "codex", "gemini")
         },
+        "build_call_limits": {
+            "author_timeout_s": config.PANEL_AUTHOR_TIMEOUT,
+            "retry_timeout_s": config.PANEL_RETRY_TIMEOUT,
+            "frontier_author_seats": list(config.FRONTIER_AUTHOR_SEATS),
+            "frontier_author_timeout_s": config.FRONTIER_AUTHOR_TIMEOUT,
+            "frontier_verify_timeout_s": config.FRONTIER_VERIFY_TIMEOUT,
+            "frontier_recovery_attempts": config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS,
+            "note": (
+                "per-seat settings apply only to routine/non-code sessions; coding "
+                "uses stage policies, and frontier timeout 0 means no coordinator "
+                "deadline while remaining user-cancellable"
+            ),
+        },
         "api_keys": {name: api_key_status(name) for name in api_key_names},
         "web_enabled": config.WEB_ENABLED,
         "remote_access_enabled": os.environ.get(config.ALLOW_REMOTE_ENV, "").strip().lower()

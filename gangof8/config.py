@@ -61,6 +61,12 @@ DELEGATION_RESULT_MAX_CHARS = 2500
 # heavy local processes; unbounded fan-out would thrash the host). The budget lock
 # keeps max_agent_calls exact under this concurrency.
 MAX_PARALLEL_AGENTS = int(os.environ.get("GANGOF8_MAX_PARALLEL_AGENTS", "4"))
+# API-backed seats (OpenRouter et al.) are plain HTTP requests, not local
+# subprocesses — gating them behind the CLI bound made a 7-seat panel run in two
+# waves when only 3 seats actually load the machine. They get their own, larger
+# bound (adapters declare local_process; unknown adapters count as local, the
+# conservative side).
+MAX_PARALLEL_API_AGENTS = int(os.environ.get("GANGOF8_MAX_PARALLEL_API_AGENTS", "8"))
 # A large single-file artifact can exceed one model response. When a written file
 # looks cut off (e.g. HTML missing </html>), the lead is asked to CONTINUE it from
 # where it stopped — appending, never re-drafting. Bound how many continuations.
@@ -69,25 +75,29 @@ ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead se
 # The lead authors whole files in one shot, so give it markedly more headroom than
 # a quick specialist call before timing out.
 LEAD_TIMEOUT = 600
-# On a build task each panel seat AUTHORS a complete candidate file — heavy work,
-# like the lead's, not a quick take. The generic per-agent timeout (e.g. claude
-# 240s) kept killing thorough seats mid-authoring (live: "claude timed out after
-# 240s" dropped one of the most important voices every build). Give panel
-# authoring production-grade headroom on produces_output tasks. (OpenRouter seats
-# already run effectively unbounded, so this also levels the field.)
-# 600s was STILL too short: a strong seat authoring a rich game needs longer
-# ("claude CLI timed out after 600s" — one of the most capable models never got
-# to submit, defeating the whole diversity bet). Losing a finished candidate
-# costs more than waiting out a slow one; the human can always Cancel a stuck
-# run. A seat's per-call ⏱ setting can raise this further (max wins), never
-# lower it below this floor.
-PANEL_AUTHOR_TIMEOUT = 1800
+# Ordinary package/panel authors receive this bounded call. Frontier authors use
+# FRONTIER_AUTHOR_TIMEOUT below so valuable code is not killed by elapsed time.
+PANEL_AUTHOR_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_AUTHOR_TIMEOUT", "360"))
+# A focused non-frontier protocol/filename recovery uses a shorter window.
+PANEL_RETRY_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_RETRY_TIMEOUT", "180"))
+FRONTIER_AUTHOR_SEATS = tuple(
+    s.strip() for s in os.environ.get("GANGOF8_FRONTIER_AUTHOR_SEATS", "claude,codex").split(",")
+    if s.strip()
+)
+# Zero is intentional: frontier implementation calls run until completion or
+# explicit user cancellation; they are not discarded by a coordinator clock.
+FRONTIER_AUTHOR_TIMEOUT = int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "0"))
+FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
+    os.environ.get("GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS", "1")
+)
+FRONTIER_VERIFY_TIMEOUT = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
+FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom
 # than the lead's fast coordination path. (Raised with the removal of the
 # judging char caps: the chair now reads both finalists genuinely in full.)
-CODIFIER_TIMEOUT = 1200
+CODIFIER_TIMEOUT = int(os.environ.get("GANGOF8_CODIFIER_TIMEOUT", "600"))
 
 # Talent menu advertised to the lead: each specialist role and what it is good
 # for, so the lead knows what it can reach for (its origin model is filled in
@@ -197,6 +207,10 @@ PANEL_SEATS_BY_BACKEND: dict[str, list[str]] = {
     "mock": ["mock"],
     "cli": ["claude", "codex", "gemini"],
 }
+# Full roster policy: the configured panel is the council.  A Gang of 8 run
+# convenes every configured panel seat; never silently tier or auto-bench seats
+# to reduce latency.  Seat failures remain visible in that round's health data,
+# while speed comes from concurrent calls and reduced downstream ceremony.
 # Rounds proceed automatically; after this many without ROUND: DONE the run
 # pauses and asks the human whether to go another block of rounds.
 ROUNDS_PER_CONSENT = 3
@@ -242,6 +256,8 @@ APPROVAL_CATEGORIES = [
 # promote (workspace → established folder) is the ONE approval-gated boundary
 # that touches real user code; cap the diff shown in its approval card.
 PROMOTE_DIFF_MAX_CHARS = 6000
+BATCH_PROMOTE_DIFF_MAX_CHARS = int(
+    os.environ.get("GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS", "60000"))
 
 # run_tests (code execution) bounds — the command runs FREELY in the council's
 # own sandbox/workspace (the spaces model gates only promote); keep it time-
@@ -253,7 +269,16 @@ RUN_TESTS_TIMEOUT = 300
 # on the session, so an approval pause can't reset the clock. Exhausted
 # attempts compose honestly: "tests still failing after N fix attempts".
 MAX_TEST_FIX_ATTEMPTS = 3
+# Runtime/acceptance verification failures are repaired separately from a model
+# supplied RUNTESTS command. The error is coordinator-generated, so it must
+# always enter this bounded loop instead of jumping straight to a false done.
+MAX_ARTIFACT_REPAIR_ATTEMPTS = 2
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
+# Existing-file revisions are authored as compact patches, not as several
+# competing whole-file rewrites.  The primary author gets the exact source up
+# to this cap so it can make a grounded edit without a chain of rediscovery
+# reads; larger files retain the normal read/search fallback.
+REVISION_SOURCE_MAX_CHARS = int(os.environ.get("GANGOF8_REVISION_SOURCE_MAX_CHARS", "80000"))
 
 # Per-agent CLI timeouts (seconds). The gemini CLI in headless plan mode is
 # markedly slower than claude/codex and prone to stalling, so give it more room
@@ -337,13 +362,20 @@ SKILL_RESULT_SANDBOX_MAX_CHARS = 40000
 MAX_ESCALATION_REQUESTS_PER_TURN = 2
 ESCALATION_RESULT_MAX_CHARS = 2500
 
+# The round-0 overview head-caps each source file, which cut a 37KB shell.html
+# off right at the engine namespace — every seat then burned SKILL chains
+# re-reading the file just to find the contract it had to bind to. For any file
+# the cap truncates, an API SURFACE (class/function/registration declarations
+# extracted from the WHOLE body) is appended, bounded per file by this.
+OVERVIEW_API_SURFACE_MAX_CHARS = 2500
+
 # Best-of-N selection: on a file-producing build, every panel seat authors a
 # complete candidate implementation, independent judges SCORE all candidates
 # blindly (author identity stripped), and the highest-scoring file is the one
 # shipped — a real model's code, not a lead re-author. Owner directive
 # 2026-07-05 ("I want true best-of-N selection").
 BEST_OF_N_MIN_CANDIDATES = 2      # fewer than this ⇒ fall back to author path
-MAX_JUDGES = 5                    # independent scoring seats (cost bound)
+MAX_JUDGES = int(os.environ.get("GANGOF8_MAX_JUDGES", "3"))
 # Judges and the chair see every candidate IN FULL — no per-candidate char cap.
 # The old 24000-char window made the vote measure "which file fit under the
 # cap": every larger candidate read as cut off mid-file, and the prompt orders
@@ -356,13 +388,31 @@ JUDGE_SCORE_MAX = 10              # score scale a judge gives each candidate
 # Scoring calls carry every candidate's full body, so give judges reading
 # headroom over the quick per-seat default (claude 240s would be the binding
 # timeout otherwise, with far more to read than before).
-JUDGE_TIMEOUT = 900
+JUDGE_TIMEOUT = int(os.environ.get("GANGOF8_JUDGE_TIMEOUT", "480"))
+# Judges run in PARALLEL waves: the first wave votes, and only a SPLIT vote
+# convenes the rest — a unanimous first wave with at least
+# JUDGE_EARLY_STOP_MIN_VOTES real votes decides the winner outright (live: a
+# 5-judge vote went 5/5 first-place; judges 4 and 5 each re-read the entire
+# multi-hundred-KB candidate corpus to add zero information).
+JUDGE_FIRST_WAVE = int(os.environ.get("GANGOF8_JUDGE_FIRST_WAVE", "2"))
+JUDGE_EARLY_STOP_MIN_VOTES = 2
+# Smoke probes are independent subprocesses. Parallelism shortens a multi-seat
+# best-of-N runtime gate without increasing model cost.
+MAX_PARALLEL_SMOKE = int(os.environ.get("GANGOF8_MAX_PARALLEL_SMOKE", "4"))
 
 # Per-file artifact materialization: an agent sometimes describes multi-file
 # output in one draft instead of emitting it. When an output task yields no full
 # ARTIFACT blocks, the coordinator fetches each intended file with its own
 # focused call (nothing to summarize). Cap how many files one task may produce.
 MAX_ARTIFACT_FILES = 8
+
+# Goal layer (/goal): a long-horizon objective decomposed ONCE by the architect
+# into milestone-sized deliverables, each run as a normal session. Bounded so a
+# runaway plan can't queue unbounded work; a goal bigger than this should be
+# split by the human.
+GOAL_MAX_MILESTONES = 8
+GOAL_PLAN_TIMEOUT = 600       # s for the single planning call (architect thinks hard)
+GOAL_SUMMARY_MAX_CHARS = 700  # per completed milestone folded into the next one's task
 
 # search_project skill bounds: keep a search cheap and the result feed-back small.
 SEARCH_MAX_FILES = 400          # files whose contents are scanned

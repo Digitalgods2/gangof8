@@ -12,6 +12,10 @@ HANDLERS lazily to keep the dependency one-directional.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import shutil
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -30,6 +34,7 @@ from .executor import (
 )
 from .models import ProposedAction, Risk, Role, Session
 from .paths import extract_delivery_target
+from . import validation
 
 # Directories never worth searching (vendored / generated / VCS noise).
 _SEARCH_SKIP_DIRS = {
@@ -87,6 +92,8 @@ def _default_read_space(session: Session) -> str:
     """Where a bare read/search/list lands when no target is given: the richest
     bound space — the established folder being examined, else the workspace,
     else the ephemeral sandbox."""
+    if session.delivery_mode == "final_batch" and session.workspace_root:
+        return WORKSPACE
     if session.established_root:
         return ESTABLISHED
     if session.workspace_root:
@@ -279,32 +286,35 @@ def _edit_file(session: Session, action: ProposedAction, data_dir: Path) -> str:
 
 
 def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
-    """Run a test command in a council space (sandbox default, or workspace) and
-    return its output. Free — no approval (the council's own scratch); still
-    bounded by timeout and output cap."""
-    import subprocess
+    """Run a parsed validation command without shell interpolation.
 
-    cmd = (_arg(action, "command") or "").strip() or "pytest -q"
+    Static parse/compile checks are allowed automatically. Functional commands
+    only reach this handler after Governance has shown the exact command in an
+    approval card, and are still limited to direct test tools.
+    """
+    cmd = (_arg(action, "command") or "").strip()
     target = _space_arg(action, SANDBOX, _WRITE_SPACES)
     cwd = space_root(session, data_dir, target)
-    _assert_outside_established(session, cwd)  # never execute/write inside the source tree
+    _assert_outside_established(session, cwd)
     cwd.mkdir(parents=True, exist_ok=True)
-    if not cwd.is_dir():
-        raise ExecutionError("no directory to run tests in")
     try:
-        proc = subprocess.run(
-            cmd, shell=True, cwd=str(cwd), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=config.RUN_TESTS_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise ExecutionError(f"command timed out after {config.RUN_TESTS_TIMEOUT}s") from e
-    except OSError as e:
-        raise ExecutionError(f"could not run command: {e}") from e
-    body = (proc.stdout or "")
-    if proc.stderr:
-        body += f"\n[stderr]\n{proc.stderr}"
-    status = "passed" if proc.returncode == 0 else f"exit {proc.returncode}"
-    return f"$ {cmd}  (cwd: {cwd})\n[{status}]\n{body}"[: config.RUN_TESTS_OUTPUT_MAX_CHARS]
+        try:
+            argv = validation.static_check_argv(cmd, cwd)
+        except validation.ValidationCommandError:
+            argv = validation.approved_test_argv(cmd)
+        return validation.run(argv, cwd, config.RUN_TESTS_TIMEOUT, config.RUN_TESTS_OUTPUT_MAX_CHARS)
+    except validation.ValidationCommandError as e:
+        raise ExecutionError(str(e)) from e
+
+
+def is_automatic_static_test(session: Session, action: ProposedAction, data_dir: Path) -> bool:
+    """Whether a RUNTESTS action is a parse/compile-only safe check."""
+    try:
+        target = _space_arg(action, SANDBOX, _WRITE_SPACES)
+        return validation.is_static_check(
+            _arg(action, "command"), space_root(session, data_dir, target))
+    except (ExecutionError, OSError):
+        return False
 
 
 def _stage(session: Session, action: ProposedAction, data_dir: Path) -> str:
@@ -397,6 +407,144 @@ def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
     return str(dst)
+
+
+def _batch_manifest(action: ProposedAction) -> tuple[list[str], dict[str, Optional[str]]]:
+    try:
+        files = json.loads(action.args.get("files", "[]"))
+        baselines = json.loads(action.args.get("baselines", "{}"))
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ExecutionError(f"invalid final-batch manifest: {e}") from e
+    if not isinstance(files, list) or not isinstance(baselines, dict):
+        raise ExecutionError("invalid final-batch manifest shape")
+    normalized: list[str] = []
+    for raw in files:
+        if not isinstance(raw, str):
+            raise ExecutionError("final-batch filenames must be strings")
+        # resolve_in_workspace performs the actual containment validation.
+        name = raw.replace("\\", "/")
+        if name not in normalized:
+            normalized.append(name)
+    return normalized, baselines
+
+
+def batch_promote_diff(session: Session, data_dir: Path, action: ProposedAction) -> str:
+    """One aggregate review document for every file in the final release."""
+    import difflib
+
+    files, _ = _batch_manifest(action)
+    if not session.workspace_root:
+        return "(goal staging workspace is unavailable)"
+    dest_root = session.delivery_root or session.established_root
+    if not dest_root:
+        return "(final delivery folder has not been selected)"
+    stage = Path(session.workspace_root)
+    dest = Path(dest_root)
+    blocks: list[str] = []
+    for name in files:
+        src = resolve_in_workspace(stage, name)
+        dst = resolve_in_workspace(dest, name)
+        if not src.is_file():
+            blocks.append(f"===== {name} =====\nMISSING FROM STAGING\n")
+            continue
+        try:
+            new = src.read_text(encoding="utf-8", errors="replace")
+            old = dst.read_text(encoding="utf-8", errors="replace") if dst.is_file() else ""
+            label = "modified" if dst.is_file() else "new file"
+            diff = "".join(difflib.unified_diff(
+                old.splitlines(keepends=True), new.splitlines(keepends=True),
+                fromfile=f"project/{name} ({label})", tofile=f"staging/{name}",
+            )) or "(no textual difference)"
+        except OSError as e:
+            diff = f"(could not preview: {e})"
+        blocks.append(f"===== {name} =====\n{diff}")
+    header = f"FINAL BATCH: {len(files)} file(s)\n\n"
+    return (header + "\n\n".join(blocks))[: config.BATCH_PROMOTE_DIFF_MAX_CHARS]
+
+
+def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Validate and release all staged files as one rollback-protected unit."""
+    files, baselines = _batch_manifest(action)
+    if not files:
+        raise ExecutionError("final batch is empty")
+    if not session.workspace_root:
+        raise ExecutionError("goal staging workspace is unavailable")
+    dest_root = session.delivery_root or session.established_root
+    if not dest_root:
+        raise ExecutionError("final delivery folder has not been selected")
+    stage = Path(session.workspace_root).resolve()
+    dest = Path(dest_root).resolve()
+
+    sources: dict[str, Path] = {}
+    targets: dict[str, Path] = {}
+    for name in files:
+        src = resolve_in_workspace(stage, name)
+        dst = resolve_in_workspace(dest, name)
+        if not src.is_file() or src.stat().st_size == 0:
+            raise ExecutionError(f"staged release file is missing/empty: {name}")
+        expected = baselines.get(name)
+        if expected is None:
+            if dst.exists():
+                raise ExecutionError(
+                    f"project changed after final review: new target now exists: {name}")
+        else:
+            if not dst.is_file():
+                raise ExecutionError(
+                    f"project changed after final review: target disappeared: {name}")
+            actual = hashlib.sha256(dst.read_bytes()).hexdigest()
+            if actual != expected:
+                raise ExecutionError(
+                    f"project changed after final review: target contents changed: {name}")
+        sources[name], targets[name] = src, dst
+
+    tx = Path(data_dir) / "release-transactions" / f"{session.session_id}_{action.action_id}"
+    backups = tx / "backups"
+    tx.mkdir(parents=True, exist_ok=True)
+    replaced: list[str] = []
+    existed: set[str] = set()
+    temps: list[Path] = []
+    try:
+        # Prepare every byte before touching the destination.
+        for name in files:
+            dst = targets[name]
+            prepared = resolve_in_workspace(tx / "prepared", name)
+            prepared.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sources[name], prepared)
+            if dst.is_file():
+                backup = resolve_in_workspace(backups, name)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst, backup)
+                existed.add(name)
+        for name in files:
+            dst = targets[name]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            prepared = resolve_in_workspace(tx / "prepared", name)
+            temp = dst.with_name(f".{dst.name}.{action.action_id}.tmp")
+            shutil.copy2(prepared, temp)
+            temps.append(temp)
+            os.replace(temp, dst)
+            replaced.append(name)
+    except Exception as e:  # noqa: BLE001 - rollback must contain any filesystem failure
+        rollback_errors: list[str] = []
+        for name in reversed(replaced):
+            dst = targets[name]
+            try:
+                if name in existed:
+                    os.replace(resolve_in_workspace(backups, name), dst)
+                elif dst.exists():
+                    dst.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(f"{name}: {rollback_error}")
+        suffix = ("; rollback problems: " + "; ".join(rollback_errors)) if rollback_errors else ""
+        raise ExecutionError(f"final batch failed and was rolled back: {e}{suffix}") from e
+    finally:
+        for temp in temps:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        shutil.rmtree(tx, ignore_errors=True)
+    return str(dest)
 
 
 def _web_search(session: Session, action: ProposedAction, data_dir: Path) -> str:
@@ -621,10 +769,10 @@ SKILLS: dict[str, Skill] = {
     ),
     "run_tests": Skill(
         name="run_tests",
-        description="Run a test command in a council space (sandbox/workspace). Free, no approval.",
+        description="Run a test command in a council space (static checks auto-run; functional tests require approval).",
         category="code_exec",
         risk=Risk.medium,
-        requires_approval=False,
+        requires_approval=True,
         allowed_roles=[Role.lead, Role.implementer, Role.critic, Role.code_generator],
         inputs=["command", "target"],
     ),
@@ -646,6 +794,15 @@ SKILLS: dict[str, Skill] = {
         allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename"],
     ),
+    "promote_batch": Skill(
+        name="promote_batch",
+        description="Release an entire verified goal staging manifest in one rollback-protected transaction.",
+        category="promote",
+        risk=Risk.medium,
+        requires_approval=True,
+        allowed_roles=[Role.lead, Role.implementer],
+        inputs=["files", "baselines"],
+    ),
 }
 
 HANDLERS: dict[str, Handler] = {
@@ -659,6 +816,7 @@ HANDLERS: dict[str, Handler] = {
     "run_tests": _run_tests,
     "stage": _stage,
     "promote": _promote,
+    "promote_batch": _promote_batch,
 }
 
 

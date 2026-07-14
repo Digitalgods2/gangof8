@@ -28,6 +28,10 @@ _REFERER = "https://github.com/Digitalgods2/gangof8"
 
 
 class OpenRouterAdapter:
+    # A plain HTTP request, not a local subprocess — bounded by the (larger)
+    # API-seat concurrency limit, so it never queues behind heavy CLI seats.
+    local_process = False
+
     def __init__(
         self,
         name: str,

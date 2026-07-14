@@ -219,14 +219,20 @@ def test_too_few_candidates_falls_back(session, store):
     assert not any(a.role == Role.implementer for a in session.proposed_actions)
 
 
-def test_integration_proposal_is_optional_and_runtime_validated(session, store):
-    """A merge is an offered alternative, not an automatic replacement."""
+def _finalists(weak=WEAK, strong=STRONG):
+    """ordered candidates for _chair_finish: Candidate 1 = weak, Candidate 2 =
+    strong; the vote (agg/votes) favors Candidate 2."""
+    ordered = [{"content": weak, "agent": "aaa", "base": "game.html"},
+               {"content": strong, "agent": "zzz", "base": "game.html"}]
+    return ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, {1: [], 2: []}
+
+
+def test_integration_offer_rides_the_chair_pass_and_is_runtime_validated(session, store):
+    """A merge is an offered alternative, not an automatic replacement — and it
+    arrives inside the SAME chair reply that ratifies the vote (no separate
+    integration call)."""
     session.integration_review_enabled = True
-    winner = STRONG
-    ordered = [
-        {"content": WEAK, "agent": "aaa"},
-        {"content": winner, "agent": "zzz"},
-    ]
+    ordered, agg, votes, defects = _finalists()
     session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
     seen = {}
 
@@ -234,35 +240,39 @@ def test_integration_proposal_is_optional_and_runtime_validated(session, store):
         seen["prompt"] = prompt
         return Contribution(
             round=0, role=member.role, agent=member.agent,
-            content=("SYNERGY: YES\nRATIONALE: keep the winner's stable loop and "
+            content=("RATIFY: Candidate 2\nDEFECT: none\n"
+                     "SYNERGY: YES\nRATIONALE: keep the winner's stable loop and "
                      "adopt Candidate 1's clearer controls\nSOURCES: Candidate 1, Candidate 2\n"
                      "ARTIFACT: game.html\n" + STRONG.replace("extra=2", "extra=3")),
         )
 
-    proposal = loop._propose_integration(
-        session, "game.html", winner, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, call, store,
-    )
+    wi, content, applied, action, proposal = loop._chair_finish(
+        session, ordered, agg, votes, defects, 1, call, store)
+    assert wi == 1 and action == "chair ratified the vote"
     assert proposal is not None
-    assert proposal.content != winner
+    assert proposal.content != STRONG
     assert proposal.source_candidates == ["Candidate 1", "Candidate 2"]
     assert "Evaluate EVERY candidate" in seen["prompt"]
+    assert "RATIFY" in seen["prompt"], "one prompt carries decision + fixes + integration"
 
 
 def test_integration_rejects_a_broken_merge(session, store):
     session.integration_review_enabled = True
-    ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
+    ordered, agg, votes, defects = _finalists()
     session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
 
     def call(member, prompt, timeout_s=None):
         return Contribution(
             round=0, role=member.role, agent=member.agent,
-            content=("SYNERGY: YES\nRATIONALE: unsafe merge\nSOURCES: Candidate 1\n"
+            content=("RATIFY: Candidate 2\nDEFECT: none\n"
+                     "SYNERGY: YES\nRATIONALE: unsafe merge\nSOURCES: Candidate 1\n"
                      "ARTIFACT: game.html\n" + BROKEN),
         )
 
-    assert loop._propose_integration(
-        session, "game.html", STRONG, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2}, call, store,
-    ) is None
+    wi, content, applied, action, proposal = loop._chair_finish(
+        session, ordered, agg, votes, defects, 1, call, store)
+    assert proposal is None, "a merge that fails the runtime gate is not offered"
+    assert wi == 1 and content == STRONG, "the ratified winner still ships"
 
 
 def test_integration_resolves_a_read_skill_before_deciding(session, store, tmp_path):
@@ -271,7 +281,7 @@ def test_integration_resolves_a_read_skill_before_deciding(session, store, tmp_p
     session.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
     session.established_root = str(tmp_path)
     (tmp_path / "source.txt").write_text("source continuity", encoding="utf-8")
-    ordered = [{"content": WEAK, "agent": "aaa"}, {"content": STRONG, "agent": "zzz"}]
+    ordered, agg, votes, defects = _finalists()
     calls = []
 
     def call(member, prompt, timeout_s=None):
@@ -282,17 +292,111 @@ def test_integration_resolves_a_read_skill_before_deciding(session, store, tmp_p
         assert "source continuity" in prompt
         return Contribution(
             round=0, role=member.role, agent=member.agent,
-            content=("SYNERGY: YES\nRATIONALE: preserve source continuity\n"
+            content=("RATIFY: Candidate 2\nDEFECT: none\n"
+                     "SYNERGY: YES\nRATIONALE: preserve source continuity\n"
                      "SOURCES: Candidate 1, Candidate 2\nARTIFACT: game.html\n"
                      + STRONG.replace("extra=2", "extra=3")),
         )
 
-    proposal = loop._propose_integration(
-        session, "game.html", STRONG, 1, ordered, {1: 4, 2: 9}, {1: 0, 2: 2},
-        call, store, governance=Governance(store),
-    )
+    wi, content, applied, action, proposal = loop._chair_finish(
+        session, ordered, agg, votes, defects, 1, call, store,
+        governance=Governance(store))
     assert proposal is not None
     assert len(calls) == 2
+
+
+def test_goal_milestone_never_pauses_for_integration(store):
+    """An unattended goal run must never stall mid-goal on a human merge
+    decision: on a goal-milestone session the chair prompt drops the SYNERGY
+    section entirely and no proposal is returned, even when integration review
+    is enabled in settings."""
+    s = SessionManager(store).create("build game.html in full", source="goal")
+    s.classification = Classification(task_type=TaskType.code,
+                                      complexity=Complexity.standard, risk=Risk.none,
+                                      produces_output=True)
+    s.integration_review_enabled = True
+    s.council = Council(members=[CouncilMember(role=Role.summarizer, agent="codifier", active=True)])
+    ordered, agg, votes, defects = _finalists()
+    seen = {}
+
+    def call(member, prompt, timeout_s=None):
+        seen["prompt"] = prompt
+        return Contribution(  # even a rogue SYNERGY offer must be ignored
+            round=0, role=member.role, agent=member.agent,
+            content=("RATIFY: Candidate 2\nDEFECT: none\n"
+                     "SYNERGY: YES\nRATIONALE: rogue\nSOURCES: Candidate 1\n"
+                     "ARTIFACT: game.html\n" + STRONG.replace("extra=2", "extra=3")),
+        )
+
+    wi, content, applied, action, proposal = loop._chair_finish(
+        s, ordered, agg, votes, defects, 1, call, store)
+    assert "SYNERGY" not in seen["prompt"], "goal milestones don't invite merge offers"
+    assert proposal is None, "…and never surface one (no mid-goal human gate)"
+    assert wi == 1 and action == "chair ratified the vote"
+
+
+# --- parallel judge waves + unanimity early stop -------------------------------
+
+
+def _judge_group():
+    return [{"agent": "aaa", "base": "game.html", "namespaced": "aaa__game.html", "content": WEAK},
+            {"agent": "zzz", "base": "game.html", "namespaced": "zzz__game.html", "content": STRONG}]
+
+
+def test_unanimous_first_wave_skips_remaining_judges(session, store):
+    """5 judges convened, but the first wave of JUDGE_FIRST_WAVE votes 3/3 for
+    the same winner — the remaining judges (each a full re-read of the whole
+    candidate corpus) are never called."""
+    judges = [CouncilMember(role=Role.panelist, agent=f"j{i}") for i in range(5)]
+    called = []
+
+    def call(member, prompt, timeout_s=None):
+        called.append(member.agent)
+        return Contribution(round=0, role=member.role, agent=member.agent,
+                            content="SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2")
+
+    ordered, agg, votes, defects, judged = loop._score_candidates(
+        session, judges, _judge_group(), call, store)
+    assert judged == config.JUDGE_FIRST_WAVE
+    assert len(called) == config.JUDGE_FIRST_WAVE, "unanimity stopped the vote early"
+    assert votes[2] == config.JUDGE_FIRST_WAVE
+
+
+def test_split_first_wave_convenes_every_judge(session, store):
+    judges = [CouncilMember(role=Role.panelist, agent=f"j{i}") for i in range(5)]
+    called = []
+
+    def call(member, prompt, timeout_s=None):
+        called.append(member.agent)
+        pick = 1 if member.agent == "j0" else 2  # j0 dissents → wave 1 splits
+        return Contribution(round=0, role=member.role, agent=member.agent,
+                            content=f"SCORE Candidate 1: 5\nSCORE Candidate 2: 6\nWINNER: Candidate {pick}")
+
+    ordered, agg, votes, defects, judged = loop._score_candidates(
+        session, judges, _judge_group(), call, store)
+    assert len(called) == 5, "a split vote runs the full bench"
+    assert judged == 5 and votes[1] == 1 and votes[2] == 4
+
+
+def test_lone_surviving_judge_does_not_early_stop(session, store):
+    """One real vote isn't unanimity (JUDGE_EARLY_STOP_MIN_VOTES): if the rest
+    of the first wave dropped, the remaining judges still run."""
+    from gangof8.registry import AgentError
+
+    judges = [CouncilMember(role=Role.panelist, agent=f"j{i}") for i in range(4)]
+    called = []
+
+    def call(member, prompt, timeout_s=None):
+        called.append(member.agent)
+        if member.agent in ("j1", "j2"):  # two of wave 1 drop
+            raise AgentError(f"{member.agent} unavailable")
+        return Contribution(round=0, role=member.role, agent=member.agent,
+                            content="SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2")
+
+    ordered, agg, votes, defects, judged = loop._score_candidates(
+        session, judges, _judge_group(), call, store)
+    assert len(called) == 4, "a 1-vote 'unanimous' wave still convenes the rest"
+    assert judged == 2
 
 
 def test_build_summary_uses_medium_confidence_after_council_drop(session, store, tmp_path):
@@ -372,8 +476,9 @@ def test_judges_are_shown_runtime_evidence(session, store):
 
 def test_chair_work_runs_on_the_codifier_summarizer(session, store):
     """Stage 3 runs on the strong CODIFIER (the Summarizer seat), not the fast
-    lead: both the chair's review AND its winner fix are made by the summarizer.
-    The panel judges are separate. Distinct agents prove the routing."""
+    lead — and it is ONE call: the merged chair pass delivers the ratify
+    decision AND the surgical fixes in a single reply (the old flow spent three
+    serial codifier calls re-reading the same candidate bodies)."""
     _candidate(session, "aaa", "game.html", WEAK)
     _candidate(session, "zzz", "game.html", STRONG)
     judges = [CouncilMember(role=Role.panelist, agent="j1")]
@@ -388,17 +493,18 @@ def test_chair_work_runs_on_the_codifier_summarizer(session, store):
                             content="SCORE Candidate 1: 3\nSCORE Candidate 2: 9\nWINNER: Candidate 2\n"
                                     "DEFECT: rename extra to reviewed")
 
-    def codifier_call(m, p):  # BOTH chair review and winner fix land here
+    def codifier_call(m, p):  # the ONE merged chair pass: decision + fixes together
         codifier_agents.append(m.agent)
-        if "RATIFY" in p:  # the chair-review prompt asks for RATIFY/OVERRIDE
-            return Contribution(round=0, role=m.role, agent=m.agent, content="RATIFY: Candidate 2\nDEFECT: none")
+        assert "RATIFY" in p, "the merged prompt asks for the RATIFY/OVERRIDE decision"
+        assert "EDIT" in p, "…and for the surgical fixes in the same reply"
         return Contribution(round=0, role=m.role, agent=m.agent,
-                            content="EDIT: game.html\n<<<<<<< OLD\nvar extra=2;\n"
+                            content="RATIFY: Candidate 2\nDEFECT: extra should be reviewed\n"
+                                    "EDIT: game.html\n<<<<<<< OLD\nvar extra=2;\n"
                                     "=======\nvar reviewed=2;\n>>>>>>> NEW\n")
 
     out = loop._run_best_of_n(session, council, judges, call, codifier_call, store)
-    assert codifier_agents and all(a == "gemini" for a in codifier_agents), \
-        "the chair's review AND fix ran on the summarizer/codifier, not the lead"
+    assert codifier_agents == ["gemini"], \
+        "the chair's review AND fix ran as ONE call on the summarizer/codifier"
     assert out["fixes"] == 1
     shipped = next(a for a in session.proposed_actions
                    if a.kind == "write_file" and a.role == Role.implementer)
@@ -476,6 +582,29 @@ def test_chair_recovers_when_every_candidate_crashes(session, store):
                    if a.kind == "write_file" and a.role == Role.implementer)
     ran, _t, _d, _dyn = smoke.smoke_source(shipped.content, ".html")
     assert ran, "the recovered file actually runs"
+
+
+def test_verification_failure_enters_bounded_artifact_repair(session, store):
+    """Coordinator validation failures repair before a terminal failure result."""
+    session.required_files = ["app.js"]
+    lead = CouncilMember(role=Role.lead, agent="repair", active=True)
+    session.council = Council(members=[lead])
+    _candidate(session, "draft", "app.js", "var g=[]; g[0].x=1;")
+    session.unresolved.append("artifact verification failed: app.js: does not run")
+
+    def repair_call(member, prompt):
+        assert member.agent == "repair"
+        assert "artifact verification failed" in prompt
+        return Contribution(round=0, role=Role.lead, agent="repair",
+                            content="ARTIFACT: app.js\nvar answer = 42;\n")
+
+    repaired = loop._repair_artifact_failure(
+        session, SessionManager(store), Governance(store), store, repair_call)
+    assert repaired is True
+    assert session.artifact_repair_attempts == 1
+    assert loop._verify_artifact_outputs(session, store, require_file=True) is True
+    assert any(a.kind == "write_file" and a.role == Role.implementer
+               and a.status == "executed" for a in session.proposed_actions)
 
 
 def test_broken_candidate_disqualified_sole_runner_wins(session, store):

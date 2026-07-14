@@ -74,7 +74,14 @@ class Governance:
                 f"role {action.role.value!r} may not use skill {skill.name!r}",
             )
             return None
-        if not skill.requires_approval:
+        # Only parse/compile-only checks can run automatically.  A cwd is not
+        # an OS sandbox, so every functional RUNTESTS command must be visible
+        # to and approved by the human before the coordinator executes it.
+        automatic_static_test = False
+        if action.kind == "run_tests":
+            from .skills import is_automatic_static_test
+            automatic_static_test = is_automatic_static_test(session, action, self.store.data_dir)
+        if not skill.requires_approval or automatic_static_test:
             return None
         for a in session.approvals:
             if a.action_ref == action.action_id and a.status == "approved":
@@ -93,6 +100,25 @@ class Governance:
         # and attach the diff so the human approves with full sight of the change.
         details = None
         if skill.category == "promote":
+            if action.kind == "promote_batch":
+                import json
+                try:
+                    files = json.loads(action.args.get("files", "[]"))
+                except (json.JSONDecodeError, TypeError):
+                    files = []
+                dest = session.delivery_root or session.established_root
+                summary = (
+                    f"APPROVE FINAL BATCH: release {len(files)} verified file(s) "
+                    f"from goal staging → {dest} as one transaction"
+                )
+                try:
+                    from .skills import batch_promote_diff
+                    details = batch_promote_diff(session, self.store.data_dir, action)
+                except Exception as e:  # noqa: BLE001
+                    details = f"(could not build final-batch preview: {e})"
+                return self.request_approval(
+                    session, action=summary, category=skill.category,
+                    risk=skill.risk, action_ref=action.action_id, details=details)
             fname = action.args.get("filename") or action.filename
             # Deliver to the explicit save target if the task named one, else the
             # established folder. Flag OVERWRITE vs new so a standing "approve all
@@ -103,9 +129,10 @@ class Governance:
                      else f"established folder {dest}")
             overwrite = False
             try:
-                overwrite = bool(dest and fname
-                                 and (Path(dest) / Path(fname).name).is_file())
-            except OSError:
+                from .executor import ExecutionError, resolve_in_workspace
+                overwrite = bool(dest and fname and resolve_in_workspace(
+                    Path(dest), fname).is_file())
+            except (OSError, ExecutionError):
                 overwrite = False
             summary = (f"promote: {fname} → {where}"
                        + (" (OVERWRITES an existing file)" if overwrite else " (new file)"))

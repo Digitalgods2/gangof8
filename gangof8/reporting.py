@@ -91,12 +91,29 @@ def run_summary(session: Any) -> dict:
         "contributions_by_model": by_model,
         "actions_by_status": action_statuses,
         "test_fix_attempts": data.get("test_fix_attempts", 0),
+        "candidate_metrics": data.get("candidate_metrics") or {},
+        "quality_gate": data.get("quality_gate") or {},
+        "frontier_author_recoveries": data.get("frontier_author_recoveries") or {},
         "files": files,
     }
 
 
 # event name -> (icon, friendly label)
 _TIMELINE = {
+    "agent_call_queued": ("...", "Model call queued"),
+    "agent_call_started": (">", "Model working"),
+    "agent_call_finished": ("+", "Model call finished"),
+    "agent_call_failed": ("!", "Model call failed"),
+    "frontier_author_recovery_started": ("↻", "Frontier author recovering"),
+    "frontier_runtime_repaired": ("+", "Frontier author repaired its code"),
+    "frontier_runtime_repair_failed": ("!", "Frontier author repair failed"),
+    "frontier_implementation_gate_failed": ("!", "Frontier implementation gate failed"),
+    "frontier_release_verdict": ("✓", "Independent frontier release verdict"),
+    "frontier_release_repair_applied": ("+", "Frontier release repair applied"),
+    "frontier_final_batch_verdict": ("✓", "Final-batch frontier verdict"),
+    "frontier_final_batch_repair_applied": ("+", "Final-batch frontier repair applied"),
+    "chair_defect_closure_incomplete": ("!", "Chair left defect closures open"),
+    "runtime_deferred": (">>", "Runtime check deferred to integration"),
     "panel_artifact_rejected": ("!", "Panel draft rejected"),
     "integration_decided": ("+", "Integration decision"),
     "panel_seat_preflight_failed": ("!", "Panel seat unavailable before run"),
@@ -190,6 +207,16 @@ def _detail(event: str, p: dict) -> str:
         return " · ".join(x for x in (p.get("task_type"), p.get("complexity"), f"risk {p.get('risk')}" if p.get("risk") else "") if x)
     if event == "round_start":
         return str(p.get("goal", ""))[:80]
+    if event in ("agent_call_queued", "agent_call_started"):
+        timeout = p.get("timeout_s")
+        limit = "no coordinator deadline" if timeout == 0 else f"limit {timeout or '?'}s"
+        return f"{p.get('agent','')} / {p.get('role','')} / {limit}"
+    if event == "agent_call_finished":
+        return f"{p.get('agent','')} / {int(p.get('duration_ms') or 0) / 1000:.1f}s"
+    if event == "agent_call_failed":
+        return f"{p.get('agent','')}: {str(p.get('error',''))[:70]}"
+    if event == "runtime_deferred":
+        return f"{p.get('file','')} / waiting for integration"
     if event == "contribution":
         return f"{p.get('role','')} · {p.get('agent','')}" + (f" ({p.get('chars')} chars)" if p.get("chars") else "")
     if event in ("skill_requested", "skill_resolved", "skill_failed"):

@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 from . import config
+from .artifacts import canonical_protocol_filename
 from .models import ProposedAction, Session
 
 # Conservative filename whitelist: word chars, dot, dash, space. No path
@@ -92,6 +93,14 @@ def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:
     handler's result string (e.g. the written path, or file contents)."""
     from .skills import HANDLERS  # local import avoids a circular dependency
 
+    # Defense in depth for restored sessions and non-parser action producers.
+    if action.kind in {"write_file", "edit_file", "promote", "read_file", "stage"}:
+        raw = action.args.get("filename", action.filename)
+        clean = canonical_protocol_filename(raw)
+        if not clean:
+            raise ExecutionError(f"unusable filename: {raw!r}")
+        action.filename = clean
+        action.args["filename"] = clean
     handler = HANDLERS.get(action.kind)
     if handler is None:
         raise ExecutionError(f"unsupported action kind: {action.kind!r}")

@@ -55,6 +55,37 @@ _LEADING_ARTIFACT_HEADER = re.compile(
 )
 
 
+_OUTER_FILENAME_WRAPPERS = (
+    ("`", "`"), ("'", "'"), ('"', '"'), ("‘", "’"), ("“", "”"),
+)
+
+
+def canonical_protocol_filename(raw: str) -> str:
+    """Strip matching presentation wrappers from a model-emitted path.
+
+    Matching outer Markdown/quote characters are syntax, never filename bytes.
+    Internal apostrophes (for example ``Benny's-theme.css``) are preserved.
+    """
+    name = str(raw or "").strip()
+    changed = True
+    while name and changed:
+        changed = False
+        if len(name) >= 4 and name.startswith("**") and name.endswith("**"):
+            name = name[2:-2].strip()
+            changed = True
+            continue
+        for left, right in _OUTER_FILENAME_WRAPPERS:
+            if len(name) >= 2 and name.startswith(left) and name.endswith(right):
+                name = name[len(left):len(name) - len(right)].strip()
+                changed = True
+                break
+    name = name.replace("\\", "/")
+    if (not name or any(ord(ch) < 32 for ch in name)
+            or name[0] in "`'\"‘“" or name[-1] in "`'\"’”"):
+        return ""
+    return name
+
+
 def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[ProposedAction]:
     """Parse marker blocks into ProposedActions in document order."""
     starts = sorted(m.start() for m in BLOCK_START.finditer(text))
@@ -64,13 +95,17 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
 
     found: list[tuple[int, ProposedAction]] = []
     for m in ARTIFACT_MARKER.finditer(text):
-        fn = m.group(1).strip()
+        fn = canonical_protocol_filename(m.group(1))
+        if not fn:
+            continue
         body = clean_artifact_body(text[m.end():content_end(m.end())], fn)
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="write_file", role=role,
             filename=fn, content=body, args={"filename": fn, "content": body})))
     for m in EDIT_MARKER.finditer(text):
-        fn = m.group("file").strip()
+        fn = canonical_protocol_filename(m.group("file"))
+        if not fn:
+            continue
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="edit_file", role=role, filename=fn,
             args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
@@ -80,7 +115,9 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
             session_id=sid, kind="run_tests", role=role,
             filename=cmd or "pytest -q", args={"command": cmd})))
     for m in PROMOTE_MARKER.finditer(text):
-        fn = m.group("file").strip()
+        fn = canonical_protocol_filename(m.group("file"))
+        if not fn:
+            continue
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="promote", role=Role.implementer,
             filename=fn, args={"filename": fn})))

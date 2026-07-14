@@ -6,6 +6,8 @@ resume sessions in the background.
 """
 
 import os
+import shutil
+import subprocess
 import time
 
 import pytest
@@ -78,16 +80,16 @@ def test_dashboard_page_served(client):
     assert "nothing executes without your approval" in r.text
 
 
-def test_logo_served_and_referenced(client):
-    """The emblem is served at /logo.png (real PNG), shown in the header before the
-    'Gang of 8' text, and reused as the browser-tab favicon."""
-    r = client.get("/logo.png")
+def test_header_lockup_is_served_and_referenced(client):
+    """The supplied single-image lockup replaces the header emblem and labels."""
+    r = client.get("/gangof8-text.png")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n" and len(r.content) > 500  # a real PNG
     page = client.get("/").text
-    assert '<img src="/logo.png" class="brand-logo"' in page  # header logo
-    assert 'rel="icon"' in page                                # favicon
+    assert '<img src="/gangof8-text.png" class="brand-lockup"' in page
+    assert "Coordinator OS" not in page
+    assert 'rel="icon"' in page  # the existing favicon is independent of the header lockup
 
 
 def test_dashboard_assets_served(client):
@@ -105,6 +107,32 @@ def test_dashboard_assets_served(client):
     assert "function enhancePrompt" in app_js.text
     assert "void enhancePrompt();" in app_js.text
     assert "const escAttr =" not in app_js.text, "shared helper must not be redeclared"
+    assert "this session has one accountable owner" in app_js.text
+    assert "contract-linked to P" in app_js.text
+    assert "Building package" in app_js.text
+
+
+def test_dashboard_detail_refresh_gate_rejects_stale_responses(client):
+    """A pre-cancel detail request cannot repaint over a newer terminal one."""
+    if shutil.which("node") is None:
+        pytest.skip("node not on PATH")
+    script = r"""
+const {createLatestRequestGate} = require('./gangof8/static/dashboard-utils.js');
+const gate = createLatestRequestGate();
+const beforeCancel = gate.begin();
+const terminalRefresh = gate.begin();
+if (gate.isCurrent(beforeCancel)) throw new Error('older response still owns rendering');
+if (!gate.isCurrent(terminalRefresh)) throw new Error('newest response lost ownership');
+gate.invalidate();
+if (gate.isCurrent(terminalRefresh)) throw new Error('cancel did not invalidate in-flight response');
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], cwd=os.getcwd(), capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    app_js = client.get("/app.js").text
+    assert "detailRefreshGate.isCurrent(requestToken)" in app_js
+    assert 'cache: "no-store"' in app_js
 
 
 def test_health_reports_backend(client):
