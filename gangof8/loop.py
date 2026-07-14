@@ -6,8 +6,11 @@ budgets; exceeding any cap force-stops with a partial answer.
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 import hashlib
+import shutil
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -187,18 +190,62 @@ def _agent_call(
         # The semaphore bounds concurrency per adapter kind (never held across
         # the budget lock, so bookkeeping never blocks on a slow call).
         with _agent_semaphore(registry, member.agent):
+            started_at = utcnow()
+            coding_call = bool(
+                session.classification
+                and session.classification.task_type == TaskType.code
+            )
             activity = {
                 "call_id": call_id, "agent": member.agent, "role": member.role.value,
-                "started_at": utcnow(), "timeout_s": timeout_s,
+                "state": "running", "started_at": started_at,
+                "last_progress_at": started_at, "progress_chars": 0,
+                "progress_detail": "request dispatched", "timeout_s": timeout_s,
+                "timeout_policy": "no_output_stall" if coding_call else "total_wall_clock",
             }
             with _SESSION_LOCK:
                 session.active_agent_calls.append(activity)
                 store.log_event(session.session_id, "agent_call_started", activity)
                 store.save_session(session)
+            last_progress_save = [0.0]
+            last_progress_chars = [0]
+
+            def _record_progress(chars: int, detail: str) -> None:
+                """Persist a throttled, token-backed heartbeat for the dashboard."""
+                now = time.monotonic()
+                # The adapter reports cumulative output characters. Ignore
+                # keep-alives and duplicate callbacks: they are not progress.
+                if chars <= last_progress_chars[0] and detail == "output":
+                    return
+                last_progress_chars[0] = max(last_progress_chars[0], chars)
+                with _SESSION_LOCK:
+                    current = next((item for item in session.active_agent_calls
+                                    if item.get("call_id") == call_id), None)
+                    if current is None:
+                        return
+                    current["last_progress_at"] = utcnow()
+                    current["progress_chars"] = last_progress_chars[0]
+                    current["progress_detail"] = detail[:80]
+                    # One small WAL write every two seconds is enough for a live
+                    # UI without turning a token stream into a write storm.
+                    if now - last_progress_save[0] >= 2.0:
+                        last_progress_save[0] = now
+                        store.log_event(
+                            session.session_id, "agent_call_progress",
+                            {"call_id": call_id, "agent": member.agent,
+                             "chars": last_progress_chars[0], "detail": detail[:80]},
+                        )
+                        store.save_session(session)
+
+            cancellation.set_current_call(call_id)
+            cancellation.set_call_kind("coding" if coding_call else "routine")
+            cancellation.register_progress(session.session_id, call_id, _record_progress)
             try:
                 result = registry.call(
                     member.agent, member.role, prompt, timeout_s, images=images)
             finally:
+                cancellation.unregister_progress(session.session_id, call_id)
+                cancellation.set_current_call(None)
+                cancellation.set_call_kind(None)
                 with _SESSION_LOCK:
                     session.active_agent_calls = [
                         item for item in session.active_agent_calls
@@ -221,6 +268,8 @@ def _agent_call(
             session.agent_calls -= 1  # failed — release the reserved slot
         raise
     finally:
+        cancellation.set_current_call(None)
+        cancellation.set_call_kind(None)
         cancellation.set_current_session(None)
     if (cancellation.is_requested(session.session_id)
             or (session.worker_lease
@@ -265,16 +314,17 @@ def _readable_files(session: Session, data_dir) -> list[str]:
     return sorted(p.name for p in d.iterdir() if p.is_file())
 
 
-def _runtime_prelude(session: Session, filename: str) -> str:
-    """Load declared runtime dependencies in their real project order.
+def _runtime_dependency_sources(session: Session, filename: str) -> list[tuple[str, str]]:
+    """Load declared runtime dependencies with their provenance preserved.
 
     A JavaScript module that extends ``Game`` is not a standalone page.  The
     old smoke check ran that file by itself and rejected correct candidates with
-    ``Game is not defined``.  Goal milestones now carry their dependency list;
-    legacy JS module tasks get the conservative ``core.js`` convention.
+    ``Game is not defined``.  Returning named chunks instead of one opaque
+    string lets validation distinguish a dependency/integration failure from a
+    defect in the package currently being verified.
     """
     if Path(filename).suffix.lower() not in {".js", ".mjs"}:
-        return ""
+        return []
     names = list(session.runtime_dependencies)
     if not names and Path(filename).name != "core.js":
         names = ["core.js"]
@@ -283,10 +333,11 @@ def _runtime_prelude(session: Session, filename: str) -> str:
     # first lookup root, followed by previously accepted project locations.
     roots = [executor.artifacts_dir(config.DATA_DIR, session.session_id),
              session.workspace_root, session.delivery_root, session.established_root]
-    chunks: list[str] = []
+    chunks: list[tuple[str, str]] = []
+    target = str(filename or "").strip().replace("\\", "/")
     for name in names:
         rel = str(name or "").strip().replace("\\", "/")
-        if not rel or rel == Path(filename).name:
+        if not rel or rel == target:
             continue
         for root in roots:
             if not root:
@@ -305,11 +356,16 @@ def _runtime_prelude(session: Session, filename: str) -> str:
                             continue
                         if actual != expected:
                             continue
-                    chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+                    chunks.append((rel, path.read_text(encoding="utf-8", errors="replace")))
                     break
             except OSError:
                 continue
-    return "\n\n".join(chunks)
+    return chunks
+
+
+def _runtime_prelude(session: Session, filename: str) -> str:
+    """Compatibility export: dependency bytes in their declared load order."""
+    return "\n\n".join(text for _name, text in _runtime_dependency_sources(session, filename))
 
 
 def _normalized_paths(names: list[str]) -> list[str]:
@@ -1324,6 +1380,13 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
 
 def _candidate_artifact_problem(session: Session, filename: str) -> str:
     """Return why a panel ARTIFACT name cannot be a deliverable candidate."""
+    normalized = str(filename or "").strip().replace("\\", "/")
+    if (session.collaboration_mode == "build_team" and session.required_files
+            and normalized not in _normalized_paths(session.required_files)):
+        return (
+            "artifact path does not exactly match the package contract; expected one of: "
+            + ", ".join(_normalized_paths(session.required_files))
+        )
     base = _basename(filename)
     if not base or base in {".", ".."}:
         return "artifact did not name a file"
@@ -2063,6 +2126,20 @@ def _deliberate(
                            timeout_s=config.CODIFIER_TIMEOUT,
                            reserve=config.COMPOSER_RESERVED_CALLS, images=images)
 
+    def owner_repair_call(member: CouncilMember, prompt: str) -> Contribution:
+        """A package owner repairs its own bytes under authoring policy.
+
+        In particular, a frontier owner keeps the explicit no-deadline coding
+        policy instead of being accidentally re-called through the 600-second
+        summarizer/codifier wrapper.
+        """
+        timeout = (config.FRONTIER_AUTHOR_TIMEOUT
+                   if member.agent in config.FRONTIER_AUTHOR_SEATS
+                   else config.PANEL_AUTHOR_TIMEOUT)
+        return _agent_call(session, registry, store, member, prompt,
+                           timeout_s=timeout,
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+
     lead = council.get(Role.lead)
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
@@ -2160,7 +2237,7 @@ def _deliberate(
         (m for m in council.members if m.role == Role.panelist and m.active
          and m.agent == session.work_package_owner), None)
     artifact_author = package_owner or lead
-    artifact_call = codifier_call if package_owner else lead_call
+    artifact_call = owner_repair_call if package_owner else lead_call
     if artifact_author and artifact_author.active:
         _complete_truncated_artifacts(session, artifact_call, artifact_author, store)
         # Package failures return to the package owner; ordinary sessions retain
@@ -2206,7 +2283,8 @@ def _deliberate(
         while (not verified and not external_conflict and session.artifact_repair_attempts
                < config.MAX_ARTIFACT_REPAIR_ATTEMPTS):
             if not _repair_artifact_failure(
-                session, manager, governance, store, codifier_call):
+                session, manager, governance, store,
+                owner_repair_call if package_owner else codifier_call):
                 break
             verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
     if not verified:
@@ -3595,20 +3673,35 @@ def _repair_artifact_failure(
     own test commands have finished.  Previously they went straight to a final
     answer that looked terminally successful to goals.
     """
-    who = _codifier(session)
+    package_owner = next(
+        (member for member in session.council.members
+         if member.active and member.agent == session.work_package_owner),
+        None,
+    )
+    # A validator may diagnose an owner's file, but it must not silently become
+    # the replacement author.  Package repair stays with the named owner; the
+    # ordinary-session codifier remains the fallback when no package exists.
+    who = package_owner or _codifier(session)
     if not (who and who.active):
         return False
     candidates = [a for a in session.proposed_actions
                   if a.kind == "write_file" and (a.content or "").strip()]
-    delivered_names = {a.filename.replace("\\", "/") for a in candidates
-                       if a.role != Role.panelist and a.status == "executed"}
-    missing_required = [name for name in session.required_files
-                        if name not in delivered_names]
-    if missing_required:
-        filename = missing_required[0]
-        matches = [a for a in candidates
-                   if a.filename.replace("\\", "/") == filename
-                   or _basename(a.filename).split("__", 1)[-1] == _basename(filename)]
+    failure = next((u for u in reversed(session.unresolved)
+                    if "verification failed" in u.lower() or "required artifact" in u.lower()),
+                   "coordinator validation failed")
+    if session.required_files:
+        normalized_required = [name.replace("\\", "/") for name in session.required_files]
+        filename = next((name for name in normalized_required if name in failure),
+                        normalized_required[0])
+        # The basename fallback may recover the owner's source bytes, but NEVER
+        # changes the repair destination.  This is the exact bug that wrote
+        # asteroids.js while src/games/asteroids.js remained invalid.
+        exact = [a for a in candidates
+                 if a.filename.replace("\\", "/") == filename]
+        matches = exact or [
+            a for a in candidates
+            if _basename(a.filename).split("__", 1)[-1] == _basename(filename)
+        ]
         target = max(matches, key=lambda a: len(a.content or "")) if matches else None
         original = target.content if target is not None else ""
     elif candidates:
@@ -3622,13 +3715,8 @@ def _repair_artifact_failure(
                 filename = filename[len(prefix):]
                 break
         original = target.content
-    elif session.required_files:
-        filename, original = session.required_files[0], ""
     else:
         return False
-    failure = next((u for u in reversed(session.unresolved)
-                    if "verification failed" in u.lower() or "required artifact" in u.lower()),
-                   "coordinator validation failed")
     while session.artifact_repair_attempts < config.MAX_ARTIFACT_REPAIR_ATTEMPTS:
         session.artifact_repair_attempts += 1
         attempt = session.artifact_repair_attempts
@@ -3639,7 +3727,7 @@ def _repair_artifact_failure(
             f"Coordinator validation failure:\n{failure}\n\n"
             f"Target file: {filename}\n"
             "Return EXACTLY one complete replacement, with no analysis or fences:\n"
-            f"ARTIFACT: {filename}\n<raw complete file bytes>\n\n"
+            f"ARTIFACT: {filename}\n<raw complete file bytes>\nEND_ARTIFACT\n\n"
             "The replacement must work with the declared dependencies already in the project.\n"
             f"CURRENT FILE:\n-----\n{original}\n-----"
         )
@@ -3658,6 +3746,13 @@ def _repair_artifact_failure(
                              "reason": "repair did not return one complete artifact"})
             continue
         repaired = writes[0]
+        if repaired.content.strip() == (original or "").strip():
+            store.log_event(
+                session.session_id, "artifact_repair_failed",
+                {"attempt": attempt, "file": filename,
+                 "reason": "repair returned unchanged bytes"},
+            )
+            break
         repaired.role = Role.implementer
         repaired.filename = filename
         repaired.args["filename"] = filename
@@ -3675,6 +3770,7 @@ def _repair_artifact_failure(
         if repaired.status == "executed":
             store.log_event(session.session_id, "artifact_repair_written",
                             {"attempt": attempt, "file": filename})
+            original = repaired.content
             return True
         store.log_event(session.session_id, "artifact_repair_failed",
                         {"attempt": attempt, "file": filename,
@@ -3836,6 +3932,40 @@ def _revision_contract_failures(session: Session, filename: str, text: str) -> l
     return failures
 
 
+def _source_syntax_failure(path: Path, text: str) -> str:
+    """Return a deterministic per-file syntax failure before runtime assembly.
+
+    Package validation must prove the package's own bytes independently of its
+    dependencies.  This gate catches a raw Markdown tail even when an unrelated
+    dependency collision forces the combined runtime check to be deferred.
+    """
+    suffix = path.suffix.lower()
+    if suffix in {".js", ".mjs", ".cjs"}:
+        node = shutil.which("node")
+        if not node:
+            return ""
+        try:
+            result = validation.run(
+                [node, "--check", str(path)], path.parent,
+                config.RUN_TESTS_TIMEOUT, config.RUN_TESTS_OUTPUT_MAX_CHARS,
+            )
+        except validation.ValidationCommandError as exc:
+            return str(exc)
+        if "[passed]" not in result:
+            return result[-600:]
+    elif suffix == ".py":
+        try:
+            ast.parse(text, filename=str(path))
+        except SyntaxError as exc:
+            return f"Python syntax error at line {exc.lineno}: {exc.msg}"
+    elif suffix == ".json":
+        try:
+            json.loads(text)
+        except ValueError as exc:
+            return f"JSON syntax error: {exc}"
+    return ""
+
+
 def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bool = False) -> bool:
     """Deterministic guardrail run whenever a task produced (or had to produce)
     file artifacts. Every executed file must exist and be real — non-empty after
@@ -3928,6 +4058,10 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
             if not text.strip():
                 failures.append(f"{action.filename}: file is empty/blank")
                 continue
+            syntax_failure = _source_syntax_failure(path, text)
+            if syntax_failure:
+                failures.append(f"{action.filename}: syntax check failed: {syntax_failure}")
+                continue
             if action.role != Role.panelist:
                 if _LEADING_ARTIFACT_HEADER.match(text):
                     failures.append(f"{action.filename}: leaked ARTIFACT protocol header into delivered content")
@@ -3969,26 +4103,54 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                 )
             elif smoke.is_web_file(path) and action.filename not in _smoke_checked:
                 _smoke_checked.add(action.filename)
-                ran, testable, detail, dynamic = smoke.smoke_test(
-                    path, prelude=_runtime_prelude(session, action.filename))
-                if not ran:
-                    failures.append(f"{action.filename}: does not run — {detail}")
-                elif testable:
-                    store.log_event(session.session_id, "runtime_ok",
-                                    {"file": action.filename, "dynamic": dynamic})
-                    # A static/frozen render is NOT a hard failure (a report or a
-                    # not-yet-started game is legitimately still) — but flag it so a
-                    # possibly-unplayable delivery isn't reported as a clean success.
-                    if dynamic is False:
-                        session.unresolved.append(
-                            f"{action.filename}: the delivered file renders a static "
-                            "screen and showed no motion under simulated input — "
-                            "verify it is actually interactive/playable")
+                dependency_sources = _runtime_dependency_sources(session, action.filename)
+                dependency_problem = None
+                combined = ""
+                for dependency_name, dependency_text in dependency_sources:
+                    combined = (combined + "\n\n" + dependency_text).strip()
+                    dep_ran, dep_testable, dep_detail, _dep_dynamic = smoke.smoke_source(
+                        combined, ".js")
+                    if dep_testable and not dep_ran:
+                        dependency_problem = (dependency_name, dep_detail)
+                        break
+                if dependency_problem:
+                    dependency_name, dep_detail = dependency_problem
+                    message = (
+                        f"integration runtime deferred for {action.filename}: declared "
+                        f"dependencies are incompatible at {dependency_name} ({dep_detail}); "
+                        "the integration package must reconcile them"
+                    )
+                    if message not in session.unresolved:
+                        session.unresolved.append(message)
+                    store.log_event(
+                        session.session_id, "runtime_dependency_incompatible",
+                        {"file": action.filename, "dependency": dependency_name,
+                         "detail": dep_detail[:300], "hard_failure": False},
+                    )
+                else:
+                    ran, testable, detail, dynamic = smoke.smoke_test(
+                        path, prelude="\n\n".join(
+                            text for _name, text in dependency_sources))
+                    if not ran:
+                        failures.append(f"{action.filename}: does not run — {detail}")
+                    elif testable:
+                        store.log_event(session.session_id, "runtime_ok",
+                                        {"file": action.filename, "dynamic": dynamic})
+                        # A static/frozen render is NOT a hard failure (a report or a
+                        # not-yet-started game is legitimately still) — but flag it so a
+                        # possibly-unplayable delivery isn't reported as a clean success.
+                        if dynamic is False:
+                            session.unresolved.append(
+                                f"{action.filename}: the delivered file renders a static "
+                                "screen and showed no motion under simulated input — "
+                                "verify it is actually interactive/playable")
         except OSError as e:
             failures.append(f"{action.filename}: verification error: {e}")
 
-    if not failures:
-        failures.extend(_run_acceptance_checks(session, store, executed))
+    # Static contract checks are independent evidence. Never suppress them just
+    # because runtime smoke already found something: that masking caused a
+    # dependency collision to hide the actual source syntax failure.
+    failures.extend(_run_acceptance_checks(session, store, executed))
 
     if failures:
         message = "artifact verification failed: " + "; ".join(failures)

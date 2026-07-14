@@ -293,6 +293,33 @@ def test_clean_artifact_body_raw_unfenced_is_unchanged():
     assert loop._clean_artifact_body(raw, "main.py") == "print('hello')"
 
 
+def test_artifact_end_marker_excludes_everything_after_file():
+    reply = (
+        "ARTIFACT: src/games/asteroids.js\n"
+        "globalThis.Asteroids = class Asteroids {};\n"
+        "END_ARTIFACT\n"
+        "## What I built\nA polished arcade implementation.\n"
+    )
+    writes = [a for a in loop._parse_proposals("s_end", reply)
+              if a.kind == "write_file"]
+    assert len(writes) == 1
+    assert writes[0].filename == "src/games/asteroids.js"
+    assert writes[0].content == "globalThis.Asteroids = class Asteroids {};"
+
+
+def test_raw_javascript_trailing_markdown_is_trimmed_conservatively():
+    raw = (
+        "(function(global){\n"
+        "  global.Asteroids = function Asteroids() {};\n"
+        "})(globalThis);\n\n"
+        "**What's in the module**\n"
+        "- complete gameplay and controls\n"
+    )
+    body = loop._clean_artifact_body(raw, "src/games/asteroids.js")
+    assert body.rstrip().endswith("})(globalThis);")
+    assert "What's in the module" not in body
+
+
 class PreambleArtifactLead:
     """Lead emits a short rationale THEN a complete file — and nothing else. The
     summarizer must NOT be called for a build."""

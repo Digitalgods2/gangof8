@@ -182,6 +182,21 @@ rewrite the owner's implementation. If a required output is missing, the same
 owner receives one focused retry for that exact artifact. Existing-file
 revisions use the owner and a surgical edit path.
 
+Artifact boundaries are explicit and path-exact:
+
+```text
+ARTIFACT: src/games/asteroids.js
+<raw file bytes>
+END_ARTIFACT
+```
+
+Only bytes inside that envelope become the file. Matching quote or Markdown
+wrappers around a path are presentation syntax, not filename characters. A
+package owner must use one of its exact contracted paths; a basename such as
+`asteroids.js` cannot silently stand in for `src/games/asteroids.js`. Legacy
+unfenced source replies receive a conservative cleanup pass for recognizable
+trailing presentation headings, followed by the normal syntax gate.
+
 Completed package files are hashed and accepted into shared staging. Hard
 downstream owners read the actual verified bytes produced by upstream owners.
 Contract-linked owners work in parallel from the declared interface; the final
@@ -198,15 +213,28 @@ runtime check.
 ### 4. Packages are verified before release
 
 A package cannot complete when its planner contract is missing or malformed,
-a required file is absent or empty, a dependency changed unexpectedly, or an
-acceptance check fails. Static checks recognized by the coordinator can run
-automatically. Functional test commands remain separately approval-gated
-because they execute code.
+a required file is absent or empty, its own source does not parse, a dependency
+changed unexpectedly, or an acceptance check fails. Per-file syntax,
+acceptance commands, dependency compatibility, and runtime smoke checks are
+separate evidence; one failure never suppresses the others. Static checks
+recognized by the coordinator can run automatically. Functional test commands
+remain separately approval-gated because they execute code.
+
+Cross-package runtime defects are attributed separately. If staged dependency
+files conflict before the current package loads, the current owner is not asked
+to rewrite unrelated code. Its independent syntax and acceptance checks still
+run, and the incompatibility is carried to the frontier integration package,
+which owns assembly-level reconciliation.
 
 Validation and test repair loops are bounded. A failure is recorded honestly;
 it does not become a successful milestone merely because the model stopped.
-When a build package cannot recover, the goal pauses with the staging directory
-intact so the failure can be inspected and the goal resumed.
+Deterministic cleanup runs before any model repair. A package repair returns to
+the original owner and exact contracted path; a summarizer or validator does
+not silently become the author. An unchanged repair is stopped rather than
+spending another identical call. When a build package cannot recover, the goal
+stops scheduling new work and enters `draining` while already-productive
+siblings finish. It becomes `paused` only after every sibling is terminal, with
+the staging directory intact for inspection and resume.
 
 ### 5. The entire goal is released once
 
@@ -287,12 +315,17 @@ The per-seat timeout shown in Settings is a routine/non-code guardrail and does
 not cap any session classified as code. Coding calls use their stage policies:
 current defaults include a 360-second non-frontier panel authoring budget, a
 180-second focused non-frontier retry budget, a 600-second lead timeout, a
-480-second judge timeout, and a 600-second codifier timeout. Claude/Codex implementation and independent
-release-verification calls are different: their default timeout is `0`, meaning
-no coordinator deadline. Their registered CLI process still stops immediately
-when the user cancels the session or goal. A provider, CLI, authentication, or
-machine failure can still end a call, but elapsed wall time alone does not
-discard frontier code.
+480-second judge timeout, and a 600-second codifier timeout. For OpenRouter
+coding calls, the stage value is a no-model-output watchdog rather than a total
+wall clock: streamed answer or reasoning tokens refresh liveness, while network
+comments and keep-alives do not. Productive remote coding can therefore exceed
+the nominal interval, but an open socket with no model progress is closed and
+recovered. Routine OpenRouter calls retain a true total wall-clock deadline.
+Claude/Codex implementation and independent release-verification calls are
+different: their default timeout is `0`, meaning no coordinator deadline. Their
+registered CLI process still stops immediately when the user cancels the
+session or goal. A provider, CLI, authentication, or machine failure can still
+end a call, but elapsed wall time alone does not discard frontier code.
 
 Gang of 8 handles failures as follows:
 
@@ -304,14 +337,18 @@ Gang of 8 handles failures as follows:
   stops delivery instead of degrading silently;
 - a missing build-package artifact gets a focused retry from its owner, with no
   coordinator deadline when that owner is Claude or Codex;
-- bounded artifact and test repair loops re-run verification after changes;
+- streaming OpenRouter calls persist output-backed progress timestamps and
+  distinguish productive generation from a silent/stalled request;
+- bounded artifact and test repair loops re-run verification after changes,
+  stay on the exact path, and return package code to its owner;
 - exhausted recovery does not report success;
-- cancellation and worker leases prevent late background workers from
-  overwriting newer authoritative state; and
+- cancellation immediately closes registered HTTP/CLI work, revokes the worker
+  lease, clears persisted active calls, and records the session terminal, so a
+  late background worker cannot overwrite newer authoritative state; and
 - after a server restart, orphaned live sessions are cancelled and active goals
   are parked as paused rather than left permanently `running` with no worker.
 
-Resume first scans the audit store for a successful, already-verified attempt
+Resume is available after draining completes. It first scans the audit store for a successful, already-verified attempt
 from the same package owner. If its complete required manifest still exists,
 Gang of 8 adopts those exact files into staging and marks the package complete
 instead of paying the model to redo it. Failed packages are reset together,
@@ -327,8 +364,11 @@ work is then recovered as described above.
 
 The dashboard groups retry sessions under their parent goal. Each package row
 shows its owner, effective session state, attempt count, blockers, and active
-model call. The goal card aggregates approval/input blockers and selects the
-actionable session, so a cancelled goal cannot continue to look like an active
+model call. Streaming calls report output characters and whether they are
+waiting for first output; coding calls are labelled with their no-output
+watchdog rather than a misleading total deadline. The goal card exposes the
+`draining` state, aggregates approval/input blockers, and selects the actionable
+session, so a cancelled goal cannot continue to look like an active
 deliberation and a release approval is not hidden behind an arbitrary package.
 
 ## Workspaces, staging, and delivery boundaries
@@ -614,7 +654,7 @@ Common environment variables:
 | `GANGOF8_SANDBOX_KEEP` | Recent inactive sandboxes retained | `25` |
 | `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
 | `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
-| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Default bounded package/panel authoring call, seconds | `360` |
+| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Package/panel authoring interval; OpenRouter code treats it as a no-output stall watchdog | `360` |
 | `GANGOF8_PANEL_RETRY_TIMEOUT` | Focused package recovery call, seconds | `180` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
 | `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author deadline; `0` means cancellable/no coordinator deadline | `0` |

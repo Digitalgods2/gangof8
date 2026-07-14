@@ -341,7 +341,7 @@ class Goal(BaseModel):
 
     goal_id: str = Field(default_factory=lambda: f"g_{short_id()}")
     text: str
-    status: str = "planning"  # planning | running | paused | completed | failed | cancelled
+    status: str = "planning"  # planning | running | draining | paused | completed | failed | cancelled
     milestones: list[GoalMilestone] = []
     current_index: int = 0
     planned_by: str = ""      # agent that authored the milestone plan

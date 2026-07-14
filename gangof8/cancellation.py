@@ -19,6 +19,7 @@ _lock = threading.Lock()
 _requested: set[str] = set()
 _procs: dict[str, set] = {}      # session_id -> set of live subprocess.Popen
 _cancelers: dict[str, set] = {}  # session_id -> set of zero-arg abort callbacks
+_progressers: dict[tuple[str, str], object] = {}  # (session, call) -> progress callback
 _tls = threading.local()         # the worker thread's current session id
 
 
@@ -33,6 +34,60 @@ def set_current_session(session_id: str | None) -> None:
 
 def current_session() -> str | None:
     return getattr(_tls, "sid", None)
+
+
+def set_current_call(call_id: str | None) -> None:
+    """Bind an adapter invocation to its persisted call record.
+
+    Adapters intentionally do not know about Session or LogStore.  This small
+    thread-local bridge lets a streaming adapter report real output progress to
+    the coordinator without coupling the adapter layer to persistence.
+    """
+    _tls.call_id = call_id
+
+
+def current_call() -> str | None:
+    return getattr(_tls, "call_id", None)
+
+
+def set_call_kind(kind: str | None) -> None:
+    _tls.call_kind = kind
+
+
+def current_call_kind() -> str | None:
+    return getattr(_tls, "call_kind", None)
+
+
+def register_progress(session_id: str | None, call_id: str | None, fn) -> None:
+    if not session_id or not call_id:
+        return
+    with _lock:
+        _progressers[(session_id, call_id)] = fn
+
+
+def unregister_progress(session_id: str | None, call_id: str | None) -> None:
+    if not session_id or not call_id:
+        return
+    with _lock:
+        _progressers.pop((session_id, call_id), None)
+
+
+def report_progress(chars: int = 0, detail: str = "output") -> None:
+    """Report meaningful adapter progress for the current call, if registered.
+
+    Network keep-alives never call this function.  Only parsed model output (or
+    an equivalent adapter-level milestone) refreshes the progress timestamp.
+    """
+    sid, call_id = current_session(), current_call()
+    if not sid or not call_id:
+        return
+    with _lock:
+        fn = _progressers.get((sid, call_id))
+    if fn is not None:
+        try:
+            fn(max(0, int(chars)), str(detail or "output"))
+        except Exception:  # noqa: BLE001 - progress reporting must never break a call
+            pass
 
 
 # --- subprocess registry ------------------------------------------------------
@@ -114,3 +169,5 @@ def clear(session_id: str) -> None:
         _requested.discard(session_id)
         _procs.pop(session_id, None)
         _cancelers.pop(session_id, None)
+        for key in [key for key in _progressers if key[0] == session_id]:
+            _progressers.pop(key, None)
