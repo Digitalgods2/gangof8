@@ -862,5 +862,6 @@ def test_legacy_establish_target_input_still_answerable(tmp_path):
     svc.store.save_session(session)
 
     resumed = svc.answer(session.session_id, req.input_id, "workspace")
-    assert resumed.status == SessionStatus.done
+    assert resumed.status == SessionStatus.failed
+    assert resumed.outcome == "failed_verification"
     assert resumed.established_asked is True

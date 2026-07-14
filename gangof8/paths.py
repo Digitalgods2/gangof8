@@ -134,7 +134,7 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
         #     real target like "…\tmp" and drops the trailing prose after it.
         for n in range(len(words) - 1, 0, -1):
             try:
-                sp = Path(" ".join(words[:n]))
+                sp = Path(" ".join(words[:n]).rstrip(",.;:)"))
                 if sp.is_dir():
                     return _nonroot(sp)
                 if sp.is_file():
@@ -156,7 +156,7 @@ def _resolve_root(cand: str, rx) -> Optional[str]:
         if not seg:
             return None
         try:
-            target = Path(cand[:sep + 1] + seg[0]).expanduser()
+            target = Path(cand[:sep + 1] + seg[0].rstrip(",.;:)")).expanduser()
             if is_posix and not target.parent.is_dir():
                 return None
             return _nonroot(target.parent if target.suffix else target)

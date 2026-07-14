@@ -10,12 +10,16 @@ Backends:
 from __future__ import annotations
 
 import json
+import hashlib
+import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import cancellation, config, intake, reporting
+from . import cancellation, config, executor, goals, intake, reporting, rounds, smoke
+from .artifacts import parse_proposals
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
 from .adapters.openrouter import OpenRouterAdapter
@@ -25,12 +29,14 @@ from .governance import Governance
 from .logstore import LogStore
 from .loop import (
     SessionCancelled,
+    _agent_call,
     resume_deliberation,
     resume_session,
     resume_with_input,
     run_session,
 )
-from .models import Budgets, Risk, Role, Session, SessionStatus, utcnow
+from .models import (Budgets, CouncilMember, FinalAnswer, Goal, GoalMilestone, InputRequest,
+                     ProposedAction, Risk, Role, Session, SessionStatus, utcnow)
 from .paths import extract_delivery_target, extract_established_root, prior_deliverable_files
 from .registry import AgentError
 from .registry import AgentRegistry
@@ -124,9 +130,13 @@ class GangOf8Service:
         self.workspaces = WorkspaceStore(self._data_dir)
         self.uploads = UploadStore(self._data_dir)
         self.secrets = SecretStore(self._data_dir)
+        self.goals = goals.GoalStore(self._data_dir)
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
-        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gangof8")
+        # Goal packages are intentionally independent work units.  Keep enough
+        # workers for the full seven-seat roster plus planning/release overhead;
+        # per-provider semaphores still enforce backend-safe call concurrency.
+        self._pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="gangof8")
         self._model_catalog_cache: Optional[tuple[float, dict]] = None
         self._or_catalog_cache: Optional[tuple[float, dict]] = None
         self._apply_settings(backend=backend)
@@ -135,6 +145,7 @@ class GangOf8Service:
         # advance or cancel them. Finalize those now so they can't linger as
         # un-cancellable "deliberating" ghosts.
         self._reconcile_orphans()
+        self._reconcile_goal_orphans()
 
     def _apply_settings(self, backend: Optional[str] = None) -> None:
         """(Re)derive backend, role mapping and registry from
@@ -429,6 +440,9 @@ class GangOf8Service:
         session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
         session.panel = list(self.panel)
+        session.required_frontier_authors = [
+            seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in session.panel
+        ]
         session.cli_timeouts = dict(self.settings.cli_timeouts or {})
         session.integration_review_enabled = self.settings.integration_review_enabled
         active = self.workspaces.active()
@@ -532,10 +546,7 @@ class GangOf8Service:
     def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None,
             attachments: Optional[list[str]] = None) -> Session:
         session = self._open(text, source, budgets, attachments)
-        return run_session(
-            session, self.manager, self.registry, self.governance, self.store,
-            role_agents=self.role_agents,
-        )
+        return self._run_owned(session, self._run_full, background=False)
 
     def submit_background(self, text: str, source: str = "api",
                           budgets: Optional[Budgets] = None,
@@ -543,8 +554,7 @@ class GangOf8Service:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
         session = self._open(text, source, budgets, attachments)
-        worker_session = self.manager.load(session.session_id) or session
-        self._pool.submit(self._safely, worker_session, self._run_full)
+        self._run_owned(session, self._run_full, background=True)
         return session
 
     def _preflight_panel(self, session: Session) -> None:
@@ -708,13 +718,40 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             role_agents=self.role_agents,
         )
 
+    def _claim_worker(self, session: Session) -> Session:
+        """Atomically claim a session and reload it carrying the lease token."""
+        token = self.store.claim_worker_lease(session.session_id)
+        if not token:
+            raise ValueError(f"session {session.session_id} is already owned or terminal")
+        owned = self.manager.load(session.session_id)
+        if owned is None:
+            raise KeyError(f"session {session.session_id} disappeared while claiming it")
+        owned.worker_lease = token
+        return owned
+
+    def _lease_current(self, session: Session) -> bool:
+        return self.store.lease_is_current(session.session_id, session.worker_lease)
+
+    def _run_owned(self, session: Session, fn, background: bool, *args) -> Session:
+        """Run a session only while it owns the persisted worker lease."""
+        worker = self._claim_worker(session)
+        if background:
+            self._pool.submit(self._safely, worker, fn, *args)
+            return worker
+        return self._safely(worker, fn, *args)
+
     def _safely(self, session: Session, fn, *args) -> Session:
         """Background guard: a session must never die silently in a thread."""
         try:
+            if not self._lease_current(session):
+                return session
             return fn(session, *args)
         except SessionCancelled:
+            if not self._lease_current(session):
+                return session
             cancellation.clear(session.session_id)
             session.stop_reason = "cancelled by user"
+            session.outcome = "cancelled"
             try:
                 self.manager.transition(session, SessionStatus.cancelled)
             except ValueError:
@@ -723,13 +760,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event(session.session_id, "session_cancelled", {})
             return session
         except Exception as e:  # noqa: BLE001 — last-resort containment
+            if not self._lease_current(session):
+                return session
             self.store.log_event(session.session_id, "internal_error", {"detail": str(e)})
+            session.outcome = "failed"
             try:
                 self.manager.transition(session, SessionStatus.failed)
             except ValueError:
                 session.status = SessionStatus.failed
                 self.store.save_session(session)
             return session
+        finally:
+            # goal bookkeeping sees every outcome (done/failed/cancelled/paused);
+            # it never raises, so it can't clobber the return value above
+            if self._lease_current(session):
+                self._maybe_advance_goal(session, background=session.goal_background)
+                self.store.release_worker_lease(session.session_id, session.worker_lease)
 
     def _ensure_adapters(self, session: Session) -> None:
         """A loaded session must be resumable regardless of how this service
@@ -1017,7 +1063,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return self.store.load_session(session_id)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session from the store (DB + JSONL log)."""
+        """Delete a session only after revoking/cancelling any live worker."""
+        session = self.manager.load(session_id)
+        if session is not None and session.status not in {
+                SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}:
+            cancellation.request(session_id)
+            self.store.revoke_worker_lease(session_id)
         return self.store.delete_session(session_id)
 
     def continue_session(self, session_id: str, text: str, background: bool = True,
@@ -1070,10 +1121,1097 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         cancellation.clear(session_id)
         self.store.log_event(session_id, "conversation_continued", {"turn": len(session.turns)})
         self.store.save_session(session)
+        return self._run_owned(session, self._run_full, background=background)
+
+    # ---- Goals (/goal): long-horizon objectives, milestone by milestone -------
+
+    def create_goal(self, text: str, background: bool = False) -> Goal:
+        """Open a goal: the architect decomposes it into milestone-sized
+        deliverables ONCE, then milestone 1 runs as a normal session. With
+        background=True the planning + first milestone run on a worker and the
+        caller polls GET /goals/{id}."""
+        raw = (text or "").strip()
+        if raw.lower().startswith("/goal"):
+            raw = raw[5:].strip()
+        if not raw:
+            raise ValueError("goal text is empty")
+        established = extract_established_root(raw)
+        delivery = extract_delivery_target(raw)
+        active = self.workspaces.active()
+        if not established and active:
+            established = active.root
+        goal = Goal(
+            text=raw,
+            collaboration_mode="build_team",
+            delivery_mode="final_batch",
+            background=background,
+            established_root=established,
+            delivery_root=delivery,
+        )
+        goal.staging_root = str((self._data_dir / "goal-workspaces" / goal.goal_id / "stage").resolve())
+        self.goals.save(goal)
+        self.store.log_event("-", "goal_created",
+                             {"goal_id": goal.goal_id, "chars": len(raw)})
         if background:
-            self._pool.submit(self._safely, session, self._run_full)
-            return session
-        return self._safely(session, self._run_full)
+            self._pool.submit(self._plan_and_start_safely, goal.goal_id)
+            return goal
+        return self._plan_and_start(goal.goal_id)
+
+    def _plan_and_start_safely(self, goal_id: str) -> None:
+        """Worker guard — a goal must never die silently in a thread."""
+        try:
+            self._plan_and_start(goal_id)
+        except Exception as e:  # noqa: BLE001 — last-resort containment
+            self.store.log_event("-", "goal_error", {"goal_id": goal_id, "detail": str(e)})
+            goal = self.goals.claim_worker_lease(goal_id, {"planning"})
+            if goal is not None:
+                goal.status = "failed"
+                goal.last_error = str(e)[:300]
+                self.goals.save_owned(goal, goal.worker_lease)
+                self.goals.release_worker_lease(goal.goal_id, goal.worker_lease)
+
+    def _goal_planner(self) -> tuple[Optional[str], Role]:
+        """The seat that authors the plan: architect › summarizer › lead —
+        first one that maps to a registered adapter."""
+        for role in (Role.architect, Role.summarizer, Role.lead):
+            agent = self.role_agents.get(role)
+            if agent and agent in self.registry.names():
+                return agent, role
+        return None, Role.architect
+
+    _GOAL_STAGE_SKIP = {
+        ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env",
+        "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
+        ".idea", ".vscode", ".next", "target", "vendor",
+    }
+
+    def _seed_goal_stage(self, goal: Goal) -> None:
+        """Create the private overlay used by every package in this goal.
+
+        Existing source is copied once, excluding generated/vendor trees that
+        dominate startup time.  The user's project remains read-only until the
+        final batch action is approved.
+        """
+        stage = Path(goal.staging_root).resolve()
+        stage.mkdir(parents=True, exist_ok=True)
+        if any(stage.iterdir()) or not goal.established_root:
+            return
+        source = Path(goal.established_root).resolve()
+        if not source.is_dir():
+            return
+        if stage == source or source in stage.parents:
+            raise ValueError("goal staging workspace must be outside the established project")
+        copied = 0
+        for path in source.rglob("*"):
+            try:
+                rel = path.relative_to(source)
+            except ValueError:
+                continue
+            if any(part in self._GOAL_STAGE_SKIP for part in rel.parts):
+                continue
+            if path.is_symlink() or not path.is_file():
+                continue
+            target = stage / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(path, target)
+                copied += 1
+            except OSError:
+                continue
+        self.store.log_event("-", "goal_stage_seeded",
+                             {"goal_id": goal.goal_id, "files": copied, "root": str(stage)})
+
+    def _normalize_work_packages(
+        self, milestones: list[GoalMilestone], goal_text: str = ""
+    ) -> tuple[list[GoalMilestone], list[str]]:
+        """Assign owners and normalize hard versus contract dependency edges.
+
+        ``depends_on`` is deliberately conservative: it blocks scheduling until
+        verified bytes exist. ``contract_depends_on`` gives an owner the upstream
+        interface immediately and never blocks its start.
+        """
+        seats = list(dict.fromkeys(s for s in self.panel if s))
+        errors: list[str] = []
+        planner_named_owners = any(m.owner for m in milestones)
+        for i, package in enumerate(milestones):
+            package.index = i
+            package.package_id = package.package_id or f"wp_{i + 1}"
+            if not package.owner or (seats and package.owner not in seats):
+                package.owner = seats[i % len(seats)] if seats else ""
+            package.depends_on = list(dict.fromkeys(
+                d for d in package.depends_on if 0 <= d < len(milestones) and d != i
+            ))
+            package.contract_depends_on = list(dict.fromkeys(
+                d for d in package.contract_depends_on
+                if (0 <= d < len(milestones) and d != i and d not in package.depends_on)
+            ))
+            # Older/mock planners did not know AFTER. Preserve their historical
+            # sequential meaning while new package plans opt into parallelism.
+            if not planner_named_owners and i > 0 and not package.depends_on:
+                package.depends_on = [i - 1]
+
+        # Frontier seats are valuable because they implement, not because they
+        # can return later as judges. Repair a weak planner assignment by moving
+        # each enabled frontier seat onto a source-producing package. Swap its
+        # prior non-code owner assignment when possible so roster coverage stays
+        # broad; prefer the release/integration package for the first frontier.
+        code_suffixes = {
+            ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx",
+            ".jsx", ".py", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
+            ".h", ".hpp", ".cs", ".rb", ".php", ".vue", ".svelte", ".swift",
+        }
+        code_indices = [
+            i for i, package in enumerate(milestones)
+            if any(Path(name).suffix.lower() in code_suffixes
+                   for name in package.required_files)
+        ]
+        frontier = [seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in seats]
+        targets = sorted(
+            code_indices,
+            key=lambda i: (not bool(milestones[i].release_files), i),
+        )
+        for seat in frontier:
+            if any(milestones[i].owner == seat for i in code_indices):
+                continue
+            target_i = next(
+                (i for i in targets
+                 if milestones[i].owner not in frontier),
+                None,
+            )
+            if target_i is None:
+                continue
+            displaced = milestones[target_i].owner
+            old_i = next(
+                (i for i, package in enumerate(milestones)
+                 if package.owner == seat and i not in code_indices),
+                None,
+            )
+            milestones[target_i].owner = seat
+            if old_i is not None and displaced:
+                milestones[old_i].owner = displaced
+
+        providers: dict[str, int] = {}
+        for i, package in enumerate(milestones):
+            for needed in package.dependencies:
+                if needed in providers and providers[needed] not in package.depends_on:
+                    package.depends_on.append(providers[needed])
+            for output in package.required_files:
+                if output in providers:
+                    previous = providers[output]
+                    if previous not in package.depends_on:
+                        package.depends_on.append(previous)
+                providers[output] = i
+
+        # A physical file requirement always wins over a contract-only hint.
+        # Keeping the same edge in both lists would make the API/UI claim it is
+        # non-blocking even though the scheduler correctly waits for the file.
+        for package in milestones:
+            package.contract_depends_on = [
+                d for d in package.contract_depends_on if d not in package.depends_on
+            ]
+            invalid_release = [name for name in package.release_files
+                               if name not in package.required_files]
+            if invalid_release:
+                errors.append(
+                    f"{package.package_id} RELEASE is not owned by OUTPUTS: "
+                    + ", ".join(invalid_release)
+                )
+
+        # Backward-compatible deterministic inference for a planner that predates
+        # RELEASE.  Only sink-package outputs are candidates; for an explicitly
+        # single-file HTML goal, prefer its one final HTML artifact and keep build
+        # scripts/source modules private.  New planner prompts declare this
+        # explicitly, so inference is a safety net rather than the normal path.
+        if milestones and not any(p.release_declared for p in milestones):
+            consumed = {d for package in milestones for d in package.depends_on}
+            sinks = [p for p in milestones if p.index not in consumed]
+            sink = sinks[-1] if sinks else milestones[-1]
+            candidates = list(sink.required_files)
+            text = (goal_text or "").lower()
+            single_file = any(phrase in text for phrase in (
+                "single-file", "single file", "one file", "one html file",
+            ))
+            html = [name for name in candidates
+                    if Path(name).suffix.lower() in (".html", ".htm")]
+            sink.release_files = html if single_file and len(html) == 1 else candidates
+            sink.release_declared = True
+
+        if (goal_text and goals.requires_delivery_contract(goal_text)
+                and any(p.release_declared for p in milestones)
+                and not any(p.release_files for p in milestones)):
+            errors.append("build plan declares no final RELEASE files")
+
+        visiting: set[int] = set()
+        visited: set[int] = set()
+
+        def visit(i: int) -> None:
+            if i in visiting:
+                errors.append("work-package dependency graph contains a cycle")
+                return
+            if i in visited:
+                return
+            visiting.add(i)
+            for dependency in milestones[i].depends_on:
+                visit(dependency)
+            visiting.remove(i)
+            visited.add(i)
+
+        for i in range(len(milestones)):
+            visit(i)
+        return milestones, list(dict.fromkeys(errors))
+
+    @staticmethod
+    def _package_ready(goal: Goal, index: int) -> bool:
+        package = goal.milestones[index]
+        return (package.status == "pending"
+                and all(goal.milestones[d].status == "done" for d in package.depends_on))
+
+    def _start_ready_packages(self, goal: Goal, background: bool) -> None:
+        """Schedule every hard-dependency-ready package; binding is duplicate-safe.
+
+        Contract-only edges are intentionally absent from ``_package_ready``:
+        their declared interface is enough for parallel authoring.
+        """
+        current = self.goals.get(goal.goal_id) or goal
+        ready = [i for i in range(len(current.milestones)) if self._package_ready(current, i)]
+        if ready:
+            self.store.log_event(
+                "-", "goal_package_wave_started",
+                {
+                    "goal_id": current.goal_id,
+                    "packages": [current.milestones[i].package_id for i in ready],
+                    "owners": [current.milestones[i].owner for i in ready],
+                },
+            )
+        for index in ready:
+            latest = self.goals.get(goal.goal_id)
+            if latest is None or latest.status != "running":
+                return
+            self._start_milestone(latest, index, background=background)
+
+    # ---- Goal v2: transactional planner/advance ownership -------------------
+
+    def _plan_and_start(self, goal_id: str) -> Goal:
+        """Plan only while owning the goal, then bind milestone 1 atomically."""
+        goal = self.goals.claim_worker_lease(goal_id, {"planning"})
+        if goal is None:
+            existing = self.goals.get(goal_id)
+            if existing is not None:
+                return existing
+            raise KeyError(f"goal {goal_id} not found")
+        token = goal.worker_lease
+        start_epoch: Optional[int] = None
+        try:
+            agent, role = self._goal_planner()
+            milestones: list[GoalMilestone] = []
+            rationale = ""
+            if agent:
+                try:
+                    result = self.registry.call(
+                        agent, role, goals.plan_prompt(goal.text, self.panel),
+                        timeout_s=config.GOAL_PLAN_TIMEOUT)
+                    milestones = goals.parse_milestones(result.content or "")
+                    goal.planned_by = agent
+                except Exception as e:  # noqa: BLE001
+                    rationale = f"planning call failed ({str(e)[:200]})"
+            if not milestones:
+                if goals.requires_delivery_contract(goal.text):
+                    goal.status = "paused"
+                    goal.last_error = "planner did not produce a delivery contract"
+                    goal.plan_rationale = rationale or goal.last_error
+                    self.goals.save_owned(goal, token)
+                    return self.goals.get(goal.goal_id) or goal
+                milestones = [GoalMilestone(
+                    index=0, title=goal.text[:80], task_text=goal.text,
+                    contract_declared=True, requires_delivery=False,
+                )]
+                rationale = (rationale or "plan was not parseable") + " - analysis-only milestone"
+            invalid = [m for m in milestones if not m.contract_declared or m.contract_error
+                       or (m.requires_delivery and not m.required_files)]
+            if invalid:
+                goal.status = "paused"
+                goal.last_error = ("planner supplied an incomplete delivery contract for: "
+                                   + ", ".join(m.title for m in invalid))[:300]
+                goal.plan_rationale = rationale or goal.last_error
+                self.goals.save_owned(goal, token)
+                return self.goals.get(goal.goal_id) or goal
+            milestones, graph_errors = self._normalize_work_packages(milestones, goal.text)
+            if graph_errors:
+                goal.status = "paused"
+                goal.last_error = "; ".join(graph_errors)[:300]
+                goal.plan_rationale = rationale or goal.last_error
+                self.goals.save_owned(goal, token)
+                return self.goals.get(goal.goal_id) or goal
+            goal.milestones = milestones
+            self._seed_goal_stage(goal)
+            goal.plan_rationale = rationale
+            goal.current_index = 0
+            goal.status = "running"
+            goal.epoch += 1
+            if not self.goals.save_owned(goal, token):
+                return self.goals.get(goal.goal_id) or goal
+            start_epoch = goal.epoch
+            self.store.log_event("-", "goal_planned",
+                                 {"goal_id": goal.goal_id, "milestones": len(milestones),
+                                  "planned_by": goal.planned_by, "epoch": goal.epoch})
+        finally:
+            self.goals.release_worker_lease(goal.goal_id, token)
+        current = self.goals.get(goal.goal_id)
+        if current and current.status == "running" and current.epoch == start_epoch:
+            self._start_ready_packages(current, background=current.background)
+        return self.goals.get(goal.goal_id) or goal
+
+    def _start_milestone(self, goal: Goal, index: int, background: bool) -> Optional[Session]:
+        """Create a session, then atomically bind it to one live goal epoch."""
+        current = self.goals.get(goal.goal_id)
+        if (current is None or current.status != "running" or current.epoch != goal.epoch
+                or not (0 <= index < len(current.milestones))):
+            return None
+        if (current.delivery_mode == "final_batch" and not self._package_ready(current, index)):
+            return None
+        if (current.delivery_mode != "final_batch"
+                and (current.current_index != index or current.current is None)):
+            return None
+        session = self._open(goals.compose_milestone_task(current, index), "goal", None, None)
+        bound = self.goals.bind_milestone(
+            current.goal_id, index, current.epoch, session.session_id)
+        if bound is None:
+            self.store.delete_session(session.session_id)
+            return None
+        milestone = bound.milestones[index]
+        prior_hashes: dict[str, str] = {}
+        for prior in bound.milestones:
+            if prior.status == "done":
+                prior_hashes.update(prior.accepted_hashes)
+        session.goal_id = bound.goal_id
+        session.goal_milestone = index
+        session.goal_epoch = bound.epoch
+        session.goal_background = bound.background
+        session.collaboration_mode = bound.collaboration_mode
+        session.delivery_mode = bound.delivery_mode
+        session.work_package_id = milestone.package_id
+        session.work_package_owner = milestone.owner
+        session.required_frontier_authors = (
+            [milestone.owner] if milestone.owner in config.FRONTIER_AUTHOR_SEATS else []
+        )
+        if bound.delivery_mode == "final_batch":
+            session.workspace_root = bound.staging_root
+            session.established_root = bound.established_root
+            session.delivery_root = bound.delivery_root
+            if milestone.owner:
+                session.panel = [milestone.owner]
+        session.required_files = list(milestone.required_files)
+        ready_contract_files: list[str] = []
+        pending_contract_files: list[str] = []
+        for dependency_index in milestone.contract_depends_on:
+            dependency = bound.milestones[dependency_index]
+            target = (ready_contract_files if dependency.status == "done"
+                      else pending_contract_files)
+            target.extend(
+                name for name in dependency.required_files
+                if Path(name).suffix.lower() in (".js", ".mjs")
+            )
+        session.runtime_dependencies = list(dict.fromkeys(
+            list(milestone.dependencies) + ready_contract_files
+        ))
+        session.deferred_runtime_dependencies = list(dict.fromkeys(pending_contract_files))
+        # A same-path dependency is an in-place revision target, not an
+        # immutable predecessor.  The old hash gate compared the edited file to
+        # its own pre-edit hash and made every correct revision fail forever.
+        mutable = {name.replace("\\", "/") for name in session.required_files}
+        session.revision_targets = [
+            name.replace("\\", "/") for name in session.runtime_dependencies
+            if name.replace("\\", "/") in mutable
+        ]
+        session.dependency_hashes = {
+            name: prior_hashes[name] for name in session.runtime_dependencies
+            if name in prior_hashes and name.replace("\\", "/") not in mutable
+        }
+        session.revision_base_hashes = {
+            name: prior_hashes[name] for name in session.revision_targets if name in prior_hashes
+        }
+        session.acceptance_commands = list(milestone.acceptance_commands)
+        self.store.save_session(session)
+        self.store.log_event(session.session_id, "goal_milestone_started",
+                             {"goal_id": bound.goal_id, "milestone": index + 1,
+                              "of": len(bound.milestones), "title": milestone.title,
+                              "epoch": bound.epoch})
+        return self._run_owned(session, self._run_full, background=background)
+
+    @staticmethod
+    def _goal_delivery_manifest(
+        session: Session, required: list[str]
+    ) -> tuple[list[str], list[str], dict[str, str]]:
+        """Exact-path, hash-bearing manifest of artifacts actually promoted."""
+        promoted = {
+            a.filename.replace("\\", "/"): a.result_path
+            for a in session.proposed_actions
+            if a.kind == "promote" and a.status == "executed" and a.result_path
+        }
+        missing = [name for name in required if name not in promoted]
+        accepted = [promoted[name] for name in required if name in promoted]
+        if not required:
+            accepted = list(dict.fromkeys(promoted.values()))
+        hashes: dict[str, str] = {}
+        for name, path in promoted.items():
+            try:
+                hashes[name] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except OSError:
+                if name in required:
+                    missing.append(name)
+        return accepted, list(dict.fromkeys(missing)), hashes
+
+    @staticmethod
+    def _goal_stage_manifest(
+        session: Session, required: list[str], staging_root: str,
+    ) -> tuple[list[str], list[str], dict[str, str]]:
+        """Copy only verified package outputs into the shared goal overlay."""
+        stage = Path(staging_root)
+        stage.mkdir(parents=True, exist_ok=True)
+        latest: dict[str, Path] = {}
+        for action in session.proposed_actions:
+            name = action.filename.replace("\\", "/")
+            if (action.role != Role.panelist and action.kind in ("write_file", "edit_file")
+                    and action.status == "executed" and action.result_path):
+                latest[name] = Path(action.result_path)
+        missing: list[str] = []
+        accepted: list[str] = []
+        hashes: dict[str, str] = {}
+        for name in required:
+            source = latest.get(name.replace("\\", "/"))
+            if source is None or not source.is_file():
+                missing.append(name)
+                continue
+            try:
+                target = executor.resolve_in_workspace(stage, name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.resolve() != target.resolve():
+                    shutil.copy2(source, target)
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            except (OSError, executor.ExecutionError):
+                missing.append(name)
+                continue
+            accepted.append(str(target))
+            hashes[name.replace("\\", "/")] = digest
+        return accepted, list(dict.fromkeys(missing)), hashes
+
+    def _goal_acceptance(self, session: Session, milestone: GoalMilestone) -> tuple[bool, list[str], str]:
+        if session.outcome != "succeeded":
+            detail = session.stop_reason or session.outcome or "session did not succeed"
+            return False, [], f"milestone execution did not succeed: {detail}"
+        if not milestone.contract_declared:
+            return False, [], "planner omitted the required OUTPUTS contract"
+        if milestone.contract_error:
+            return False, [], "invalid delivery contract: " + milestone.contract_error
+        if milestone.requires_delivery and not milestone.required_files:
+            return False, [], "delivery contract declares no required files"
+        goal = self.goals.get(session.goal_id) if session.goal_id else None
+        if goal and goal.delivery_mode == "final_batch":
+            accepted, missing, _ = self._goal_stage_manifest(
+                session, milestone.required_files, goal.staging_root)
+        else:
+            accepted, missing, _ = self._goal_delivery_manifest(session, milestone.required_files)
+        if missing:
+            return False, accepted, "required delivery missing: " + ", ".join(missing)
+        return True, accepted, "acceptance passed"
+
+    @staticmethod
+    def _goal_release_files(goal: Goal) -> list[str]:
+        """Return only the explicit user-facing manifest, never all staging.
+
+        Package ``required_files`` are internal build inputs.  Treating every one
+        as a deliverable leaked source trees and test harnesses into goals that
+        requested one final artifact.
+        """
+        files: list[str] = []
+        for package in goal.milestones:
+            for name in package.release_files:
+                normalized = name.replace("\\", "/")
+                if normalized not in files:
+                    files.append(normalized)
+        return files
+
+    @staticmethod
+    def _release_baselines(files: list[str], destination: str) -> dict[str, Optional[str]]:
+        root = Path(destination)
+        out: dict[str, Optional[str]] = {}
+        for name in files:
+            try:
+                path = executor.resolve_in_workspace(root, name)
+                out[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            except (OSError, executor.ExecutionError):
+                out[name] = None
+        return out
+
+    def _authorize_goal_release(self, session: Session) -> Session:
+        """Create exactly one approval-bearing action for the complete manifest."""
+        destination = session.delivery_root or session.established_root
+        if not destination:
+            raise ValueError("final delivery folder has not been selected")
+        files = list(session.required_files)
+        baselines = self._release_baselines(files, destination)
+        action = ProposedAction(
+            session_id=session.session_id,
+            kind="promote_batch",
+            role=Role.implementer,
+            filename=f"final batch ({len(files)} files)",
+            args={"files": json.dumps(files), "baselines": json.dumps(baselines)},
+        )
+        session.proposed_actions = [action]
+        approval = self.governance.authorize_action(session, action)
+        if approval is None:
+            raise RuntimeError("final batch unexpectedly bypassed its approval gate")
+        action.approval_id = approval.approval_id
+        action.status = "awaiting_approval"
+        if session.status == SessionStatus.awaiting_input:
+            self.manager.transition(session, SessionStatus.deliberating)
+        self.manager.transition(session, SessionStatus.awaiting_approval)
+        session.stop_reason = "one final batch approval needed"
+        self.store.save_session(session)
+        return session
+
+    def _verify_goal_release(self, goal: Goal, session: Session) -> bool:
+        """Semantic final-batch gate by a non-owner frontier implementer."""
+        enabled_frontier = [
+            seat for seat in config.FRONTIER_AUTHOR_SEATS
+            if seat in self.panel and seat in self.registry.names()
+        ]
+        if not enabled_frontier:
+            session.quality_gate = {
+                "verdict": "SKIPPED", "detail": "no frontier seat is enabled",
+            }
+            self.store.save_session(session)
+            return True
+        release_owners = {
+            package.owner for package in goal.milestones if package.release_files
+        }
+        verifier_name = next(
+            (seat for seat in enabled_frontier if seat not in release_owners),
+            None,
+        )
+        if verifier_name is None:
+            detail = (
+                "no independent frontier release engineer is available after "
+                f"excluding release owner(s): {', '.join(sorted(release_owners)) or 'none'}"
+            )
+            session.quality_gate = {"verdict": "FAIL", "detail": detail}
+            session.unresolved.append(detail)
+            session.stop_reason = "frontier final-batch verification failed"
+            session.outcome = "failed_verification"
+            self.manager.transition(session, SessionStatus.composing)
+            session.final = FinalAnswer(
+                answer="The assembled final batch was not released because independent frontier verification was unavailable.",
+                confidence="low", risks_unresolved=list(session.unresolved),
+                next_action="Restore a second frontier seat and resume the goal.",
+            )
+            self.manager.transition(session, SessionStatus.failed)
+            self.store.save_session(session)
+            return False
+
+        member = CouncilMember(role=Role.panelist, agent=verifier_name, active=True)
+        stage = Path(goal.staging_root)
+
+        def read_files() -> list[tuple[str, str]]:
+            loaded: list[tuple[str, str]] = []
+            for name in session.required_files:
+                path = executor.resolve_in_workspace(stage, name)
+                loaded.append((name, path.read_text(encoding="utf-8", errors="replace")))
+            return loaded
+
+        files = read_files()
+        total_edits = 0
+        for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
+            prompt = rounds.frontier_release_prompt(
+                session, files, repair_attempt=attempt)
+            try:
+                answer = _agent_call(
+                    session, self.registry, self.store, member, prompt,
+                    timeout_s=config.FRONTIER_VERIFY_TIMEOUT,
+                )
+            except Exception as e:  # normalized below into a release failure
+                # Do not absorb explicit cancellation; the goal cancellation path
+                # owns that state transition.
+                if isinstance(e, SessionCancelled):
+                    raise
+                session.quality_gate = {
+                    "verifier": verifier_name, "verdict": "FAIL", "detail": str(e),
+                }
+                break
+            verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
+            expected = {
+                f"R{i}" for i in range(
+                    1, len(rounds.acceptance_requirements(session.task.text)) + 1)
+            }
+            checked = {item.get("id") for item in checks}
+            missing_checks = sorted(expected - checked)
+            if missing_checks:
+                verdict = "FAIL"
+                defects.append("missing acceptance checks: " + ", ".join(missing_checks))
+            session.quality_gate = {
+                "verifier": verifier_name,
+                "verdict": verdict,
+                "checks": checks,
+                "remaining_defects": defects,
+                "missing_checks": missing_checks,
+                "attempt": attempt + 1,
+                "repairs_applied": total_edits,
+            }
+            self.store.log_event(
+                session.session_id, "frontier_final_batch_verdict",
+                {"agent": verifier_name, "verdict": verdict,
+                 "checks": len(checks), "defects": len(defects),
+                 "attempt": attempt + 1},
+            )
+            if verdict == "PASS":
+                session.outcome = "succeeded"
+                self.store.save_session(session)
+                return True
+            if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
+                break
+            edits = [action for action in parse_proposals(
+                session.session_id, answer.content, Role.implementer)
+                if action.kind == "edit_file"
+                and action.filename in session.required_files
+            ]
+            applied = 0
+            for action in edits:
+                action.args["target"] = "workspace"
+                try:
+                    path = executor.execute(session, action, self._data_dir)
+                except executor.ExecutionError as e:
+                    action.status = "failed"
+                    action.error = str(e)
+                else:
+                    action.status = "executed"
+                    action.result_path = path
+                    applied += 1
+                session.proposed_actions.append(action)
+            if not applied:
+                session.quality_gate["detail"] = (
+                    "verifier rejected the batch without a usable implementation repair"
+                )
+                break
+            files = read_files()
+            runtime_failures = []
+            for name, content in files:
+                ran, testable, detail, _dynamic = smoke.smoke_source(
+                    content, Path(name).suffix or ".txt")
+                if testable and not ran:
+                    runtime_failures.append(f"{name}: {detail}")
+            if runtime_failures:
+                session.quality_gate["detail"] = "frontier repair failed runtime: " + "; ".join(runtime_failures)
+                break
+            total_edits += applied
+            self.store.log_event(
+                session.session_id, "frontier_final_batch_repair_applied",
+                {"agent": verifier_name, "edits": applied},
+            )
+
+        detail = session.quality_gate.get("detail") or (
+            "; ".join(session.quality_gate.get("remaining_defects") or [])
+            or "semantic acceptance did not pass"
+        )
+        session.unresolved.append(f"frontier final-batch verifier rejected release: {detail}")
+        session.stop_reason = "frontier final-batch verification failed"
+        session.outcome = "failed_verification"
+        self.manager.transition(session, SessionStatus.composing)
+        session.final = FinalAnswer(
+            answer="The assembled final batch failed independent frontier verification and was not offered for approval.",
+            confidence="low", risks_unresolved=list(session.unresolved),
+            next_action="Resume the goal so the frontier release engineer can repair and re-check it.",
+        )
+        self.manager.transition(session, SessionStatus.failed)
+        self.store.save_session(session)
+        return False
+
+    def _prepare_goal_release(self, goal: Goal) -> None:
+        """Create the final review session after every package has staged cleanly."""
+        files = self._goal_release_files(goal)
+        goal.release_files = files
+        if not files:
+            goal.status = "completed"
+            goal.release_status = "released"
+            self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
+            return
+        session = self._open(
+            f"[FINAL BATCH RELEASE] {goal.text}\nReview and release all staged package outputs together.",
+            "goal-release", None, None)
+        session.goal_id = goal.goal_id
+        session.goal_epoch = goal.epoch
+        session.goal_release = True
+        # Semantic verification must evaluate the original brief, not the short
+        # coordinator wrapper used to create this release session.
+        session.task.text = goal.text
+        session.collaboration_mode = "build_team"
+        session.delivery_mode = "final_batch"
+        session.workspace_root = goal.staging_root
+        session.established_root = goal.established_root
+        session.delivery_root = goal.delivery_root
+        session.required_files = files
+        session.panel = []
+        self.store.save_session(session)
+        self.manager.transition(session, SessionStatus.classified)
+        self.manager.transition(session, SessionStatus.deliberating)
+        goal.release_session_id = session.session_id
+        if not self._verify_goal_release(goal, session):
+            goal.status = "paused"
+            goal.release_status = "failed_verification"
+            goal.last_error = session.stop_reason or "frontier final-batch verification failed"
+            return
+        goal.status = "awaiting_release"
+        if not (session.delivery_root or session.established_root):
+            request = InputRequest(
+                session_id=session.session_id, agent="system", role=Role.coordinator,
+                round=0, purpose="promote_target", resume_token="",
+                question=(
+                    f"The complete goal batch is staged ({len(files)} files). Where should "
+                    "the final batch go? Reply with one folder path. You will then see one "
+                    "aggregate diff and approve the whole release once."
+                ),
+            )
+            session.input_requests.append(request)
+            session.stop_reason = "final batch needs a delivery target"
+            goal.release_status = "awaiting_target"
+            self.store.log_event(session.session_id, "input_requested", request.model_dump())
+            self.manager.transition(session, SessionStatus.awaiting_input)
+        else:
+            goal.release_status = "awaiting_approval"
+            self._authorize_goal_release(session)
+
+    def _maybe_advance_goal(self, session: Session, background: bool = False) -> None:
+        """Advance only from the goal epoch that started this session."""
+        if not session.goal_id:
+            return
+        try:
+            goal = None
+            # Parallel packages may finish in the same instant.  Wait briefly
+            # for the other completion transaction instead of dropping this
+            # package's terminal event on a busy goal lease.
+            for _ in range(100):
+                goal = self.goals.claim_worker_lease(session.goal_id, {"running", "paused"})
+                if goal is not None:
+                    break
+                current = self.goals.get(session.goal_id)
+                if current is None or current.status not in ("running", "paused"):
+                    return
+                time.sleep(0.02)
+            if goal is None:
+                return
+            token = goal.worker_lease
+            schedule_ready = False
+            try:
+                idx = session.goal_milestone
+                milestone = goal.milestones[idx] if (
+                    idx is not None and 0 <= idx < len(goal.milestones)) else None
+                if (milestone is None or milestone.session_id != session.session_id
+                        or session.goal_epoch != goal.epoch):
+                    return
+                if session.status == SessionStatus.done:
+                    accepted, files, detail = self._goal_acceptance(session, milestone)
+                    milestone.acceptance_detail = detail
+                    if not accepted:
+                        milestone.status = "failed"
+                        goal.status = "paused"
+                        goal.last_error = detail[:300]
+                        self.goals.save_owned(goal, token)
+                        self.store.log_event(session.session_id, "goal_milestone_rejected",
+                                             {"goal_id": goal.goal_id, "milestone": idx + 1,
+                                              "reason": detail})
+                        return
+                    if goal.delivery_mode == "final_batch":
+                        _, _, hashes = self._goal_stage_manifest(
+                            session, milestone.required_files, goal.staging_root)
+                    else:
+                        _, _, hashes = self._goal_delivery_manifest(
+                            session, milestone.required_files)
+                    milestone.status = "done"
+                    milestone.files = list(files)
+                    milestone.accepted_files = list(files)
+                    milestone.accepted_hashes = {
+                        name: hashes[name] for name in milestone.required_files if name in hashes
+                    }
+                    milestone.summary = (session.final.answer if session.final else "")[
+                        : config.GOAL_SUMMARY_MAX_CHARS]
+                    self.store.log_event(session.session_id, "goal_milestone_done",
+                                         {"goal_id": goal.goal_id, "milestone": idx + 1,
+                                          "of": len(goal.milestones)})
+                    remaining = [m.index for m in goal.milestones if m.status != "done"]
+                    if not remaining:
+                        if goal.delivery_mode == "final_batch" and goal.status == "running":
+                            self._prepare_goal_release(goal)
+                        elif goal.delivery_mode != "final_batch":
+                            goal.status = "completed"
+                            self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
+                        self.goals.save_owned(goal, token)
+                    else:
+                        goal.current_index = min(remaining)
+                        if self.goals.save_owned(goal, token):
+                            schedule_ready = goal.status == "running"
+                elif session.status == SessionStatus.failed:
+                    milestone.status = "failed"
+                    goal.status = "paused"
+                    goal.last_error = (session.stop_reason or f"milestone {idx + 1} failed")[:300]
+                    self.goals.save_owned(goal, token)
+                    self.store.log_event("-", "goal_paused",
+                                         {"goal_id": goal.goal_id, "reason": goal.last_error})
+                elif session.status == SessionStatus.cancelled:
+                    milestone.status = "pending"
+                    goal.status = "paused"
+                    goal.last_error = f"milestone {idx + 1} was cancelled"
+                    self.goals.save_owned(goal, token)
+                    self.store.log_event("-", "goal_paused",
+                                         {"goal_id": goal.goal_id, "reason": goal.last_error})
+            finally:
+                self.goals.release_worker_lease(goal.goal_id, token)
+            if schedule_ready:
+                current = self.goals.get(goal.goal_id)
+                if current and current.status == "running" and current.epoch == session.goal_epoch:
+                    self._start_ready_packages(current, background=background)
+        except Exception as e:  # noqa: BLE001
+            self.store.log_event("-", "goal_advance_error",
+                                 {"goal_id": session.goal_id, "detail": str(e)})
+
+    def _goal_views(self, items: list[Goal]) -> list[dict]:
+        """Attach aggregate/actionable state without mutating durable goals."""
+        sessions = self.store.list_sessions(limit=None)
+        by_id = {item["session_id"]: item for item in sessions}
+        views: list[dict] = []
+        for goal in items:
+            data = goal.model_dump()
+            related = [item for item in sessions if item.get("goal_id") == goal.goal_id]
+            terminal_goal = goal.status in ("cancelled", "completed", "failed")
+            approvals = (0 if terminal_goal else
+                         sum(item.get("pending_approvals", 0) for item in related))
+            inputs = (0 if terminal_goal else
+                      sum(item.get("pending_inputs", 0) for item in related))
+            active_calls = (0 if terminal_goal else
+                            sum(len(item.get("active_agent_calls") or []) for item in related))
+            package_views: list[dict] = []
+            for package in goal.milestones:
+                package_data = package.model_dump()
+                attempts = [item for item in related
+                            if item.get("work_package_id") == package.package_id]
+                current = by_id.get(package.session_id or "", {})
+                effective_status = package.status
+                if goal.status == "cancelled" and package.status == "running":
+                    # Repair the API view of pre-upgrade cancelled goals whose
+                    # durable package row was left looking live.
+                    effective_status = "cancelled"
+                package_data.update({
+                    "status": effective_status,
+                    "attempt_count": len(attempts),
+                    "session_status": current.get("status"),
+                    "pending_approvals": current.get("pending_approvals", 0),
+                    "pending_inputs": current.get("pending_inputs", 0),
+                    "active_agent_calls": current.get("active_agent_calls", []),
+                })
+                package_views.append(package_data)
+            data["milestones"] = package_views
+            if goal.status in ("cancelled", "completed", "failed"):
+                display_status = goal.status
+            elif approvals:
+                display_status = "awaiting_approval"
+            elif inputs:
+                display_status = "awaiting_input"
+            else:
+                display_status = goal.status
+            actionable = None
+            if not terminal_goal:
+                actionable = next(
+                    (item for item in related if item.get("pending_approvals")), None)
+                actionable = actionable or next(
+                    (item for item in related if item.get("pending_inputs")), None)
+                if actionable is None and goal.release_session_id:
+                    actionable = by_id.get(goal.release_session_id)
+                if actionable is None:
+                    current = goal.current
+                    actionable = (by_id.get(current.session_id)
+                                  if current and current.session_id else None)
+                if actionable is None:
+                    actionable = next((item for item in related
+                                       if item.get("status") not in
+                                       ("done", "failed", "cancelled")), None)
+            data.update({
+                "display_status": display_status,
+                "active_packages": (0 if terminal_goal else
+                                    sum(1 for package in goal.milestones
+                                        if package.status == "running")),
+                "pending_approvals": approvals,
+                "pending_inputs": inputs,
+                "active_agent_calls": active_calls,
+                "actionable_session_id": actionable.get("session_id") if actionable else None,
+            })
+            views.append(data)
+        return views
+
+    def list_goals(self) -> list[dict]:
+        return self._goal_views(list(reversed(self.goals.list())))
+
+    def get_goal(self, goal_id: str) -> Optional[dict]:
+        goal = self.goals.get(goal_id)
+        return self._goal_views([goal])[0] if goal else None
+
+    def cancel_goal(self, goal_id: str) -> dict:
+        """Cancel a goal and its running milestone session. Cancelled is
+        terminal — use resume on a PAUSED goal to retry a milestone."""
+        goal = self.goals.cancel(goal_id)
+        if goal is None:
+            raise KeyError(f"goal {goal_id} not found")
+        if goal.status in ("completed", "cancelled", "failed"):
+            # A just-cancelled goal belongs here too; its epoch/lease have
+            # already been invalidated atomically by GoalStore.cancel().
+            ms = goal.current
+            if ms and ms.session_id:
+                try:
+                    self.cancel_session(ms.session_id)
+                except KeyError:
+                    pass
+            for package in goal.milestones:
+                if package.session_id and (ms is None or package.session_id != ms.session_id):
+                    try:
+                        self.cancel_session(package.session_id)
+                    except (KeyError, ValueError):
+                        pass
+            if goal.release_session_id:
+                try:
+                    self.cancel_session(goal.release_session_id)
+                except (KeyError, ValueError):
+                    pass
+            self.store.log_event("-", "goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
+            return goal.model_dump()
+
+    def _recover_verified_goal_packages(self, goal_id: str) -> list[str]:
+        """Adopt completed package attempts that lost their goal commit.
+
+        Session verification and goal staging are separate durable transactions.
+        A pause/restart in the old implementation could land between them.  On
+        resume, recover exact owner/package outputs from any completed successful
+        attempt before spending another model call.
+        """
+        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        if goal is None:
+            return []
+        token = goal.worker_lease
+        recovered: list[str] = []
+        superseded: list[str] = []
+        try:
+            candidates: dict[str, list[Session]] = {}
+            for meta in self.store.list_sessions(limit=None):
+                session = self.manager.load(meta.get("session_id", ""))
+                if (session is None or session.goal_id != goal_id
+                        or session.status != SessionStatus.done
+                        or session.outcome != "succeeded"
+                        or not session.work_package_id):
+                    continue
+                candidates.setdefault(session.work_package_id, []).append(session)
+            for package in goal.milestones:
+                if package.status == "done":
+                    continue
+                match = next((session for session in candidates.get(package.package_id, [])
+                              if session.work_package_owner == package.owner
+                              and set(package.required_files).issubset(
+                                  set(session.required_files))), None)
+                if match is None:
+                    continue
+                accepted, missing, hashes = self._goal_stage_manifest(
+                    match, package.required_files, goal.staging_root)
+                if missing:
+                    continue
+                if package.session_id and package.session_id != match.session_id:
+                    superseded.append(package.session_id)
+                package.status = "done"
+                package.session_id = match.session_id
+                package.files = list(accepted)
+                package.accepted_files = list(accepted)
+                package.accepted_hashes = {
+                    name: hashes[name] for name in package.required_files if name in hashes
+                }
+                package.acceptance_detail = "recovered verified output from completed attempt"
+                package.summary = (match.final.answer if match.final else "")[
+                    : config.GOAL_SUMMARY_MAX_CHARS]
+                recovered.append(package.package_id)
+                self.store.log_event(
+                    match.session_id, "goal_milestone_recovered",
+                    {"goal_id": goal_id, "milestone": package.index + 1},
+                )
+            remaining = [m.index for m in goal.milestones if m.status != "done"]
+            goal.current_index = min(remaining) if remaining else len(goal.milestones)
+            self.goals.save_owned(goal, token)
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+        for session_id in superseded:
+            try:
+                self.cancel_session(session_id)
+            except (KeyError, ValueError):
+                pass
+        return recovered
+
+    def resume_goal(self, goal_id: str, background: bool = True) -> dict:
+        """Retry a paused goal's current milestone with a FRESH session (the
+        prior attempt failed or was cancelled)."""
+        goal = self.goals.get(goal_id)
+        if goal is None:
+            raise KeyError(f"goal {goal_id} not found")
+        if goal.status != "paused":
+            raise ValueError(f"cannot resume a goal in status '{goal.status}'")
+        recovered = self._recover_verified_goal_packages(goal_id)
+        goal = self.goals.get(goal_id) or goal
+        if recovered:
+            self.store.log_event(
+                "-", "goal_packages_recovered",
+                {"goal_id": goal_id, "packages": recovered},
+            )
+        if all(m.status == "done" for m in goal.milestones) and goal.delivery_mode == "final_batch":
+            goal = self.goals.resume(goal_id)
+            if goal is None:
+                raise ValueError("goal changed while attempting to resume final release")
+            goal.release_session_id = None
+            goal.release_status = "not_started"
+            goal.last_error = ""
+            self._prepare_goal_release(goal)
+            self.goals.save(goal)
+            return self.get_goal(goal_id) or goal.model_dump()
+        if goal.current is None:  # defensive: nothing left to run
+            goal.status = "completed"
+            self.goals.save(goal)
+            return goal.model_dump()
+        goal = self.goals.resume(goal_id)
+        if goal is None:
+            raise ValueError("goal changed while attempting to resume")
+        self.store.log_event("-", "goal_resumed", {"goal_id": goal_id, "epoch": goal.epoch})
+        self._start_ready_packages(goal, background=background)
+        return self.get_goal(goal_id) or goal.model_dump()
+
+    def delete_goal(self, goal_id: str) -> bool:
+        """Remove the goal record. Its milestone sessions remain in the store."""
+        return self.goals.remove(goal_id)
+
+    def _reconcile_goal_orphans(self) -> None:
+        """After a restart there is no worker driving any goal: running
+        milestone sessions were just cancelled by _reconcile_orphans, so park
+        planning/running goals as paused — resume retries the current milestone."""
+        try:
+            for goal in self.goals.list():
+                if goal.status == "cancelled":
+                    # Older cancellation logic made the parent terminal but
+                    # left package rows as "running", which kept the dashboard
+                    # visually alive forever. Normalize those records once.
+                    changed = False
+                    for package in goal.milestones:
+                        if package.status == "running":
+                            package.status = "cancelled"
+                            changed = True
+                    if changed:
+                        self.goals.save(goal)
+                    continue
+                if goal.status not in ("planning", "running"):
+                    continue
+                parked = self.goals.park_active(goal.goal_id, "interrupted by a server restart")
+                if parked is not None:
+                    self.store.log_event("-", "goal_paused",
+                                         {"goal_id": parked.goal_id, "reason": parked.last_error})
+        except Exception:  # noqa: BLE001 — a bad record must not stop the server
+            pass
 
     def timeline(self, session_id: str) -> dict:
         """A readable run timeline built from the session's JSONL event log."""
@@ -1102,7 +2240,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         every live-state session is unambiguously orphaned. Marks each cancelled
         (thread preserved) rather than deleting, and never blocks startup."""
         try:
-            metas = self.store.list_sessions()
+            # Startup recovery is correctness work, not a dashboard page: scan
+            # every persisted row so a live session older than the UI's first
+            # 100 entries cannot remain an orphan forever.
+            metas = self.store.list_sessions(limit=None)
         except Exception:  # noqa: BLE001 — a bad record must not stop the server
             return
         live = {s.value for s in self._LIVE}
@@ -1114,7 +2255,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if session is None:
                 continue
             session.stop_reason = "interrupted by a server restart"
-            cancellation.clear(sid)
+            session.outcome = "cancelled"
+            session.active_agent_calls = []
+            # In a hot-reload scenario the old Python thread may still be alive.
+            # Signal it and revoke its token before recording the terminal state.
+            cancellation.request(sid)
+            self.store.revoke_worker_lease(sid)
+            session.worker_lease = ""
             try:
                 self.manager.transition(session, SessionStatus.cancelled)
             except ValueError:
@@ -1140,9 +2287,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if r.status == "pending":
                     r.status = "declined"
             session.stop_reason = "cancelled by user"
+            session.outcome = "cancelled"
             cancellation.clear(session_id)
             self.manager.transition(session, SessionStatus.cancelled)
             self.store.log_event(session_id, "session_cancelled", {"from": "paused"})
+            self._maybe_advance_goal(session, background=True)
             return {"session_id": session_id, "status": "cancelled"}
         # running — flag it; the worker finalizes to cancelled at the next checkpoint
         cancellation.request(session_id)
@@ -1151,6 +2300,64 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     def list(self) -> list[dict]:
         return self.store.list_sessions()
+
+    def _finish_goal_release(self, session: Session, approved: bool) -> Session:
+        """Resolve the special one-action release session without another LLM run."""
+        action = next((a for a in session.proposed_actions if a.kind == "promote_batch"), None)
+        goal = self.goals.get(session.goal_id) if session.goal_id else None
+        if action is None or goal is None or goal.release_session_id != session.session_id:
+            raise ValueError("final-batch release state is incomplete")
+        if not approved:
+            action.status = "denied"
+            action.error = "final batch approval denied; staged files retained"
+            session.stop_reason = action.error
+            session.outcome = "cancelled"
+            self.manager.transition(session, SessionStatus.cancelled)
+            goal.status = "paused"
+            goal.release_status = "denied"
+            goal.last_error = action.error
+            self.goals.save(goal)
+            return session
+        action.status = "approved"
+        self.manager.transition(session, SessionStatus.composing)
+        try:
+            destination = executor.execute(session, action, self.store.data_dir)
+            action.status = "executed"
+            action.result_path = destination
+            files = json.loads(action.args.get("files", "[]"))
+            root = Path(destination)
+            session.files_changed.extend(str(root / name) for name in files)
+            session.tools_called.append("promote_batch")
+            session.final = FinalAnswer(
+                answer=(f"Released the complete verified goal batch in one transaction: "
+                        f"{len(files)} files → {destination}."),
+                confidence="high", assumptions=[], risks_unresolved=[], next_action=None)
+            session.outcome = "succeeded"
+            session.stop_reason = "final batch released"
+            self.manager.transition(session, SessionStatus.done)
+            self.store.log_event(session.session_id, "final_batch_released",
+                                 {"goal_id": goal.goal_id, "files": files,
+                                  "destination": destination})
+            goal.status = "completed"
+            goal.release_status = "released"
+            goal.last_error = ""
+            self.goals.save(goal)
+        except Exception as e:  # noqa: BLE001
+            action.status = "failed"
+            action.error = str(e)
+            session.outcome = "failed"
+            session.stop_reason = f"final batch release failed: {e}"
+            session.final = FinalAnswer(
+                answer="The final batch was not released. The transaction failed and rollback was attempted.",
+                confidence="low", assumptions=[], risks_unresolved=[str(e)],
+                next_action="Review the conflict, then resume the goal to generate a fresh final diff.")
+            self.manager.transition(session, SessionStatus.failed)
+            goal.status = "paused"
+            goal.release_status = "failed"
+            goal.last_error = session.stop_reason[:300]
+            self.goals.save(goal)
+        self.store.save_session(session)
+        return session
 
     def approve(self, session_id: str, approval_id: str, approved: bool,
                 by: str = "user", background: bool = False,
@@ -1164,9 +2371,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session = self.manager.load(session_id)
         if session is None:
             raise KeyError(f"session {session_id} not found")
+        # The awaiting-approval status can become visible a few milliseconds
+        # before the background worker reaches its finally block and releases
+        # the lease. An approval in that window used to be logged but rejected
+        # as a stale write, then resume reloaded the still-pending snapshot.
+        # A paused worker has returned from deliberation and will perform no more
+        # session work, so hand off its token atomically and reload authority.
+        if session.status == SessionStatus.awaiting_approval and session.worker_lease:
+            self.store.release_worker_lease(session_id, session.worker_lease)
+            session = self.manager.load(session_id) or session
         self._ensure_adapters(session)
         approval = self.governance.resolve(session, approval_id, approved, by=by,
                                            approve_all=approve_all)
+        if session.goal_release:
+            return self._finish_goal_release(session, approved)
         if session.status != SessionStatus.awaiting_approval:
             return session  # nothing to resume — approval was informational
         if not approved and approval.action_ref is None:
@@ -1176,9 +2394,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if session.has_pending_approval:
             return session  # other gates still open; stay paused
         if background:
-            self._pool.submit(self._safely, session, self._resume_full)
-            return session
-        return self._resume_full(session)
+            return self._run_owned(session, self._resume_full, background=True)
+        session = self._run_owned(session, self._resume_full, background=False)
+        # synchronous resume runs in the caller's (request) thread — chain any
+        # follow-on goal milestone on a worker so the response isn't held hostage
+        self._maybe_advance_goal(session, background=True)
+        return session
 
     def pending_approvals(self) -> list[dict]:
         return self._pending(SessionStatus.awaiting_approval, "approvals")
@@ -1227,9 +2448,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.store.log_event(session_id, "input_answered", req.model_dump())
         self.store.save_session(session)
         if background:
-            self._pool.submit(self._safely, session, self._answer_continue, req)
-            return session
-        return self._answer_continue(session, req)
+            return self._run_owned(session, self._answer_continue, True, req)
+        session = self._run_owned(session, self._answer_continue, False, req)
+        self._maybe_advance_goal(session, background=True)
+        return session
 
     # answers that keep the build in the council's own spaces (no delivery target)
     _WORKSPACE_ANSWERS = {"workspace", "sandbox", "none", "skip", "no", "keep", "here"}
@@ -1303,7 +2525,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             ans = (req.answer or "").strip()
             if ans.lower() in self._WORKSPACE_ANSWERS:
                 for a in session.proposed_actions:
-                    if a.kind == "promote" and a.status == "proposed":
+                    if a.kind in ("promote", "promote_batch") and a.status == "proposed":
                         a.status = "denied"
                         a.error = "user kept the files in the council workspace"
             else:
@@ -1311,6 +2533,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if picked is None and ("/" in ans or "\\" in ans):
                     picked = str(Path(ans).expanduser().resolve())
                 session.established_root = picked
+            if session.goal_release:
+                goal = self.goals.get(session.goal_id) if session.goal_id else None
+                if goal is None:
+                    raise ValueError("goal release no longer has a goal")
+                if ans.lower() in self._WORKSPACE_ANSWERS:
+                    self.manager.transition(session, SessionStatus.composing)
+                    session.outcome = "succeeded"
+                    session.stop_reason = "final batch retained in staging by user"
+                    session.final = FinalAnswer(
+                        answer=f"The complete batch remains in goal staging: {session.workspace_root}",
+                        confidence="high")
+                    self.manager.transition(session, SessionStatus.done)
+                    goal.status = "completed"
+                    goal.release_status = "released"
+                    self.goals.save(goal)
+                    return session
+                if not session.established_root:
+                    raise ValueError("a valid final delivery folder is required")
+                goal.established_root = session.established_root
+                goal.release_status = "awaiting_approval"
+                self.goals.save(goal)
+                self.store.save_session(session)
+                return self._authorize_goal_release(session)
             self.store.save_session(session)
             return resume_deliberation(
                 session, self.manager, self.registry, self.governance,
@@ -1340,6 +2585,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event(session.session_id, "agent_error", {"detail": str(e)})
             self.manager.transition(session, SessionStatus.composing)
             session.final = fallback_final(session, "agent resume failed")
+            session.outcome = "failed"
             self.manager.transition(session, SessionStatus.done)
             self.store.save_session(session)
             return session
@@ -1358,5 +2604,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.store.log_event(session_id, "input_declined", req.model_dump())
         self.registry.cancel(req.agent, req.resume_token)
         session.stop_reason = "input declined"
+        session.outcome = "cancelled"
         self.manager.transition(session, SessionStatus.cancelled)
+        if session.goal_release and session.goal_id:
+            goal = self.goals.get(session.goal_id)
+            if goal and goal.release_session_id == session.session_id:
+                goal.status = "paused"
+                goal.release_status = "denied"
+                goal.last_error = "final delivery target was declined; staged files retained"
+                self.goals.save(goal)
         return session

@@ -45,7 +45,7 @@ def test_edit_file_metadata():
 
 def test_run_tests_metadata():
     s = get_skill("run_tests")
-    assert s.category == "code_exec" and s.requires_approval is False  # now free
+    assert s.category == "code_exec" and s.requires_approval is True
     assert s.risk == Risk.medium and Role.implementer in s.allowed_roles
     assert Role.critic in s.allowed_roles
 
@@ -90,26 +90,27 @@ def test_edit_file_rejects_missing_and_ambiguous(session, tmp_path):
 def test_run_tests_executes_and_captures(session, tmp_path):
     root = tmp_path / "proj"
     root.mkdir()
+    (root / "check.py").write_text("print('TESTS-OK')\n", encoding="utf-8")
     session.workspace_root = str(root)
     action = ProposedAction(
         session_id=session.session_id, kind="run_tests", role=Role.implementer,
-        args={"command": "python -c \"print('TESTS-OK')\""},
+        args={"command": "python -m py_compile check.py", "target": "workspace"},
     )
     out = execute(session, action, tmp_path)
-    assert "TESTS-OK" in out
     assert "[passed]" in out
 
 
 def test_run_tests_reports_nonzero_exit(session, tmp_path):
     root = tmp_path / "proj"
     root.mkdir()
+    (root / "check.py").write_text("if True print('broken')\n", encoding="utf-8")
     session.workspace_root = str(root)
     action = ProposedAction(
         session_id=session.session_id, kind="run_tests", role=Role.implementer,
-        args={"command": "python -c \"import sys; sys.exit(3)\""},
+        args={"command": "python -m py_compile check.py", "target": "workspace"},
     )
     out = execute(session, action, tmp_path)
-    assert "exit 3" in out
+    assert "exit 1" in out
 
 
 # ---- proposal parsing (EDIT / RUNTESTS blocks in a draft) --------------------

@@ -229,7 +229,8 @@ def is_web_file(path) -> bool:
     return Path(path).suffix.lower() in _WEB_SUFFIXES
 
 
-def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple[bool, bool, str, Optional[bool]]:
+def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25,
+                 prelude: str = "") -> tuple[bool, bool, str, Optional[bool]]:
     """Run web source and report (ran, testable, detail, dynamic).
 
     - ran: False only on a DETECTED runtime failure (throws on load, hangs).
@@ -246,7 +247,11 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple
     if not node:
         return True, False, "node not on PATH — runtime test skipped", None
     if suffix in (".js", ".mjs"):
-        src = text
+        # A module can intentionally extend globals defined by an earlier file
+        # (e.g. ``class Frogger extends Game`` after ``core.js``).  Running it
+        # alone turns a valid dependency into a false runtime failure, so the
+        # caller may provide the real load-order prelude from its staged project.
+        src = (prelude + "\n" + text) if prelude else text
     else:
         scripts = _SCRIPT_RE.findall(text or "")
         if not scripts:
@@ -279,7 +284,7 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25) -> tuple
     return False, True, "did not run — " + (out.strip()[:200] or "no output"), None
 
 
-def smoke_test(path, timeout_s: int = 25) -> tuple[bool, bool, str, Optional[bool]]:
+def smoke_test(path, timeout_s: int = 25, prelude: str = "") -> tuple[bool, bool, str, Optional[bool]]:
     """(ran, testable, detail, dynamic) for a file on disk. See smoke_source."""
     p = Path(path)
     if not is_web_file(p):
@@ -288,4 +293,4 @@ def smoke_test(path, timeout_s: int = 25) -> tuple[bool, bool, str, Optional[boo
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return False, True, f"unreadable: {e}", None
-    return smoke_source(text, p.suffix, timeout_s)
+    return smoke_source(text, p.suffix, timeout_s, prelude=prelude)

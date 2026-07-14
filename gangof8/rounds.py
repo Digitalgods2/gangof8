@@ -220,9 +220,83 @@ def _output_contract(session: Session) -> str:
         "(the OLD snippet must be unique in the file):\n"
         "EDIT: path/to/file.py\n"
         "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
-        "To run the test suite in your sandbox (free, no approval), add a line:\n"
-        "RUNTESTS: <command>   (e.g. RUNTESTS: pytest -q; omit the command to default)\n"
+        "For a static parse/compile check, add one of these auto-safe lines:\n"
+        "RUNTESTS: node --check path/to/file.js\n"
+        "RUNTESTS: python -m py_compile path/to/file.py\n"
+        "Functional RUNTESTS commands require explicit human approval and must name the command.\n"
     )
+
+
+def revision_patch_prompt(session: Session, targets: list[str], source_context: str) -> str:
+    """One grounded author edits an existing deliverable without rewriting it.
+
+    Best-of-N is useful for greenfield alternatives.  It is counterproductive
+    for a 40–100 KB established file: every seat must reconstruct the whole
+    program, then judges compare mostly duplicated bytes.  Revision work gets a
+    single author, an exact sandbox copy, and a bounded review instead.
+    """
+    names = ", ".join(targets)
+    return (
+        f"Task: {session.task.text}\n"
+        f"{_GOVERNANCE_CONTEXT}"
+        "You are the PRIMARY REVISION AUTHOR. This is an in-place change, not a "
+        "greenfield rewrite. The exact current file has already been copied into "
+        "the council sandbox. Preserve every unrelated behavior, public API, and "
+        "existing game/module. Implement only the requested milestone.\n\n"
+        f"Revision target(s): {names}\n"
+        "Return one or more surgical edits ONLY, using this exact format:\n"
+        "EDIT: path/to/file\n"
+        "<<<<<<< OLD\n<unique exact text from the current file>\n=======\n"
+        "<replacement text>\n>>>>>>> NEW\n\n"
+        "Do NOT emit a complete ARTIFACT replacement. Do NOT remove or rename an "
+        "existing public class/function/registration unless the task explicitly "
+        "requires it. The coordinator applies these edits to the sandbox copy, "
+        "runs its browser smoke/behavior checks, and asks a reviewer to inspect "
+        "the patch before any delivery.\n\n"
+        "CURRENT SOURCE (authoritative; edit this exact version):\n"
+        f"-----\n{source_context}\n-----"
+    )
+
+
+def revision_review_prompt(session: Session, targets: list[str], patch_summary: str,
+                           assertions: list[str]) -> str:
+    """Ask one reviewer to inspect a narrow revision, not author a rival file."""
+    required = "\n".join(f"- {item}" for item in assertions) or "- preserve existing public APIs"
+    return (
+        f"Task: {session.task.text}\n"
+        "You are the REVISION REVIEWER. Inspect the applied patch below against "
+        "the task. Do not write code and do not propose a full rewrite. Identify "
+        "only release-blocking defects: broken integration, lost existing APIs, "
+        "or a requested behavior that is clearly absent.\n\n"
+        f"Targets: {', '.join(targets)}\n"
+        f"Required behavior/API signals:\n{required}\n\n"
+        f"Applied patch:\n-----\n{patch_summary}\n-----\n\n"
+        "End with exactly one of:\n"
+        "REVIEW: PASS\n"
+        "REVIEW: FAIL - <specific, actionable defect>"
+    )
+
+
+def revision_repair_prompt(session: Session, report: str, source_context: str) -> str:
+    return (
+        f"Task: {session.task.text}\n"
+        "A reviewer found this release-blocking defect in your in-place patch:\n"
+        f"{report}\n\n"
+        "Return ONLY the additional surgical EDIT block(s) needed to correct it; "
+        "do not rewrite the file. The current sandbox source is:\n-----\n"
+        f"{source_context}\n-----"
+    )
+
+
+def revision_review_failures(text: str) -> list[str]:
+    """Extract explicit blocking findings; unstructured prose is advisory."""
+    failures: list[str] = []
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s*REVIEW\s*:\s*FAIL\s*(?:[-:—]\s*)?(.*)$", line, re.I)
+        if m:
+            detail = m.group(1).strip()
+            failures.append(detail or "reviewer rejected the patch")
+    return failures
 
 
 def lead_prompt(
@@ -469,6 +543,17 @@ def _panel_file_contract(session: Session) -> str:
     produces = bool(session.classification and session.classification.produces_output)
     if not produces:
         return ""
+    if session.collaboration_mode == "build_team" and session.work_package_owner:
+        required = ", ".join(session.required_files) or "the package result"
+        return (
+            f"You are the SOLE OWNER of this build package, not a candidate in a "
+            f"contest. Produce the substantive implementation now. Required staged "
+            f"outputs: {required}. Emit every file as —\n"
+            "ARTIFACT: <exact relative filename>\n<full file contents>\n"
+            "— raw bytes after the ARTIFACT line, with no fences. Do not emit "
+            "PROMOTE: package files remain in shared staging until one final batch "
+            "release. Honor other owners' interfaces and do not recreate their files.\n"
+        )
     return (
         "This is a BEST-OF-N build: emit YOUR COMPLETE candidate implementation "
         "as a block —\n"
@@ -597,32 +682,6 @@ def parse_candidate_scores(text: str, n: int) -> tuple[dict[int, int], int | Non
     return scores, winner, defects
 
 
-def winner_fix_prompt(session: Session, filename: str, body: str, defects: list[str],
-                      source: str = "") -> str:
-    """Ask for SURGICAL edits to the winning candidate — the defects judges
-    flagged — never a rewrite (best-of-N ships the winner's own code). `source`
-    (the reference to match) is included so the finisher isn't blind to it: the
-    live failure was the codifier answering with `SKILL: read_file` to fetch the
-    source it lacked instead of edits, so the winner shipped unfixed."""
-    deflines = "\n".join(f"- {d}" for d in defects)
-    return (
-        f"Task: {session.task.text}\n"
-        f"{_GOVERNANCE_CONTEXT}"
-        f"{_source_fidelity_block(session, source)}"
-        f"The file below WON a blind best-of-N vote and will ship. Judges flagged "
-        "these specific defects to fix — fix ONLY these, with surgical edits; do "
-        "NOT rewrite or restyle the file (its author won on merit):\n"
-        f"{deflines}\n"
-        "Emit one EDIT block per fix (the OLD snippet must be unique in the file):\n"
-        "EDIT: " + filename + "\n"
-        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
-        "If a flagged defect is not real or not safely fixable in isolation, skip "
-        "it. Emit nothing but EDIT blocks.\n\n"
-        # full body: EDIT OLD-snippets must be verifiably unique in the WHOLE file
-        f"----- {filename} -----\n{body}"
-    )
-
-
 # The lead's standing charter — who it is on EVERY task, stated up front so it
 # acts as the chair by design, not by whatever the flow leaves over.
 CHAIR_CHARTER = (
@@ -643,33 +702,73 @@ _OVERRIDE_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?OVERRIDE\s*[:—–-]\s*
 _RATIFY_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?RATIFY\b", re.IGNORECASE | re.MULTILINE)
 
 
-def chair_review_prompt(session: Session, top: list[dict], source: str = "") -> str:
-    """The chair reviews the blind vote's top two IN FULL and ratifies or
-    overrides. `top` = [{label, score, votes, content, role}, ...], winner
-    first. Author identity stays hidden (Candidate N) as it was for the judges.
-    `source` (when named) is the reference the output must match — the chair, like
-    the judges, otherwise never saw it."""
+def chair_finish_prompt(session: Session, candidates: list[dict], filename: str,
+                        offer_integration: bool, source: str = "") -> str:
+    """The chair's SINGLE finishing pass — the decisions the old flow spent
+    three serial codifier calls on (review → fix → integration), each
+    re-reading the same candidate bodies. `candidates` = [{label, role, score,
+    votes, content, judge_defects}, ...], vote winner first, runner-up second;
+    the remaining candidates are included only when integration review is on.
+    Author identity stays hidden (Candidate N) as it was for the judges.
+    `source` (when named) is the reference the output must match — the chair,
+    like the judges, otherwise never saw it."""
     blocks = []
-    for c in top:
+    for c in candidates:
+        flagged = "".join(
+            f"\n[JUDGE DEFECT D{i}: {d}]"
+            for i, d in enumerate(c.get("judge_defects") or [], 1)
+        )
         blocks.append(
             f"===== Candidate {c['label']} ({c['role']} — score {c['score']}, "
-            f"{c['votes']} first-place vote(s)) =====\n"
-            f"{c['content']}")  # in full — "read BOTH in full" must be literally true
-    win, run = top[0]["label"], top[1]["label"]
+            f"{c['votes']} first-place vote(s)) ====={flagged}\n"
+            f"{c['content']}")  # in full — "read both finalists in full" must be literally true
+    win, run = candidates[0]["label"], candidates[1]["label"]
+    integration = ""
+    if offer_integration:
+        integration = (
+            "3) INTEGRATION — independently authored candidates can contain "
+            "complementary strengths at a fine-grained level. Evaluate EVERY "
+            "candidate below against the task and each other. Offer an "
+            "integration ONLY when it makes a concrete, testable improvement "
+            "over the file you chose without mixing incompatible designs — "
+            "never merely to average preferences (the human decides whether to "
+            "use it; your chosen candidate stays the default). If no meaningful "
+            "integration exists, end your reply with exactly:\n"
+            "SYNERGY: NO - <brief reason>\n"
+            "If one does, end with exactly this structure and a COMPLETE "
+            "replacement file (no PROMOTE line):\n"
+            "SYNERGY: YES\n"
+            "RATIONALE: <which specific strengths from which candidates are combined>\n"
+            f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
+            "<complete integrated file contents>\n")
     return (
         f"Task the candidates implement: {session.task.text}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"{CHAIR_CHARTER}"
         f"{_source_fidelity_block(session, source)}"
-        "The blind judge vote ranked these two highest. The vote is ADVISORY to "
-        "you — judges score by reading and can miss a real bug or a missed "
-        "requirement. Read BOTH in full and decide. Emit exactly one line:\n"
+        "The blind judge vote ranked these candidates; the top two are your "
+        "FINALISTS (VOTE WINNER and runner-up). The vote is ADVISORY to you — "
+        "judges score by reading and can miss a real bug or a missed "
+        "requirement. Read both finalists in full, then deliver ALL of your "
+        "chair duties in THIS ONE reply, in this order:\n"
+        "1) THE DECISION — exactly one line:\n"
         f"RATIFY: Candidate {win}\n"
         "  — or —\n"
         f"OVERRIDE: Candidate {run} - <specific, concrete reason the runner-up is better>\n"
-        "Then list concrete defects in the file you chose for a surgical finishing "
-        "pass — one per line, 'DEFECT: <what and where>' — or 'DEFECT: none'. "
-        "Do NOT rewrite; the author won on merit.\n\n"
+        "2) DEFECTS AND FIXES — list the concrete defects in the file you "
+        "chose, one per line, 'DEFECT: <what and where>' (or 'DEFECT: none'), "
+        "then FIX exactly those with surgical EDIT blocks against that file — "
+        "do NOT rewrite or restyle it; its author won on merit. The OLD "
+        "snippet must be unique in the file:\n"
+        f"EDIT: {filename}\n"
+        "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
+        "If a flagged defect is not real or not safely fixable in isolation, "
+        "name it and skip the edit. For EVERY JUDGE DEFECT D-number on the "
+        "candidate you choose, also emit exactly one closure line: "
+        "'RESOLVE D1: FIXED - <edit/evidence>' or "
+        "'RESOLVE D1: REJECTED - <specific evidence it is not a defect>'. "
+        "A missing resolution is an open defect and blocks release.\n"
+        f"{integration}\n"
         + "\n\n".join(blocks)
     )
 
@@ -686,6 +785,135 @@ def parse_chair_decision(text: str, winner_label: int, runnerup_label: int) -> t
     defects = [d.strip() for d in _DEFECT_RE.findall(text or "")
                if d.strip() and d.strip().lower() != "none"]
     return chosen, overrode, defects
+
+
+_RESOLUTION_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?RESOLVE\s+(D\d+)\s*:\s*"
+    r"(FIXED|REJECTED)\s*[-—–:]\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VERDICT_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?VERDICT\s*:\s*(PASS|FAIL)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CHECK_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?CHECK(?:\s+(R\d+))?\s*:\s*"
+    r"(PASS|FAIL)\s*[-—–:]\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_defect_resolutions(text: str) -> dict[str, dict[str, str]]:
+    return {
+        m.group(1).upper(): {"status": m.group(2).upper(), "detail": m.group(3).strip()}
+        for m in _RESOLUTION_RE.finditer(text or "")
+    }
+
+
+def acceptance_requirements(task: str) -> list[str]:
+    """Extract a bounded, stable checklist from an implementation brief."""
+    raw_lines = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+                 for line in (task or "").splitlines()]
+    candidates = [line for line in raw_lines if 8 <= len(line) <= 500]
+    candidates.extend(
+        part.strip() for part in re.split(r"(?<=[.!?])\s+|;\s+", task or "")
+        if 8 <= len(part.strip()) <= 500
+    )
+    explicit = re.compile(
+        r"\b(?:must|should|shall|required|include|support|allow|provide|ensure|"
+        r"controls?|keyboard|touch|pause|audio|responsive|persist|save|load|"
+        r"acceptance|deliver|file|function|feature)\b",
+        re.IGNORECASE,
+    )
+    selected = [item for item in candidates if explicit.search(item)] or candidates
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in selected:
+        key = re.sub(r"\s+", " ", item).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+        if len(out) >= 40:
+            break
+    return out or [(task or "deliver the requested implementation").strip()[:500]]
+
+
+def frontier_release_prompt(
+    session: Session, files: list[tuple[str, str]],
+    defect_register: Optional[list[str]] = None,
+    resolutions: Optional[dict[str, dict[str, str]]] = None,
+    repair_attempt: int = 0,
+) -> str:
+    """Independent frontier release engineering: semantic acceptance + repair."""
+    register = "\n".join(
+        f"D{i}: {defect}" for i, defect in enumerate(defect_register or [], 1)
+    ) or "none"
+    closure = "\n".join(
+        f"{key}: {value.get('status')} - {value.get('detail')}"
+        for key, value in (resolutions or {}).items()
+    ) or "none"
+    bodies = "\n\n".join(
+        f"===== FILE: {name} =====\n{content}" for name, content in files
+    )
+    requirements = acceptance_requirements(session.task.text)
+    checklist = "\n".join(
+        f"R{i}: {requirement}" for i, requirement in enumerate(requirements, 1)
+    )
+    repair = (
+        "This is the confirmation pass after your prior repair. Do not trust the "
+        "claimed fix; re-inspect the resulting files from scratch."
+        if repair_attempt else
+        "If any requirement fails, do implementation work now: emit the smallest "
+        "safe EDIT block(s) that fully repair it."
+    )
+    return (
+        "You are the independent FRONTIER RELEASE ENGINEER. You did not select or "
+        "summarize this result. Inspect the actual final code in full and protect "
+        "the user from a superficially runnable but incomplete package.\n\n"
+        f"ORIGINAL TASK:\n{session.task.text}\n\n"
+        f"JUDGE DEFECT REGISTER:\n{register}\n\n"
+        f"CHAIR CLOSURE CLAIMS:\n{closure}\n\n"
+        f"REQUIRED ACCEPTANCE CHECKLIST:\n{checklist}\n\n"
+        f"{repair}\n"
+        "Test every explicit behavior in the task, not merely syntax/load. Verify "
+        "every registered defect is demonstrably closed. Emit exactly one line "
+        "for EVERY R-number: 'CHECK R1: PASS - <specific evidence>' or "
+        "'CHECK R1: FAIL - <specific evidence>'. Then emit DEFECT lines for "
+        "every remaining problem. End with exactly 'VERDICT: PASS' only if all "
+        "explicit requirements pass and no material defect remains; otherwise end "
+        "with 'VERDICT: FAIL'. Missing R-number checks invalidate a PASS. For repairs, "
+        "use exact unique OLD/NEW EDIT blocks and the exact file paths shown.\n\n"
+        f"{bodies}"
+    )
+
+
+def parse_frontier_verdict(text: str) -> tuple[str, list[dict[str, str]], list[str]]:
+    match = _VERDICT_RE.search(text or "")
+    verdict = match.group(1).upper() if match else "FAIL"
+    checks = [
+        {"id": (m.group(1) or "").upper(),
+         "status": m.group(2).upper(), "detail": m.group(3).strip()}
+        for m in _CHECK_RE.finditer(text or "")
+    ]
+    defects = [d.strip() for d in _DEFECT_RE.findall(text or "")
+               if d.strip() and d.strip().lower() != "none"]
+    if not checks or any(item["status"] == "FAIL" for item in checks) or defects:
+        verdict = "FAIL"
+    return verdict, checks, defects
+
+
+def frontier_runtime_repair_prompt(
+    session: Session, filename: str, content: str, failure: str,
+) -> str:
+    return (
+        "You are still the IMPLEMENTATION OWNER of this candidate, not a judge. "
+        "The coordinator executed your code and found the failure below. Repair "
+        "your own implementation now with exact, unique OLD/NEW EDIT blocks. "
+        "Preserve its design and fulfill the original task; return no plan.\n\n"
+        f"ORIGINAL TASK:\n{session.task.text}\n\n"
+        f"RUNTIME FAILURE:\n{failure}\n\n"
+        f"===== FILE: {filename} =====\n{content}"
+    )
 
 
 def chair_recover_prompt(session: Session, filename: str, body: str, error: str) -> str:
@@ -706,42 +934,6 @@ def chair_recover_prompt(session: Session, filename: str, body: str, error: str)
         "Emit nothing but EDIT blocks.\n\n"
         # full body: EDIT OLD-snippets must be verifiably unique in the WHOLE file
         f"----- {filename} -----\n{body}"
-    )
-
-
-def integration_prompt(session: Session, filename: str, candidates: list[dict], source: str = "") -> str:
-    """Ask the codifier whether a real micro-level merge is worth offering.
-
-    This is deliberately an offer, not an automatic rewrite: only a concrete,
-    materially better integration earns a human decision point.
-    """
-    labeled = "\n\n".join(
-        f"----- Candidate {c['label']} ({c['role']}; score {c['score']}, "
-        f"{c['votes']} first-place votes) -----\n{c['content']}"
-        for c in candidates
-    )
-    return (
-        f"Task: {session.task.text}\n"
-        f"{_GOVERNANCE_CONTEXT}"
-        "You are the council's integration reviewer. The blind vote has chosen "
-        "a default winner, but independently authored candidates can contain "
-        "complementary strengths at a fine-grained level. Evaluate EVERY "
-        "candidate below against the task and each other.\n"
-        "Offer an integration only when it makes a concrete, testable improvement "
-        "over the voted winner without mixing incompatible designs. Do not offer "
-        "one merely to average preferences. The human will decide whether to use it.\n"
-        "If no meaningful integration exists, emit exactly:\n"
-        "SYNERGY: NO - <brief reason>\n"
-        "If a source reference is supplied below, use it directly and do not request "
-        "a SKILL to read it again.\n"
-        "If it does, emit exactly this structure, with a COMPLETE replacement "
-        "file and no PROMOTE line:\n"
-        "SYNERGY: YES\n"
-        "RATIONALE: <which specific strengths from which candidates are combined>\n"
-        f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
-        "<complete integrated file contents>\n\n"
-        f"CANDIDATES:\n{labeled}"
-        + (f"\n\nSOURCE REFERENCE:\n{source}" if source else "")
     )
 
 
@@ -815,7 +1007,8 @@ def test_fix_prompt(
         "EDIT: <filename>\n"
         "<<<<<<< OLD\n<exact existing text>\n=======\n<replacement text>\n>>>>>>> NEW\n"
         "— or a full 'ARTIFACT: <filename>' re-write when the change is large. The "
-        "same test command re-runs automatically after your fix; emit a "
+        "same static check re-runs automatically after your fix; a functional "
+        "RUNTESTS command waits for the user's approval. Emit a "
         "'RUNTESTS: <command>' line only to CHANGE the command. If the failure is "
         "genuinely unfixable here (e.g. a missing system dependency), say why in "
         "one short paragraph and emit no blocks.\n"

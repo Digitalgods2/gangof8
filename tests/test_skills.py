@@ -35,7 +35,8 @@ def session(tmp_path) -> Session:
 
 def test_registry_contains_skills():
     expected = {"write_file", "read_file", "search_project", "list_dir",
-                "web_search", "web_fetch", "edit_file", "run_tests", "stage", "promote"}
+                "web_search", "web_fetch", "edit_file", "run_tests", "stage",
+                "promote", "promote_batch"}
     assert set(SKILLS) == expected
     assert set(HANDLERS) == expected
     assert all(isinstance(s, Skill) for s in SKILLS.values())

@@ -16,8 +16,8 @@ TASK = "Write check.py, a tiny script, and make sure it runs clean."
 
 FAILING_DRAFT = (
     "ARTIFACT: check.py\n"
-    "import sys\nsys.exit(1)\n"
-    "RUNTESTS: python check.py\n"
+    "if True print('broken')\n"
+    "RUNTESTS: python -m py_compile check.py\n"
 )
 
 FIXED_FILE = "ARTIFACT: check.py\nprint('ok')\n"
@@ -40,7 +40,7 @@ class FixingLead:
                 self.fix_calls += 1
                 if self.keep_failing:
                     return AdapterResult(
-                        content="ARTIFACT: check.py\nimport sys\nsys.exit(2)\n", duration_ms=1)
+                        content="ARTIFACT: check.py\nif True print('still broken')\n", duration_ms=1)
                 return AdapterResult(content=self.fix_draft, duration_ms=1)
             return AdapterResult(content=FAILING_DRAFT, duration_ms=1)
         return self._inner.call(role, prompt, timeout_s)
@@ -107,7 +107,7 @@ def test_passing_tests_never_enter_the_loop(tmp_path):
             if role == Role.lead:
                 assert "TEST OUTPUT:" not in prompt, "no repair prompt for a passing build"
                 return AdapterResult(
-                    content="ARTIFACT: check.py\nprint('ok')\nRUNTESTS: python check.py\n",
+                    content="ARTIFACT: check.py\nprint('ok')\nRUNTESTS: python -m py_compile check.py\n",
                     duration_ms=1)
             return self._inner.call(role, prompt, timeout_s)
 

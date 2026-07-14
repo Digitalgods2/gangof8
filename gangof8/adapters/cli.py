@@ -55,6 +55,11 @@ def _neutral_cwd() -> str:
 
 
 class CliAdapter:
+    # A heavy local subprocess: counts against the machine-wide CLI concurrency
+    # bound (loop._agent_call). HTTP-backed adapters set this False and share a
+    # larger bound of their own.
+    local_process = True
+
     def __init__(self, agent: str, name: Optional[str] = None, model: Optional[str] = None,
                  api_key_getter=None, role_models: Optional[dict] = None):
         self.agent = agent  # claude | codex | gemini
@@ -161,7 +166,11 @@ class CliAdapter:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e
         cancellation.register_proc(sid, proc)
         try:
-            out, err = proc.communicate(input=prompt, timeout=max(30, timeout_s))
+            # A non-positive timeout intentionally means no coordinator deadline.
+            # The process remains cancellation-registered and can still be killed
+            # instantly from the API/dashboard.
+            deadline = None if timeout_s <= 0 else max(30, timeout_s)
+            out, err = proc.communicate(input=prompt, timeout=deadline)
         except subprocess.TimeoutExpired as e:
             proc.kill()
             try:

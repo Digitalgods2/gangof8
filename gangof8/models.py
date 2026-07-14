@@ -9,7 +9,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 
 
 def utcnow() -> str:
@@ -287,6 +287,92 @@ class IntegrationProposal(BaseModel):
     runtime_checked: Optional[bool] = None
 
 
+class GoalMilestone(BaseModel):
+    """One bounded goal step, or one owned package in a build-team graph."""
+
+    index: int
+    title: str
+    task_text: str
+    # Build-team goals treat milestones as owned work packages.  Legacy goals
+    # leave these empty and retain the original sequential council workflow.
+    package_id: str = ""
+    owner: str = ""
+    # Hard dependencies block scheduling until verified bytes exist in shared
+    # staging. Contract dependencies expose another package's declared
+    # interface immediately and therefore do NOT block parallel authoring.
+    depends_on: list[int] = []  # zero-based hard/artifact package indexes
+    contract_depends_on: list[int] = []  # zero-based non-blocking interface indexes
+    interface_contract: str = ""
+    status: str = "pending"  # pending | running | done | failed | cancelled
+    session_id: Optional[str] = None  # the deliberation that ran/is running it
+    # The planner declares the files and validation context up front.  A goal
+    # can only move forward after these exact outputs have been accepted.
+    # ``contract_declared`` distinguishes an intentional analysis-only
+    # ``OUTPUTS: NONE`` from a planner that simply forgot the contract.  The
+    # latter must never silently advance a build goal.
+    contract_declared: bool = False
+    requires_delivery: bool = False
+    contract_error: str = ""  # malformed/missing planner contract; never accepted
+    required_files: list[str] = []
+    # Internal package outputs stay in goal staging.  Only this explicit subset
+    # may cross into the user's delivery folder during the one final release.
+    # This prevents source modules, build tools, and smoke harnesses from being
+    # shipped merely because the integration package needed them internally.
+    release_files: list[str] = []
+    release_declared: bool = False
+    dependencies: list[str] = []
+    # Only coordinator-recognised static checks run automatically.  Functional
+    # tests are represented by a governed RUNTESTS action instead.
+    acceptance_commands: list[str] = []
+    files: list[str] = []             # accepted, delivered files only (legacy name)
+    accepted_files: list[str] = []    # explicit manifest; never sandbox drafts
+    accepted_hashes: dict[str, str] = {}  # relative delivery path -> SHA-256
+    acceptance_detail: str = ""
+    summary: str = ""                 # snippet of its final answer, for context
+
+
+class Goal(BaseModel):
+    """A long-horizon objective with an explicitly versioned collaboration flow.
+
+    New build-team goals schedule owned packages from a dependency graph into
+    shared staging and release one final batch. Persisted legacy goals retain
+    their sequential tournament/milestone behavior.
+    """
+
+    goal_id: str = Field(default_factory=lambda: f"g_{short_id()}")
+    text: str
+    status: str = "planning"  # planning | running | paused | completed | failed | cancelled
+    milestones: list[GoalMilestone] = []
+    current_index: int = 0
+    planned_by: str = ""      # agent that authored the milestone plan
+    plan_rationale: str = ""
+    last_error: str = ""      # why the goal paused/failed, for the UI
+    # Workflow versioning is explicit so goals persisted before the build-team
+    # overhaul never change semantics halfway through a run.
+    collaboration_mode: str = "tournament"  # tournament | build_team
+    delivery_mode: str = "milestone"        # milestone | final_batch
+    background: bool = False
+    staging_root: str = ""
+    established_root: Optional[str] = None
+    delivery_root: Optional[str] = None
+    release_session_id: Optional[str] = None
+    release_status: str = "not_started"  # not_started | awaiting_target | awaiting_approval | released | denied | failed
+    release_files: list[str] = []
+    # A goal-level epoch invalidates a planner/milestone worker that belonged to
+    # an earlier cancelled or retried run.  The short-lived lease is persisted
+    # by GoalStore while planning/advancing metadata.
+    epoch: int = 0
+    worker_lease: str = ""
+    created_at: str = Field(default_factory=utcnow)
+    updated_at: str = Field(default_factory=utcnow)
+
+    @property
+    def current(self) -> Optional[GoalMilestone]:
+        if 0 <= self.current_index < len(self.milestones):
+            return self.milestones[self.current_index]
+        return None
+
+
 class Session(BaseModel):
     schema_version: int = SESSION_SCHEMA_VERSION
     session_id: str
@@ -301,6 +387,25 @@ class Session(BaseModel):
     #                                      promote lands, so a "read A, save to B" task never
     #                                      overwrites its source. None ⇒ deliver to established_root.
     panel: list[str] = []  # seat names convened for this session (resume-stable)
+    collaboration_mode: str = "tournament"
+    delivery_mode: str = "immediate"
+    work_package_id: str = ""
+    work_package_owner: str = ""
+    # Frontier models are implementation quorum, not optional late judges.
+    required_frontier_authors: list[str] = []
+    frontier_author_recoveries: dict[str, int] = {}
+    # Persist the real author/runtime funnel and semantic release gate.
+    candidate_metrics: dict = {}
+    quality_gate: dict = {}
+    # Contract-linked JavaScript can be authored before its provider exists.
+    # Runtime validation is deferred until integration for these exact pending
+    # package outputs; static checks still run immediately.
+    deferred_runtime_dependencies: list[str] = []
+    # Persisted call activity gives the API/UI an honest heartbeat while a
+    # blocking CLI or HTTP model call is in flight.
+    active_agent_calls: list[dict] = []
+    goal_background: bool = False
+    goal_release: bool = False
     cli_timeouts: dict[str, int] = {}  # per-seat call timeout (s), from Settings; {} ⇒ config defaults
     integration_review_enabled: bool = False
     integration_proposal: Optional[IntegrationProposal] = None
@@ -311,8 +416,30 @@ class Session(BaseModel):
     consent_extra_rounds: int = 0  # rounds the human granted beyond ROUNDS_PER_CONSENT
     compose_now: bool = False  # human said "finish" — skip further rounds, compose from the work so far
     test_fix_attempts: int = 0  # goal-loop repairs spent (persisted: a pause can't reset the clock)
+    artifact_repair_attempts: int = 0  # deterministic validation-repair attempts
     turns: list[dict] = []  # the conversation: [{role:'user'|'council', text}] — grows as the
     #                         human responds to a conclusion and the council deliberates again.
+    goal_id: Optional[str] = None       # set when this session runs one Goal milestone
+    goal_milestone: Optional[int] = None  # which milestone (index) it runs
+    goal_epoch: int = 0  # Goal.epoch captured when this milestone session started
+    # Goal acceptance contract copied from GoalMilestone when the session is
+    # opened.  Empty fields preserve the ordinary one-shot session behaviour.
+    required_files: list[str] = []
+    runtime_dependencies: list[str] = []
+    dependency_hashes: dict[str, str] = {}
+    # A revision target is both an input and an output (for example editing
+    # ``arcade.html`` in place).  Its baseline is recorded for audit/conflict
+    # detection, but it must not be treated as an immutable dependency after
+    # the author has intentionally changed it.
+    revision_targets: list[str] = []
+    revision_base_hashes: dict[str, str] = {}
+    revision_api_contract: dict[str, list[str]] = {}
+    revision_assertions: dict[str, list[str]] = {}
+    acceptance_commands: list[str] = []
+    outcome: str = "pending"  # pending | succeeded | failed_verification | failed | cancelled
+    # A background worker owns a short-lived lease.  Store writes from a
+    # superseded worker are rejected after restart/cancel/retry.
+    worker_lease: str = ""
     attachments: list[dict] = []  # [{id, name, kind}] folded into the task text
     budgets: Budgets = Field(default_factory=Budgets)
     budgets_locked: bool = False  # True when caller supplied explicit budgets

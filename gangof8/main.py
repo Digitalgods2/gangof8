@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import __version__, config, reporting, security
+from . import __version__, config, goals, reporting, security
 from .models import Role
 from .service import GangOf8Service
 
@@ -79,6 +79,7 @@ def _summary(session) -> dict:
     return {
         "session_id": session.session_id,
         "status": session.status.value,
+        "outcome": session.outcome,
         "stop_reason": session.stop_reason,
         "final": session.final.model_dump() if session.final else None,
         "pending_approvals": [a.model_dump() for a in session.approvals if a.status == "pending"],
@@ -92,6 +93,15 @@ def _summary(session) -> dict:
         "files_changed": session.files_changed,
         "workspace_root": session.workspace_root,
         "established_root": session.established_root,
+        "collaboration_mode": session.collaboration_mode,
+        "delivery_mode": session.delivery_mode,
+        "work_package_id": session.work_package_id,
+        "work_package_owner": session.work_package_owner,
+        "required_frontier_authors": session.required_frontier_authors,
+        "frontier_author_recoveries": session.frontier_author_recoveries,
+        "candidate_metrics": session.candidate_metrics,
+        "quality_gate": session.quality_gate,
+        "goal_release": session.goal_release,
         "attachments": session.attachments,
         "integration_proposal": (
             session.integration_proposal.model_dump() if session.integration_proposal else None
@@ -115,6 +125,13 @@ def logo() -> FileResponse:
     favicon (referenced from index.html)."""
     return FileResponse(_STATIC / "logo.png", media_type="image/png",
                         headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/gangof8-text.png")
+def header_lockup() -> FileResponse:
+    """The single-image dashboard header lockup supplied by the user."""
+    return FileResponse(_STATIC / "gangof8-text.png", media_type="image/png",
+                        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
 
 
 @app.get("/app.css")
@@ -154,6 +171,15 @@ def diagnostics() -> dict:
 @app.post("/tasks")
 def submit_task(body: TaskIn) -> dict:
     try:
+        if goals.should_auto_route(body.text, has_attachments=bool(body.attachments)):
+            goal = service.create_goal(body.text, background=body.background)
+            payload = service.get_goal(goal.goal_id) or goal.model_dump()
+            payload.update({
+                "kind": "goal",
+                "auto_routed": True,
+                "route_reason": "substantial build: parallel owned packages + final batch",
+            })
+            return payload
         if body.background:
             session = service.submit_background(
                 body.text, source=body.source, attachments=body.attachments)
@@ -227,6 +253,12 @@ def get_session(session_id: str) -> dict:
     data = service.get(session_id)
     if data is None:
         raise HTTPException(status_code=404, detail="session not found")
+    # Old persisted sessions predate these audit fields; expose explicit empty
+    # values so API/UI consumers never have to guess whether a key disappeared.
+    data.setdefault("required_frontier_authors", [])
+    data.setdefault("frontier_author_recoveries", {})
+    data.setdefault("candidate_metrics", {})
+    data.setdefault("quality_gate", {})
     service.annotate_council_models(data)  # label each member with the model it runs
     data["council_health"] = reporting.council_health(data.get("unresolved", []))
     data["run_summary"] = reporting.run_summary(data)
@@ -332,6 +364,63 @@ def followup_session(session_id: str, body: FollowUpIn) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"session_id": session.session_id, "status": session.status.value}
+
+
+# ---- Goals (/goal): long-horizon objectives, milestone by milestone -----------
+
+
+class GoalIn(BaseModel):
+    text: str
+    background: bool = False  # True: plan + run on a worker, poll GET /goals/{id}
+
+
+@app.post("/goals")
+def create_goal(body: GoalIn) -> dict:
+    """Open a build-team goal: owned packages share private staging and the
+    complete verified manifest crosses into the project through one approval."""
+    try:
+        goal = service.create_goal(body.text, background=body.background)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return service.get_goal(goal.goal_id) or goal.model_dump()
+
+
+@app.get("/goals")
+def list_goals() -> list[dict]:
+    return service.list_goals()
+
+
+@app.get("/goals/{goal_id}")
+def get_goal(goal_id: str) -> dict:
+    data = service.get_goal(goal_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="goal not found")
+    return data
+
+
+@app.post("/goals/{goal_id}/cancel")
+def cancel_goal(goal_id: str) -> dict:
+    try:
+        return service.cancel_goal(goal_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="goal not found")
+
+
+@app.post("/goals/{goal_id}/resume")
+def resume_goal(goal_id: str) -> dict:
+    try:
+        return service.resume_goal(goal_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="goal not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.delete("/goals/{goal_id}")
+def delete_goal(goal_id: str) -> dict:
+    if not service.delete_goal(goal_id):
+        raise HTTPException(status_code=404, detail="goal not found")
+    return {"deleted": goal_id}
 
 
 # ---- Settings / preferences --------------------------------------------------

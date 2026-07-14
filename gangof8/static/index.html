@@ -14,9 +14,7 @@
   <div class="blob a"></div><div class="blob b"></div><div class="blob c"></div>
 </div>
 <header>
-  <span class="brand"><img src="/logo.png" class="brand-logo" alt="Gang of 8 logo">
-    <span class="brand-name"><h1>Gang of 8</h1><small>Coordinator OS · Type 1</small></span>
-  </span>
+  <span class="brand"><img src="/gangof8-text.png" class="brand-lockup" alt="Gang of 8"></span>
   <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
   <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
   <span class="bpill tagline">🔒 nothing executes without your approval</span>
@@ -70,6 +68,10 @@
 
 <main>
   <div id="left">
+    <div id="goalsWrap" style="display:none">
+      <h2>Goals</h2>
+      <div id="goals"></div>
+    </div>
     <h2>Sessions</h2>
     <div id="sessions"></div>
   </div>
@@ -89,7 +91,7 @@
         <button onclick="pickFile('image')">🖼️ Attach image</button>
       </div>
     </div>
-    <textarea id="task" rows="1" placeholder="Describe a task for the council…  (Enter to send, Shift+Enter for a new line)"
+    <textarea id="task" rows="1" placeholder="Describe a task for the council…  (Enter to send, Shift+Enter for a new line, /goal for a long build)"
               oninput="autoGrow(this)" onkeydown="composerKey(event)"></textarea>
     <button class="ghost" onclick="clearComposer()">Clear</button>
     <button id="enhanceBtn" type="button" class="ghost"

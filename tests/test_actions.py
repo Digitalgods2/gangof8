@@ -91,7 +91,8 @@ def test_unsafe_filenames_fail_without_writing(tmp_path):
     service = GangOf8Service(data_dir=tmp_path)
     service.registry.register(ArtifactAdapter(draft="ARTIFACT: ..\\..\\evil.md\ncontent"))
     session = service.run(TASK, source="test")
-    assert session.status == SessionStatus.done
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
     assert session.proposed_actions[0].status == "failed"
     assert session.files_changed == []
     assert any("failed" in u for u in session.unresolved)
@@ -391,7 +392,8 @@ def test_code_task_with_no_artifact_fails_verification(tmp_path):
         req = session.input_requests[-1]
         session = service.answer(session.session_id, req.input_id, "workspace")
 
-    assert session.status == SessionStatus.done
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
     assert session.final is not None
     assert session.final.confidence == "low"
     assert "failed artifact verification" in session.final.answer

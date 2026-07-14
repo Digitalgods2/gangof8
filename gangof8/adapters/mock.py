@@ -100,6 +100,8 @@ PANEL_VIEW = (
 
 
 class MockAdapter:
+    local_process = False  # in-process double: never gate it behind the CLI bound
+
     def __init__(self, name: str = "mock"):
         # A name per instance lets tests register several mock seats as a panel.
         self.name = name

@@ -351,7 +351,8 @@ def test_blank_artifact_on_noncode_task_is_not_a_confident_success(tmp_path):
 
     session = svc.run("Write a short report summarizing the storage options.", source="test")
 
-    assert session.status == SessionStatus.done
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
     assert session.final.confidence == "low", "an empty file must not be high confidence"
     assert "failed artifact verification" in session.final.answer
     # the blank write was rejected, so nothing landed

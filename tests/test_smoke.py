@@ -93,6 +93,16 @@ def test_bare_js_file_runs():
     assert ran is True and testable is True, detail
 
 
+def test_js_module_smoke_uses_declared_load_order_prelude():
+    """A game module may legally depend on a prior core.js global."""
+    module = "class Frogger extends Game {}\nwindow.Frogger = Frogger;"
+    ran_alone, _testable, _detail, _dyn = smoke.smoke_source(module, ".js")
+    assert ran_alone is False
+    ran, testable, detail, _dyn = smoke.smoke_source(
+        module, ".js", prelude="class Game {}\nwindow.Game = Game;")
+    assert ran is True and testable is True, detail
+
+
 def test_bare_js_crash_caught():
     ran, testable, detail, _dyn = smoke.smoke_source("var a; a.b.c = 1;", ".js")
     assert ran is False and testable is True

@@ -1,5 +1,6 @@
 let current = null;
 let liveKey = null, liveSince = 0;  // drives the ticking elapsed timer
+const detailRefreshGate = createLatestRequestGate();
 // Expand/collapse state for rollup sections, keyed by stable id (e.g.
 // "sec_contributions"). Tracked here rather than read off the DOM because
 // renderDetail() rebuilds #right.innerHTML every 3s, which would otherwise
@@ -407,9 +408,17 @@ function followupKey(e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFollowup(current); }
 }
 
+// What the composer's cancel button acts on this poll cycle: the open running
+// session, or (with none open) the live goal itself. Set in refresh().
+let _cancelTarget = null;
+
 async function cancelCurrent() {
+  if (_cancelTarget && _cancelTarget.kind === "goal") {
+    return cancelGoal(_cancelTarget.id);
+  }
   if (!current) return;
   if (!confirm("Cancel this run? It stops at the next step — an in-flight agent call finishes first.")) return;
+  detailRefreshGate.invalidate(); _lastDetailSig = "";
   const note = document.getElementById("submitNote");
   const r = await fetch(`/sessions/${current}/cancel`, {method: "POST"});
   if (r.ok) { const d = await r.json(); note.style.color = ""; note.textContent = d.status === "cancelled" ? "cancelled" : "cancelling…"; pollLoop(); }
@@ -422,10 +431,40 @@ async function submitTask() {
   const note = document.getElementById("submitNote");
   if (!text && !attachments.length) { note.textContent = "type a task or attach a file"; return; }
   if (!text) { note.textContent = "add a short instruction for the attachment(s)"; return; }
+  // /goal <big objective> — architect assigns owned build packages; outputs
+  // accumulate in private staging and cross into the project as one final batch.
+  if (/^\/goal\b/i.test(text)) {
+    const goalText = text.replace(/^\/goal\b/i, "").trim();
+    if (!goalText) {
+      note.textContent = "usage: /goal <a big objective — the council gets owned build packages and one final release>";
+      return;
+    }
+    const g = await api("/goals", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({text: goalText, background: true})});
+    note.style.color = ""; note.textContent = "goal " + g.goal_id + " opened — assigning build packages…";
+    _followGoal = g.goal_id; _planShownFor = "";  // main pane tracks this goal
+    current = null;
+    history.replaceState(null, "", location.pathname + location.search);
+    clearComposer();
+    pollLoop();  // planning + milestone 1 just started → fast polling
+    return;
+  }
   const r = await api("/tasks", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({text, source:"dashboard", background:true,
                           attachments: attachments.map(a => a.id)})});
+  if (r.goal_id) {
+    note.style.color = "";
+    note.textContent = "substantial build auto-routed to goal " + r.goal_id
+      + " — assigning parallel implementation owners…";
+    _followGoal = r.goal_id; _planShownFor = "";
+    current = null;
+    history.replaceState(null, "", location.pathname + location.search);
+    clearComposer();
+    pollLoop();
+    return;
+  }
   note.style.color = ""; note.textContent = "submitted " + r.session_id;
   current = r.session_id;
   clearComposer();
@@ -441,16 +480,193 @@ function _hasSelectionIn(el) {
 }
 let _lastListSig = "", _lastDetailSig = "";
 
+// ---- goals rail: long-horizon objectives above the session list -------------
+const GOAL_LIVE = new Set(["planning", "running", "awaiting_release"]);
+let _goalsCache = [], _lastGoalsSig = "";
+let _sessionsCache = [];
+
+// ---- goal following: the MAIN PANE tracks the active goal ------------------
+// While a goal is live the right pane shouldn't sit on the empty hero: show a
+// planning state until milestone 1's session exists, then open each milestone's
+// session as the goal advances. Selecting an unrelated session stops the
+// steering; it resumes if you come back to one of the goal's sessions.
+let _followGoal = null, _planShownFor = "";
+
+function _goalSessions(g) {
+  const sessions = (g.milestones || []).map(m => m.session_id).filter(Boolean);
+  if (g.release_session_id) sessions.push(g.release_session_id);
+  return sessions;
+}
+
+function renderPlanningHero(g) {
+  if (_planShownFor === g.goal_id) return;  // don't re-clobber every poll
+  _planShownFor = g.goal_id;
+  document.getElementById("right").innerHTML = `
+    <div class="hero-empty">
+      <div class="badge-row">
+        <span class="bpill"><span class="dot dot-brand"></span>goal ${esc(g.goal_id)}</span>
+        <span class="bpill">🧭 assigning build packages…</span>
+      </div>
+      <h1>Forming the build team and<br><span class="grad-text">assigning owned packages.</span></h1>
+      <p>The architect is mapping dependencies and interfaces. Ready packages
+         start in parallel and their work accumulates in private staging.</p>
+    </div>`;
+}
+
+function _followActiveGoal() {
+  if (!_followGoal) {
+    // adopt a live goal when nothing is open, or when the open session is
+    // already one of its milestones (e.g. after a page reload mid-goal)
+    const live = _goalsCache.find(g => GOAL_LIVE.has(g.status) &&
+      (!current || _goalSessions(g).includes(current)));
+    if (live) _followGoal = live.goal_id;
+  }
+  if (!_followGoal) return;
+  const fg = _goalsCache.find(g => g.goal_id === _followGoal);
+  if (!fg || (current && !_goalSessions(fg).includes(current))) {
+    _followGoal = null;  // goal gone, or the user moved elsewhere
+    return;
+  }
+  const ms = fg.milestones || [];
+  const cur = ms[fg.current_index] || ms[ms.length - 1] || null;
+  const latest = fg.actionable_session_id || fg.release_session_id
+    || (cur && cur.session_id) || _goalSessions(fg).slice(-1)[0] || null;
+  if (latest && latest !== current) {
+    detailRefreshGate.invalidate();
+    current = latest; _lastDetailSig = ""; _lastListSig = ""; _planShownFor = "";
+    if (location.hash !== "#" + latest) history.replaceState(null, "", "#" + latest);
+  } else if (!latest && fg.status === "planning" && !current) {
+    renderPlanningHero(fg);
+  }
+  if (!GOAL_LIVE.has(fg.status)) _followGoal = null;  // settled — stop steering
+}
+
+function goalCard(g) {
+  const ms = g.milestones || [];
+  const done = ms.filter(m => m.status === "done").length;
+  const running = g.active_packages ?? ms.filter(m => m.status === "running").length;
+  const owners = new Set(ms.map(m => m.owner).filter(Boolean)).size;
+  const displayStatus = g.display_status || g.status;
+  const icons = {done: "✓", running: "▶", pending: "○", failed: "×",
+    awaiting_approval: "!", awaiting_input: "?", cancelled: "×"};
+  const rows = ms.map(m => {
+    const hard = (m.depends_on || []).filter(i => ms[i] && ms[i].status !== "done");
+    const contracts = m.contract_depends_on || [];
+    const edge = hard.length
+      ? ` · waiting for verified P${hard.map(i => i + 1).join(", P")}`
+      : contracts.length ? ` · contract-linked to P${contracts.map(i => i + 1).join(", P")}` : "";
+    const rowStatus = m.pending_approvals ? "awaiting_approval"
+      : m.pending_inputs ? "awaiting_input" : m.status;
+    const attempts = m.attempt_count > 1 ? ` · ${m.attempt_count} attempts` : "";
+    const working = (m.active_agent_calls || []).length
+      ? ` · ${m.active_agent_calls.map(c => c.agent).join(", ")} working` : "";
+    const title = `${m.title}${m.owner ? ` — owner ${m.owner}` : ""}${edge}${attempts}${working}`;
+    return `
+      <div class="gms ${esc(rowStatus)}" title="${esc(title)}"
+           ${m.session_id ? `onclick="select('${esc(m.session_id)}')"` : ""}>
+        <span class="gicon">${icons[rowStatus] || "○"}</span>
+        <span class="gtitle">${esc(m.title)}${m.owner ? ` <small>— ${esc(m.owner)}${esc(edge)}${esc(attempts)}${esc(working)}</small>` : ""}</span>
+      </div>`;
+  }).join("");
+  const live = GOAL_LIVE.has(g.status);
+  const btns =
+    (g.status === "paused" ? `<button class="gbtn" onclick="resumeGoal('${esc(g.goal_id)}', event)">Resume</button>` : "") +
+    (live || g.status === "paused" ? `<button class="gbtn ghost" onclick="cancelGoal('${esc(g.goal_id)}', event)">Cancel</button>` : "") +
+    (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "");
+  const aggregate = g.delivery_mode === "final_batch"
+    ? `<div class="sub">Build team · ${owners} model${owners === 1 ? "" : "s"} · ${running} active` +
+      `${g.active_agent_calls ? ` · ${g.active_agent_calls} model call${g.active_agent_calls === 1 ? "" : "s"}` : ""}` +
+      `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
+      `${g.pending_inputs ? ` · ${g.pending_inputs} question blocked` : ""}` +
+      ` · shared staging · ${esc(g.release_status || "not_started")}</div>` : "";
+  return `
+    <div class="goal ${esc(g.status)}">
+      <div class="ghead">
+        <span class="pill g-${esc(displayStatus)}">${esc(displayStatus.replaceAll("_", " "))}</span>
+        <span class="gprog">${done}/${ms.length || "…"}</span>
+        ${btns}
+      </div>
+      <div class="text" title="click to expand/collapse"
+           onclick="this.classList.toggle('open')">${esc(g.text)}</div>
+      ${g.last_error ? `<div class="gerr">${esc(g.last_error)}</div>` : ""}
+      ${aggregate}
+      ${rows}
+    </div>`;
+}
+
+async function refreshGoals(sessions = null) {
+  if (sessions) _sessionsCache = sessions;
+  _goalsCache = await api("/goals").catch(() => []) || [];
+  const wrap = document.getElementById("goalsWrap");
+  const el = document.getElementById("goals");
+  if (!wrap || !el) return;
+  wrap.style.display = _goalsCache.length ? "" : "none";
+  _followActiveGoal();  // steer the main pane before the detail render runs
+  const sig = JSON.stringify(_goalsCache);
+  if (sig === _lastGoalsSig || _hasSelectionIn(el)) return;
+  _lastGoalsSig = sig;
+  el.innerHTML = _goalsCache.map(goalCard).join("");
+}
+
+async function resumeGoal(id, ev) {
+  ev.stopPropagation();
+  await fetch(`/goals/${encodeURIComponent(id)}/resume`, {method: "POST"});
+  _lastGoalsSig = ""; pollLoop();
+}
+
+async function cancelGoal(id, ev) {
+  if (ev) ev.stopPropagation();  // no event when called from the composer button
+  if (!confirm("Cancel this goal? Every running package will be cancelled too.")) return;
+  detailRefreshGate.invalidate(); _lastDetailSig = "";
+  await fetch(`/goals/${encodeURIComponent(id)}/cancel`, {method: "POST"});
+  _lastGoalsSig = ""; pollLoop();
+}
+
+async function deleteGoal(id, ev) {
+  ev.stopPropagation();
+  if (!confirm("Remove this goal? Its milestone sessions stay in the session list.")) return;
+  await fetch(`/goals/${encodeURIComponent(id)}`, {method: "DELETE"});
+  _lastGoalsSig = ""; pollLoop();
+}
+
 async function refresh() {
   const sessions = await api("/sessions");
+  _sessionsCache = sessions;
+  await refreshGoals(sessions);
   const el = document.getElementById("sessions");
-  // Show "Cancel run" only while the open session is actually running.
+  // Cancel button: a running open session cancels that run; with none open, a
+  // LIVE goal (planning, or between milestones) offers cancelling the goal —
+  // otherwise the /goal planning window had no cancel anywhere in the composer.
   const curS = sessions.find(s => s.session_id === current);
   const cancelBtn = document.getElementById("cancelBtn");
-  if (cancelBtn) cancelBtn.style.display = (curS && !TERMINAL_STATES.has(curS.status)) ? "inline-block" : "none";
+  if (cancelBtn) {
+    const liveGoal = _goalsCache.find(g => GOAL_LIVE.has(g.status));
+    const currentGoal = curS && curS.goal_id
+      ? _goalsCache.find(g => g.goal_id === curS.goal_id && GOAL_LIVE.has(g.status)) : null;
+    if (currentGoal) {
+      _cancelTarget = {kind: "goal", id: currentGoal.goal_id};
+      cancelBtn.textContent = "Cancel goal";
+      cancelBtn.style.display = "inline-block";
+    } else if (curS && !TERMINAL_STATES.has(curS.status)) {
+      _cancelTarget = {kind: "run"};
+      cancelBtn.textContent = "Cancel run";
+      cancelBtn.style.display = "inline-block";
+    } else if (liveGoal) {
+      _cancelTarget = {kind: "goal", id: liveGoal.goal_id};
+      cancelBtn.textContent = "Cancel goal";
+      cancelBtn.style.display = "inline-block";
+    } else {
+      _cancelTarget = null;
+      cancelBtn.style.display = "none";
+    }
+  }
   // Only rebuild the list when something actually changed AND no selection is
   // active in it — re-rendering identical HTML every poll wiped selections.
-  const listSig = JSON.stringify(sessions.map(s =>
+  const visibleGoalIds = new Set(_goalsCache.map(g => g.goal_id));
+  // Hide package attempts only while their owning goal card exists. If a goal
+  // is removed, its retained sessions become directly accessible again.
+  const visibleSessions = sessions.filter(s => !s.goal_id || !visibleGoalIds.has(s.goal_id));
+  const listSig = JSON.stringify(visibleSessions.map(s =>
     [s.session_id, s.status, s.pending_approvals || 0, s.pending_inputs || 0,
      s.task_text || "", s.session_id === current]));
   if (listSig === _lastListSig || _hasSelectionIn(el)) {
@@ -458,7 +674,7 @@ async function refresh() {
     return sessions;
   }
   _lastListSig = listSig;
-  el.innerHTML = sessions.map(s => `
+  el.innerHTML = visibleSessions.map(s => `
     <div class="session ${s.session_id===current?"active":""}" onclick="select('${s.session_id}')">
       <button class="trash" title="Delete this session" onclick="deleteSession('${s.session_id}', event)">🗑</button>
       <div class="text">${esc(s.task_text) || "(no text)"}</div>
@@ -468,7 +684,9 @@ async function refresh() {
         ${s.pending_inputs ? `<span class="pill awaiting_input">${s.pending_inputs} question</span>` : ""}
         <span>${esc(s.session_id)}</span>
       </div>
-    </div>`).join("");
+    </div>`).join("") || (_goalsCache.length
+      ? '<div class="sub" style="padding:8px 4px">Package attempts are grouped under Goals above.</div>'
+      : "");
   if (current) await _refreshDetail();
   return sessions;
 }
@@ -483,7 +701,8 @@ async function refresh() {
 // still awaiting its answer (a CONSULT/DELEGATE happens INSIDE the lead's
 // call, so the session JSON alone never shows it while it's happening) AND a
 // rolling activity feed — what the council is actually doing right now, not
-// just a timer. Returns the talent line; fills _liveFeed as a side effect.
+// just a timer. Both values stay local until the refresh-order gate accepts
+// this request, so obsolete work cannot mutate the visible live card.
 let _liveTalent = "";
 let _liveFeed = [];  // recent {ts, icon, label, detail} rows for the live card
 
@@ -496,16 +715,28 @@ async function _liveActivity(sid) {
     else if (["delegation_resolved", "delegation_failed", "delegation_denied",
               "round_synthesized", "final_composed"].includes(e.event)) open = "";
   }
-  _liveFeed = events.filter(e => e.event !== "status_change").slice(-8);
-  return open.slice(0, 90);
+  return {
+    talent: open.slice(0, 90),
+    feed: events.filter(e => e.event !== "status_change").slice(-8),
+  };
 }
 
 async function _refreshDetail() {
-  const detail = await fetch("/sessions/" + current).then(r => r.ok ? r.json() : null);
+  const sid = current;
+  if (!sid) return;
+  const requestToken = detailRefreshGate.begin();
+  const detail = await fetch("/sessions/" + encodeURIComponent(sid), {cache: "no-store"})
+    .then(r => r.ok ? r.json() : null);
+  if (!detailRefreshGate.isCurrent(requestToken) || current !== sid) return;
   const workingNow = detail &&
     ["received", "classified", "deliberating", "composing"].includes(detail.status);
-  _liveTalent = workingNow ? await _liveActivity(detail.session_id).catch(() => "") : "";
-  if (!workingNow) _liveFeed = [];
+  let activity = {talent: "", feed: []};
+  if (workingNow) {
+    activity = await _liveActivity(detail.session_id).catch(() => activity);
+    if (!detailRefreshGate.isCurrent(requestToken) || current !== sid) return;
+  }
+  _liveTalent = activity.talent;
+  _liveFeed = activity.feed;
   const right = document.getElementById("right");
   const feedKey = _liveFeed.length
     ? _liveFeed[_liveFeed.length - 1].ts + ":" + _liveFeed.length : "";
@@ -522,15 +753,20 @@ async function _refreshDetail() {
 // no requests at all; resume instantly when the tab is shown again.
 const TERMINAL_STATES = new Set(["done", "cancelled", "failed"]);
 const POLL_ACTIVE = 3000, POLL_IDLE = 20000, POLL_HIDDEN = 30000;
-let _pollTimer = null;
+let _pollTimer = null, _pollGeneration = 0;
 async function pollLoop() {
+  const pollGeneration = ++_pollGeneration;
   if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
   let delay = POLL_IDLE;
   if (document.hidden) {
     delay = POLL_HIDDEN;  // tab not visible: skip the fetch entirely
   } else {
     const sessions = await refresh().catch(() => []);
-    const working = (sessions || []).some(s => !TERMINAL_STATES.has(s.status));
+    // A submit/cancel/resolve may start a newer poll while this one awaits the
+    // API. Only that newest poll is allowed to own the next timer.
+    if (pollGeneration !== _pollGeneration) return;
+    const working = (sessions || []).some(s => !TERMINAL_STATES.has(s.status))
+      || _goalsCache.some(g => GOAL_LIVE.has(g.status));
     delay = working ? POLL_ACTIVE : POLL_IDLE;
   }
   _pollTimer = setTimeout(pollLoop, delay);
@@ -542,6 +778,7 @@ async function deleteSession(id, ev) {
   const r = await fetch("/sessions/" + encodeURIComponent(id), {method: "DELETE"});
   if (r.ok) {
     if (current === id) {
+      detailRefreshGate.invalidate();
       current = null;
       history.replaceState(null, "", location.pathname + location.search);
       renderEmptyHero();
@@ -551,6 +788,7 @@ async function deleteSession(id, ev) {
 }
 
 function select(id) {
+  detailRefreshGate.invalidate();
   current = id; _lastDetailSig = ""; _lastListSig = "";
   // deep link: keep the open session in the URL so a refresh (or a shared
   // link) lands back on it instead of the empty state
@@ -564,6 +802,12 @@ function renderDetail(s) {
   const final = s.final;
   const approvals = (s.approvals||[]).filter(a => a.status === "pending");
   const inputs = (s.input_requests||[]).filter(i => i.status === "pending");
+  const verificationFailed = s.outcome === "failed_verification";
+  const packageMode = s.collaboration_mode === "build_team" && !!s.work_package_owner;
+  const parentGoal = packageMode ? _goalsCache.find(g => g.goal_id === s.goal_id) : null;
+  const currentPackage = parentGoal
+    ? (parentGoal.milestones || []).find(m => m.package_id === s.work_package_id)
+    : null;
 
   // The poll timer re-renders this pane every few seconds; snapshot any
   // in-progress answer text + focus/caret + scroll so reading/typing isn't
@@ -578,7 +822,8 @@ function renderDetail(s) {
   const working = ["received","classified","deliberating","composing"].includes(s.status);
   const spokenRoles = new Set((s.contributions||[]).map(c => c.role));
   const members = ((s.council||{}).members||[]);
-  const roster = members.filter(m => m.active && m.agent && m.agent !== "system");
+  const roster = members.filter(m => m.active && m.agent && m.agent !== "system" &&
+    (!packageMode || m.role === "panelist"));
   const agentOf = Object.fromEntries(members.map(m => [m.role, m.agent]));
   // exact model per seat, learned from the contributions that carried it
   // exact model per ROLE+AGENT, learned from the contributions that carried it —
@@ -604,9 +849,27 @@ function renderDetail(s) {
       waitAgent = waitRole ? (agentOf[waitRole] || "") : "";
     }
   }
+  if (packageMode) {
+    liveGoal = `package ${s.work_package_id || ""}${currentPackage ? ` · ${currentPackage.title}` : ""}`;
+    waitRole = "owner";
+    waitAgent = s.work_package_owner;
+  }
+  const activeCall = (s.active_agent_calls || [])[0] || null;
+  if (activeCall) {
+    waitRole = activeCall.role || waitRole;
+    waitAgent = activeCall.agent || waitAgent;
+    const deadline = activeCall.timeout_s === 0
+      ? "no coordinator deadline"
+      : `${activeCall.timeout_s || "?"}s limit`;
+    liveGoal = `${packageMode ? "package owner" : "model"} working · ${deadline}`;
+  }
   // reset the elapsed clock whenever the live situation actually changes
-  const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${waitRole}` : null;
-  if (key !== liveKey) { liveKey = key; liveSince = working ? Date.now() : 0; }
+  const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${activeCall?.call_id || waitRole}` : null;
+  if (key !== liveKey) {
+    liveKey = key;
+    liveSince = working
+      ? (activeCall?.started_at ? Date.parse(activeCall.started_at) : Date.now()) : 0;
+  }
 
   // ---- client-side rollup stats (no walls of text) ----
   const contribs = s.contributions || [];
@@ -630,6 +893,14 @@ function renderDetail(s) {
   if (agentCount) statBits.push(`<b>${agentCount}</b> agent${agentCount === 1 ? "" : "s"}`);
   if (delegations) statBits.push(`<b>${delegations}</b> delegation${delegations === 1 ? "" : "s"}`);
   if (runSummary.test_fix_attempts) statBits.push(`<b>${runSummary.test_fix_attempts}</b> test repair${runSummary.test_fix_attempts === 1 ? "" : "s"}`);
+  const candidateMetrics = runSummary.candidate_metrics || s.candidate_metrics || {};
+  if (candidateMetrics.authored !== undefined) {
+    statBits.push(`<b>${candidateMetrics.authored}</b> authored / <b>${candidateMetrics.runnable || 0}</b> runnable`);
+  }
+  const qualityGate = runSummary.quality_gate || s.quality_gate || {};
+  if (qualityGate.verdict) {
+    statBits.push(`release gate <b>${esc(String(qualityGate.verdict).toLowerCase())}</b>${qualityGate.verifier ? ` by ${esc(qualityGate.verifier)}` : ""}`);
+  }
   // legacy sessions may carry court-era disagreements; show them if present
   if (disagreements.length) statBits.push(`<b>${disagreements.length}</b> disagreement${disagreements.length === 1 ? "" : "s"}`);
 
@@ -656,7 +927,7 @@ function renderDetail(s) {
 
   right.innerHTML = `
     <div class="card">
-      <h3>Task — <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+      <h3>Task — <span class="pill ${esc(s.status)}">${esc(verificationFailed ? "failed verification" : s.status)}</span>
           ${s.stop_reason ? `<span class="sub"> · ${esc(s.stop_reason)}</span>` : ""}</h3>
       <div class="mono">${esc(s.task?.text)}</div>
       ${s.established_root ? `<div class="sub" style="margin-top:6px" title="read-only source; files reach it only via an approved promote">📂 established folder: <span class="mono">${esc(s.established_root)}</span></div>` : ""}
@@ -667,7 +938,7 @@ function renderDetail(s) {
 
     ${showSummary ? `
       <div class="card summary">
-        <h3>${(s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary"}</h3>
+        <h3>${verificationFailed ? "Verification failed — not delivered" : ((s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary")}</h3>
         ${final ? `
           <div class="row" style="margin-top:0"><span class="conf-${esc(final.confidence)}">${esc(final.confidence)} confidence</span></div>
           <pre>${esc(final.answer)}</pre>` : ``}
@@ -703,7 +974,7 @@ function renderDetail(s) {
         <div class="livehead">
           <span class="dot"></span>
           <div>
-            <div class="what">${esc(s.status)}<span class="ell"></span></div>
+            <div class="what">${packageMode ? "Building package" : esc(s.status)}<span class="ell"></span></div>
             <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""}${_liveTalent ? ` · 🤝 ${esc(_liveTalent)}` : ""} · <span id="elapsed">0:00</span></div>
           </div>
         </div>
@@ -716,11 +987,18 @@ function renderDetail(s) {
           </div>`).join("")}</div>` : ""}
       </div>` : ""}
 
-    ${roster.length ? `
+    ${(roster.length || (parentGoal && (parentGoal.milestones || []).length)) ? `
       <div class="card">
-        <h3>Council</h3>
+        <h3>${packageMode ? "Build team" : "Council"}${packageMode ? ` <span class="sub">· this session has one accountable owner</span>` : ""}</h3>
         <div class="roster">
-          ${roster.map(m => {
+          ${packageMode && parentGoal ? (parentGoal.milestones || []).map((m, i) => {
+            const active = m.package_id === s.work_package_id;
+            const hard = (m.depends_on || []).filter(d => parentGoal.milestones[d] && parentGoal.milestones[d].status !== "done");
+            const title = hard.length
+              ? `blocked on verified package ${hard.map(d => d + 1).join(", ")}`
+              : (m.contract_depends_on || []).length ? "running from declared interfaces; no artifact wait" : "no upstream blocker";
+            return `<span class="seat role-panelist ${active ? "spoke" : "on"}" title="${esc(title)}">P${i + 1} · ${esc(m.owner || "unassigned")} · ${esc(m.status)}</span>`;
+          }).join("") : roster.map(m => {
             const talent = !DRIVE_ROLES.has(m.role);
             // the model this member's role+agent actually ran; else the one it
             // WILL run (resolved server-side: role pin › seat pin › CLI default).
@@ -730,7 +1008,7 @@ function renderDetail(s) {
               title="${title}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${full ? ` · ${esc(shortModel(full))}` : ""}</span>`;
           }).join("")}
         </div>
-        ${(() => {
+        ${!packageMode ? (() => {
           // Recruitment feed: one plain-language row per talent the lead pulled
           // in — "claude · opus called in as Code Generator" — so a mid-round
           // CONSULT/DELEGATE is a first-class visible event. Answered pulls
@@ -746,7 +1024,7 @@ function renderDetail(s) {
             <div class="talentrow">⏳ <b>${esc(_liveTalent)}</b>
               <span class="sub">— recruited by the lead, answering now…</span></div>`);
           return rows.join("");
-        })()}
+        })() : `<div class="sub" style="margin-top:8px">The highlighted owner writes this package. Contract-linked owners can work simultaneously; only hard artifact dependencies wait.</div>`}
       </div>` : ""}
 
     ${(s.council_health && s.council_health.degraded) ? `
@@ -757,17 +1035,20 @@ function renderDetail(s) {
         ${s.council_health.notes.map(n => `<div class="hrow">${esc(n)}</div>`).join("")}
       </div>` : ""}
 
-    ${approvals.map(a => `
-      <div class="card needs">
-        <h3>Approval needed — ${esc(a.category)} / ${esc(a.risk)}</h3>
-        <div>${esc(a.action)}</div>
-        ${a.details ? `<pre class="diff">${diffHtml(a.details)}</pre>` : ""}
-        <div class="row">
-          <button onclick="resolveApproval('${a.approval_id}', true)">Approve</button>
-          <button onclick="resolveApproval('${a.approval_id}', true, true)" title="Approve this and every other ${esc(a.category)} in this session — one decision instead of N identical clicks">Approve all ${esc(a.category)}s</button>
-          <button class="deny" onclick="resolveApproval('${a.approval_id}', false)">Deny</button>
-        </div>
-      </div>`).join("")}
+    ${approvals.map(a => {
+      const isBatch = String(a.action || "").includes("APPROVE FINAL BATCH");
+      return `
+        <div class="card needs">
+          <h3>${isBatch ? "Final batch ready" : "Approval needed — " + esc(a.category) + " / " + esc(a.risk)}</h3>
+          <div>${esc(a.action)}</div>
+          ${a.details ? `<pre class="diff">${diffHtml(a.details)}</pre>` : ""}
+          <div class="row">
+            <button onclick="resolveApproval('${a.approval_id}', true)">${isBatch ? "Approve final batch" : "Approve"}</button>
+            ${isBatch ? "" : `<button onclick="resolveApproval('${a.approval_id}', true, true)" title="Approve this and every other ${esc(a.category)} in this session — one decision instead of N identical clicks">Approve all ${esc(a.category)}s</button>`}
+            <button class="deny" onclick="resolveApproval('${a.approval_id}', false)">Deny</button>
+          </div>
+        </div>`;
+    }).join("")}
 
     ${inputs.map(i => {
       const ip = i.purpose === "integration_decision" ? s.integration_proposal : null;
@@ -1179,7 +1460,7 @@ function renderSettings(s, seats) {
           </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
                  spellcheck="false" placeholder="exact model id" style="flex:1;min-width:220px;display:none">
           <label class="sub" style="flex:0 0 auto;display:flex;align-items:center;gap:5px;margin:0"
-                 title="Call timeout for this seat, in seconds (built-in default ${_tod}s). Raise it so a thorough seat isn't dropped mid-work; heavy authoring keeps a built-in minimum.">⏱
+                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). It never caps a coding session; Claude/Codex implementation and frontier release verification have no coordinator deadline and remain user-cancellable.">⏱
             <input type="number" class="cli_timeout" data-seat="${esc(x.name)}" min="30" max="3600" step="10"
                    value="${escAttr(String(_to))}" placeholder="${escAttr(String(_tod))}" style="width:74px">s</label>
         </div>`;}).join("")}
@@ -1187,7 +1468,7 @@ function renderSettings(s, seats) {
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
-      <div class="sub"><b>⏱ timeout</b> is each seat's per-call budget in seconds (built-in defaults: claude 240 · codex 300 · gemini 150). Raise it so a thorough seat (e.g. claude on opus) isn't dropped mid-work; lower it to fail faster on a stall. Heavy authoring (lead / panel / codifier) keeps its own built-in minimum, so a small value here can't starve it.</div>
+      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). It does not cap any coding session. Code calls use their author/lead/judge/codifier stage policy; Claude/Codex implementation-owner and independent release-verifier calls use no coordinator deadline. Cancel still terminates their CLI process immediately.</div>
       <div class="sub">Uncheck a seat to run <b>OpenRouter-only</b>: its roles fall back to an enabled OpenRouter model (below), and it leaves the panel. Needs an OpenRouter key and at least one enabled OpenRouter seat — otherwise the seat stays on so the council always has a lead.</div>
     </div>
 
