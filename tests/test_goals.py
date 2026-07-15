@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from gangof8 import goals as goals_mod
+from gangof8 import assembly, goals as goals_mod
 from gangof8.adapters.mock import MockAdapter
 from gangof8.models import Goal, GoalMilestone, Role, Session, SessionStatus, Task
 from gangof8.registry import AdapterResult
@@ -602,6 +602,20 @@ def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
             "call_id": "call_1", "agent": "claude", "role": "panelist",
             "started_at": "2026-07-13T22:00:00Z", "timeout_s": 320,
         }],
+        agent_calls=1,
+        agent_call_attempts=2,
+        agent_attempt_duration_ms=360_000,
+        package_output_authors={"src/core.js": "claude", "src/view.js": "gemini"},
+        package_output_attempts={"src/core.js": 2, "src/view.js": 1},
+        package_output_history={
+            "src/core.js": [
+                {"attempt": 1, "agent": "claude", "kind": "primary", "status": "failed"},
+                {"attempt": 2, "agent": "gemini", "kind": "failover", "status": "completed"},
+            ]
+        },
+        package_call_failures={"claude": "timed out"},
+        package_started_at="2026-07-13T22:04:00+00:00",
+        package_deadline_at="2026-07-13T22:10:00+00:00",
         approvals=[ApprovalRequest(
             session_id="s_active", action="release", category="file_write")],
         task=Task(task_id="t", session_id="s_active", text="core"),
@@ -617,6 +631,121 @@ def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
     assert [attempt["session_id"] for attempt in package["attempts"]] == ["s_old", "s_active"]
     assert package["attempts"][0]["is_current"] is False
     assert package["attempts"][1]["is_current"] is True
+    assert package["agent_call_attempts"] == 2
+    assert package["agent_attempt_duration_ms"] == 360_000
+    assert package["output_authors"]["src/view.js"] == "gemini"
+    assert package["output_attempts"]["src/core.js"] == 2
+    assert package["output_history"]["src/core.js"][0]["agent"] == "claude"
+    assert package["attempts"][1]["output_history"]["src/core.js"][1]["agent"] == "gemini"
+    assert package["author_failures"]["claude"] == "timed out"
+    assert package["authoring_deadline_at"].endswith("+00:00")
+    assert view["agent_call_attempts"] == 2
+    assert view["agent_attempt_duration_ms"] == 360_000
+
+
+def test_assembly_template_failure_reopens_only_its_upstream_owner(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="assemble",
+        status="running",
+        epoch=4,
+        current_index=1,
+        collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        milestones=[
+            GoalMilestone(
+                index=0,
+                package_id="wp_template",
+                owner="codex",
+                title="template",
+                task_text="template",
+                status="done",
+                session_id="s_bad_template",
+                contract_declared=True,
+                requires_delivery=True,
+                required_files=["index.template.html"],
+                accepted_files=["stage/index.template.html"],
+                accepted_hashes={"index.template.html": "bad"},
+            ),
+            GoalMilestone(
+                index=1,
+                package_id="wp_assembly",
+                owner="codex",
+                title="assembly",
+                task_text="assembly",
+                status="running",
+                session_id="s_assembly",
+                depends_on=[0],
+                contract_declared=True,
+                requires_delivery=True,
+                required_files=["arcade.html"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_bad_template",
+        status=SessionStatus.done,
+        outcome="succeeded",
+        goal_id=goal.goal_id,
+        goal_epoch=4,
+        goal_milestone=0,
+        work_package_id="wp_template",
+        work_package_owner="codex",
+        required_files=["index.template.html"],
+        task=Task(task_id="t_bad", session_id="s_bad_template", text="template"),
+    ))
+    failed = Session(
+        session_id="s_assembly",
+        status=SessionStatus.failed,
+        outcome="failed_verification",
+        goal_id=goal.goal_id,
+        goal_epoch=4,
+        goal_milestone=1,
+        work_package_id="wp_assembly",
+        work_package_owner="codex",
+        assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        quality_gate={
+            "verdict": "FAIL",
+            "stage": "deterministic_assembly",
+            "detail": "directive is nested inside <script>",
+        },
+        stop_reason="deterministic assembly contract failed",
+        task=Task(task_id="t_assembly", session_id="s_assembly", text="assembly"),
+    )
+    scheduled: list[int] = []
+    monkeypatch.setattr(
+        service,
+        "_start_ready_packages",
+        lambda current, background: scheduled.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    service._maybe_advance_goal(failed)
+
+    repairing = service.goals.get(goal.goal_id)
+    assert repairing.status == "running"
+    assert [package.status for package in repairing.milestones] == ["pending", "pending"]
+    provider = repairing.milestones[0]
+    assert provider.invalidated_session_ids == ["s_bad_template"]
+    assert provider.accepted_hashes == {}
+    assert repairing.current_index == 0
+    assert scheduled == [0]
+
+    service.goals.park_active(goal.goal_id, "simulated restart")
+    assert service._recover_verified_goal_packages(goal.goal_id) == []
+    still_paused = service.goals.get(goal.goal_id)
+    assert still_paused.milestones[0].status == "pending"
+
+    reopened = service.goals.resume(goal.goal_id)
+    assert [package.status for package in reopened.milestones] == ["pending", "pending"]
+    assert reopened.milestones[0].invalidated_session_ids == ["s_bad_template"]
 
 
 def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(tmp_path):

@@ -66,6 +66,10 @@ function goalRenderSignature(goal) {
       session_id: m.session_id,
       attempt_count: m.attempt_count,
       session_status: m.session_status,
+      agent_call_attempts: m.agent_call_attempts,
+      output_authors: m.output_authors || {},
+      output_attempts: m.output_attempts || {},
+      authoring_deadline_at: m.authoring_deadline_at,
       active_agent_calls: m.active_agent_calls || [],
     })),
   });

@@ -1589,6 +1589,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.delivery_mode = bound.delivery_mode
         session.work_package_id = milestone.package_id
         session.work_package_owner = milestone.owner
+        session.package_helpers = [
+            seat for seat in session.panel
+            if seat and seat != milestone.owner
+        ]
         session.assembly_mode, session.assembly_template = self._assembly_contract(milestone)
         session.required_frontier_authors = (
             [milestone.owner]
@@ -2040,6 +2044,58 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             goal.release_status = "awaiting_approval"
             self._authorize_goal_release(session)
 
+    def _invalidate_assembly_template_provider(
+        self, goal: Goal, session: Session, assembly_index: int,
+    ) -> Optional[GoalMilestone]:
+        """Attribute a deterministic template-contract failure upstream.
+
+        The final assembly package cannot repair an accepted template it does
+        not own. Mark the owning package retryable and blacklist only the
+        structurally invalid attempt so resume preserves every healthy sibling.
+        """
+        if (session.assembly_mode != assembly.HTML_INLINE
+                or not session.assembly_template
+                or session.assembly_template == assembly.OWNER_TEMPLATE
+                or (session.quality_gate or {}).get("stage") != "deterministic_assembly"):
+            return None
+        detail = str((session.quality_gate or {}).get("detail") or "").lower()
+        if not any(marker in detail for marker in (
+            "template", "directive", "external script", "stylesheet reference",
+            "complete document",
+        )):
+            return None
+        template = session.assembly_template.replace("\\", "/")
+        provider = next(
+            (package for package in goal.milestones
+             if package.index != assembly_index
+             and template in {name.replace("\\", "/") for name in package.required_files}),
+            None,
+        )
+        if provider is None:
+            return None
+        if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
+            provider.invalidated_session_ids.append(provider.session_id)
+        provider.status = "failed"
+        provider.files = []
+        provider.accepted_files = []
+        provider.accepted_hashes = {}
+        provider.acceptance_detail = (
+            f"invalidated by deterministic assembly: {detail}"
+        )[:300]
+        self.store.log_event(
+            session.session_id,
+            "assembly_template_provider_invalidated",
+            {
+                "goal_id": goal.goal_id,
+                "assembly_package": assembly_index + 1,
+                "provider_package": provider.index + 1,
+                "provider_session_id": provider.session_id,
+                "template": template,
+                "reason": detail[:300],
+            },
+        )
+        return provider
+
     def _maybe_advance_goal(self, session: Session, background: bool = False) -> None:
         """Advance only from the goal epoch that started this session."""
         if not session.goal_id:
@@ -2127,17 +2183,47 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             schedule_ready = goal.status == "running"
                 elif session.status == SessionStatus.failed:
                     milestone.status = "failed"
-                    sibling_running = any(
-                        item.status == "running" and item.index != idx
-                        for item in goal.milestones
-                    )
-                    goal.status = "draining" if sibling_running else "paused"
-                    goal.last_error = (session.stop_reason or f"milestone {idx + 1} failed")[:300]
-                    self.goals.save_owned(goal, token)
-                    self.store.log_event(
-                        "-", "goal_draining" if sibling_running else "goal_paused",
-                        {"goal_id": goal.goal_id, "reason": goal.last_error},
-                    )
+                    invalidated_provider = self._invalidate_assembly_template_provider(
+                        goal, session, idx)
+                    if invalidated_provider is not None:
+                        # This is an ownership-attribution correction, not a
+                        # reason to make the human press Resume twice. Rebuild
+                        # the exact upstream provider, then let hard-dependency
+                        # scheduling rerun assembly automatically.
+                        invalidated_provider.status = "pending"
+                        invalidated_provider.session_id = None
+                        milestone.status = "pending"
+                        milestone.session_id = None
+                        goal.status = "running"
+                        goal.current_index = invalidated_provider.index
+                        goal.last_error = (
+                            f"rebuilding invalid assembly template from package "
+                            f"{invalidated_provider.index + 1}"
+                        )
+                        if self.goals.save_owned(goal, token):
+                            schedule_ready = True
+                        self.store.log_event(
+                            "-", "assembly_template_rebuild_scheduled",
+                            {
+                                "goal_id": goal.goal_id,
+                                "provider_package": invalidated_provider.index + 1,
+                                "assembly_package": idx + 1,
+                            },
+                        )
+                    else:
+                        sibling_running = any(
+                            item.status == "running" and item.index != idx
+                            for item in goal.milestones
+                        )
+                        goal.status = "draining" if sibling_running else "paused"
+                        goal.last_error = (
+                            session.stop_reason or f"milestone {idx + 1} failed"
+                        )[:300]
+                        self.goals.save_owned(goal, token)
+                        self.store.log_event(
+                            "-", "goal_draining" if sibling_running else "goal_paused",
+                            {"goal_id": goal.goal_id, "reason": goal.last_error},
+                        )
                 elif session.status == SessionStatus.cancelled:
                     milestone.status = "pending"
                     sibling_running = any(
@@ -2199,6 +2285,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     "pending_approvals": current.get("pending_approvals", 0),
                     "pending_inputs": current.get("pending_inputs", 0),
                     "active_agent_calls": current.get("active_agent_calls", []),
+                    "agent_calls": current.get("agent_calls", 0),
+                    "agent_call_attempts": current.get("agent_call_attempts", 0),
+                    "agent_attempt_duration_ms": current.get(
+                        "agent_attempt_duration_ms", 0
+                    ),
+                    "output_authors": current.get("package_output_authors", {}),
+                    "output_attempts": current.get("package_output_attempts", {}),
+                    "output_history": current.get("package_output_history", {}),
+                    "author_failures": current.get("package_call_failures", {}),
+                    "authoring_started_at": current.get("package_started_at"),
+                    "authoring_deadline_at": current.get("package_deadline_at"),
                     "attempts": [
                         {
                             "number": number,
@@ -2207,6 +2304,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             "created_at": item.get("created_at"),
                             "updated_at": item.get("updated_at"),
                             "active_agent_calls": item.get("active_agent_calls") or [],
+                            "agent_calls": item.get("agent_calls", 0),
+                            "agent_call_attempts": item.get("agent_call_attempts", 0),
+                            "agent_attempt_duration_ms": item.get(
+                                "agent_attempt_duration_ms", 0
+                            ),
+                            "output_authors": item.get("package_output_authors") or {},
+                            "output_attempts": item.get("package_output_attempts") or {},
+                            "output_history": item.get("package_output_history") or {},
+                            "author_failures": item.get("package_call_failures") or {},
+                            "authoring_started_at": item.get("package_started_at"),
+                            "authoring_deadline_at": item.get("package_deadline_at"),
                             "is_current": item.get("session_id") == package.session_id,
                         }
                         for number, item in enumerate(attempts, start=1)
@@ -2246,6 +2354,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "pending_approvals": approvals,
                 "pending_inputs": inputs,
                 "active_agent_calls": active_calls,
+                "agent_call_attempts": sum(
+                    item.get("agent_call_attempts", 0) for item in related
+                ),
+                "agent_attempt_duration_ms": sum(
+                    item.get("agent_attempt_duration_ms", 0) for item in related
+                ),
                 "actionable_session_id": actionable.get("session_id") if actionable else None,
             })
             views.append(data)
@@ -2316,6 +2430,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     continue
                 match = next((session for session in candidates.get(package.package_id, [])
                               if session.work_package_owner == package.owner
+                              and session.session_id not in package.invalidated_session_ids
                               and set(package.required_files).issubset(
                                   set(session.required_files))), None)
                 if match is None:
@@ -2794,11 +2909,26 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 session, self.manager, self.registry, self.governance,
                 self.store, role_agents=self.role_agents,
             )
+        resume_started = time.monotonic()
         try:
             result = self.registry.resume(req.agent, req.resume_token, req.answer)
         except AgentError as e:
+            elapsed_ms = int((time.monotonic() - resume_started) * 1000)
+            session.agent_call_attempts += 1
+            session.agent_attempt_duration_ms += elapsed_ms
             session.unresolved.append(f"resume after user input failed: {e}")
-            self.store.log_event(session.session_id, "agent_error", {"detail": str(e)})
+            self.store.log_event(
+                session.session_id,
+                "agent_call_failed",
+                {
+                    "agent": req.agent,
+                    "role": req.role.value,
+                    "attempt": session.agent_call_attempts,
+                    "duration_ms": elapsed_ms,
+                    "error": str(e)[:300],
+                    "resumed_after_input": True,
+                },
+            )
             self.manager.transition(session, SessionStatus.composing)
             session.final = fallback_final(session, "agent resume failed")
             session.outcome = "failed"
@@ -2808,6 +2938,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return resume_with_input(
             session, self.manager, self.registry, self.governance, self.store,
             self.role_agents, req, result,
+            attempt_duration_ms=int((time.monotonic() - resume_started) * 1000),
         )
 
     def decline_input(self, session_id: str, input_id: str, by: str = "user") -> Session:

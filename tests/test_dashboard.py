@@ -118,6 +118,11 @@ def test_dashboard_assets_served(client):
     assert "activePollInterval()" in app_js.text
     assert "uiPreferences.collapse_finished" in app_js.text
     assert 'replace(/^\\uFEFF/, "")' in app_js.text
+    assert app_js.text.index("const runSummary = s.run_summary || {}") < app_js.text.index(
+        "const callAttempts = s.agent_call_attempts"
+    )
+    assert "package elapsed" in app_js.text
+    assert "aggregate attempt time" in app_js.text
 
 
 def test_dashboard_detail_refresh_gate_rejects_stale_responses(client):

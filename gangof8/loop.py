@@ -10,10 +10,12 @@ import ast
 import json
 import re
 import hashlib
+import math
 import shutil
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -135,6 +137,53 @@ def _effective_agent_timeout(
     return max(1, int(requested))
 
 
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _package_seconds_remaining(session: Session) -> int:
+    """Whole seconds left in the one shared package-authoring deadline."""
+    if not session.package_deadline_at:
+        return config.PACKAGE_AUTHOR_DEADLINE
+    remaining = (
+        _parse_utc(session.package_deadline_at) - datetime.now(timezone.utc)
+    ).total_seconds()
+    return max(0, math.ceil(remaining))
+
+
+def _ensure_package_deadline(session: Session, store: LogStore) -> int:
+    """Start one persisted deadline for initial fan-out and focused retries."""
+    if not session.package_deadline_at:
+        now = datetime.now(timezone.utc)
+        session.package_started_at = now.isoformat()
+        session.package_deadline_at = (
+            now + timedelta(seconds=config.PACKAGE_AUTHOR_DEADLINE)
+        ).isoformat()
+        store.log_event(
+            session.session_id,
+            "package_deadline_started",
+            {
+                "package": session.work_package_id,
+                "owner": session.work_package_owner,
+                "deadline_at": session.package_deadline_at,
+                "limit_s": config.PACKAGE_AUTHOR_DEADLINE,
+            },
+        )
+        store.save_session(session)
+    return _package_seconds_remaining(session)
+
+
+def _package_call_timeout(session: Session, member: CouncilMember, requested: int) -> int:
+    remaining = _package_seconds_remaining(session)
+    if remaining <= 0:
+        raise QualityGateFailed(
+            f"package {session.work_package_id or 'implementation'} exhausted its shared "
+            "authoring deadline"
+        )
+    return _effective_agent_timeout(session, member.agent, min(requested, remaining))
+
+
 def _codifier(session: Session) -> Optional[CouncilMember]:
     """Who does the post-panel CODIFY + EXAMINE work — selecting, reviewing, and
     fixing the panel's output and finishing the deliverable. This is the STRONG
@@ -164,8 +213,9 @@ def _agent_call(
     cap = session.budgets.max_agent_calls - max(0, min(reserve, session.budgets.max_agent_calls - 1))
     # Reserve a budget slot UP FRONT (under lock) so concurrent fan-out calls can't
     # slip past a check-then-increment gap and oversubscribe max_agent_calls. The
-    # slot is rolled back if the call fails or pauses, preserving the sequential
-    # semantics ("only a completed call counts").
+    # completed-call slot is rolled back if the call fails or pauses, preserving
+    # the budget semantics.  ``agent_call_attempts`` is separate and never rolls
+    # back, so the read-only API still exposes every timeout/error attempt.
     with _SESSION_LOCK:
         if session.agent_calls >= cap:
             raise BudgetExceeded(
@@ -173,6 +223,9 @@ def _agent_call(
                 + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
             )
         session.agent_calls += 1
+        session.agent_call_attempts += 1
+        attempt = session.agent_call_attempts
+    attempt_started = time.monotonic()
     # Per-seat Settings values cap ordinary calls; coding stages supply their
     # own finite hard deadline. Cancellation remains active in either case.
     timeout_s = _effective_agent_timeout(session, member.agent, timeout_s)
@@ -180,7 +233,7 @@ def _agent_call(
     store.log_event(
         session.session_id, "agent_call_queued",
         {"call_id": call_id, "agent": member.agent, "role": member.role.value,
-         "timeout_s": timeout_s},
+         "timeout_s": timeout_s, "attempt": attempt},
     )
     # Tag this worker thread with the session so the CLI adapter can register its
     # subprocess for hard cancellation (kill on request). current_session is
@@ -190,6 +243,14 @@ def _agent_call(
         # The semaphore bounds concurrency per adapter kind (never held across
         # the budget lock, so bookkeeping never blocks on a slow call).
         with _agent_semaphore(registry, member.agent):
+            # A queued package author gets only the wall-clock time still left
+            # after waiting for its concurrency slot.  This is what makes the
+            # deadline package-wide instead of N independent per-call clocks.
+            if session.collaboration_mode == "build_team" and session.package_deadline_at:
+                remaining = _package_seconds_remaining(session)
+                if remaining <= 0:
+                    raise AgentError("shared package authoring deadline reached before dispatch")
+                timeout_s = min(timeout_s, remaining)
             started_at = utcnow()
             coding_call = bool(
                 session.classification
@@ -208,6 +269,8 @@ def _agent_call(
                 "progress_detail": "request dispatched", "timeout_s": timeout_s,
                 "timeout_policy": "hard_deadline",
                 "stall_timeout_s": stall_timeout_s,
+                "attempt": attempt,
+                "package_deadline_at": session.package_deadline_at,
             }
             with _SESSION_LOCK:
                 session.active_agent_calls.append(activity)
@@ -264,15 +327,22 @@ def _agent_call(
         e.agent_name = member.agent
         with _SESSION_LOCK:
             session.agent_calls -= 1  # paused, not completed — resume re-counts it
+            session.agent_attempt_duration_ms += int(
+                (time.monotonic() - attempt_started) * 1000
+            )
         raise
     except Exception as exc:
+        elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
         with _SESSION_LOCK:
             store.log_event(
                 session.session_id, "agent_call_failed",
                 {"call_id": call_id, "agent": member.agent,
-                 "role": member.role.value, "error": str(exc)[:300]},
+                 "role": member.role.value, "attempt": attempt,
+                 "error": str(exc)[:300], "duration_ms": elapsed_ms},
             )
             session.agent_calls -= 1  # failed — release the reserved slot
+            session.agent_attempt_duration_ms += elapsed_ms
+            store.save_session(session)
         raise
     finally:
         cancellation.set_current_call(None)
@@ -281,6 +351,22 @@ def _agent_call(
     if (cancellation.is_requested(session.session_id)
             or (session.worker_lease
                 and not store.lease_is_current(session.session_id, session.worker_lease))):
+        elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+        with _SESSION_LOCK:
+            session.agent_attempt_duration_ms += elapsed_ms
+            store.log_event(
+                session.session_id,
+                "agent_call_discarded",
+                {
+                    "call_id": call_id,
+                    "agent": member.agent,
+                    "role": member.role.value,
+                    "attempt": attempt,
+                    "duration_ms": elapsed_ms,
+                    "reason": "cancelled or stale worker lease after response",
+                },
+            )
+            store.save_session(session)
         raise SessionCancelled()
     contribution = Contribution(
         round=session.current_round,
@@ -291,12 +377,15 @@ def _agent_call(
         tokens=result.tokens,
         duration_ms=result.duration_ms,
     )
+    elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
     with _SESSION_LOCK:
         store.log_event(
             session.session_id, "agent_call_finished",
             {"call_id": call_id, "agent": member.agent,
-             "role": member.role.value, "duration_ms": result.duration_ms},
+             "role": member.role.value, "duration_ms": result.duration_ms,
+             "elapsed_ms": elapsed_ms},
         )
+        session.agent_attempt_duration_ms += elapsed_ms
         session.contributions.append(contribution)
         store.log_event(
             session.session_id,
@@ -1428,9 +1517,18 @@ def _capture_panel_artifacts(
             store.log_event(session.session_id, "panel_artifact_rejected",
                             {"agent": member.agent, "file": a.filename, "reason": problem})
             continue
-        fn = f"{member.agent}__{_basename(a.filename)}"
+        contract_filename = a.filename.replace("\\", "/")
+        # Encode the structural path in the advisory filename so two files with
+        # the same basename cannot clobber one another in the sandbox.
+        namespaced_path = contract_filename.replace("/", "__")
+        fn = f"{member.agent}__{namespaced_path}"
         a.filename = fn
         a.args["filename"] = fn
+        # Preserve the exact contracted path before namespacing the sandbox
+        # draft.  Basename-only adoption was ambiguous for e.g. two index.js
+        # files in different folders and could not safely enforce assignments.
+        a.args["contract_filename"] = contract_filename
+        a.args["package_author"] = member.agent
         governance.authorize_action(session, a)
         if a.status != "denied":
             try:
@@ -1503,6 +1601,8 @@ def _panel_one(
             dropped_contribution = c
         elif dropped_contribution is None:
             _capture_panel_artifacts(session, member, c.content, governance, store)
+            with _SESSION_LOCK:
+                session.package_call_failures.pop(member.agent, None)
             return c
     except AgentInputRequired:
         reason = "asked for user input"
@@ -1512,6 +1612,8 @@ def _panel_one(
     except AgentError as e:
         reason = str(e)
     frontier_author = bool(
+        session.collaboration_mode != "build_team"
+        and
         session.assembly_mode != assembly.HTML_INLINE
         and
         timeout_s is not None and member.agent in config.FRONTIER_AUTHOR_SEATS
@@ -1541,6 +1643,8 @@ def _panel_one(
         if dropped_contribution is not None and dropped_contribution in session.contributions:
             session.contributions.remove(dropped_contribution)
         session.unresolved.append(f"panel seat '{member.agent}' dropped this round: {reason}")
+        if session.collaboration_mode == "build_team":
+            session.package_call_failures[member.agent] = reason[:300]
         store.log_event(session.session_id, "panel_seat_dropped",
                         {"agent": member.agent, "round": session.current_round,
                          "error": reason[:300]})
@@ -1710,10 +1814,143 @@ def _run_in_place_revision(
     return False
 
 
+def _package_output_assignments(
+    session: Session, council: Council,
+) -> dict[str, CouncilMember]:
+    """Assign exact package outputs across enabled authors.
+
+    The owner is always an author and remains accountable.  Additional enabled
+    seats receive whole output paths in contract order.  This is deliberately
+    structural: content length and guessed byte/token costs play no part.
+    """
+    required = list(dict.fromkeys(
+        name.replace("\\", "/") for name in session.required_files if name
+    ))
+    owner = next(
+        (m for m in council.members
+         if m.active and m.agent == session.work_package_owner),
+        None,
+    )
+    if owner is None and session.work_package_owner:
+        owner = CouncilMember(
+            role=Role.panelist, agent=session.work_package_owner, active=True,
+        )
+    if owner is None:
+        return {}
+    # Every package author is a panelist at this stage so its output is first
+    # captured as a namespaced, auditable draft and only then adopted.
+    authors = [CouncilMember(
+        role=Role.panelist, agent=owner.agent, active=True,
+    )]
+    if session.assembly_mode != assembly.HTML_INLINE and len(required) > 1:
+        for agent in session.package_helpers:
+            if not agent or any(author.agent == agent for author in authors):
+                continue
+            authors.append(CouncilMember(
+                role=Role.panelist,
+                agent=agent,
+                active=True,
+            ))
+            if len(authors) >= len(required):
+                break
+    return {
+        filename: authors[index % len(authors)]
+        for index, filename in enumerate(required)
+    }
+
+
+def _package_author_jobs(
+    assignments: dict[str, CouncilMember],
+) -> list[tuple[CouncilMember, list[str]]]:
+    """Group exact output assignments into one concurrent call per agent."""
+    jobs: list[tuple[CouncilMember, list[str]]] = []
+    by_agent: dict[str, int] = {}
+    for filename, member in assignments.items():
+        if member.agent not in by_agent:
+            by_agent[member.agent] = len(jobs)
+            jobs.append((member, [filename]))
+        else:
+            jobs[by_agent[member.agent]][1].append(filename)
+    return jobs
+
+
+def _record_package_job_results(
+    session: Session,
+    jobs: list[tuple[CouncilMember, list[str]]],
+    results: list[Optional[Contribution]],
+    kind: str,
+) -> None:
+    """Persist per-path call provenance without relabeling another artifact."""
+    for (member, filenames), contribution in zip(jobs, results, strict=True):
+        status = "completed" if contribution is not None else "failed"
+        reason = session.package_call_failures.get(member.agent, "")
+        for filename in filenames:
+            entry = {
+                "attempt": session.package_output_attempts.get(filename, 0),
+                "agent": member.agent,
+                "kind": kind,
+                "status": status,
+            }
+            if reason:
+                entry["reason"] = reason
+            session.package_output_history.setdefault(filename, []).append(entry)
+
+
+def _package_failover_assignments(
+    session: Session,
+    missing: list[str],
+    primary_assignments: dict[str, CouncilMember],
+    successful_agents: set[str],
+) -> dict[str, CouncilMember]:
+    """Assign unresolved paths once to healthy siblings, deterministically.
+
+    The least-loaded successful primary author wins; original assignment order
+    is the stable tie-break. No content is substituted—the selected sibling
+    must make a new exact-path authoring call.
+    """
+    members: dict[str, CouncilMember] = {}
+    order: dict[str, int] = {}
+    for member in primary_assignments.values():
+        if member.agent not in members:
+            order[member.agent] = len(order)
+            members[member.agent] = member
+    eligible = [agent for agent in members if agent in successful_agents]
+    load = {agent: 0 for agent in eligible}
+    for author in session.package_output_authors.values():
+        if author in load:
+            load[author] += 1
+    failovers: dict[str, CouncilMember] = {}
+    for filename in missing:
+        original = session.package_output_authors.get(filename, "")
+        candidates = [agent for agent in eligible if agent != original]
+        if not candidates:
+            continue
+        selected = min(candidates, key=lambda agent: (load[agent], order[agent]))
+        failovers[filename] = members[selected]
+        load[selected] += 1
+    return failovers
+
+
+def _package_author_timeout(session: Session, member: CouncilMember, retry: bool = False) -> int:
+    requested = (
+        config.PANEL_RETRY_TIMEOUT
+        if retry or session.assembly_mode == assembly.HTML_INLINE else
+        config.FRONTIER_AUTHOR_TIMEOUT
+        if member.agent in config.FRONTIER_AUTHOR_SEATS else
+        config.PANEL_AUTHOR_TIMEOUT
+    )
+    # One author wave may consume at most one third of the shared package
+    # deadline. This leaves deterministic room for a correction/failover wave
+    # and never depends on guessed output byte or token counts.
+    return _package_call_timeout(
+        session, member, min(requested, config.PACKAGE_AUTHOR_WAVE_TIMEOUT)
+    )
+
+
 def _adopt_owned_package_artifacts(
     session: Session, owner: str, store: LogStore,
 ) -> tuple[list[str], list[str]]:
-    """Turn one package owner's namespaced drafts into the real package outputs.
+    """Turn assigned authors' namespaced drafts into the real package outputs.
 
     No lead re-authoring and no promote action is involved: these implementer
     writes are verified in the session sandbox, then the goal service copies
@@ -1726,20 +1963,33 @@ def _adopt_owned_package_artifacts(
     }
     adopted: list[str] = []
     proposals: list[ProposedAction] = []
-    prefix = f"{owner}__"
     for draft in session.proposed_actions:
         if (draft.kind != "write_file" or draft.role != Role.panelist
-                or not draft.filename.startswith(prefix) or not (draft.content or "").strip()):
+                or not (draft.content or "").strip()):
             continue
-        base = draft.filename[len(prefix):]
+        filename_agent, separator, base = draft.filename.partition("__")
+        if not separator:
+            continue
+        draft_agent = str(draft.args.get("package_author") or filename_agent)
+        contract_filename = str(draft.args.get("contract_filename") or "").replace("\\", "/")
         matches = [name for name in required if _basename(name) == _basename(base)]
-        if len(matches) == 1:
+        if contract_filename in required:
+            filename = contract_filename
+        elif len(matches) == 1:
             filename = matches[0]
         elif not required:
             filename = _basename(base)
         elif len(required) == 1 and Path(required[0]).suffix.lower() == Path(base).suffix.lower():
             filename = required[0]
         else:
+            continue
+        expected_author = session.package_output_authors.get(filename, owner)
+        if draft_agent != expected_author:
+            store.log_event(
+                session.session_id,
+                "package_artifact_author_rejected",
+                {"file": filename, "expected": expected_author, "actual": draft_agent},
+            )
             continue
         if filename in existing or filename in adopted:
             continue
@@ -1783,6 +2033,11 @@ def _adopt_owned_package_artifacts(
         ))
         adopted.append(filename)
     if proposals:
+        contract_order = {filename: index for index, filename in enumerate(required)}
+        proposals.sort(key=lambda proposal: contract_order.get(
+            proposal.filename.replace("\\", "/"), len(contract_order)
+        ))
+        adopted = [proposal.filename.replace("\\", "/") for proposal in proposals]
         _append_proposals(session, store, proposals)
         store.log_event(session.session_id, "work_package_outputs_adopted",
                         {"owner": owner, "files": adopted})
@@ -1874,37 +2129,72 @@ def _run_panel_rounds(
             session.unresolved.append("rounds stopped: wall-time budget reached")
             break
         session.current_round = r
-        build_package = (
+        build_package = bool(
             session.collaboration_mode == "build_team" and session.work_package_owner
         )
         assembly_package = bool(build_package and session.assembly_mode)
+        package_assignments: dict[str, CouncilMember] = {}
+        package_jobs: list[tuple[CouncilMember, list[str]]] = []
+        if build_package:
+            remaining_deadline = _ensure_package_deadline(session, store)
+            if remaining_deadline <= 0:
+                raise QualityGateFailed(
+                    f"package {session.work_package_id or r + 1} exhausted its shared "
+                    "authoring deadline"
+                )
+            package_assignments = _package_output_assignments(session, council)
+            if session.required_files and not package_assignments:
+                raise QualityGateFailed("package has required outputs but no accountable author")
+            package_jobs = _package_author_jobs(package_assignments)
+            session.package_output_authors = {
+                filename: member.agent
+                for filename, member in package_assignments.items()
+            }
+            for filename in package_assignments:
+                session.package_output_attempts.setdefault(filename, 0)
+            store.log_event(
+                sid,
+                "package_author_fanout_started",
+                {
+                    "package": session.work_package_id,
+                    "owner": session.work_package_owner,
+                    "assignments": session.package_output_authors,
+                    "authors": len(package_jobs),
+                    "deadline_at": session.package_deadline_at,
+                    "seconds_remaining": remaining_deadline,
+                    "wave_timeout_s": config.PACKAGE_AUTHOR_WAVE_TIMEOUT,
+                    "failover_policy": "one distinct healthy author per unresolved path",
+                },
+            )
         spec = RoundSpec(
             round=r,
             goal=(
-                f"build package {session.work_package_id or r + 1}: owner "
-                f"{session.work_package_owner} authors the contracted outputs"
+                f"build package {session.work_package_id or r + 1}: accountable owner "
+                f"{session.work_package_owner} integrates exact-output author fan-out"
                 if build_package else
                 f"panel round {r + 1}: every seat contributes; lead synthesizes"
             ),
             agents=([Role.panelist] if build_package else
                     ([Role.panelist, Role.lead] if panel else [Role.lead])),
             stop_condition=(
-                "owner produces every contracted artifact"
+                "every assigned author produces its exact contracted artifacts"
                 if build_package else "lead declares ROUND: DONE"
             ),
             output_requirement=(
-                "owner-authored staged package artifacts"
+                "assigned, owner-accountable staged package artifacts"
                 if build_package else
                 "synthesis (and ARTIFACT/PROMOTE files when ready)"
             ),
             timeout_s=(
-                _effective_agent_timeout(
-                    session, session.work_package_owner,
+                min(
+                    remaining_deadline,
+                    config.PACKAGE_AUTHOR_WAVE_TIMEOUT,
                     (config.PANEL_RETRY_TIMEOUT
                      if assembly_package else
                      config.FRONTIER_AUTHOR_TIMEOUT
                      if session.work_package_owner in config.FRONTIER_AUTHOR_SEATS
-                     else config.PANEL_AUTHOR_TIMEOUT))
+                     else config.PANEL_AUTHOR_TIMEOUT),
+                )
                 if build_package else config.AGENT_TIMEOUT_DEFAULT
             ),
         )
@@ -1919,7 +2209,31 @@ def _run_panel_rounds(
         # (a) FAN-OUT — every panel seat answers in parallel (bounded by the
         # per-kind semaphores inside _agent_call); a failing seat is dropped.
         results: list[Contribution] = []
-        if panel:
+        if build_package and package_jobs:
+            for _member, filenames in package_jobs:
+                for filename in filenames:
+                    session.package_output_attempts[filename] += 1
+            primary_results = _fan_out(
+                session,
+                package_jobs,
+                lambda job: _panel_one(
+                    session,
+                    job[0],
+                    rounds.package_output_prompt(
+                        session, job[0], r, job[1], session.package_output_authors,
+                    ),
+                    call,
+                    governance,
+                    store,
+                    _package_author_timeout(session, job[0]),
+                ),
+                "package-author",
+            )
+            _record_package_job_results(
+                session, package_jobs, primary_results, "primary"
+            )
+            results = [c for c in primary_results if c]
+        elif panel:
             # On a build, seats author whole candidate files — give them
             # production-grade time so a thorough seat (claude/opus) isn't
             # killed mid-authoring by the quick per-agent timeout.
@@ -1945,36 +2259,194 @@ def _run_panel_rounds(
         if session.collaboration_mode == "build_team" and session.work_package_owner:
             adopted, missing = _adopt_owned_package_artifacts(
                 session, session.work_package_owner, store)
-            owner_member = next((m for m in panel if m.agent == session.work_package_owner), None)
-            if missing and owner_member is not None and not assembly_package:
-                retry_prompt = (
-                    rounds.panel_prompt(session, owner_member, r, ov, readable)
-                    + "\n\nYour first response did not provide these exact required files: "
-                    + ", ".join(missing)
-                    + ". "
-                    + ((next((item for item in reversed(session.unresolved)
-                              if "assembly template rejected" in item), "") + " ")
-                       if assembly_package else "")
-                    + "Emit those complete ARTIFACT blocks NOW; no plan, SKILL reads, or PROMOTE."
+            # A completed response that merely missed the envelope/path gets one
+            # focused correction within the original deadline.  A timeout/error
+            # never triggers the old identical full-call recovery.
+            successful_agents = {contribution.agent for contribution in results}
+            retry_assignments = {
+                filename: package_assignments[filename]
+                for filename in missing
+                if (filename in package_assignments
+                    and package_assignments[filename].agent in successful_agents)
+            }
+            retry_jobs = _package_author_jobs(retry_assignments)
+            if retry_jobs and _package_seconds_remaining(session) > 0:
+                for _member, filenames in retry_jobs:
+                    for filename in filenames:
+                        session.package_output_attempts[filename] += 1
+                correction_results = _fan_out(
+                    session,
+                    retry_jobs,
+                    lambda job: _panel_one(
+                        session,
+                        job[0],
+                        rounds.package_output_prompt(
+                            session,
+                            job[0],
+                            r,
+                            job[1],
+                            session.package_output_authors,
+                            feedback=(
+                                "Your completed response did not yield these exact files: "
+                                + ", ".join(job[1])
+                                + ". Correct only the artifact envelope, exact path, or "
+                                  "contract issue and emit the complete files now. "
+                                + next((item for item in reversed(session.unresolved)
+                                        if "assembly template rejected" in item), "")
+                            ),
+                        ),
+                        call,
+                        governance,
+                        store,
+                        _package_author_timeout(session, job[0], retry=True),
+                    ),
+                    "package-correction",
                 )
-                owner_retry_timeout = (
-                    config.PANEL_RETRY_TIMEOUT
-                    if assembly_package else
-                    config.FRONTIER_AUTHOR_TIMEOUT
-                    if owner_member.agent in config.FRONTIER_AUTHOR_SEATS
-                    else config.PANEL_RETRY_TIMEOUT
+                _record_package_job_results(
+                    session, retry_jobs, correction_results, "correction"
                 )
-                retry = _panel_one(session, owner_member, retry_prompt, call,
-                                   governance, store, owner_retry_timeout)
-                if retry is not None:
-                    results.append(retry)
+                results.extend(
+                    contribution for contribution in correction_results if contribution
+                )
                 more, missing = _adopt_owned_package_artifacts(
                     session, session.work_package_owner, store)
                 adopted.extend(more)
+                successful_agents.update(
+                    contribution.agent
+                    for contribution in correction_results if contribution
+                )
+
+            # Transport/model failures and repeated protocol misses are not
+            # retried against the same backend. Reassign only the still-missing
+            # exact paths to healthy siblings, once, under the same deadline.
+            failover_assignments = _package_failover_assignments(
+                session, missing, package_assignments, successful_agents
+            )
+            failover_jobs = _package_author_jobs(failover_assignments)
+            if failover_jobs and _package_seconds_remaining(session) > 0:
+                for filename, member in failover_assignments.items():
+                    previous = session.package_output_authors.get(
+                        filename, session.work_package_owner
+                    )
+                    session.package_output_authors[filename] = member.agent
+                    session.package_output_attempts[filename] += 1
+                    store.log_event(
+                        sid,
+                        "package_output_reassigned",
+                        {
+                            "file": filename,
+                            "from": previous,
+                            "to": member.agent,
+                            "reason": session.package_call_failures.get(
+                                previous, "required artifact still missing"
+                            )[:300],
+                            "deadline_at": session.package_deadline_at,
+                            "seconds_remaining": _package_seconds_remaining(session),
+                        },
+                    )
+                failover_results = _fan_out(
+                    session,
+                    failover_jobs,
+                    lambda job: _panel_one(
+                        session,
+                        job[0],
+                        rounds.package_output_prompt(
+                            session,
+                            job[0],
+                            r,
+                            job[1],
+                            session.package_output_authors,
+                            feedback=(
+                                "A different assigned author failed to deliver these "
+                                "exact files. This is a bounded failover, not a request "
+                                "to reuse or relabel sibling work. Author the complete "
+                                "files now: " + ", ".join(job[1])
+                            ),
+                        ),
+                        call,
+                        governance,
+                        store,
+                        _package_author_timeout(session, job[0], retry=True),
+                    ),
+                    "package-failover",
+                )
+                _record_package_job_results(
+                    session, failover_jobs, failover_results, "failover"
+                )
+                results.extend(
+                    contribution for contribution in failover_results if contribution
+                )
+                more, missing = _adopt_owned_package_artifacts(
+                    session, session.work_package_owner, store)
+                adopted.extend(more)
+
+                # If the failover answered but only missed the exact artifact
+                # envelope, use the third and final wave for a path correction.
+                failover_successful = {
+                    contribution.agent
+                    for contribution in failover_results if contribution
+                }
+                final_assignments = {
+                    filename: failover_assignments[filename]
+                    for filename in missing
+                    if (
+                        filename in failover_assignments
+                        and failover_assignments[filename].agent in failover_successful
+                        and session.package_output_attempts.get(filename, 0) < 3
+                    )
+                }
+                final_jobs = _package_author_jobs(final_assignments)
+                if final_jobs and _package_seconds_remaining(session) > 0:
+                    for _member, filenames in final_jobs:
+                        for filename in filenames:
+                            session.package_output_attempts[filename] += 1
+                    final_results = _fan_out(
+                        session,
+                        final_jobs,
+                        lambda job: _panel_one(
+                            session,
+                            job[0],
+                            rounds.package_output_prompt(
+                                session,
+                                job[0],
+                                r,
+                                job[1],
+                                session.package_output_authors,
+                                feedback=(
+                                    "Your failover response completed but did not yield "
+                                    "these exact artifact paths: " + ", ".join(job[1])
+                                    + ". Correct the envelope/path only and emit the "
+                                      "complete files now."
+                                ),
+                            ),
+                            call,
+                            governance,
+                            store,
+                            _package_author_timeout(session, job[0], retry=True),
+                        ),
+                        "package-failover-correction",
+                    )
+                    _record_package_job_results(
+                        session, final_jobs, final_results, "failover_correction"
+                    )
+                    results.extend(
+                        contribution for contribution in final_results if contribution
+                    )
+                    more, missing = _adopt_owned_package_artifacts(
+                        session, session.work_package_owner, store)
+                    adopted.extend(more)
             if missing:
+                assigned_missing = {
+                    filename: session.package_output_authors.get(
+                        filename, session.work_package_owner)
+                    for filename in missing
+                }
                 failure = (
-                    f"package owner {session.work_package_owner} did not produce: "
-                    + ", ".join(missing))
+                    f"package {session.work_package_id or r + 1} did not produce: "
+                    + ", ".join(
+                        f"{filename} (assigned {assigned_missing[filename]})"
+                        for filename in missing
+                    ))
                 store.log_event(
                     sid, "package_attempt_failed",
                     {
@@ -1982,16 +2454,23 @@ def _run_panel_rounds(
                         "owner": session.work_package_owner,
                         "reason": "missing_required_artifacts",
                         "missing": missing,
+                        "assigned_authors": assigned_missing,
+                        "author_failures": dict(session.package_call_failures),
+                        "output_attempts": dict(session.package_output_attempts),
                         "assembly_mode": session.assembly_mode,
+                        "deadline_at": session.package_deadline_at,
+                        "seconds_remaining": _package_seconds_remaining(session),
                     },
                 )
-                if (assembly_package
-                        or session.work_package_owner in config.FRONTIER_AUTHOR_SEATS):
-                    raise QualityGateFailed(failure)
-                raise AgentError(failure)
+                raise QualityGateFailed(failure)
             summary = (
-                f"Package {session.work_package_id or r + 1} was implemented by its "
-                f"owner {session.work_package_owner}. Staged outputs: "
+                f"Package {session.work_package_id or r + 1} was integrated under "
+                f"accountable owner {session.work_package_owner}. Exact output authors: "
+                + ", ".join(
+                    f"{filename}={agent}"
+                    for filename, agent in session.package_output_authors.items()
+                )
+                + ". Staged outputs: "
                 f"{', '.join(adopted) if adopted else 'analysis/handoff only'}.\nROUND: DONE"
             )
             with _SESSION_LOCK:
@@ -2318,7 +2797,14 @@ def _deliberate(
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
     except QualityGateFailed as e:
         assembly_failure = session.assembly_mode == assembly.HTML_INLINE
-        stage = "deterministic_assembly" if assembly_failure else "frontier_implementation"
+        package_failure = bool(
+            session.collaboration_mode == "build_team" and session.work_package_owner
+        )
+        stage = (
+            "deterministic_assembly" if assembly_failure else
+            "package_implementation" if package_failure else
+            "frontier_implementation"
+        )
         session.outcome = "failed_verification"
         session.stop_reason = f"{stage.replace('_', ' ')} failed: {e}"
         session.unresolved.append(session.stop_reason)
@@ -2326,7 +2812,11 @@ def _deliberate(
             "verdict": "FAIL", "stage": stage,
             "detail": str(e),
         }
-        event = "assembly_failed" if assembly_failure else "frontier_implementation_gate_failed"
+        event = (
+            "assembly_failed" if assembly_failure else
+            "package_implementation_gate_failed" if package_failure else
+            "frontier_implementation_gate_failed"
+        )
         store.log_event(sid, event, {"detail": str(e)})
         manager.transition(session, SessionStatus.composing)
         session.final = FinalAnswer(
@@ -2334,6 +2824,11 @@ def _deliberate(
                 "The run was stopped because the compact assembly template did not "
                 "satisfy its explicit manifest contract. No file was delivered."
                 if assembly_failure else
+                "The run was stopped because one or more exact package outputs did not "
+                "complete under the shared authoring deadline. Successful sibling work "
+                "was not relabeled or substituted for the missing output, and no file "
+                "was delivered."
+                if package_failure else
                 "The run was stopped because a required frontier implementation "
                 "did not complete or did not run. It was not silently replaced by "
                 "a weaker candidate or counted later as a judge. No file was delivered."
@@ -2344,6 +2839,9 @@ def _deliberate(
             next_action=(
                 "Resume or rerun so the owner can emit one compact manifest template."
                 if assembly_failure else
+                "Retry the failed package; its outputs will be assigned independently "
+                "to enabled authors under one accountable owner and one shared deadline."
+                if package_failure else
                 "Resume or rerun so the named frontier owner can finish the code."
             ),
         )
@@ -4258,6 +4756,13 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                 for failure in _revision_contract_failures(session, action.filename, text):
                     failures.append(f"{action.filename}: {failure}")
             if path.suffix.lower() in {".html", ".htm"}:
+                try:
+                    assembly.validate_template_directives(text)
+                except assembly.AssemblyError as exc:
+                    failures.append(
+                        f"{action.filename}: assembly template contract failed: {exc}"
+                    )
+                    continue
                 low = text.lower()
                 has_open = "<!doctype" in low or "<html" in low
                 if has_open and "</html>" not in low:
@@ -4383,11 +4888,16 @@ def resume_with_input(
     role_agents: Optional[dict[Role, str]],
     req: InputRequest,
     result: AdapterResult,
+    attempt_duration_ms: Optional[int] = None,
 ) -> Session:
     """Continue a session after the human answered an agent's question.
     `result` is the completed output of the previously paused call."""
     sid = session.session_id
     session.agent_calls += 1  # the resumed call was a real agent call
+    session.agent_call_attempts += 1
+    session.agent_attempt_duration_ms += int(
+        result.duration_ms if attempt_duration_ms is None else attempt_duration_ms
+    )
     # The human's answer joins the session context as a coordinator
     # contribution — later agent calls are fresh backend tasks and would
     # otherwise never see it (they'd re-ask the same question).

@@ -34,6 +34,15 @@ _STYLESHEET_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 _CSS_IMPORT_RE = re.compile(r"@import\b", re.IGNORECASE)
+_HTML_ASSEMBLY_TOKEN_RE = re.compile(
+    r"<!--.*?-->|</?(?:script|style)\b[^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_COMMENT_DIRECTIVE_RE = re.compile(
+    r"<!--\s*GANGOF8:(?P<kind>STYLE|SCRIPT)\s+"
+    r"(?P<path>[^\r\n]+?)\s*-->",
+    re.IGNORECASE,
+)
 
 
 class AssemblyError(ValueError):
@@ -104,6 +113,69 @@ def directive_contract(sources: list[str]) -> str:
     return "\n".join(lines)
 
 
+def validate_template_directives(template: str) -> tuple[str, ...]:
+    """Validate compact assembly markers before any source is expanded.
+
+    Directives represent complete ``style`` or ``script`` elements, so nesting
+    one inside an existing element of the same kind produces invalid HTML/JS.
+    Enforce standalone structural markers directly; no response-size heuristic
+    or generated-source inspection is involved.
+    """
+    containers: list[str] = []
+    seen: list[str] = []
+    marker_count = len(list(_UNRESOLVED_DIRECTIVE_RE.finditer(template)))
+    for token in _HTML_ASSEMBLY_TOKEN_RE.finditer(template):
+        raw = token.group(0)
+        if raw.startswith("<!--"):
+            if not _UNRESOLVED_DIRECTIVE_RE.search(raw):
+                continue
+            directive = _COMMENT_DIRECTIVE_RE.fullmatch(raw)
+            line_start = template.rfind("\n", 0, token.start()) + 1
+            next_line = template.find("\n", token.end())
+            line_end = len(template) if next_line < 0 else next_line
+            standalone = (
+                not template[line_start:token.start()].strip()
+                and not template[token.end():line_end].strip()
+            )
+            if directive is None or not standalone:
+                raise AssemblyError(
+                    "HTML inline template contains a malformed or non-standalone "
+                    "assembly directive"
+                )
+            kind = directive.group("kind").lower()
+            name = directive.group("path").strip().strip("`\"'").replace("\\", "/")
+            if containers:
+                raise AssemblyError(
+                    f"assembly directive for {name} must be standalone; it is nested "
+                    f"inside <{containers[-1]}>"
+                )
+            suffix = Path(name).suffix.lower()
+            if kind == "style" and suffix != ".css":
+                raise AssemblyError(f"STYLE directive requires a CSS dependency: {name}")
+            if kind == "script" and suffix != ".js":
+                raise AssemblyError(f"SCRIPT directive requires a JavaScript dependency: {name}")
+            if name in seen:
+                raise AssemblyError(
+                    f"assembly template references a dependency more than once: {name}"
+                )
+            seen.append(name)
+            continue
+
+        tag = re.match(r"<(?P<closing>/)?(?P<kind>script|style)\b", raw, re.IGNORECASE)
+        if tag is None:
+            continue
+        kind = tag.group("kind").lower()
+        if tag.group("closing"):
+            if kind in containers:
+                reverse_index = containers[::-1].index(kind)
+                del containers[len(containers) - reverse_index - 1:]
+        else:
+            containers.append(kind)
+    if marker_count != len(seen):
+        raise AssemblyError("HTML inline template contains a malformed assembly directive")
+    return tuple(seen)
+
+
 def load_accepted_text(
     root: Path, name: str, expected_hashes: dict[str, str],
 ) -> tuple[str, str]:
@@ -157,6 +229,7 @@ def materialize_html_inline(
     seen: list[str] = []
     hashes: dict[str, str] = {}
 
+    validate_template_directives(template)
     if _SCRIPT_SRC_RE.search(template) or _STYLESHEET_LINK_RE.search(template):
         raise AssemblyError("HTML inline template contains an external script or stylesheet reference")
 

@@ -179,6 +179,14 @@ class LogStore:
             goal_id, package_id, package_owner = None, "", ""
             goal_epoch, goal_milestone, goal_release = None, None, False
             active_agent_calls: list[dict] = []
+            agent_calls, agent_call_attempts = 0, 0
+            agent_attempt_duration_ms = 0
+            package_output_authors: dict[str, str] = {}
+            package_output_attempts: dict[str, int] = {}
+            package_output_history: dict[str, list[dict]] = {}
+            package_call_failures: dict[str, str] = {}
+            package_started_at = None
+            package_deadline_at = None
             try:
                 data = json.loads(r[4])
                 task_text = (data.get("task") or {}).get("text", "")
@@ -189,6 +197,17 @@ class LogStore:
                 goal_milestone = data.get("goal_milestone")
                 goal_release = bool(data.get("goal_release"))
                 active_agent_calls = list(data.get("active_agent_calls") or [])
+                agent_calls = int(data.get("agent_calls") or 0)
+                agent_call_attempts = int(data.get("agent_call_attempts") or agent_calls)
+                agent_attempt_duration_ms = int(
+                    data.get("agent_attempt_duration_ms") or 0
+                )
+                package_output_authors = dict(data.get("package_output_authors") or {})
+                package_output_attempts = dict(data.get("package_output_attempts") or {})
+                package_output_history = dict(data.get("package_output_history") or {})
+                package_call_failures = dict(data.get("package_call_failures") or {})
+                package_started_at = data.get("package_started_at")
+                package_deadline_at = data.get("package_deadline_at")
                 pending_approvals = sum(
                     1 for a in data.get("approvals", []) if a.get("status") == "pending"
                 )
@@ -211,6 +230,15 @@ class LogStore:
                     "goal_milestone": goal_milestone,
                     "goal_release": goal_release,
                     "active_agent_calls": active_agent_calls,
+                    "agent_calls": agent_calls,
+                    "agent_call_attempts": agent_call_attempts,
+                    "agent_attempt_duration_ms": agent_attempt_duration_ms,
+                    "package_output_authors": package_output_authors,
+                    "package_output_attempts": package_output_attempts,
+                    "package_output_history": package_output_history,
+                    "package_call_failures": package_call_failures,
+                    "package_started_at": package_started_at,
+                    "package_deadline_at": package_deadline_at,
                 }
             )
         return out

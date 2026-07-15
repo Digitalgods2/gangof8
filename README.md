@@ -35,7 +35,7 @@ build goal.
 | Start it with | Any normal prompt | `/goal <objective>`, or a substantial build brief auto-routed from `/tasks` |
 | Best for | Questions, research, reviews, designs, and bounded deliverables | Multi-file builds, overhauls, and long objectives |
 | Council behavior | Every enabled seat produces an independent take or candidate | The architect creates owned work packages with dependencies |
-| Model ownership | Competing whole solutions, followed by blind selection | One named model owns each package and its output paths |
+| Model ownership | Competing whole solutions, followed by blind selection | One named model is accountable for each package; exact sibling outputs can fan out to enabled authors |
 | Concurrency | Panel calls, smoke checks, and judge waves run in parallel | Contract-linked packages start together; only hard artifact dependencies wait |
 | Integration | Blind best-of-N plus a strong finishing/chair pass | Shared staging makes completed package files available downstream |
 | Delivery | A governed `promote` action for the session | One aggregate diff and one `Approve final batch` decision |
@@ -82,13 +82,15 @@ A build-team package that combines accepted JavaScript and CSS into one HTML
 deliverable declares `ASSEMBLY: HTML_INLINE` plus either an accepted template
 path or `TEMPLATE: OWNER`. Accepted template paths are assembled with zero model
 calls. `OWNER` permits one finite call that returns only a compact HTML skeleton
-containing exact `GANGOF8:STYLE` and `GANGOF8:SCRIPT` directives. The coordinator
+containing exact, standalone `GANGOF8:STYLE` and `GANGOF8:SCRIPT` directives.
+Directives may not sit inside existing `<style>` or `<script>` elements because
+each expands into a complete element of that kind. The coordinator
 then verifies every dependency's accepted SHA-256 and expands every declared
 source exactly once from staging.
 
 Assembly uses no byte or character thresholds. Expanded source is never sent
 through skill-result truncation, model context, or generic artifact repair.
-Missing, duplicate, undeclared, changed, non-UTF-8, or unsafe inline sources
+Malformed, nested, missing, duplicate, undeclared, changed, non-UTF-8, or unsafe inline sources
 fail the explicit assembly gate before delivery. The final assembled file is
 then hash-checked and smoke-validated deterministically.
 
@@ -195,14 +197,24 @@ Every package whose hard dependencies are satisfied is scheduled. A package
 that only consumes another owner's declared interface can start immediately,
 even while that provider is still working. Dashboard goals run in the
 background, so a broad plan normally puts most or all enabled owners into its
-first execution wave. Each package session contains its named owner rather than
-convening another seven-way candidate tournament.
+first execution wave. Each package session remains accountable to its named
+owner rather than convening another seven-way candidate tournament.
 
-The owner writes the package's declared artifacts directly. The coordinator
-adopts those artifacts into the package paths; a lead model does not silently
-rewrite the owner's implementation. If a required output is missing, the same
-owner receives one focused retry for that exact artifact. Existing-file
-revisions use the owner and a surgical edit path.
+For a package with several independent output paths, the coordinator assigns
+whole paths across the owner and enabled implementation sub-agents and launches
+those calls concurrently. The owner authors at least one output and remains
+accountable for the package contract; helpers cannot overwrite or claim a path
+assigned to someone else. The coordinator adopts the assigned artifacts in
+contract order, and a lead model does not silently rewrite them. Assignment is
+based on exact output structure—not guessed response sizes, byte counts, or
+token thresholds. Existing-file revisions still use the owner and a surgical
+edit path.
+
+Each author receives the package/interface sections of the goal plus the exact
+file assignment map, instead of every author receiving another copy of the full
+product brief. A completed response that misses an artifact envelope or exact
+path can receive one focused correction from that file's assigned author. A
+timed-out or errored author is not immediately repeated.
 
 Artifact boundaries are explicit and path-exact:
 
@@ -264,6 +276,13 @@ spending another identical call. When a build package cannot recover, the goal
 stops scheduling new work and enters `draining` while already-productive
 siblings finish. It becomes `paused` only after every sibling is terminal, with
 the staging directory intact for inspection and resume.
+
+If deterministic final assembly proves that an accepted upstream HTML template
+violated its directive structure, the failure is attributed to that template's
+owning package. That exact upstream session is excluded from verified-work
+recovery; the coordinator schedules the template package again before assembly
+without another human checkpoint, while retaining all unrelated accepted
+sibling packages. After a process restart, one Resume continues that repair.
 
 ### 5. The entire goal is released once
 
@@ -342,8 +361,10 @@ final-batch delivery.
 
 The per-seat timeout shown in Settings is a routine/non-code guardrail and does
 not cap any session classified as code. Coding calls use their stage policies:
-current defaults include a 360-second non-frontier panel authoring budget, a
-180-second focused non-frontier retry budget, a 600-second lead timeout, a
+current defaults include a 360-second non-frontier panel authoring ceiling, a
+180-second focused protocol-correction ceiling, one 360-second shared package
+authoring deadline split into at most three 120-second author waves, a
+600-second lead timeout, a
 480-second judge timeout, a 600-second codifier timeout, a 600-second frontier
 author timeout, and a 300-second frontier release-verification timeout. Every
 stage value is a total hard deadline. OpenRouter additionally closes a coding
@@ -357,11 +378,20 @@ Gang of 8 handles failures as follows:
 - an unavailable local Claude or Codex login is detected before a CLI-backed
   ordinary run and recorded as degraded council health;
 - an ordinary non-frontier seat that hits a hard timeout is recorded as dropped;
-- a frontier author returning a stub or transient error is re-called as the same
-  implementation owner; a missing or non-runnable required frontier candidate
-  stops delivery instead of degrading silently;
-- a missing ordinary build-package artifact gets one focused, finite retry from
-  its owner; deterministic assembly spends only its one compact-template call;
+- outside build-team packages, a frontier tournament author returning a stub or
+  transient error is re-called as the same implementation owner; a missing or
+  non-runnable required frontier candidate stops delivery instead of degrading
+  silently;
+- all authors in a build package share one wall-clock deadline, including time
+  queued for a concurrency slot; each wave receives at most one third of that
+  deadline, so one wedged provider cannot consume the recovery window;
+- a timeout/error is never retried against the same author. Only its unresolved
+  exact paths may be reassigned once to a healthy sibling, which must author new
+  artifacts under the remaining shared deadline. Completed sibling outputs are
+  preserved, and the original and delivering authors remain in the audit trail;
+- a completed protocol/path miss can receive one focused exact-path correction;
+  no assignment or timeout decision uses guessed file byte or token counts;
+- deterministic assembly spends only its one compact-template call;
 - streaming OpenRouter calls persist output-backed progress timestamps and
   distinguish productive generation from a silent/stalled request;
 - bounded artifact and test repair loops re-run verification after changes,
@@ -388,8 +418,13 @@ the recorded error and explicitly resume the paused goal; completed verified
 work is then recovered as described above.
 
 The dashboard groups retry sessions under their parent goal. Each package row
-shows its owner, effective session state, attempt count, blockers, and active
-model call. Streaming calls report output characters and whether they are
+shows its accountable owner, exact-output author count, effective session
+state, session attempt count, total model-call attempts, blockers, and active
+model calls. The goal/session read-only APIs also expose the current
+file-to-author map, append-only per-file author history, attempt counts, author
+failures, shared deadline, package wall time, and aggregate elapsed time across
+successful and failed model attempts. Streaming calls
+report output characters and whether they are
 waiting for first output; calls show their finite hard deadline, and streaming
 providers also show the independent no-output limit. The goal card exposes the
 `draining` state, aggregates approval/input blockers, and selects the actionable
@@ -745,7 +780,8 @@ Common environment variables:
 | `GANGOF8_PANEL_RETRY_TIMEOUT` | Focused package recovery call, seconds | `180` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
 | `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author hard deadline, seconds | `600` |
-| `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls after a stub/transient failure | `1` |
+| `GANGOF8_PACKAGE_AUTHOR_DEADLINE` | Shared wall-clock deadline for all primary, correction, and distinct-author failover waves in one package; each wave is capped at one third | `360` |
+| `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls for non-build-team frontier tournament authors | `1` |
 | `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Independent frontier release hard deadline, seconds | `300` |
 | `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
 | `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Independent no-model-output stall deadline, seconds | `180` |
@@ -811,6 +847,8 @@ council:
 - existing-file revisions use compact surgical edits rather than seven full
   rewrites;
 - build-team goals eliminate duplicate whole-solution candidate generation;
+- multi-output packages fan exact paths across enabled authors concurrently,
+  with semantic package-only prompts and no response-size heuristics;
 - all hard-dependency-ready work packages run concurrently;
 - contract-linked modules defer only their premature standalone runtime probe,
   while integration owns the assembled runtime check;

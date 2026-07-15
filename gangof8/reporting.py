@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +73,28 @@ def run_summary(session: Any) -> dict:
         status = action.get("status") or "unknown"
         action_statuses[status] = action_statuses.get(status, 0) + 1
 
+    package_elapsed_ms = 0
+    if data.get("package_started_at"):
+        try:
+            started = datetime.fromisoformat(
+                str(data["package_started_at"]).replace("Z", "+00:00")
+            )
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            raw_status = data.get("status")
+            status = getattr(raw_status, "value", raw_status)
+            if status in {"done", "failed", "cancelled"} and data.get("updated_at"):
+                ended = datetime.fromisoformat(
+                    str(data["updated_at"]).replace("Z", "+00:00")
+                )
+                if ended.tzinfo is None:
+                    ended = ended.replace(tzinfo=timezone.utc)
+            else:
+                ended = datetime.now(timezone.utc)
+            package_elapsed_ms = max(0, int((ended - started).total_seconds() * 1000))
+        except (TypeError, ValueError):
+            package_elapsed_ms = 0
+
     files: list[dict] = []
     for raw_path in data.get("files_changed") or []:
         path = Path(raw_path)
@@ -86,7 +109,14 @@ def run_summary(session: Any) -> dict:
 
     return {
         "agent_calls": data.get("agent_calls", len(contributions)),
+        "agent_call_attempts": data.get(
+            "agent_call_attempts", data.get("agent_calls", len(contributions))
+        ),
         "contribution_duration_ms": duration_ms,
+        "agent_attempt_duration_ms": int(
+            data.get("agent_attempt_duration_ms") or duration_ms
+        ),
+        "package_elapsed_ms": package_elapsed_ms,
         "contributions_by_agent": by_agent,
         "contributions_by_model": by_model,
         "actions_by_status": action_statuses,
@@ -95,6 +125,11 @@ def run_summary(session: Any) -> dict:
         "quality_gate": data.get("quality_gate") or {},
         "assembly_result": data.get("assembly_result") or {},
         "frontier_author_recoveries": data.get("frontier_author_recoveries") or {},
+        "package_output_authors": data.get("package_output_authors") or {},
+        "package_output_attempts": data.get("package_output_attempts") or {},
+        "package_output_history": data.get("package_output_history") or {},
+        "package_call_failures": data.get("package_call_failures") or {},
+        "package_deadline_at": data.get("package_deadline_at"),
         "files": files,
     }
 
@@ -105,14 +140,22 @@ _TIMELINE = {
     "agent_call_started": (">", "Model working"),
     "agent_call_finished": ("+", "Model response received"),
     "agent_call_failed": ("!", "Model call failed"),
+    "agent_call_discarded": ("!", "Late model response discarded"),
+    "package_deadline_started": (">", "Shared package deadline started"),
+    "package_author_fanout_started": (">>", "Exact-output authors dispatched"),
+    "package_output_reassigned": ("↻", "Exact output reassigned"),
+    "package_artifact_author_rejected": ("!", "Wrong package author rejected"),
     "frontier_author_recovery_started": ("↻", "Frontier author recovering"),
     "frontier_runtime_repaired": ("+", "Frontier author repaired its code"),
     "frontier_runtime_repair_failed": ("!", "Frontier author repair failed"),
     "frontier_implementation_gate_failed": ("!", "Frontier implementation gate failed"),
+    "package_implementation_gate_failed": ("!", "Package implementation gate failed"),
     "assembly_materialized": ("+", "Deterministic assembly materialized"),
     "deterministic_release_verified": ("✓", "Deterministic release verified"),
     "assembly_failed": ("!", "Deterministic assembly failed"),
     "assembly_template_rejected": ("!", "Assembly template rejected"),
+    "assembly_template_provider_invalidated": ("!", "Upstream template attempt invalidated"),
+    "assembly_template_rebuild_scheduled": (">>", "Upstream template rebuild scheduled"),
     "assembly_skill_request_rejected": ("!", "Assembly dependency read rejected"),
     "assembly_repair_skipped": (">", "Expanded artifact kept out of model repair"),
     "package_attempt_failed": ("!", "Package attempt failed"),
@@ -220,9 +263,16 @@ def _detail(event: str, p: dict) -> str:
         limit = "no coordinator deadline" if timeout == 0 else f"limit {timeout or '?'}s"
         return f"{p.get('agent','')} / {p.get('role','')} / {limit}"
     if event == "agent_call_finished":
-        return f"{p.get('agent','')} / {int(p.get('duration_ms') or 0) / 1000:.1f}s"
+        elapsed = int(p.get("elapsed_ms") or p.get("duration_ms") or 0)
+        return f"{p.get('agent','')} / {elapsed / 1000:.1f}s"
     if event == "agent_call_failed":
-        return f"{p.get('agent','')}: {str(p.get('error',''))[:70]}"
+        elapsed = int(p.get("duration_ms") or 0)
+        duration = f" / {elapsed / 1000:.1f}s" if elapsed else ""
+        return f"{p.get('agent','')}{duration}: {str(p.get('error',''))[:70]}"
+    if event == "package_output_reassigned":
+        return (
+            f"{p.get('file','')}: {p.get('from','')} → {p.get('to','')}"
+        )[:110]
     if event == "runtime_deferred":
         return f"{p.get('file','')} / waiting for integration"
     if event == "contribution":

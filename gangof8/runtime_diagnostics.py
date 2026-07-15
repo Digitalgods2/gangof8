@@ -52,15 +52,21 @@ def collect_runtime_diagnostics(
             "retry_timeout_s": config.PANEL_RETRY_TIMEOUT,
             "frontier_author_seats": list(config.FRONTIER_AUTHOR_SEATS),
             "frontier_author_timeout_s": config.FRONTIER_AUTHOR_TIMEOUT,
+            "package_author_deadline_s": config.PACKAGE_AUTHOR_DEADLINE,
+            "package_author_wave_timeout_s": config.PACKAGE_AUTHOR_WAVE_TIMEOUT,
             "frontier_verify_timeout_s": config.FRONTIER_VERIFY_TIMEOUT,
             "openrouter_output_stall_timeout_s": config.OPENROUTER_OUTPUT_STALL_TIMEOUT,
             "frontier_recovery_attempts": config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS,
+            "build_team_same_author_timeout_recovery_attempts": 0,
+            "build_team_distinct_author_failovers_per_output": 1,
             "routine_openrouter_policy": "total_wall_clock",
             "coding_openrouter_policy": "hard_deadline_and_no_model_output_stall",
             "stream_progress_persisted": True,
             "note": (
                 "per-seat settings apply only to routine/non-code sessions; coding "
-                "uses finite stage deadlines; OpenRouter also enforces an independent "
+                "uses finite stage deadlines; build-team authors share one package "
+                "deadline and timed-out authors are not repeated; OpenRouter enforces "
+                "an independent "
                 "no-model-output stall limit; all calls remain user-cancellable"
             ),
         },
