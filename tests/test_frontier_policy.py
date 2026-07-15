@@ -49,6 +49,7 @@ def test_frontier_timeout_is_finite_and_uses_the_stage_policy():
     assert loop._effective_agent_timeout(
         session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == config.FRONTIER_AUTHOR_TIMEOUT
     assert 0 < config.FRONTIER_AUTHOR_TIMEOUT <= 600
+    assert 0 < config.PACKAGE_AUTHOR_DEADLINE <= 360
     assert 0 < config.FRONTIER_VERIFY_TIMEOUT <= 600
 
 

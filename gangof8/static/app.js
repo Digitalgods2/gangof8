@@ -9,6 +9,14 @@ const detailRefreshGate = createLatestRequestGate();
 // re-renders, so open/closed state survives each poll deterministically.
 let openSections = {};
 
+function shortDuration(ms) {
+  const seconds = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
 function toggleSection(key) {
   openSections[key] = !openSections[key];
   const el = document.querySelector(`.collapse[data-sec="${key}"]`);
@@ -557,17 +565,22 @@ function goalCard(g) {
     const rowStatus = m.pending_approvals ? "awaiting_approval"
       : m.pending_inputs ? "awaiting_input" : m.status;
     const attempts = m.attempt_count > 1 ? ` · ${m.attempt_count} attempts` : "";
+    const outputAuthors = Object.values(m.output_authors || {});
+    const fanout = new Set(outputAuthors).size > 1
+      ? ` · ${new Set(outputAuthors).size} exact-output authors` : "";
+    const callAttempts = m.agent_call_attempts
+      ? ` · ${m.agent_call_attempts} model attempt${m.agent_call_attempts === 1 ? "" : "s"}` : "";
     const working = (m.active_agent_calls || []).length
       ? ` · ${m.active_agent_calls.map(c => {
           const chars = c.progress_chars || 0;
           return `${c.agent} ${chars ? `streaming ${chars.toLocaleString()} chars` : "waiting for output"}`;
         }).join(", ")}` : "";
-    const title = `${m.title}${m.owner ? ` — owner ${m.owner}` : ""}${edge}${attempts}${working}`;
+    const title = `${m.title}${m.owner ? ` — accountable owner ${m.owner}` : ""}${edge}${attempts}${fanout}${callAttempts}${working}`;
     return `
       <div class="gms ${esc(rowStatus)}" title="${esc(title)}"
            ${m.session_id ? `onclick="select('${esc(m.session_id)}')"` : ""}>
         <span class="gicon">${icons[rowStatus] || "○"}</span>
-        <span class="gtitle">${esc(m.title)}${m.owner ? ` <small>— ${esc(m.owner)}${esc(edge)}${esc(attempts)}${esc(working)}</small>` : ""}</span>
+        <span class="gtitle">${esc(m.title)}${m.owner ? ` <small>— ${esc(m.owner)}${esc(edge)}${esc(attempts)}${esc(fanout)}${esc(callAttempts)}${esc(working)}</small>` : ""}</span>
       </div>`;
   }).join("");
   const live = GOAL_LIVE.has(g.status);
@@ -888,7 +901,8 @@ function renderDetail(s) {
     waitRole = "owner";
     waitAgent = s.work_package_owner;
   }
-  const activeCall = (s.active_agent_calls || [])[0] || null;
+  const activeCalls = s.active_agent_calls || [];
+  const activeCall = activeCalls[0] || null;
   if (activeCall) {
     waitRole = activeCall.role || waitRole;
     waitAgent = activeCall.agent || waitAgent;
@@ -901,7 +915,10 @@ function renderDetail(s) {
     const progress = chars
       ? `streamed ${chars.toLocaleString()} chars`
       : "waiting for first model output";
-    liveGoal = `${packageMode ? "package owner" : "model"} working · ${progress} · ${deadline}${stall}`;
+    const workers = packageMode && activeCalls.length > 1
+      ? `${activeCalls.length} package authors working`
+      : `${packageMode ? "package author" : "model"} working`;
+    liveGoal = `${workers} · ${progress} · ${deadline}${stall}`;
   }
   // reset the elapsed clock whenever the live situation actually changes
   const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${activeCall?.call_id || waitRole}` : null;
@@ -921,6 +938,7 @@ function renderDetail(s) {
     new Set(contribs.map(c => c.round)).size;
   const calls = s.agent_calls ?? contribs.length;
   const runSummary = s.run_summary || {};
+  const callAttempts = s.agent_call_attempts ?? runSummary.agent_call_attempts ?? calls;
   // talents the lead pulled in = contributions from non-driver roles
   // (panelists contribute every round by design — they are not delegations)
   const DRIVE_ROLES = new Set(["lead", "panelist", "summarizer", "coordinator"]);
@@ -928,9 +946,19 @@ function renderDetail(s) {
   // "7 agent calls · 3 agents · 2 delegations"
   const statBits = [];
   if (calls) statBits.push(`<b>${calls}</b> agent call${calls === 1 ? "" : "s"}`);
-  const activeMs = runSummary.contribution_duration_ms || 0;
-  if (activeMs) statBits.push(`<b>${(activeMs / 1000).toFixed(activeMs < 10000 ? 1 : 0)}s</b> model time`);
-  if (agentCount) statBits.push(`<b>${agentCount}</b> agent${agentCount === 1 ? "" : "s"}`);
+  if (callAttempts > calls) {
+    statBits.push(`<b>${callAttempts}</b> total attempt${callAttempts === 1 ? "" : "s"}`);
+  }
+  const packageElapsedMs = runSummary.package_elapsed_ms || 0;
+  if (packageElapsedMs) {
+    statBits.push(`<b>${shortDuration(packageElapsedMs)}</b> package elapsed`);
+  }
+  const completedModelMs = runSummary.contribution_duration_ms || 0;
+  const attemptMs = runSummary.agent_attempt_duration_ms || completedModelMs;
+  if (attemptMs) {
+    statBits.push(`<span title="Sum of elapsed time across every model attempt, including failed and overlapping calls"><b>${shortDuration(attemptMs)}</b> aggregate attempt time</span>`);
+  }
+  if (agentCount) statBits.push(`<b>${agentCount}</b> successful agent${agentCount === 1 ? "" : "s"}`);
   if (delegations) statBits.push(`<b>${delegations}</b> delegation${delegations === 1 ? "" : "s"}`);
   if (runSummary.test_fix_attempts) statBits.push(`<b>${runSummary.test_fix_attempts}</b> test repair${runSummary.test_fix_attempts === 1 ? "" : "s"}`);
   const candidateMetrics = runSummary.candidate_metrics || s.candidate_metrics || {};

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -88,6 +89,17 @@ FRONTIER_AUTHOR_SEATS = tuple(
 FRONTIER_AUTHOR_TIMEOUT = max(
     1, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "600"))
 )
+# One wall-clock deadline covers every author and any focused protocol retry in
+# a work package.  Parallel fan-out therefore cannot turn into serial N x timeout
+# behavior when a provider wedges or a local concurrency slot is queued.
+PACKAGE_AUTHOR_DEADLINE = max(
+    1, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "360"))
+)
+# Package authoring has three bounded waves: primary authors, a focused
+# correction or reassignment, and (when still useful) one final exact-path
+# correction.  Deriving the per-wave liveness cap from the shared deadline
+# leaves recovery headroom without guessing at file byte/token sizes.
+PACKAGE_AUTHOR_WAVE_TIMEOUT = max(1, math.ceil(PACKAGE_AUTHOR_DEADLINE / 3))
 FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
     os.environ.get("GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS", "1")
 )

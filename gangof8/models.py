@@ -333,6 +333,10 @@ class GoalMilestone(BaseModel):
     files: list[str] = []             # accepted, delivered files only (legacy name)
     accepted_files: list[str] = []    # explicit manifest; never sandbox drafts
     accepted_hashes: dict[str, str] = {}  # relative delivery path -> SHA-256
+    # Downstream deterministic validation can prove that an otherwise completed
+    # upstream attempt violated its template contract. Resume must not silently
+    # recover that exact session as verified work again.
+    invalidated_session_ids: list[str] = []
     acceptance_detail: str = ""
     summary: str = ""                 # snippet of its final answer, for context
 
@@ -397,6 +401,19 @@ class Session(BaseModel):
     delivery_mode: str = "immediate"
     work_package_id: str = ""
     work_package_owner: str = ""
+    # A package owner remains accountable, but independently authored outputs
+    # can be assigned to other enabled seats.  Assignments are exact paths,
+    # never inferred from file size or arbitrary response-length thresholds.
+    package_helpers: list[str] = []
+    package_output_authors: dict[str, str] = {}
+    package_output_attempts: dict[str, int] = {}
+    # Append-only per-path provenance. ``package_output_authors`` identifies
+    # the current/delivering author; this ledger preserves failed primaries and
+    # every correction/failover without relabeling sibling work.
+    package_output_history: dict[str, list[dict]] = {}
+    package_call_failures: dict[str, str] = {}
+    package_started_at: Optional[str] = None
+    package_deadline_at: Optional[str] = None
     # Frontier models are implementation quorum, not optional late judges.
     required_frontier_authors: list[str] = []
     frontier_author_recoveries: dict[str, int] = {}
@@ -468,6 +485,12 @@ class Session(BaseModel):
     unresolved: list[str] = []
     final: Optional[FinalAnswer] = None
     agent_calls: int = 0
+    # Unlike ``agent_calls`` (completed calls used by the budget), this audit
+    # counter never rolls back when a call times out, errors, or asks for input.
+    agent_call_attempts: int = 0
+    # Actual elapsed time across every attempted call, including timeouts and
+    # errors. This may exceed wall time because fan-out calls overlap.
+    agent_attempt_duration_ms: int = 0
     current_round: int = 0
     stop_reason: Optional[str] = None
     blocked_on_missing_info: bool = False

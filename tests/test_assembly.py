@@ -117,6 +117,53 @@ def test_materializer_rejects_changed_or_html_unsafe_accepted_sources(tmp_path):
             _template(), root, ["assets/app.css", "src/app.js"], hashes)
 
 
+def test_materializer_rejects_directives_nested_in_script_or_style(tmp_path):
+    root = tmp_path / "stage"
+    hashes = _write_manifest(root, {
+        "assets/app.css": "body {}\n",
+        "src/app.js": "globalThis.app = true;\n",
+    })
+    nested = (
+        "<!doctype html><html><head>\n"
+        "<!-- GANGOF8:STYLE assets/app.css -->\n"
+        "</head><body><script id=\"arcade-scripts\">\n"
+        "<!-- GANGOF8:SCRIPT src/app.js -->\n"
+        "</script></body></html>"
+    )
+
+    with pytest.raises(assembly.AssemblyError, match="nested inside <script>"):
+        assembly.materialize_html_inline(
+            nested, root, ["assets/app.css", "src/app.js"], hashes)
+
+
+def test_package_verification_rejects_nested_assembly_template_early(tmp_path):
+    template = tmp_path / "index.template.html"
+    template.write_text(
+        "<!doctype html><html><body><script>\n"
+        "<!-- GANGOF8:SCRIPT src/app.js -->\n"
+        "</script></body></html>",
+        encoding="utf-8",
+    )
+    store = LogStore(tmp_path / "data")
+    session = Session(
+        session_id="s_nested_template",
+        task=Task(task_id="t", session_id="s_nested_template", text="build template"),
+        required_files=["index.template.html"],
+        proposed_actions=[ProposedAction(
+            session_id="s_nested_template",
+            kind="write_file",
+            role=Role.implementer,
+            filename="index.template.html",
+            status="executed",
+            result_path=str(template),
+        )],
+    )
+
+    assert loop._verify_artifact_outputs(session, store, require_file=True) is False
+    assert "assembly template contract failed" in session.unresolved[-1]
+    assert "nested inside <script>" in session.unresolved[-1]
+
+
 def test_upstream_template_materializes_with_zero_model_calls(tmp_path):
     root = tmp_path / "stage"
     hashes = _write_manifest(root, {

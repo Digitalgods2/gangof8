@@ -500,6 +500,100 @@ def round_context(session: Session, seat_agent: str, round_idx: int) -> str:
     return "\n\n".join(parts)
 
 
+def _package_task_context(session: Session) -> str:
+    """Return the package/interface portion of a composed goal task.
+
+    Goal sessions carry the full product brief for traceability.  Repeating
+    that entire brief to every file author needlessly multiplies context and
+    makes a focused implementation call slower.  The goal composer already
+    emits semantic section markers, so trim by those sections rather than by a
+    made-up character or byte limit.  Legacy/unmarked tasks remain unchanged.
+    """
+    text = session.task.text or ""
+    for marker in (
+        "NON-BLOCKING INTERFACE INPUTS",
+        "THE PACKAGE TO COMPLETE NOW",
+    ):
+        position = text.find(marker)
+        if position >= 0:
+            return text[position:].strip()
+    return text.strip()
+
+
+def package_output_prompt(
+    session: Session,
+    member: CouncilMember,
+    round_idx: int,
+    assigned_files: list[str],
+    output_authors: dict[str, str],
+    feedback: str = "",
+) -> str:
+    """Focused exact-output authoring prompt for an accountable work package."""
+    assigned = [name.replace("\\", "/") for name in assigned_files]
+    all_outputs = [name.replace("\\", "/") for name in session.required_files]
+    owner = session.work_package_owner
+    assignment_lines = "\n".join(
+        f"- {name}: {output_authors.get(name, owner)}" for name in all_outputs
+    )
+    responsibility = (
+        "You are the accountable package owner and the primary author of the exact "
+        "outputs assigned to you."
+        if member.agent == owner else
+        f"You are an implementation sub-agent working under accountable owner {owner}."
+    )
+    retry = (
+        "\nTARGETED CORRECTION FROM THE COORDINATOR:\n" + feedback.strip() + "\n"
+        if feedback.strip() else ""
+    )
+    if session.assembly_mode == assembly.HTML_INLINE:
+        sources = [
+            name for name in session.runtime_dependencies
+            if name != session.assembly_template
+        ]
+        implementation_contract = (
+            "This is a compact deterministic HTML integration template. Do not read "
+            "or copy dependency bodies. Place each literal directive exactly once at "
+            "the correct style/script location and load order:\n"
+            + assembly.directive_contract(sources)
+            + "\nAuthor only the document structure, required DOM IDs, accessibility/meta "
+              "markup, and minimal bootstrap glue. Do not wrap directives in style or "
+              "script tags.\n"
+        )
+    else:
+        implementation_contract = (
+            "Implement only your assigned outputs. Coordinate through the declared "
+            "interfaces and sibling-output map; do not recreate another author's file.\n"
+        )
+        if any(name.endswith((".template.html", ".template.htm")) for name in assigned):
+            implementation_contract += (
+                "Every GANGOF8:STYLE or GANGOF8:SCRIPT directive in an HTML template "
+                "must be a literal standalone line. Never place a directive inside an "
+                "existing <style> or <script> element: the coordinator expands each "
+                "directive into a complete element of that kind.\n"
+            )
+    exact = ", ".join(assigned)
+    return (
+        f"{_GOVERNANCE_CONTEXT}"
+        f"Work package: {session.work_package_id or round_idx + 1}\n"
+        f"Accountable owner: {owner}\n"
+        f"Origin model for this author: {member.agent}\n"
+        f"{responsibility}\n\n"
+        "PACKAGE AND INTERFACE CONTEXT:\n"
+        f"{_package_task_context(session)}\n\n"
+        "EXACT OUTPUT ASSIGNMENTS:\n"
+        f"{assignment_lines}\n\n"
+        f"YOUR ASSIGNED OUTPUTS: {exact}\n"
+        f"{implementation_contract}"
+        "For every assigned output, emit exactly one complete block:\n"
+        "ARTIFACT: <exact assigned relative filename>\n"
+        "<full file contents>\n"
+        "END_ARTIFACT\n"
+        "Use raw contents without code fences. Do not emit PROMOTE, a plan, a status "
+        "update, SKILL requests, or files assigned to another author.\n"
+        f"{retry}"
+    )
+
+
 def panel_prompt(
     session: Session, member: CouncilMember, round_idx: int,
     established_overview: str = "", readable: list[str] = (),
@@ -570,8 +664,10 @@ def _panel_file_contract(session: Session) -> str:
                 "envelope; no plan, SKILL lines, or PROMOTE.\n"
             )
         return (
-            f"You are the SOLE OWNER of this build package, not a candidate in a "
-            f"contest. Produce the substantive implementation now. Required staged "
+            f"You are the ACCOUNTABLE OWNER of this build package, not a candidate in a "
+            f"contest. Produce the substantive implementation assigned to you now. "
+            f"The coordinator may assign exact sibling outputs to implementation "
+            f"sub-agents while you retain package accountability. Required staged "
             f"outputs: {required}. Emit every file as —\n"
             "ARTIFACT: <exact relative filename>\n<full file contents>\nEND_ARTIFACT\n"
             "— raw bytes inside that envelope, with no fences. Do not emit "
