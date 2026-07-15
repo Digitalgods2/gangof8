@@ -17,7 +17,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import config, executor, rounds, skills, smoke, validation
+from . import assembly, config, executor, rounds, skills, smoke, validation
 from .artifacts import (
     ARTIFACT_MARKER as _ARTIFACT_MARKER,
     BLOCK_START as _BLOCK_START,
@@ -115,12 +115,12 @@ def _effective_agent_timeout(
 ) -> int:
     """Resolve one timeout; Settings caps never govern coding sessions.
 
-    Code work uses the stage policy supplied by the coordinator (author, judge,
-    lead, codifier, repair, or the explicit frontier no-deadline value). The
+    Code work uses the finite stage policy supplied by the coordinator (author,
+    judge, lead, codifier, or repair). The
     per-seat Settings value is solely a routine/non-code guardrail.
     """
     if requested is not None and int(requested) <= 0:
-        return 0
+        return 1
     configured = (getattr(session, "cli_timeouts", None) or {}).get(agent)
     classification = getattr(session, "classification", None)
     coding = bool(classification and classification.task_type == TaskType.code)
@@ -173,8 +173,8 @@ def _agent_call(
                 + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
             )
         session.agent_calls += 1
-    # Per-seat Settings values cap ordinary calls. An explicit zero is the
-    # frontier author/verifier no-deadline mode; cancellation remains active.
+    # Per-seat Settings values cap ordinary calls; coding stages supply their
+    # own finite hard deadline. Cancellation remains active in either case.
     timeout_s = _effective_agent_timeout(session, member.agent, timeout_s)
     call_id = f"call_{threading.get_ident()}_{time.monotonic_ns()}"
     store.log_event(
@@ -195,12 +195,19 @@ def _agent_call(
                 session.classification
                 and session.classification.task_type == TaskType.code
             )
+            getter = getattr(registry, "get", None)
+            adapter = getter(member.agent) if callable(getter) else None
+            stall_timeout_s = (
+                config.OPENROUTER_OUTPUT_STALL_TIMEOUT
+                if getattr(adapter, "streams_progress", False) else None
+            )
             activity = {
                 "call_id": call_id, "agent": member.agent, "role": member.role.value,
                 "state": "running", "started_at": started_at,
                 "last_progress_at": started_at, "progress_chars": 0,
                 "progress_detail": "request dispatched", "timeout_s": timeout_s,
-                "timeout_policy": "no_output_stall" if coding_call else "total_wall_clock",
+                "timeout_policy": "hard_deadline",
+                "stall_timeout_s": stall_timeout_s,
             }
             with _SESSION_LOCK:
                 session.active_agent_calls.append(activity)
@@ -1472,17 +1479,29 @@ def _panel_one(
         # after Claude requested source, dropping a healthy owner mid-package.
         def recall(m: CouncilMember, p: str) -> Contribution:
             return call(m, p, timeout_s) if timeout_s is not None else call(m, p)
-        c = _resolve_skill_requests(
-            session, member, prompt, c, call, governance, store, recall=recall)
+        if (session.assembly_mode == assembly.HTML_INLINE
+                and _SKILL_REQUEST_MARKER.search(c.content or "")):
+            # Assembly dependencies are already accepted and manifest-bound.
+            # Feeding them through read_file would reintroduce the serial,
+            # truncated byte-copy loop this path exists to eliminate.
+            reason = "assembly template requested dependency reads instead of emitting compact glue"
+            dropped_contribution = c
+            store.log_event(
+                session.session_id, "assembly_skill_request_rejected",
+                {"agent": member.agent, "reason": reason},
+            )
+        else:
+            c = _resolve_skill_requests(
+                session, member, prompt, c, call, governance, store, recall=recall)
         # A stub take (tool-call debris / announced-but-not-done work) would
         # only pollute the synthesis and later context windows — drop the seat
         # for this round AND remove its debris from the transcript (the
         # panel_seat_dropped event + unresolved note keep the audit trail). No
         # retry below when this is a required frontier implementation author.
-        if rounds.reply_is_stub(c.content, skills_resolved=True):
+        if dropped_contribution is None and rounds.reply_is_stub(c.content, skills_resolved=True):
             reason = "stub reply (announced or attempted the work instead of doing it)"
             dropped_contribution = c
-        else:
+        elif dropped_contribution is None:
             _capture_panel_artifacts(session, member, c.content, governance, store)
             return c
     except AgentInputRequired:
@@ -1493,6 +1512,8 @@ def _panel_one(
     except AgentError as e:
         reason = str(e)
     frontier_author = bool(
+        session.assembly_mode != assembly.HTML_INLINE
+        and
         timeout_s is not None and member.agent in config.FRONTIER_AUTHOR_SEATS
     )
     recoveries = session.frontier_author_recoveries.get(member.agent, 0)
@@ -1725,6 +1746,36 @@ def _adopt_owned_package_artifacts(
         content = _clean_artifact_body(draft.content, filename)
         if not content.strip():
             continue
+        if session.assembly_mode == assembly.HTML_INLINE:
+            try:
+                result = assembly.materialize_html_inline(
+                    content,
+                    Path(session.workspace_root or ""),
+                    _assembly_sources(session),
+                    session.dependency_hashes,
+                )
+            except (assembly.AssemblyError, executor.ExecutionError, OSError) as exc:
+                issue = f"deterministic assembly template rejected: {exc}"
+                if issue not in session.unresolved:
+                    session.unresolved.append(issue)
+                store.log_event(
+                    session.session_id, "assembly_template_rejected",
+                    {"owner": owner, "file": filename, "reason": str(exc)},
+                )
+                continue
+            content = result.content
+            session.assembly_result = {
+                "mode": assembly.HTML_INLINE,
+                "template": assembly.OWNER_TEMPLATE,
+                "sources": list(result.sources),
+                "source_hashes": result.source_hashes,
+                "model_calls": 1,
+            }
+            store.log_event(
+                session.session_id, "assembly_materialized",
+                {"file": filename, "template": assembly.OWNER_TEMPLATE,
+                 "sources": list(result.sources), "model_calls": 1},
+            )
         proposals.append(ProposedAction(
             session_id=session.session_id, kind="write_file", role=Role.implementer,
             filename=filename, content=content,
@@ -1737,6 +1788,55 @@ def _adopt_owned_package_artifacts(
                         {"owner": owner, "files": adopted})
     present = existing | set(adopted)
     return adopted, [name for name in required if name not in present]
+
+
+def _assembly_sources(session: Session) -> list[str]:
+    return [
+        name.replace("\\", "/") for name in session.runtime_dependencies
+        if name.replace("\\", "/") != session.assembly_template.replace("\\", "/")
+    ]
+
+
+def _prepare_deterministic_assembly(session: Session, store: LogStore) -> bool:
+    """Materialize an accepted upstream template without invoking any model."""
+    if (session.assembly_mode != assembly.HTML_INLINE
+            or not session.assembly_template
+            or session.assembly_template == assembly.OWNER_TEMPLATE):
+        return False
+    if not session.workspace_root:
+        raise assembly.AssemblyError("deterministic assembly has no staging workspace")
+    template, template_hash = assembly.load_accepted_text(
+        Path(session.workspace_root), session.assembly_template,
+        session.dependency_hashes,
+    )
+    result = assembly.materialize_html_inline(
+        template, Path(session.workspace_root), _assembly_sources(session),
+        session.dependency_hashes,
+    )
+    if len(session.required_files) != 1:
+        raise assembly.AssemblyError("deterministic assembly must own one output")
+    filename = session.required_files[0].replace("\\", "/")
+    action = ProposedAction(
+        session_id=session.session_id, kind="write_file", role=Role.implementer,
+        filename=filename, content=result.content,
+        args={"filename": filename, "content": result.content},
+    )
+    _append_proposals(session, store, [action])
+    session.assembly_result = {
+        "mode": assembly.HTML_INLINE,
+        "template": session.assembly_template,
+        "template_hash": template_hash,
+        "sources": list(result.sources),
+        "source_hashes": result.source_hashes,
+        "model_calls": 0,
+    }
+    store.log_event(
+        session.session_id, "assembly_materialized",
+        {"file": filename, "template": session.assembly_template,
+         "sources": list(result.sources), "model_calls": 0},
+    )
+    store.save_session(session)
+    return True
 
 
 def _run_panel_rounds(
@@ -1777,6 +1877,7 @@ def _run_panel_rounds(
         build_package = (
             session.collaboration_mode == "build_team" and session.work_package_owner
         )
+        assembly_package = bool(build_package and session.assembly_mode)
         spec = RoundSpec(
             round=r,
             goal=(
@@ -1799,7 +1900,9 @@ def _run_panel_rounds(
             timeout_s=(
                 _effective_agent_timeout(
                     session, session.work_package_owner,
-                    (config.FRONTIER_AUTHOR_TIMEOUT
+                    (config.PANEL_RETRY_TIMEOUT
+                     if assembly_package else
+                     config.FRONTIER_AUTHOR_TIMEOUT
                      if session.work_package_owner in config.FRONTIER_AUTHOR_SEATS
                      else config.PANEL_AUTHOR_TIMEOUT))
                 if build_package else config.AGENT_TIMEOUT_DEFAULT
@@ -1811,7 +1914,7 @@ def _run_panel_rounds(
             store.save_session(session)  # banner shows the round goal + awaited seat live
         readable = _readable_files(session, store.data_dir)
         # the big up-front context is only worth its tokens once — round 1
-        ov = established_overview if r == 0 else ""
+        ov = established_overview if r == 0 and not assembly_package else ""
 
         # (a) FAN-OUT — every panel seat answers in parallel (bounded by the
         # per-kind semaphores inside _agent_call); a failing seat is dropped.
@@ -1826,7 +1929,9 @@ def _run_panel_rounds(
                 lambda m: _panel_one(session, m,
                                      rounds.panel_prompt(session, m, r, ov, readable),
                                      call, governance, store,
-                                     ((config.FRONTIER_AUTHOR_TIMEOUT
+                                     ((config.PANEL_RETRY_TIMEOUT
+                                       if assembly_package else
+                                       config.FRONTIER_AUTHOR_TIMEOUT
                                        if m.agent in config.FRONTIER_AUTHOR_SEATS
                                        else config.PANEL_AUTHOR_TIMEOUT)
                                       if _produces else None)),
@@ -1841,14 +1946,20 @@ def _run_panel_rounds(
             adopted, missing = _adopt_owned_package_artifacts(
                 session, session.work_package_owner, store)
             owner_member = next((m for m in panel if m.agent == session.work_package_owner), None)
-            if missing and owner_member is not None:
+            if missing and owner_member is not None and not assembly_package:
                 retry_prompt = (
                     rounds.panel_prompt(session, owner_member, r, ov, readable)
                     + "\n\nYour first response did not provide these exact required files: "
                     + ", ".join(missing)
-                    + ". Emit those complete ARTIFACT blocks NOW; no plan, no PROMOTE."
+                    + ". "
+                    + ((next((item for item in reversed(session.unresolved)
+                              if "assembly template rejected" in item), "") + " ")
+                       if assembly_package else "")
+                    + "Emit those complete ARTIFACT blocks NOW; no plan, SKILL reads, or PROMOTE."
                 )
                 owner_retry_timeout = (
+                    config.PANEL_RETRY_TIMEOUT
+                    if assembly_package else
                     config.FRONTIER_AUTHOR_TIMEOUT
                     if owner_member.agent in config.FRONTIER_AUTHOR_SEATS
                     else config.PANEL_RETRY_TIMEOUT
@@ -1864,7 +1975,18 @@ def _run_panel_rounds(
                 failure = (
                     f"package owner {session.work_package_owner} did not produce: "
                     + ", ".join(missing))
-                if session.work_package_owner in config.FRONTIER_AUTHOR_SEATS:
+                store.log_event(
+                    sid, "package_attempt_failed",
+                    {
+                        "package": session.work_package_id,
+                        "owner": session.work_package_owner,
+                        "reason": "missing_required_artifacts",
+                        "missing": missing,
+                        "assembly_mode": session.assembly_mode,
+                    },
+                )
+                if (assembly_package
+                        or session.work_package_owner in config.FRONTIER_AUTHOR_SEATS):
                     raise QualityGateFailed(failure)
                 raise AgentError(failure)
             summary = (
@@ -2065,6 +2187,31 @@ def _deliberate(
 
     manager.transition(session, SessionStatus.deliberating)
 
+    if (session.assembly_mode == assembly.HTML_INLINE
+            and session.assembly_template != assembly.OWNER_TEMPLATE):
+        try:
+            _prepare_deterministic_assembly(session, store)
+        except (assembly.AssemblyError, executor.ExecutionError, OSError) as exc:
+            detail = f"deterministic assembly contract failed: {exc}"
+            session.unresolved.append(detail)
+            session.quality_gate = {
+                "verdict": "FAIL", "stage": "deterministic_assembly",
+                "detail": str(exc),
+            }
+            session.outcome = "failed_verification"
+            session.stop_reason = detail
+            store.log_event(sid, "assembly_failed", {"reason": str(exc)})
+            manager.transition(session, SessionStatus.composing)
+            session.final = FinalAnswer(
+                answer="The deterministic assembly contract was invalid, so no output was delivered.",
+                confidence="low", assumptions=[], risks_unresolved=list(session.unresolved),
+                next_action="Correct the declared template or dependency manifest and resume the goal.",
+            )
+            manager.transition(session, SessionStatus.failed)
+            store.log_event(sid, "final_composed", session.final.model_dump())
+            store.save_session(session)
+            return session
+
     start = time.monotonic()
     # image attachments are shown to vision-capable agents on every call
     images = image_inputs(store.data_dir, session.attachments)
@@ -2084,22 +2231,23 @@ def _deliberate(
         # earlier owners' real bytes, rather than a stale snapshot of the target.
         overview_session = session.model_copy(
             update={"established_root": session.workspace_root, "delivery_root": None})
-    _ov_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overview")
-    try:
-        _ov_fut = _ov_ex.submit(lambda: "\n\n".join(p for p in (
-            _conversation_overview(session),
-            _established_overview(overview_session, store.data_dir),
-            _web_overview(session),
-        ) if p))
-        while True:
-            if cancellation.is_requested(sid):
-                raise SessionCancelled()
-            _ov_done, _ = wait([_ov_fut], timeout=0.5)
-            if _ov_done:
-                established_overview = _ov_fut.result()
-                break
-    finally:
-        _ov_ex.shutdown(wait=False, cancel_futures=True)
+    if not session.assembly_mode:
+        _ov_ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overview")
+        try:
+            _ov_fut = _ov_ex.submit(lambda: "\n\n".join(p for p in (
+                _conversation_overview(session),
+                _established_overview(overview_session, store.data_dir),
+                _web_overview(session),
+            ) if p))
+            while True:
+                if cancellation.is_requested(sid):
+                    raise SessionCancelled()
+                _ov_done, _ = wait([_ov_fut], timeout=0.5)
+                if _ov_done:
+                    established_overview = _ov_fut.result()
+                    break
+        finally:
+            _ov_ex.shutdown(wait=False, cancel_futures=True)
     if established_overview:
         store.log_event(sid, "context_overview", {"chars": len(established_overview)})
 
@@ -2129,9 +2277,9 @@ def _deliberate(
     def owner_repair_call(member: CouncilMember, prompt: str) -> Contribution:
         """A package owner repairs its own bytes under authoring policy.
 
-        In particular, a frontier owner keeps the explicit no-deadline coding
-        policy instead of being accidentally re-called through the 600-second
-        summarizer/codifier wrapper.
+        In particular, a frontier owner keeps its explicit finite authoring
+        policy instead of being accidentally re-called through the summarizer/
+        codifier wrapper.
         """
         timeout = (config.FRONTIER_AUTHOR_TIMEOUT
                    if member.agent in config.FRONTIER_AUTHOR_SEATS
@@ -2169,17 +2317,23 @@ def _deliberate(
     except AgentInputRequired as e:
         return _pause_for_input(session, manager, store, e, purpose="deliberation")
     except QualityGateFailed as e:
+        assembly_failure = session.assembly_mode == assembly.HTML_INLINE
+        stage = "deterministic_assembly" if assembly_failure else "frontier_implementation"
         session.outcome = "failed_verification"
-        session.stop_reason = f"frontier implementation gate failed: {e}"
+        session.stop_reason = f"{stage.replace('_', ' ')} failed: {e}"
         session.unresolved.append(session.stop_reason)
         session.quality_gate = {
-            "verdict": "FAIL", "stage": "frontier_implementation",
+            "verdict": "FAIL", "stage": stage,
             "detail": str(e),
         }
-        store.log_event(sid, "frontier_implementation_gate_failed", {"detail": str(e)})
+        event = "assembly_failed" if assembly_failure else "frontier_implementation_gate_failed"
+        store.log_event(sid, event, {"detail": str(e)})
         manager.transition(session, SessionStatus.composing)
         session.final = FinalAnswer(
             answer=(
+                "The run was stopped because the compact assembly template did not "
+                "satisfy its explicit manifest contract. No file was delivered."
+                if assembly_failure else
                 "The run was stopped because a required frontier implementation "
                 "did not complete or did not run. It was not silently replaced by "
                 "a weaker candidate or counted later as a judge. No file was delivered."
@@ -2187,7 +2341,11 @@ def _deliberate(
             confidence="low",
             assumptions=[],
             risks_unresolved=list(session.unresolved),
-            next_action="Resume or rerun so the named frontier owner can finish the code.",
+            next_action=(
+                "Resume or rerun so the owner can emit one compact manifest template."
+                if assembly_failure else
+                "Resume or rerun so the named frontier owner can finish the code."
+            ),
         )
         manager.transition(session, SessionStatus.failed)
         store.log_event(sid, "final_composed", session.final.model_dump())
@@ -3684,6 +3842,19 @@ def _repair_artifact_failure(
     who = package_owner or _codifier(session)
     if not (who and who.active):
         return False
+    if session.assembly_mode == assembly.HTML_INLINE:
+        # Never put the coordinator-expanded payload back through a context
+        # window.  The package already spent its single bounded model call on
+        # compact glue; accepted source bugs must be repaired in their owning
+        # packages, while manifest/template defects fail semantically above.
+        store.log_event(
+            session.session_id, "assembly_repair_skipped",
+            {
+                "reason": "expanded_artifacts_are_not_model_repair_inputs",
+                "model_calls": session.agent_calls,
+            },
+        )
+        return False
     candidates = [a for a in session.proposed_actions
                   if a.kind == "write_file" and (a.content or "").strip()]
     failure = next((u for u in reversed(session.unresolved)
@@ -3839,10 +4010,26 @@ def _build_summary_final(session: Session, delivered: list[ProposedAction]) -> F
     )
 
 
+def _noop_acceptance_command(command: str) -> bool:
+    """Return true for planner sentinels that explicitly mean no check.
+
+    New plans discard these while parsing; this runtime defense also repairs
+    old persisted goals whose acceptance list already contains ``NONE``.
+    """
+    normalized = (command or "").strip().strip("`").strip().lower()
+    return normalized in {
+        "", "none", "n/a", "na", "-", "not applicable", "no check", "no checks",
+    }
+
+
 def _run_acceptance_checks(session: Session, store: LogStore,
                            actions: list[ProposedAction]) -> list[str]:
     """Stage an exact project tree and run static planner checks only."""
-    if not session.acceptance_commands:
+    commands = [
+        command for command in session.acceptance_commands
+        if not _noop_acceptance_command(command)
+    ]
+    if not commands:
         return []
     import shutil
 
@@ -3883,7 +4070,7 @@ def _run_acceptance_checks(session: Session, store: LogStore,
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src, dst)
         failures: list[str] = []
-        for command in session.acceptance_commands:
+        for command in commands:
             try:
                 argv = validation.static_check_argv(command, stage)
                 result = validation.run(argv, stage, config.RUN_TESTS_TIMEOUT,

@@ -321,6 +321,12 @@ class GoalMilestone(BaseModel):
     release_files: list[str] = []
     release_declared: bool = False
     dependencies: list[str] = []
+    # Deterministic final assembly. ``html_inline`` expands explicit template
+    # directives from accepted staged dependencies without sending dependency
+    # bodies through a model. ``assembly_template`` is either an accepted
+    # relative template path or ``owner`` for one compact glue-only author call.
+    assembly_mode: str = ""
+    assembly_template: str = ""
     # Only coordinator-recognised static checks run automatically.  Functional
     # tests are represented by a governed RUNTESTS action instead.
     acceptance_commands: list[str] = []
@@ -427,6 +433,10 @@ class Session(BaseModel):
     required_files: list[str] = []
     runtime_dependencies: list[str] = []
     dependency_hashes: dict[str, str] = {}
+    assembly_mode: str = ""
+    assembly_template: str = ""
+    # Persisted audit data for deterministic assembly and read-only APIs.
+    assembly_result: dict = {}
     # A revision target is both an input and an output (for example editing
     # ``arcade.html`` in place).  Its baseline is recorded for audit/conflict
     # detection, but it must not be treated as an immutable dependency after

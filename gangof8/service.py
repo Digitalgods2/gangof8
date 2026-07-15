@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import cancellation, config, executor, goals, intake, reporting, rounds, smoke
+from . import assembly, cancellation, config, executor, goals, intake, reporting, rounds, smoke
 from .artifacts import parse_proposals
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
@@ -42,7 +42,16 @@ from .registry import AgentError
 from .registry import AgentRegistry
 from .runtime_diagnostics import collect_runtime_diagnostics
 from .sessions import SessionManager
-from .settings import Settings, budgets_overrides, load_settings, save_settings
+from .settings import (
+    Settings,
+    SettingsProfile,
+    apply_settings_profile,
+    budgets_overrides,
+    load_default_settings_profile,
+    load_settings,
+    make_settings_profile,
+    save_settings,
+)
 from .uploads import UploadStore, attachment_context
 from .workspaces import WorkspaceError, WorkspaceStore
 
@@ -116,9 +125,14 @@ class GangOf8Service:
         panel: Optional[list[str]] = None,
     ):
         self._data_dir = Path(data_dir) if data_dir else config.DATA_DIR
-        # Persisted settings layer over config/env. With no settings.json this
-        # returns the pure config/env defaults, so behaviour is unchanged.
-        self.settings = load_settings(self._data_dir)
+        # A normal application start (no injected data_dir) uses the bundled,
+        # versioned non-secret profile when settings.json does not exist. Tests
+        # and embedders with an explicit data directory retain config defaults
+        # unless they explicitly load/apply a profile.
+        self.settings = load_settings(
+            self._data_dir, use_packaged_default=data_dir is None
+        )
+        self._explicit_backend = backend
         self._explicit_role_agents = role_agents  # explicit arg always wins
         # Explicit panel roster: None ⇒ derive per backend; [] ⇒ no panel
         # (lead-only solo mode — fast runs and focused tests).
@@ -151,7 +165,7 @@ class GangOf8Service:
         """(Re)derive backend, role mapping and registry from
         the explicit args + current self.settings. Precedence for backend:
         explicit arg › settings.json › env/config default."""
-        self.backend = backend or self.settings.backend
+        self.backend = backend or self._explicit_backend or self.settings.backend
         if self.backend not in config.ROLE_AGENTS_BY_BACKEND:
             raise ValueError(f"unknown backend '{self.backend}' (mock | cli)")
         # role mapping: explicit arg › settings (non-empty) › backend default
@@ -430,6 +444,33 @@ class GangOf8Service:
                 save_settings(self.settings, self._data_dir)
                 self._apply_settings()
         return self.settings
+
+    def settings_profile(self) -> SettingsProfile:
+        """Export the current portable settings; secrets and paths are absent."""
+        return make_settings_profile(self.settings)
+
+    def import_settings_profile(self, profile: SettingsProfile) -> Settings:
+        """Atomically replace portable settings from a validated profile.
+
+        Registry derivation is attempted before persistence.  A bad backend,
+        role, risk value, or other runtime-incompatible selection therefore
+        leaves both memory and settings.json on the previous known-good state.
+        """
+        previous = self.settings
+        candidate = apply_settings_profile(previous, profile)
+        self.settings = candidate
+        try:
+            self._apply_settings()
+            save_settings(self.settings, self._data_dir)
+        except Exception:
+            self.settings = previous
+            self._apply_settings()
+            raise
+        return self.settings
+
+    def load_default_settings_profile(self) -> Settings:
+        """Apply the profile shipped with this installation."""
+        return self.import_settings_profile(load_default_settings_profile())
 
     def _open(self, text: str, source: str, budgets: Optional[Budgets],
               attachments: Optional[list[str]] = None) -> Session:
@@ -1250,6 +1291,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if not planner_named_owners and i > 0 and not package.depends_on:
                 package.depends_on = [i - 1]
 
+            package.assembly_mode, package.assembly_template = self._assembly_contract(package)
+
         # Frontier seats are valuable because they implement, not because they
         # can return later as judges. Repair a weak planner assignment by moving
         # each enabled frontier seat onto a source-producing package. Swap its
@@ -1316,6 +1359,47 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     f"{package.package_id} RELEASE is not owned by OUTPUTS: "
                     + ", ".join(invalid_release)
                 )
+            if package.assembly_mode:
+                if package.assembly_mode != assembly.HTML_INLINE:
+                    errors.append(
+                        f"{package.package_id} has unsupported ASSEMBLY mode: "
+                        f"{package.assembly_mode}"
+                    )
+                    continue
+                html_outputs = [
+                    name for name in package.required_files
+                    if Path(name).suffix.lower() in {".html", ".htm"}
+                ]
+                if len(package.required_files) != 1 or len(html_outputs) != 1:
+                    errors.append(
+                        f"{package.package_id} HTML_INLINE assembly must own exactly one HTML output"
+                    )
+                if not package.dependencies:
+                    errors.append(
+                        f"{package.package_id} HTML_INLINE assembly declares no staged sources"
+                    )
+                if (package.assembly_template != assembly.OWNER_TEMPLATE
+                        and package.assembly_template not in package.dependencies):
+                    errors.append(
+                        f"{package.package_id} TEMPLATE must be OWNER or one of REQUIRES"
+                    )
+                inline_sources = [
+                    name for name in package.dependencies
+                    if name != package.assembly_template
+                ]
+                unsupported = [
+                    name for name in inline_sources
+                    if Path(name).suffix.lower() not in {".css", ".js"}
+                ]
+                if unsupported:
+                    errors.append(
+                        f"{package.package_id} HTML_INLINE has unsupported source files: "
+                        + ", ".join(unsupported)
+                    )
+            elif package.assembly_template:
+                errors.append(
+                    f"{package.package_id} declares TEMPLATE without an ASSEMBLY mode"
+                )
 
         # Backward-compatible deterministic inference for a planner that predates
         # RELEASE.  Only sink-package outputs are candidates; for an explicitly
@@ -1359,6 +1443,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         for i in range(len(milestones)):
             visit(i)
         return milestones, list(dict.fromkeys(errors))
+
+    @staticmethod
+    def _assembly_contract(package: GoalMilestone) -> tuple[str, str]:
+        """Normalize explicit assembly metadata and backfill pre-contract plans."""
+        mode = assembly.normalize_mode(package.assembly_mode)
+        template = assembly.normalize_template(package.assembly_template)
+        if not mode and assembly.infer_html_inline(
+                package.required_files, package.dependencies,
+                package.release_files, package.task_text):
+            mode = assembly.HTML_INLINE
+            template = assembly.OWNER_TEMPLATE
+        if mode == assembly.HTML_INLINE and not template:
+            template = assembly.OWNER_TEMPLATE
+        return mode, template
 
     @staticmethod
     def _package_ready(goal: Goal, index: int) -> bool:
@@ -1491,8 +1589,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.delivery_mode = bound.delivery_mode
         session.work_package_id = milestone.package_id
         session.work_package_owner = milestone.owner
+        session.assembly_mode, session.assembly_template = self._assembly_contract(milestone)
         session.required_frontier_authors = (
-            [milestone.owner] if milestone.owner in config.FRONTIER_AUTHOR_SEATS else []
+            [milestone.owner]
+            if (not session.assembly_mode and milestone.owner in config.FRONTIER_AUTHOR_SEATS)
+            else []
         )
         if bound.delivery_mode == "final_batch":
             session.workspace_root = bound.staging_root
@@ -1671,7 +1772,68 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return session
 
     def _verify_goal_release(self, goal: Goal, session: Session) -> bool:
-        """Semantic final-batch gate by a non-owner frontier implementer."""
+        """Verify an assembled batch deterministically or by an independent frontier."""
+        release_packages = [package for package in goal.milestones if package.release_files]
+        deterministic_release = bool(release_packages) and all(
+            self._assembly_contract(package)[0] == assembly.HTML_INLINE
+            for package in release_packages
+        )
+        if deterministic_release:
+            failures: list[str] = []
+            verified_hashes: dict[str, str] = {}
+            stage = Path(goal.staging_root)
+            expected = {
+                name: package.accepted_hashes.get(name, "")
+                for package in release_packages for name in package.release_files
+            }
+            for name in session.required_files:
+                try:
+                    path = executor.resolve_in_workspace(stage, name)
+                    raw = path.read_bytes()
+                except (OSError, executor.ExecutionError) as exc:
+                    failures.append(f"{name}: unavailable during deterministic release verification ({exc})")
+                    continue
+                digest = hashlib.sha256(raw).hexdigest()
+                verified_hashes[name] = digest
+                if not expected.get(name) or digest != expected[name]:
+                    failures.append(f"{name}: staged bytes no longer match the accepted assembly output")
+                    continue
+                content = raw.decode("utf-8", errors="replace")
+                ran, testable, detail, _dynamic = smoke.smoke_source(
+                    content, Path(name).suffix or ".txt"
+                )
+                if testable and not ran:
+                    failures.append(f"{name}: {detail}")
+            session.quality_gate = {
+                "verdict": "FAIL" if failures else "PASS",
+                "stage": "deterministic_assembly_release",
+                "verifier": "coordinator",
+                "files": list(session.required_files),
+                "hashes": verified_hashes,
+                "remaining_defects": failures,
+            }
+            self.store.log_event(
+                session.session_id, "deterministic_release_verified",
+                {"verdict": session.quality_gate["verdict"],
+                 "files": list(session.required_files), "failures": failures},
+            )
+            if not failures:
+                session.outcome = "succeeded"
+                self.store.save_session(session)
+                return True
+            session.unresolved.extend(failures)
+            session.stop_reason = "deterministic final-batch verification failed"
+            session.outcome = "failed_verification"
+            self.manager.transition(session, SessionStatus.composing)
+            session.final = FinalAnswer(
+                answer="The deterministic assembly changed or failed its runtime check and was not released.",
+                confidence="low", risks_unresolved=list(session.unresolved),
+                next_action="Restore the accepted staged inputs and resume the goal.",
+            )
+            self.manager.transition(session, SessionStatus.failed)
+            self.store.save_session(session)
+            return False
+
         enabled_frontier = [
             seat for seat in config.FRONTIER_AUTHOR_SEATS
             if seat in self.panel and seat in self.registry.names()
@@ -2008,17 +2170,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             data = goal.model_dump()
             related = [item for item in sessions if item.get("goal_id") == goal.goal_id]
             terminal_goal = goal.status in ("cancelled", "completed", "failed")
+            live_related = [
+                item for item in related
+                if item.get("status") not in ("done", "failed", "cancelled")
+            ]
             approvals = (0 if terminal_goal else
-                         sum(item.get("pending_approvals", 0) for item in related))
+                         sum(item.get("pending_approvals", 0) for item in live_related))
             inputs = (0 if terminal_goal else
-                      sum(item.get("pending_inputs", 0) for item in related))
+                      sum(item.get("pending_inputs", 0) for item in live_related))
             active_calls = (0 if terminal_goal else
-                            sum(len(item.get("active_agent_calls") or []) for item in related))
+                            sum(len(item.get("active_agent_calls") or []) for item in live_related))
             package_views: list[dict] = []
             for package in goal.milestones:
                 package_data = package.model_dump()
                 attempts = [item for item in related
                             if item.get("work_package_id") == package.package_id]
+                attempts = sorted(attempts, key=lambda item: item.get("created_at") or "")
                 current = by_id.get(package.session_id or "", {})
                 effective_status = package.status
                 if goal.status == "cancelled" and package.status == "running":
@@ -2032,6 +2199,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     "pending_approvals": current.get("pending_approvals", 0),
                     "pending_inputs": current.get("pending_inputs", 0),
                     "active_agent_calls": current.get("active_agent_calls", []),
+                    "attempts": [
+                        {
+                            "number": number,
+                            "session_id": item.get("session_id"),
+                            "status": item.get("status"),
+                            "created_at": item.get("created_at"),
+                            "updated_at": item.get("updated_at"),
+                            "active_agent_calls": item.get("active_agent_calls") or [],
+                            "is_current": item.get("session_id") == package.session_id,
+                        }
+                        for number, item in enumerate(attempts, start=1)
+                    ],
                 })
                 package_views.append(package_data)
             data["milestones"] = package_views

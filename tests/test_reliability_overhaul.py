@@ -27,7 +27,9 @@ def test_explicit_timeout_is_a_cap_and_retry_is_bounded():
     assert loop._effective_agent_timeout(session, "claude", 900) == 320
     assert loop._effective_agent_timeout(session, "gemini", 360) == 360
     assert loop._effective_agent_timeout(session, "claude", config.PANEL_RETRY_TIMEOUT) == 180
-    assert loop._effective_agent_timeout(session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == 0
+    assert loop._effective_agent_timeout(
+        session, "claude", config.FRONTIER_AUTHOR_TIMEOUT
+    ) == 320
 
 
 def test_final_batch_package_suppresses_even_late_repair_promotes(tmp_path):
@@ -273,6 +275,13 @@ def test_acceptance_stage_preserves_nested_paths(tmp_path):
         filename="src/check.py", status="executed", result_path=str(delivered),
     )
     assert loop._run_acceptance_checks(session, store, [action]) == []
+
+
+def test_persisted_none_acceptance_check_is_a_noop(tmp_path):
+    store = LogStore(tmp_path / "data")
+    session = SessionManager(store).create("old package plan", source="goal")
+    session.acceptance_commands = ["NONE"]
+    assert loop._run_acceptance_checks(session, store, []) == []
 
 
 def test_same_path_goal_dependency_becomes_a_revision_target(tmp_path, monkeypatch):

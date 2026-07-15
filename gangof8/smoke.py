@@ -45,10 +45,21 @@ const _chain = new Proxy(function(){}, {
   get(t, k){ if (k === Symbol.toPrimitive) return () => 0; return _chain; },
   apply(){ return _chain; }, construct(){ return _chain; }
 });
+function _style(){
+  return new Proxy({
+    setProperty:_noop, removeProperty:()=>"", getPropertyValue:()=>"",
+    getPropertyPriority:()=>"", item:()=>"", length:0, cssText:""
+  }, {
+    get(t, k){ return k in t ? t[k] : ""; },
+    set(t, k, v){ t[k] = v; return true; }
+  });
+}
 function _el(){
   return { getContext: () => _ctx, addEventListener: _add, removeEventListener: _noop,
-    appendChild: _noop, removeChild: _noop, setAttribute: _noop, getAttribute: () => null,
-    style: {}, classList: { add:_noop, remove:_noop, toggle:_noop, contains: () => false },
+    appendChild: _noop, append:_noop, prepend:_noop, removeChild: _noop, remove:_noop,
+    replaceChildren:_noop, insertAdjacentElement:_noop, insertAdjacentHTML:_noop,
+    setAttribute: _noop, getAttribute: () => null,
+    style: _style(), classList: { add:_noop, remove:_noop, toggle:_noop, contains: () => false },
     getBoundingClientRect: () => ({ left:0, top:0, right:800, bottom:600, width:800, height:600 }),
     focus: _noop, blur: _noop, requestPointerLock: _noop, textContent: "", innerHTML: "",
     value: "", width: 800, height: 600, clientWidth: 800, clientHeight: 600, dataset: {},
@@ -117,6 +128,9 @@ _def("AudioContext", _audioCtor);
 _def("webkitAudioContext", _audioCtor);
 _def("Image", function(){ return _el(); });
 _def("FontFace", function(){ return { load: () => Promise.resolve() }; });
+_def("ResizeObserver", function(){ return { observe:_noop, unobserve:_noop, disconnect:_noop }; });
+_def("IntersectionObserver", function(){ return { observe:_noop, unobserve:_noop, disconnect:_noop, takeRecords:()=>[] }; });
+_def("MutationObserver", function(){ return { observe:_noop, disconnect:_noop, takeRecords:()=>[] }; });
 _def("screen", { width:800, height:600, orientation:{ lock:_noop } });
 // Browser globals scripts legitimately call BARE (they resolve to window.* in a
 // browser). Missing these here FALSELY rejected valid games as crashers — e.g.

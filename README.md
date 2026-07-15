@@ -16,6 +16,12 @@ Seats can be enabled, disabled, remapped, and model-pinned in Settings. New
 runs snapshot the enabled roster; disabling seats is the supported way to use a
 smaller council.
 
+The repository ships a versioned portable settings profile. A fresh
+installation uses it when no `settings.json` exists, and any installation can
+export its current profile, import another one, or restore the packaged profile
+from Settings. Profiles move council/model choices and preferences only; they
+never contain API keys, workspaces, sandbox paths, or session data.
+
 Gang of 8 is currently version `0.1.0` and under active development. It is a
 single-user desktop service, not a hosted multi-tenant system.
 
@@ -58,8 +64,8 @@ capacity second when they are enabled:
 - a failed frontier candidate goes back to the same model for implementation
   repair before judging; returning later only as a judge does not satisfy the
   author quorum;
-- frontier authoring and release-verification calls have no coordinator wall
-  clock by default. They remain immediately cancellable by the user;
+- frontier authoring and release-verification calls have finite hard deadlines
+  by default and remain immediately cancellable by the user;
 - a selected implementation is checked against an explicit requirement list
   and judge-defect register by a different frontier release engineer; and
 - a build team's assembled final batch receives the same independent frontier
@@ -69,6 +75,22 @@ capacity second when they are enabled:
 
 Disabling Claude or Codex in Settings intentionally removes that seat from the
 required quorum. This is the supported way to request a smaller council.
+
+### Deterministic final assembly
+
+A build-team package that combines accepted JavaScript and CSS into one HTML
+deliverable declares `ASSEMBLY: HTML_INLINE` plus either an accepted template
+path or `TEMPLATE: OWNER`. Accepted template paths are assembled with zero model
+calls. `OWNER` permits one finite call that returns only a compact HTML skeleton
+containing exact `GANGOF8:STYLE` and `GANGOF8:SCRIPT` directives. The coordinator
+then verifies every dependency's accepted SHA-256 and expands every declared
+source exactly once from staging.
+
+Assembly uses no byte or character thresholds. Expanded source is never sent
+through skill-result truncation, model context, or generic artifact repair.
+Missing, duplicate, undeclared, changed, non-UTF-8, or unsafe inline sources
+fail the explicit assembly gate before delivery. The final assembled file is
+then hash-checked and smoke-validated deterministically.
 
 ## How an ordinary task works
 
@@ -220,6 +242,13 @@ separate evidence; one failure never suppresses the others. Static checks
 recognized by the coordinator can run automatically. Functional test commands
 remain separately approval-gated because they execute code.
 
+`CHECK: NONE` is an explicit no-check declaration, not a shell command, and is
+discarded both when a new plan is parsed and when an older persisted package is
+verified. The deterministic HTML smoke harness supplies standard layout APIs
+such as `ResizeObserver`, `IntersectionObserver`, `MutationObserver`, and the
+CSS `style.setProperty()` surface so missing test doubles do not trigger an
+expensive model rewrite. A detected application exception still fails the gate.
+
 Cross-package runtime defects are attributed separately. If staged dependency
 files conflict before the current package loads, the current owner is not asked
 to rewrite unrelated code. Its independent syntax and acceptance checks still
@@ -315,17 +344,13 @@ The per-seat timeout shown in Settings is a routine/non-code guardrail and does
 not cap any session classified as code. Coding calls use their stage policies:
 current defaults include a 360-second non-frontier panel authoring budget, a
 180-second focused non-frontier retry budget, a 600-second lead timeout, a
-480-second judge timeout, and a 600-second codifier timeout. For OpenRouter
-coding calls, the stage value is a no-model-output watchdog rather than a total
-wall clock: streamed answer or reasoning tokens refresh liveness, while network
-comments and keep-alives do not. Productive remote coding can therefore exceed
-the nominal interval, but an open socket with no model progress is closed and
-recovered. Routine OpenRouter calls retain a true total wall-clock deadline.
-Claude/Codex implementation and independent release-verification calls are
-different: their default timeout is `0`, meaning no coordinator deadline. Their
-registered CLI process still stops immediately when the user cancels the
-session or goal. A provider, CLI, authentication, or machine failure can still
-end a call, but elapsed wall time alone does not discard frontier code.
+480-second judge timeout, a 600-second codifier timeout, a 600-second frontier
+author timeout, and a 300-second frontier release-verification timeout. Every
+stage value is a total hard deadline. OpenRouter additionally closes a coding
+request after 180 seconds with no answer or reasoning tokens; transport
+comments and keep-alives do not count as progress. Registered HTTP connections
+and CLI processes also stop immediately when the user cancels the session or
+goal.
 
 Gang of 8 handles failures as follows:
 
@@ -335,8 +360,8 @@ Gang of 8 handles failures as follows:
 - a frontier author returning a stub or transient error is re-called as the same
   implementation owner; a missing or non-runnable required frontier candidate
   stops delivery instead of degrading silently;
-- a missing build-package artifact gets a focused retry from its owner, with no
-  coordinator deadline when that owner is Claude or Codex;
+- a missing ordinary build-package artifact gets one focused, finite retry from
+  its owner; deterministic assembly spends only its one compact-template call;
 - streaming OpenRouter calls persist output-backed progress timestamps and
   distinguish productive generation from a silent/stalled request;
 - bounded artifact and test repair loops re-run verification after changes,
@@ -365,11 +390,16 @@ work is then recovered as described above.
 The dashboard groups retry sessions under their parent goal. Each package row
 shows its owner, effective session state, attempt count, blockers, and active
 model call. Streaming calls report output characters and whether they are
-waiting for first output; coding calls are labelled with their no-output
-watchdog rather than a misleading total deadline. The goal card exposes the
+waiting for first output; calls show their finite hard deadline, and streaming
+providers also show the independent no-output limit. The goal card exposes the
 `draining` state, aggregates approval/input blockers, and selects the actionable
 session, so a cancelled goal cannot continue to look like an active
 deliberation and a release approval is not hidden behind an arbitrary package.
+Package-attempt history is retained in the goal API. Resume immediately selects
+the new attempt; if a historical failed attempt is opened directly, it is
+labelled historical and points to the running retry. Package briefs omit live
+status words because their text is a start-time snapshot, while the goal card
+and build-team roster always render the current authoritative package state.
 
 ## Workspaces, staging, and delivery boundaries
 
@@ -573,6 +603,9 @@ running.
 | `POST /goals/{id}/cancel` | Cancel a goal |
 | `GET /settings`, `PUT /settings` | Read or patch persisted settings |
 | `GET /settings/seats` | Inspect seat and model availability |
+| `GET /settings/profile` | Export the current versioned, non-secret portable profile |
+| `POST /settings/profile` | Validate and load a portable profile |
+| `POST /settings/profile/default` | Load the packaged `default-settings.json` profile |
 | `PUT /settings/api-keys/{name}` | Store `openrouter` or `gemini` locally |
 | `GET /workspaces`, `POST /workspaces` | List or register workspaces |
 | `PUT /workspaces/active` | Select or clear the active workspace |
@@ -639,10 +672,64 @@ Invoke-RestMethod @request
 
 ## Configuration and environment variables
 
-Editable non-secret settings are stored in `data/settings.json`. The effective
-precedence is persisted settings over environment/config defaults, except an
-explicit CLI backend argument takes precedence when constructing the service.
-API-key environment variables always override locally stored keys.
+Editable non-secret settings are stored in `data/settings.json`. When that file
+does not yet exist on a normal application start, Gang of 8 loads the packaged
+`gangof8/default-settings.json` profile as the new-install baseline. Persisted
+settings replace that baseline thereafter. An explicit backend argument (the
+CLI and launcher set this from `GANGOF8_BACKEND`) still takes precedence for
+the running service. API-key environment variables always override locally
+stored keys.
+
+### Portable settings profiles
+
+Open **Settings → Portable settings profile** to use the three profile actions:
+
+- **Export saved profile** downloads `gangof8-settings-profile.json` from the
+  currently persisted settings.
+- **Import profile…** validates and loads a profile from another installation.
+- **Load packaged defaults** restores the versioned profile shipped with this
+  build.
+
+A profile includes:
+
+- the backend, enabled local CLI seats, their selected models, and routine
+  timeout preferences;
+- enabled OpenRouter seats and exact model slugs;
+- the explicit panel roster, full role-to-seat mapping, and per-role model
+  pins;
+- budget overrides, risk boundary, composer controls, consent-round interval,
+  and the council integration-review preference; and
+- dashboard polling and finished-section collapse preferences.
+
+A profile explicitly cannot include API keys or other secrets, registered or
+active workspaces, sandbox/delivery/source paths, uploads, sessions, goals, or
+other installation state. Unknown fields are rejected during import instead of
+being silently accepted. Loading is transactional: an invalid runtime mapping
+does not overwrite the previous `settings.json`.
+
+The sandbox is intentionally installation-specific. Unless
+`GANGOF8_SANDBOX` is explicitly set for that machine, each install derives it
+from the operating system: `%LOCALAPPDATA%\GangOf8\sandbox` on Windows and a
+Gang of 8 subdirectory under the system temporary directory elsewhere.
+
+The same workflow is available through the API. For example:
+
+```powershell
+# Export
+Invoke-RestMethod http://127.0.0.1:8790/settings/profile |
+  ConvertTo-Json -Depth 20 |
+  Set-Content -Encoding utf8 gangof8-settings-profile.json
+
+# Import
+$profile = Get-Content -Raw gangof8-settings-profile.json
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8790/settings/profile `
+  -ContentType application/json -Body $profile
+
+# Restore the profile bundled with this build
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8790/settings/profile/default
+```
 
 Common environment variables:
 
@@ -654,13 +741,14 @@ Common environment variables:
 | `GANGOF8_SANDBOX_KEEP` | Recent inactive sandboxes retained | `25` |
 | `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
 | `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
-| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Package/panel authoring interval; OpenRouter code treats it as a no-output stall watchdog | `360` |
+| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Package/panel authoring hard deadline, seconds | `360` |
 | `GANGOF8_PANEL_RETRY_TIMEOUT` | Focused package recovery call, seconds | `180` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
-| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author deadline; `0` means cancellable/no coordinator deadline | `0` |
+| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author hard deadline, seconds | `600` |
 | `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls after a stub/transient failure | `1` |
-| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Independent frontier release deadline; `0` means cancellable/no coordinator deadline | `0` |
+| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Independent frontier release hard deadline, seconds | `300` |
 | `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
+| `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Independent no-model-output stall deadline, seconds | `180` |
 | `GANGOF8_CODIFIER_TIMEOUT` | Strong finishing pass timeout, seconds | `600` |
 | `GANGOF8_JUDGE_TIMEOUT` | Candidate judge timeout, seconds | `480` |
 | `GANGOF8_MAX_JUDGES` | Maximum blind judges | `3` |
@@ -756,10 +844,10 @@ graph permits it.
 ### Claude timed out after reading a file
 
 Start a new session after updating/restarting the app. New Claude/Codex author
-and release-verifier calls show `no coordinator deadline`; source-read/search
-follow-ups retain that policy. A persisted session created by older code keeps
-its original timeout snapshot. User cancellation still terminates an in-flight
-CLI process.
+calls use a 600-second hard deadline and release-verifier calls use 300 seconds;
+source-read/search follow-ups retain the stage deadline. A persisted session
+created by older code keeps its original timeout snapshot. User cancellation
+still terminates an in-flight CLI process.
 
 ### I am being asked to approve every output file
 
@@ -824,7 +912,8 @@ gangof8/goals.py               Goal planning, persistence, package contracts
 gangof8/skills.py              Governed file/web/test/delivery operations
 gangof8/governance.py          Approval policy and action authorization
 gangof8/models.py              Persisted domain models
-gangof8/settings.py            Settings schema, persistence, migration
+gangof8/settings.py            Settings/profile schema, persistence, migration
+gangof8/default-settings.json  Portable new-install/default council profile
 gangof8/logstore.py            SQLite sessions and JSONL audit logs
 gangof8/adapters/              Mock, local CLI, and OpenRouter adapters
 gangof8/static/                Dashboard HTML, CSS, JavaScript, and images

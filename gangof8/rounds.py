@@ -11,7 +11,7 @@ import re
 from typing import Optional
 
 from .models import Contribution, Council, CouncilMember, Role, Session
-from . import config
+from . import assembly, config
 from .skills import get_skill
 
 
@@ -547,6 +547,28 @@ def _panel_file_contract(session: Session) -> str:
         return ""
     if session.collaboration_mode == "build_team" and session.work_package_owner:
         required = ", ".join(session.required_files) or "the package result"
+        if session.assembly_mode == assembly.HTML_INLINE:
+            sources = [
+                name for name in session.runtime_dependencies
+                if name != session.assembly_template
+            ]
+            directives = assembly.directive_contract(sources)
+            return (
+                "You own only the compact HTML integration template. The coordinator "
+                "already has every accepted dependency and will expand it directly; "
+                "do NOT request/read dependency files and do NOT copy any CSS or "
+                "JavaScript body into your response. Produce the required complete HTML "
+                f"document skeleton as ARTIFACT: {required}, placing each of these "
+                "literal standalone directives exactly once at the correct style/script "
+                "location and JavaScript load order:\n"
+                f"{directives}\n"
+                "The coordinator replaces each directive with a classic inline tag and "
+                "the full hash-verified staged source. Author only DOM structure, IDs, "
+                "accessibility/meta markup, and minimal bootstrap glue required by the "
+                "task. Do not wrap a directive inside <style> or <script>. Emit the "
+                "complete compact template now using the normal ARTIFACT/END_ARTIFACT "
+                "envelope; no plan, SKILL lines, or PROMOTE.\n"
+            )
         return (
             f"You are the SOLE OWNER of this build package, not a candidate in a "
             f"contest. Produce the substantive implementation now. Required staged "

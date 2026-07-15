@@ -110,6 +110,15 @@ def test_parse_milestones_records_explicit_acceptance_contract():
     assert ms[0].contract_declared and ms[0].requires_delivery
 
 
+def test_parse_milestones_treats_check_none_as_no_check():
+    plan = (
+        "PACKAGE 1: Integrate\nOWNER: claude\nTASK: Assemble.\n"
+        "OUTPUTS: index.html\nCHECK: NONE\n"
+    )
+    package = goals_mod.parse_milestones(plan)[0]
+    assert package.acceptance_commands == []
+
+
 def test_parse_release_manifest_is_separate_from_staging_outputs():
     plan = (
         "PACKAGE 1: Integrate\nOWNER: claude\nAFTER: NONE\nCONTRACTS: NONE\n"
@@ -293,6 +302,9 @@ def test_contract_linked_owner_receives_pending_interface_without_future_bytes()
     assert "PROVIDES ARC.Game and ARC.registerGame" in text
     assert "may still be working" in text
     assert "OTHER OWNED PACKAGES" in text
+    assert "status running" not in text
+    assert "(running)" not in text
+    assert "not live status indicators" in text
 
 
 def test_compose_milestone_task_frames_scope():
@@ -576,6 +588,13 @@ def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
             index=0, package_id="wp_1", owner="claude", title="core", task_text="core",
             status="running", session_id="s_active", contract_declared=True)])
     service.goals.save(goal)
+    old = Session(
+        session_id="s_old", status=SessionStatus.failed,
+        goal_id=goal.goal_id, work_package_id="wp_1", work_package_owner="claude",
+        active_agent_calls=[{"call_id": "stale_terminal_call"}],
+        task=Task(task_id="t0", session_id="s_old", text="core"),
+    )
+    service.store.save_session(old)
     session = Session(
         session_id="s_active", status=SessionStatus.awaiting_approval,
         goal_id=goal.goal_id, work_package_id="wp_1", work_package_owner="claude",
@@ -593,7 +612,11 @@ def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
     assert view["pending_approvals"] == 1
     assert view["active_agent_calls"] == 1
     assert view["actionable_session_id"] == "s_active"
-    assert view["milestones"][0]["attempt_count"] == 1
+    package = view["milestones"][0]
+    assert package["attempt_count"] == 2
+    assert [attempt["session_id"] for attempt in package["attempts"]] == ["s_old", "s_active"]
+    assert package["attempts"][0]["is_current"] is False
+    assert package["attempts"][1]["is_current"] is True
 
 
 def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(tmp_path):

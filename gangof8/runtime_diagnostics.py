@@ -53,15 +53,15 @@ def collect_runtime_diagnostics(
             "frontier_author_seats": list(config.FRONTIER_AUTHOR_SEATS),
             "frontier_author_timeout_s": config.FRONTIER_AUTHOR_TIMEOUT,
             "frontier_verify_timeout_s": config.FRONTIER_VERIFY_TIMEOUT,
+            "openrouter_output_stall_timeout_s": config.OPENROUTER_OUTPUT_STALL_TIMEOUT,
             "frontier_recovery_attempts": config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS,
             "routine_openrouter_policy": "total_wall_clock",
-            "coding_openrouter_policy": "no_model_output_stall",
+            "coding_openrouter_policy": "hard_deadline_and_no_model_output_stall",
             "stream_progress_persisted": True,
             "note": (
                 "per-seat settings apply only to routine/non-code sessions; coding "
-                "uses stage policies; OpenRouter coding intervals measure silence, "
-                "not productive streamed time; frontier timeout 0 means no coordinator "
-                "deadline while remaining user-cancellable"
+                "uses finite stage deadlines; OpenRouter also enforces an independent "
+                "no-model-output stall limit; all calls remain user-cancellable"
             ),
         },
         "api_keys": {name: api_key_status(name) for name in api_key_names},

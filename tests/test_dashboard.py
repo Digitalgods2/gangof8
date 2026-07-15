@@ -110,6 +110,14 @@ def test_dashboard_assets_served(client):
     assert "this session has one accountable owner" in app_js.text
     assert "contract-linked to P" in app_js.text
     assert "Building package" in app_js.text
+    assert "Export saved profile" in app_js.text
+    assert "Import profile" in app_js.text
+    assert "Load packaged defaults" in app_js.text
+    assert 'fetch("/settings/profile"' in app_js.text
+    assert 'fetch("/settings/profile/default"' in app_js.text
+    assert "activePollInterval()" in app_js.text
+    assert "uiPreferences.collapse_finished" in app_js.text
+    assert 'replace(/^\\uFEFF/, "")' in app_js.text
 
 
 def test_dashboard_detail_refresh_gate_rejects_stale_responses(client):
@@ -133,6 +141,39 @@ if (gate.isCurrent(terminalRefresh)) throw new Error('cancel did not invalidate 
     app_js = client.get("/app.js").text
     assert "detailRefreshGate.isCurrent(requestToken)" in app_js
     assert 'cache: "no-store"' in app_js
+
+
+def test_dashboard_tracks_historical_and_current_goal_attempts(client):
+    if shutil.which("node") is None:
+        pytest.skip("node not on PATH")
+    script = r"""
+const {
+  goalSessionIds, goalRenderSignature, packageAttemptState,
+} = require('./gangof8/static/dashboard-utils.js');
+const attempts = [
+  {number:1, session_id:'s_old', status:'failed', created_at:'2026-01-01T00:00:00Z'},
+  {number:2, session_id:'s_new', status:'deliberating', created_at:'2026-01-01T00:01:00Z', is_current:true},
+];
+const goal = {goal_id:'g_1', status:'running', actionable_session_id:'s_new',
+  milestones:[{package_id:'wp_1', status:'running', session_id:'s_new', attempts}]};
+const old = {session_id:'s_old', status:'failed', goal_id:'g_1', work_package_id:'wp_1'};
+const ids = goalSessionIds(goal, [old]);
+if (!ids.includes('s_old') || !ids.includes('s_new')) throw new Error('attempt history lost');
+const state = packageAttemptState(old, goal, [old]);
+if (!state.isHistorical || state.selectedNumber !== 1 || state.currentNumber !== 2)
+  throw new Error('historical/current attempt identity is wrong');
+const before = goalRenderSignature(goal);
+goal.milestones[0].status = 'done';
+if (before === goalRenderSignature(goal)) throw new Error('parent transition did not invalidate detail');
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], cwd=os.getcwd(), capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    app_js = client.get("/app.js").text
+    assert "Retry attempt" in app_js
+    assert "Package briefs are captured when an attempt starts" in app_js
+    assert "goalRenderSignature(parentGoal)" in app_js
 
 
 def test_health_reports_backend(client):

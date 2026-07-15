@@ -20,7 +20,16 @@ from gangof8.models import (
 )
 from gangof8.service import GangOf8Service
 from gangof8.sessions import migrate_session_data
-from gangof8.settings import Settings, load_settings, save_settings
+from gangof8.settings import (
+    PORTABLE_SETTINGS_FIELDS,
+    Settings,
+    SettingsProfile,
+    apply_settings_profile,
+    load_default_settings_profile,
+    load_settings,
+    make_settings_profile,
+    save_settings,
+)
 
 
 class _UnauthenticatedPanelAdapter:
@@ -116,6 +125,80 @@ def test_settings_migration_stamps_current_version(tmp_path):
     assert load_settings(tmp_path).settings_version == 1
 
 
+def test_packaged_default_profile_is_valid_and_complete():
+    profile = load_default_settings_profile()
+    assert profile.profile_version == 1
+    assert set(profile.settings) == set(PORTABLE_SETTINGS_FIELDS)
+    assert profile.settings["backend"] == "cli"
+    assert profile.settings["cli_models"] == {
+        "claude": "claude-opus-4.8",
+        "codex": "gpt-5.5",
+        "gemini": "gemini-3.5-flash",
+    }
+    assert profile.settings["openrouter_enabled"] == {
+        "deepseek": True, "glm": True, "qwen": True, "kimi": True,
+    }
+
+
+def test_packaged_defaults_seed_a_fresh_application_without_machine_state(tmp_path):
+    settings = load_settings(tmp_path, use_packaged_default=True)
+    assert settings.backend == "cli"
+    assert settings.role_agents["lead"] == "claude"
+    assert settings.ui.poll_interval_ms == 5000
+    # Settings has no place for installation-local or secret data.
+    dumped = settings.model_dump()
+    assert not ({"api_keys", "workspace", "sandbox", "delivery_root"} & set(dumped))
+
+
+def test_portable_profile_replaces_maps_but_preserves_nonportable_schema_state():
+    current = Settings(
+        role_agents={"critic": "old"},
+        cli_models={"claude": "old"},
+    )
+    profile = SettingsProfile(settings={
+        "role_agents": {"critic": "codex"},
+        "cli_models": {"claude": "opus"},
+        "ui": {"poll_interval_ms": 4321},
+    })
+    loaded = apply_settings_profile(current, profile)
+    assert loaded.role_agents == {"critic": "codex"}
+    assert loaded.cli_models == {"claude": "opus"}
+    assert loaded.ui.poll_interval_ms == 4321
+    assert loaded.ui.collapse_finished is True
+    assert loaded.settings_version == current.settings_version
+
+
+def test_profile_export_is_an_explicit_nonsecret_allowlist():
+    profile = make_settings_profile(Settings())
+    assert set(profile.settings) == set(PORTABLE_SETTINGS_FIELDS)
+    serialized = profile.model_dump_json()
+    for forbidden in ("api_key", "secret", "workspace", "sandbox", "delivery_root"):
+        assert forbidden not in serialized.lower()
+
+
+def test_profile_import_rolls_back_if_persistence_fails(tmp_path, monkeypatch):
+    import gangof8.service as service_mod
+
+    svc = GangOf8Service(data_dir=tmp_path, backend="mock")
+    before = svc.settings.model_dump()
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service_mod, "save_settings", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        svc.import_settings_profile(SettingsProfile(settings={
+            "backend": "cli", "ui": {"poll_interval_ms": 9876},
+        }))
+    assert svc.settings.model_dump() == before
+    assert svc.backend == "mock"
+
+
+def test_profile_rejects_unknown_or_nonportable_fields():
+    with pytest.raises(ValueError, match="non-portable or unknown"):
+        SettingsProfile(settings={"workspace": "C:/private", "api_key": "secret"})
+
+
 def test_session_migration_stamps_current_version():
     data = {"session_id": "s_1", "task": {"task_id": "t_1", "session_id": "s_1", "text": "x"}}
     assert migrate_session_data(data)["schema_version"] == SESSION_SCHEMA_VERSION
@@ -177,6 +260,10 @@ def test_explicit_backend_arg_wins(tmp_path):
     save_settings(Settings(backend="cli"), tmp_path)
     svc = GangOf8Service(data_dir=tmp_path, backend="mock")
     assert svc.backend == "mock"
+    svc.update_settings({"backend": "cli", "ui": {"poll_interval_ms": 4321}})
+    assert svc.backend == "mock", "settings refresh must not discard the constructor override"
+    svc.load_default_settings_profile()
+    assert svc.backend == "mock", "profile load must not discard the constructor override"
 
 
 def test_cli_catalog_normalizes_dotted_claude_slugs(tmp_path, monkeypatch):
@@ -318,6 +405,75 @@ def test_put_settings_role_mapping(client):
     r = client.put("/settings", json={"role_agents": {"researcher": "gemini"}})
     assert r.status_code == 200
     assert r.json()["resolved_role_agents"]["researcher"] == "gemini"
+
+
+def test_profile_api_round_trip_preserves_keys_workspaces_and_sandbox(tmp_path, monkeypatch):
+    from gangof8 import config
+    from gangof8 import main as main_mod
+
+    _no_gemini_env(monkeypatch)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    data_dir = tmp_path / "data"
+    root = tmp_path / "project"
+    root.mkdir()
+    main_mod.service = GangOf8Service(data_dir=data_dir)
+    api = TestClient(main_mod.app)
+
+    api.put("/settings", json={
+        "backend": "cli",
+        "cli_models": {"claude": "opus", "codex": "gpt-5.5"},
+        "openrouter_enabled": {"qwen": True},
+        "role_agents": {"lead": "claude", "critic": "codex"},
+        "role_models": {"critic": "gpt-5.5"},
+        "ui": {"poll_interval_ms": 4444, "collapse_finished": False},
+    })
+    api.put("/settings/api-keys/openrouter", json={"value": "sk-or-keep-me"})
+    workspace = api.post("/workspaces", json={"name": "project", "root": str(root)}).json()
+    api.put("/workspaces/active", json={"id": workspace["id"]})
+
+    profile = api.get("/settings/profile").json()
+    profile_text = json.dumps(profile)
+    assert "sk-or-keep-me" not in profile_text
+    assert str(root) not in profile_text
+    assert str(config.SANDBOX_ROOT) not in profile_text
+
+    api.put("/settings", json={
+        "cli_models": {"claude": "haiku"},
+        "openrouter_enabled": {},
+        "role_agents": {},
+        "role_models": {},
+        "ui": {"poll_interval_ms": 9999, "collapse_finished": True},
+    })
+    loaded = api.post("/settings/profile", json=profile)
+    assert loaded.status_code == 200, loaded.text
+    current = api.get("/settings").json()
+    assert current["cli_models"]["claude"] == "opus"
+    assert current["openrouter_enabled"] == {"qwen": True}
+    assert current["role_models"] == {"critic": "gpt-5.5"}
+    assert current["ui"] == {"poll_interval_ms": 4444, "collapse_finished": False}
+    assert api.get("/settings/api-keys/openrouter/reveal").json()["value"] == "sk-or-keep-me"
+    workspaces = api.get("/workspaces").json()
+    assert workspaces["active"] == workspace["id"]
+    assert workspaces["sandbox_root"] == str(config.SANDBOX_ROOT)
+
+
+def test_profile_api_rejects_paths_and_secrets(client):
+    r = client.post("/settings/profile", json={
+        "profile_version": 1,
+        "name": "unsafe",
+        "settings": {"workspace": "C:/private", "api_key": "sk-secret"},
+    })
+    assert r.status_code == 422
+
+
+def test_packaged_default_button_api_applies_default_without_keys(client):
+    client.put("/settings", json={"backend": "mock", "cli_models": {"claude": "haiku"}})
+    r = client.post("/settings/profile/default")
+    assert r.status_code == 200, r.text
+    settings = client.get("/settings").json()
+    assert settings["backend"] == "cli"
+    assert settings["cli_models"]["claude"] == "claude-opus-4.8"
+    assert client.get("/settings/api-keys/openrouter").json()["present"] is False
 
 
 def test_seats_lists_cli_and_openrouter_agents(client):

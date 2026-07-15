@@ -51,10 +51,24 @@ BARE_GLOBALS = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
                "let t=0; function loop(){ x.fillRect(t%100,0,5,5); t++; requestAnimationFrame(loop); }\n" \
                "requestAnimationFrame(loop);\n</script></body></html>"
 
+BROWSER_LAYOUT_APIS = "<!doctype html><html><body><canvas id='c'></canvas><script>\n" \
+                      "const cv=document.getElementById('c');\n" \
+                      "cv.style.setProperty('--scale','1');\n" \
+                      "const ro=new ResizeObserver(()=>{}); ro.observe(cv); ro.disconnect();\n" \
+                      "const io=new IntersectionObserver(()=>{}); io.observe(cv); io.disconnect();\n" \
+                      "const mo=new MutationObserver(()=>{}); mo.observe(cv,{}); mo.disconnect();\n" \
+                      "requestAnimationFrame(()=>cv.getContext('2d').fillRect(0,0,1,1));\n" \
+                      "</script></body></html>"
+
 
 def test_bare_browser_globals_do_not_falsely_crash():
     ran, testable, detail, _dyn = smoke.smoke_source(BARE_GLOBALS, ".html")
     assert ran is True and testable is True, detail  # not "addEventListener is not defined"
+
+
+def test_layout_observers_and_css_style_api_do_not_falsely_crash():
+    ran, testable, detail, _dyn = smoke.smoke_source(BROWSER_LAYOUT_APIS, ".html")
+    assert ran is True and testable is True, detail
 
 
 def test_clean_web_file_runs():
