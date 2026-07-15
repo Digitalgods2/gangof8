@@ -1,0 +1,72 @@
+{
+  "profile_version": 1,
+  "name": "Gang of 8 settings",
+  "settings": {
+    "backend": "cli",
+    "role_agents": {
+      "lead": "codex",
+      "panelist": "codex",
+      "knowledge_retriever": "claude",
+      "researcher": "codex",
+      "architect": "claude",
+      "code_generator": "codex",
+      "api_integrator": "glm",
+      "critic": "gemini",
+      "red_team": "qwen",
+      "fact_validator": "codex",
+      "implementer": "kimi",
+      "summarizer": "gemini"
+    },
+    "role_models": {
+      "panelist": "gpt-5.6-sol",
+      "knowledge_retriever": "claude-opus-4.6",
+      "researcher": "gpt-5.5",
+      "architect": "claude-opus-4.8",
+      "code_generator": "gpt-5.5",
+      "red_team": "qwen/qwen3.7-plus",
+      "fact_validator": "gpt-5.4",
+      "summarizer": "gemini-3.5-flash"
+    },
+    "panel_seats": [],
+    "cli_models": {
+      "claude": "claude-opus-4.8",
+      "codex": "gpt-5.6-sol",
+      "gemini": "gemini-3.5-flash"
+    },
+    "cli_timeouts": {
+      "claude": 320,
+      "codex": 320,
+      "gemini": 320
+    },
+    "cli_enabled": {
+      "claude": true,
+      "codex": true,
+      "gemini": true
+    },
+    "openrouter_enabled": {
+      "deepseek": true,
+      "glm": true,
+      "qwen": true,
+      "kimi": true
+    },
+    "openrouter_models": {
+      "deepseek": "deepseek/deepseek-v4-pro",
+      "glm": "z-ai/glm-5.2",
+      "qwen": "qwen/qwen3.7-plus",
+      "kimi": "moonshotai/kimi-k2.7-code"
+    },
+    "budgets": {},
+    "risk_boundary": "low",
+    "composer": {
+      "prose_min_chars": 200,
+      "reserved_calls": 2,
+      "max_critic_tests": 3
+    },
+    "rounds_per_consent": 3,
+    "integration_review_enabled": true,
+    "ui": {
+      "poll_interval_ms": 5000,
+      "collapse_finished": true
+    }
+  }
+}

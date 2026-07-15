@@ -75,8 +75,9 @@ ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead se
 # The lead authors whole files in one shot, so give it markedly more headroom than
 # a quick specialist call before timing out.
 LEAD_TIMEOUT = 600
-# Ordinary package/panel authors receive this bounded call. Frontier authors use
-# FRONTIER_AUTHOR_TIMEOUT below so valuable code is not killed by elapsed time.
+# Ordinary package/panel authors receive this bounded call. Frontier authors get
+# a larger but still finite hard deadline so a wedged provider cannot hold a
+# package or release gate indefinitely.
 PANEL_AUTHOR_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_AUTHOR_TIMEOUT", "360"))
 # A focused non-frontier protocol/filename recovery uses a shorter window.
 PANEL_RETRY_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_RETRY_TIMEOUT", "180"))
@@ -84,13 +85,18 @@ FRONTIER_AUTHOR_SEATS = tuple(
     s.strip() for s in os.environ.get("GANGOF8_FRONTIER_AUTHOR_SEATS", "claude,codex").split(",")
     if s.strip()
 )
-# Zero is intentional: frontier implementation calls run until completion or
-# explicit user cancellation; they are not discarded by a coordinator clock.
-FRONTIER_AUTHOR_TIMEOUT = int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "0"))
+FRONTIER_AUTHOR_TIMEOUT = max(
+    1, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "600"))
+)
 FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
     os.environ.get("GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS", "1")
 )
-FRONTIER_VERIFY_TIMEOUT = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
+FRONTIER_VERIFY_TIMEOUT = max(
+    1, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "300"))
+)
+OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
+    1, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
+)
 FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing

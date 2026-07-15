@@ -194,6 +194,14 @@ button.deny:hover { background:rgba(255,93,108,.12); box-shadow:none; }
         padding:16px 18px; margin-bottom:14px; }
 .card h3 { margin:0 0 8px; font-size:12px; color:var(--dim); text-transform:uppercase;
            letter-spacing:.14em; font-weight:600; }
+.brief-note { margin:8px 0; padding:7px 9px; border-left:2px solid var(--line-strong);
+              background:rgba(255,255,255,.018); }
+.attempt-notice { display:flex; align-items:center; justify-content:space-between; gap:14px;
+                  margin:9px 0; padding:10px 12px; border:1px solid rgba(57,208,255,.35);
+                  border-radius:10px; background:rgba(57,208,255,.07); color:var(--text);
+                  font-size:12.5px; }
+.attempt-notice b { color:var(--brand-2); }
+.attempt-notice button { flex:none; }
 /* the ONE gate — dashed, yellow, unmistakable (promote-gate motif from the site) */
 .needs { border:1px dashed rgba(245,197,66,.5);
          background:linear-gradient(180deg,rgba(245,197,66,.05),transparent); }
@@ -384,6 +392,7 @@ header .hbtn:hover { color:var(--text); border-color:#fff3; transform:translateY
 .sset input[type=text], .sset input[type=number], .sset input[type=password],
 .sset select, .sset textarea { border-color:var(--scl, var(--line)); }
 .sset.s-ws       { --sc:#2dd4bf; --sbg:rgba(45,212,191,.05);  --scl:rgba(45,212,191,.4); }
+.sset.s-profile  { --sc:#79c0ff; --sbg:rgba(121,192,255,.05); --scl:rgba(121,192,255,.4); }
 .sset.s-backend  { --sc:#58a6ff; --sbg:rgba(88,166,255,.05);  --scl:rgba(88,166,255,.4); }
 .sset.s-models   { --sc:#bc8cff; --sbg:rgba(188,140,255,.05); --scl:rgba(188,140,255,.4); }
 .sset.s-gemkey   { --sc:#3fb950; --sbg:rgba(63,185,80,.05);   --scl:rgba(63,185,80,.4); }
@@ -392,6 +401,7 @@ header .hbtn:hover { color:var(--text); border-color:#fff3; transform:translateY
 .sset.s-roles    { --sc:#e3b341; --sbg:rgba(227,179,65,.05);  --scl:rgba(227,179,65,.4); }
 .sset.s-gov      { --sc:#f85149; --sbg:rgba(248,81,73,.05);   --scl:rgba(248,81,73,.4); }
 .sset.s-ui       { --sc:#8b949e; --sbg:rgba(139,148,158,.05); --scl:rgba(139,148,158,.4); }
+.profile-actions { flex-wrap:wrap; justify-content:flex-start; }
 .field { display:flex; align-items:center; gap:8px; margin-top:6px; }
 .field span, .field .lbl { flex:0 0 150px; color:var(--dim); font-size:12.5px; }
 /* password input with an in-field reveal eye. The .field span rule pins

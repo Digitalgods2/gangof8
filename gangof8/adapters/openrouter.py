@@ -20,7 +20,7 @@ from typing import Callable, Optional
 
 import httpx
 
-from .. import cancellation
+from .. import cancellation, config
 from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentError
@@ -33,6 +33,7 @@ class OpenRouterAdapter:
     # A plain HTTP request, not a local subprocess — bounded by the (larger)
     # API-seat concurrency limit, so it never queues behind heavy CLI seats.
     local_process = False
+    streams_progress = True
 
     def __init__(
         self,
@@ -90,9 +91,9 @@ class OpenRouterAdapter:
         # httpx's scalar timeout is per socket operation. A provider can keep a
         # request alive forever with transport-level trickles, which is exactly
         # how the live Qwen call ran for 16 minutes under a nominal 360-second
-        # limit. Reads are therefore unbounded here and the token-progress
-        # watchdog below owns the real stall policy. timeout_s == 0 remains the
-        # explicit no-deadline frontier-author mode.
+        # limit. Reads are therefore unbounded here and the watchdog below owns
+        # the real hard deadline. Streaming still supplies truthful progress,
+        # but token trickles never extend the stage's finite wall-clock bound.
         transport_timeout = httpx.Timeout(
             None,
             connect=30.0,
@@ -102,11 +103,10 @@ class OpenRouterAdapter:
         client = httpx.Client(timeout=transport_timeout)
         finished = threading.Event()
         stalled = threading.Event()
-        deadline_reason = ["stalled"]
+        deadline_reason = ["timed out"]
         progress_lock = threading.Lock()
         last_progress = [time.monotonic()]
         output_chars = [0]
-        coding_call = cancellation.current_call_kind() == "coding"
 
         def _abort() -> None:
             try:
@@ -120,28 +120,37 @@ class OpenRouterAdapter:
                 output_chars[0] = max(output_chars[0], chars)
             cancellation.report_progress(output_chars[0], "model output streaming")
 
-        def _watch_stall() -> None:
+        def _watch_deadline() -> None:
             if timeout_s <= 0:
                 return
-            stall_s = max(1.0, float(timeout_s))
+            deadline_s = max(1.0, float(timeout_s))
+            stall_s = float(config.OPENROUTER_OUTPUT_STALL_TIMEOUT)
             while not finished.wait(0.5):
                 with progress_lock:
                     quiet_for = time.monotonic() - last_progress[0]
                 elapsed = time.monotonic() - t0
-                if (quiet_for if coding_call else elapsed) >= stall_s:
-                    deadline_reason[0] = "stalled" if coding_call else "timed out"
+                if quiet_for >= stall_s:
+                    deadline_reason[0] = "stalled"
+                    stalled.set()
+                    _abort()
+                    return
+                if elapsed >= deadline_s:
+                    deadline_reason[0] = "timed out"
                     stalled.set()
                     _abort()
                     return
 
         def _deadline_error() -> str:
-            if deadline_reason[0] == "timed out":
-                return f"{self.name} (OpenRouter) timed out after {timeout_s}s"
-            return f"{self.name} (OpenRouter) stalled: no model output for {timeout_s}s"
+            if deadline_reason[0] == "stalled":
+                return (
+                    f"{self.name} (OpenRouter) stalled: no model output for "
+                    f"{config.OPENROUTER_OUTPUT_STALL_TIMEOUT}s"
+                )
+            return f"{self.name} (OpenRouter) timed out after {timeout_s}s"
 
         watchdog = threading.Thread(
-            target=_watch_stall,
-            name=f"gangof8-{self.name}-stall-watch",
+            target=_watch_deadline,
+            name=f"gangof8-{self.name}-deadline-watch",
             daemon=True,
         )
         cancellation.register_canceler(sid, _abort)
@@ -170,6 +179,16 @@ class OpenRouterAdapter:
                         for raw_line in resp.iter_lines():
                             if sid and cancellation.is_requested(sid):
                                 raise SessionCancelled()
+                            # The watchdog is required to interrupt a blocked
+                            # socket, but thread scheduling must not decide
+                            # whether a routine total deadline is enforced. A
+                            # final SSE line arriving after the deadline is
+                            # still late even if the watcher has not run yet.
+                            if (timeout_s > 0
+                                    and time.monotonic() - t0 >= max(1.0, float(timeout_s))):
+                                deadline_reason[0] = "timed out"
+                                stalled.set()
+                                raise AgentError(_deadline_error())
                             line = (raw_line.decode("utf-8", errors="replace")
                                     if isinstance(raw_line, bytes) else str(raw_line or ""))
                             if not line.startswith("data:"):

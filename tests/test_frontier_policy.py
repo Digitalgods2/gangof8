@@ -43,11 +43,13 @@ def test_protocol_filenames_strip_all_outer_presentation_quotes():
     assert canonical_protocol_filename("'assets/Benny\'s-theme.css'") == "assets/Benny's-theme.css"
 
 
-def test_zero_frontier_timeout_overrides_a_short_settings_cap():
+def test_frontier_timeout_is_finite_and_uses_the_stage_policy():
     session = _code_session()
     session.cli_timeouts = {"claude": 30}
     assert loop._effective_agent_timeout(
-        session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == 0
+        session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == config.FRONTIER_AUTHOR_TIMEOUT
+    assert 0 < config.FRONTIER_AUTHOR_TIMEOUT <= 600
+    assert 0 < config.FRONTIER_VERIFY_TIMEOUT <= 600
 
 
 def test_settings_timeout_never_caps_any_coding_stage():

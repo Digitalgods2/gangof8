@@ -1,5 +1,6 @@
 let current = null;
 let liveKey = null, liveSince = 0;  // drives the ticking elapsed timer
+let uiPreferences = {poll_interval_ms: 3000, collapse_finished: true};
 const detailRefreshGate = createLatestRequestGate();
 // Expand/collapse state for rollup sections, keyed by stable id (e.g.
 // "sec_contributions"). Tracked here rather than read off the DOM because
@@ -493,9 +494,7 @@ let _sessionsCache = [];
 let _followGoal = null, _planShownFor = "";
 
 function _goalSessions(g) {
-  const sessions = (g.milestones || []).map(m => m.session_id).filter(Boolean);
-  if (g.release_session_id) sessions.push(g.release_session_id);
-  return sessions;
+  return goalSessionIds(g, _sessionsCache);
 }
 
 function renderPlanningHero(g) {
@@ -613,8 +612,24 @@ async function refreshGoals(sessions = null) {
 
 async function resumeGoal(id, ev) {
   ev.stopPropagation();
-  await fetch(`/goals/${encodeURIComponent(id)}/resume`, {method: "POST"});
-  _lastGoalsSig = ""; pollLoop();
+  const response = await fetch(`/goals/${encodeURIComponent(id)}/resume`, {method: "POST"});
+  const resumed = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert("could not resume: " + (resumed.detail || response.status));
+    return;
+  }
+  _followGoal = id;
+  _planShownFor = "";
+  detailRefreshGate.invalidate();
+  _lastDetailSig = "";
+  _lastGoalsSig = "";
+  // The resume endpoint returns the fresh actionable package session. Select
+  // it immediately instead of leaving the failed attempt in the main pane.
+  if (resumed.actionable_session_id) {
+    current = resumed.actionable_session_id;
+    history.replaceState(null, "", "#" + current);
+  }
+  pollLoop();
 }
 
 async function cancelGoal(id, ev) {
@@ -743,7 +758,10 @@ async function _refreshDetail() {
   const right = document.getElementById("right");
   const feedKey = _liveFeed.length
     ? _liveFeed[_liveFeed.length - 1].ts + ":" + _liveFeed.length : "";
-  const sig = JSON.stringify(detail) + "|talent:" + _liveTalent + "|feed:" + feedKey;
+  const parentGoal = detail?.goal_id
+    ? _goalsCache.find(goal => goal.goal_id === detail.goal_id) : null;
+  const sig = JSON.stringify(detail) + "|goal:" + goalRenderSignature(parentGoal)
+    + "|talent:" + _liveTalent + "|feed:" + feedKey;
   if (sig === _lastDetailSig) return;
   const terminal = detail && TERMINAL_STATES.has(detail.status);
   if (!terminal && _hasSelectionIn(right)) return;
@@ -755,8 +773,12 @@ async function _refreshDetail() {
 // working. Idle (everything done/cancelled/failed) → slow checks; tab hidden →
 // no requests at all; resume instantly when the tab is shown again.
 const TERMINAL_STATES = new Set(["done", "cancelled", "failed"]);
-const POLL_ACTIVE = 3000, POLL_IDLE = 20000, POLL_HIDDEN = 30000;
+const POLL_ACTIVE_DEFAULT = 3000, POLL_IDLE = 20000, POLL_HIDDEN = 30000;
 let _pollTimer = null, _pollGeneration = 0;
+function activePollInterval() {
+  const n = Number(uiPreferences.poll_interval_ms);
+  return Number.isFinite(n) ? Math.max(500, Math.min(60000, n)) : POLL_ACTIVE_DEFAULT;
+}
 async function pollLoop() {
   const pollGeneration = ++_pollGeneration;
   if (_pollTimer) { clearTimeout(_pollTimer); _pollTimer = null; }
@@ -770,7 +792,7 @@ async function pollLoop() {
     if (pollGeneration !== _pollGeneration) return;
     const working = (sessions || []).some(s => !TERMINAL_STATES.has(s.status))
       || _goalsCache.some(g => GOAL_LIVE.has(g.status));
-    delay = working ? POLL_ACTIVE : POLL_IDLE;
+    delay = working ? activePollInterval() : POLL_IDLE;
   }
   _pollTimer = setTimeout(pollLoop, delay);
 }
@@ -811,6 +833,15 @@ function renderDetail(s) {
   const currentPackage = parentGoal
     ? (parentGoal.milestones || []).find(m => m.package_id === s.work_package_id)
     : null;
+  const attemptState = packageMode
+    ? packageAttemptState(s, parentGoal, _sessionsCache) : null;
+  const retryRunning = !!(attemptState?.isHistorical && currentPackage &&
+    !TERMINAL_STATES.has(currentPackage.session_status || currentPackage.status));
+  const taskStatusLabel = retryRunning
+    ? `historical ${verificationFailed ? "failed verification" : s.status}`
+    : (verificationFailed ? "failed verification" : s.status);
+  const attemptMeta = attemptState?.total
+    ? `attempt ${attemptState.selectedNumber || "?"} of ${attemptState.total}` : "";
 
   // The poll timer re-renders this pane every few seconds; snapshot any
   // in-progress answer text + focus/caret + scroll so reading/typing isn't
@@ -862,13 +893,15 @@ function renderDetail(s) {
     waitRole = activeCall.role || waitRole;
     waitAgent = activeCall.agent || waitAgent;
     const deadline = activeCall.timeout_s === 0
-      ? "no coding deadline"
-      : `${activeCall.timeout_s || "?"}s no-output watchdog`;
+      ? "no hard deadline"
+      : `${activeCall.timeout_s || "?"}s hard deadline`;
+    const stall = activeCall.stall_timeout_s
+      ? ` · ${activeCall.stall_timeout_s}s no-output limit` : "";
     const chars = activeCall.progress_chars || 0;
     const progress = chars
       ? `streamed ${chars.toLocaleString()} chars`
       : "waiting for first model output";
-    liveGoal = `${packageMode ? "package owner" : "model"} working · ${progress} · ${deadline}`;
+    liveGoal = `${packageMode ? "package owner" : "model"} working · ${progress} · ${deadline}${stall}`;
   }
   // reset the elapsed clock whenever the live situation actually changes
   const key = working ? `${s.session_id}|${s.status}|${s.current_round}|${s.agent_calls}|${activeCall?.call_id || waitRole}` : null;
@@ -906,7 +939,9 @@ function renderDetail(s) {
   }
   const qualityGate = runSummary.quality_gate || s.quality_gate || {};
   if (qualityGate.verdict) {
-    statBits.push(`release gate <b>${esc(String(qualityGate.verdict).toLowerCase())}</b>${qualityGate.verifier ? ` by ${esc(qualityGate.verifier)}` : ""}`);
+    const gateLabel = String(qualityGate.stage || "").startsWith("deterministic_assembly")
+      ? "deterministic assembly gate" : "release gate";
+    statBits.push(`${gateLabel} <b>${esc(String(qualityGate.verdict).toLowerCase())}</b>${qualityGate.verifier ? ` by ${esc(qualityGate.verifier)}` : ""}`);
   }
   // legacy sessions may carry court-era disagreements; show them if present
   if (disagreements.length) statBits.push(`<b>${disagreements.length}</b> disagreement${disagreements.length === 1 ? "" : "s"}`);
@@ -930,12 +965,19 @@ function renderDetail(s) {
 
   const showSummary = !!final || contribs.length || disagreements.length;
   // finished sessions collapse by default; live ones expand so progress shows
-  const collapseDefault = working;
+  const collapseDefault = working || uiPreferences.collapse_finished === false;
 
   right.innerHTML = `
     <div class="card">
-      <h3>Task — <span class="pill ${esc(s.status)}">${esc(verificationFailed ? "failed verification" : s.status)}</span>
+      <h3>Task — <span class="pill ${esc(s.status)}">${esc(taskStatusLabel)}</span>
+          ${attemptMeta ? `<span class="sub"> · ${esc(attemptMeta)}${attemptState.isHistorical ? " · historical" : " · current"}</span>` : ""}
           ${s.stop_reason ? `<span class="sub"> · ${esc(s.stop_reason)}</span>` : ""}</h3>
+      ${retryRunning ? `<div class="attempt-notice live-attempt">
+        <span><b>Retry attempt ${esc(attemptState.currentNumber || attemptState.total)} is still running.</b>
+        This failed result is historical, not the goal's current state.</span>
+        <button onclick="select('${esc(currentPackage.session_id)}')">View active retry</button>
+      </div>` : ""}
+      ${packageMode ? `<div class="sub brief-note">Package briefs are captured when an attempt starts. Any status words inside older briefs are historical; the live build-team state is shown below.</div>` : ""}
       <div class="mono">${esc(s.task?.text)}</div>
       ${s.established_root ? `<div class="sub" style="margin-top:6px" title="read-only source; files reach it only via an approved promote">📂 established folder: <span class="mono">${esc(s.established_root)}</span></div>` : ""}
       ${(s.attachments||[]).length ? `<div class="atts" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${
@@ -945,7 +987,7 @@ function renderDetail(s) {
 
     ${showSummary ? `
       <div class="card summary">
-        <h3>${verificationFailed ? "Verification failed — not delivered" : ((s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary")}</h3>
+        <h3>${retryRunning ? "Historical attempt failed — retry still running" : (verificationFailed ? "Verification failed — not delivered" : ((s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary"))}</h3>
         ${final ? `
           <div class="row" style="margin-top:0"><span class="conf-${esc(final.confidence)}">${esc(final.confidence)} confidence</span></div>
           <pre>${esc(final.answer)}</pre>` : ``}
@@ -1003,7 +1045,10 @@ function renderDetail(s) {
             const hard = (m.depends_on || []).filter(d => parentGoal.milestones[d] && parentGoal.milestones[d].status !== "done");
             const title = hard.length
               ? `blocked on verified package ${hard.map(d => d + 1).join(", ")}`
-              : (m.contract_depends_on || []).length ? "running from declared interfaces; no artifact wait" : "no upstream blocker";
+              : m.status === "done" ? "completed"
+              : m.status === "running" && (m.contract_depends_on || []).length
+                ? "running from declared interfaces; no artifact wait"
+                : `${m.status}; no upstream blocker`;
             return `<span class="seat role-panelist ${active ? "spoke" : "on"}" title="${esc(title)}">P${i + 1} · ${esc(m.owner || "unassigned")} · ${esc(m.status)}</span>`;
           }).join("") : roster.map(m => {
             const talent = !DRIVE_ROLES.has(m.role);
@@ -1308,6 +1353,7 @@ async function openSettings() {
     api("/settings/api-keys/gemini").catch(() => ({present: false})),
   ]);
   settingsCache = settings;
+  applyUiPreferences(settings.ui);
   seatsCache = seatsResp.seats || [];
   wsCache = wsResp;
   orKey = keyResp || {present: false};
@@ -1317,6 +1363,22 @@ async function openSettings() {
 
 function closeSettings() {
   document.getElementById("settingsOverlay").classList.remove("open");
+}
+
+function applyUiPreferences(ui) {
+  uiPreferences = Object.assign(
+    {poll_interval_ms: 3000, collapse_finished: true}, ui || {}
+  );
+}
+
+async function loadUiPreferences() {
+  try {
+    const settings = await api("/settings");
+    settingsCache = settings;
+    applyUiPreferences(settings.ui);
+  } catch (_) {
+    // The dashboard remains usable with the built-in visual defaults.
+  }
 }
 
 // Model options for a ROLE's model pin: the catalog of whichever seat the role
@@ -1418,6 +1480,18 @@ function renderSettings(s, seats) {
   }).join("");
 
   document.getElementById("settingsBody").innerHTML = `
+    <div class="sset s-profile">
+      <label>Portable settings profile</label>
+      <div class="field profile-actions">
+        <button class="ghost" onclick="exportSettingsProfile()">Export saved profile</button>
+        <button class="ghost" onclick="chooseSettingsProfile()">Import profile…</button>
+        <button onclick="loadDefaultSettingsProfile()">Load packaged defaults</button>
+        <input id="settingsProfileFile" type="file" accept="application/json,.json"
+               style="display:none" onchange="importSettingsProfile(event)">
+      </div>
+      <div class="sub">Moves local CLI and OpenRouter seat/model selections, role and model mapping, governance/composer controls, and UI preferences between installations. API keys, workspaces, sandbox/delivery folders, sessions, and other machine state are never included.</div>
+    </div>
+
     <div class="sset s-ws">
       <label>Workspace ${tip("workspace")}</label>
       ${wsRows || '<div class="sub">no workspaces — add one below</div>'}
@@ -1467,7 +1541,7 @@ function renderSettings(s, seats) {
           </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
                  spellcheck="false" placeholder="exact model id" style="flex:1;min-width:220px;display:none">
           <label class="sub" style="flex:0 0 auto;display:flex;align-items:center;gap:5px;margin:0"
-                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). It never caps a coding session; Claude/Codex implementation and frontier release verification have no coordinator deadline and remain user-cancellable.">⏱
+                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). Coding stages use separate finite author, lead, judge, repair, and release deadlines; every call remains user-cancellable.">⏱
             <input type="number" class="cli_timeout" data-seat="${esc(x.name)}" min="30" max="3600" step="10"
                    value="${escAttr(String(_to))}" placeholder="${escAttr(String(_tod))}" style="width:74px">s</label>
         </div>`;}).join("")}
@@ -1475,7 +1549,7 @@ function renderSettings(s, seats) {
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
-      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). It does not cap any coding session. Code calls use their author/lead/judge/codifier stage policy; Claude/Codex implementation-owner and independent release-verifier calls use no coordinator deadline. Cancel still terminates their CLI process immediately.</div>
+      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). Coding calls use finite author/lead/judge/codifier/release stage deadlines. Cancel still terminates their CLI process immediately.</div>
       <div class="sub">Uncheck a seat to run <b>OpenRouter-only</b>: its roles fall back to an enabled OpenRouter model (below), and it leaves the panel. Needs an OpenRouter key and at least one enabled OpenRouter seat — otherwise the seat stays on so the council always has a lead.</div>
     </div>
 
@@ -1586,6 +1660,88 @@ function _num(id, fallback) {
   return Number.isFinite(v) ? v : fallback;
 }
 
+function _profileNote(message, bad = false) {
+  const note = document.getElementById("savedNote");
+  if (!note) return;
+  note.style.color = bad ? "var(--bad)" : "";
+  note.textContent = message;
+}
+
+async function _refreshSettingsAfterProfile(message) {
+  const [settings, seatsResp] = await Promise.all([
+    api("/settings"),
+    api("/settings/seats").catch(() => ({seats: []})),
+  ]);
+  settingsCache = settings;
+  seatsCache = seatsResp.seats || [];
+  applyUiPreferences(settings.ui);
+  openSections = {};
+  renderSettings(settingsCache, seatsCache);
+  _profileNote(message);
+  loadHealth();
+  pollLoop();
+}
+
+async function exportSettingsProfile() {
+  try {
+    const profile = await api("/settings/profile");
+    const blob = new Blob([JSON.stringify(profile, null, 2) + "\n"], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "gangof8-settings-profile.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    _profileNote("portable profile exported ✓");
+  } catch (e) {
+    _profileNote(`profile export failed: ${e.message || e}`, true);
+  }
+}
+
+function chooseSettingsProfile() {
+  document.getElementById("settingsProfileFile")?.click();
+}
+
+async function importSettingsProfile(event) {
+  const input = event?.target;
+  const file = input?.files?.[0];
+  if (!file) return;
+  try {
+    // Windows PowerShell 5.1 may write UTF-8 JSON with a BOM.  Treat it as the
+    // same portable file instead of rejecting an otherwise valid export.
+    const profile = JSON.parse((await file.text()).replace(/^\uFEFF/, ""));
+    const r = await fetch("/settings/profile", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(profile),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || `HTTP ${r.status}`);
+    }
+    await _refreshSettingsAfterProfile("profile loaded; keys and folders unchanged ✓");
+  } catch (e) {
+    _profileNote(`profile import failed: ${e.message || e}`, true);
+  } finally {
+    if (input) input.value = "";
+  }
+}
+
+async function loadDefaultSettingsProfile() {
+  if (!confirm("Load the packaged Gang of 8 defaults?\n\nThis replaces model, role, governance/composer, and UI preferences. API keys, workspaces, and sandbox folders stay unchanged.")) return;
+  try {
+    const r = await fetch("/settings/profile/default", {method: "POST"});
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || `HTTP ${r.status}`);
+    }
+    await _refreshSettingsAfterProfile("packaged defaults loaded; keys and folders unchanged ✓");
+  } catch (e) {
+    _profileNote(`could not load packaged defaults: ${e.message || e}`, true);
+  }
+}
+
 // One-click preset: enable every OpenRouter seat, turn off the local CLI seats,
 // and save. Needs an OpenRouter key — without one the backend keeps the CLIs on
 // (a role must always have a seat), so we stop and say so rather than no-op.
@@ -1689,6 +1845,9 @@ async function saveSettings() {
   if (r.ok) {
     note.textContent = "saved ✓";
     settingsCache = await r.json();
+    applyUiPreferences(settingsCache.ui);
+    openSections = {};
+    pollLoop();
     loadHealth();  // header backend label may have changed
     // also commit a workspace folder typed but not yet added — Save should
     // persist it too, not silently drop it (idempotent on the backend).
@@ -1901,7 +2060,7 @@ bindComposerDrag();
 // deep link: /#<session_id> re-opens that session; otherwise the hero greets
 if (location.hash.length > 1) select(decodeURIComponent(location.hash.slice(1)));
 else renderEmptyHero();
-pollLoop();
+loadUiPreferences().finally(() => pollLoop());
 setInterval(tickElapsed, 1000);
 // when a task is submitted or an action resolved, jump back to fast polling
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollLoop(); });

@@ -21,6 +21,36 @@ node --check gangof8\static\app.js
 GitHub Actions runs the Ruff correctness checks and the full test suite for
 pull requests and changes to `main`.
 
+## Reliability follow-up: bound failed model calls
+
+An implementation-owner call that runs for many minutes and then returns a
+refusal or no required artifacts is a failed call, even when its subprocess
+exits successfully. Do not report that outcome only as `agent_call_finished`
+or silently allow an unlimited retry.
+
+Mitigation/fix requirements:
+
+- Replace `timeout_s: 0` for coding calls with a configurable, finite hard
+  deadline. The default should stop a single call well before 19 minutes
+  (target: at most 10 minutes), while preserving immediate user cancellation.
+- Where the backend exposes streaming activity, enforce a separate no-output
+  stall deadline and persist meaningful progress timestamps. Do not treat a
+  buffered CLI's permanent `progress_chars: 0` as proof of healthy progress.
+- Separate transport completion from semantic success. If a package requires
+  artifacts and the response is a refusal, malformed artifact contract, or
+  contains none of the required files, record a failed attempt with an explicit
+  reason such as `missing_required_artifacts`.
+- Keep recovery bounded. A targeted retry may be attempted, but repeated
+  timeout/refusal/no-artifact results must fail or pause the package instead of
+  consuming unbounded wall time.
+- Expose elapsed time, deadline, last real progress, attempt number, and failure
+  reason through the session/timeline read APIs and dashboard.
+
+Regression coverage should include a slow adapter that exceeds the hard
+deadline, a successful subprocess that returns only a refusal, a response that
+omits required artifact markers, and a bounded retry that reaches a clear
+terminal package state.
+
 ## Module boundaries
 
 - `service.py` wires storage, configuration, adapter registration, background

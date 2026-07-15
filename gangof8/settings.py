@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import config
 
 SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_PROFILE_VERSION = 1
 
 
 class ComposerSettings(BaseModel):
@@ -87,6 +88,98 @@ class Settings(BaseModel):
     integration_review_enabled: bool = True
 
 
+# Portable profiles use an explicit allowlist.  Do not replace this with a
+# blanket Settings.model_dump(): a future machine-specific path or secret must
+# not silently become exportable just because it was added to Settings.
+PORTABLE_SETTINGS_FIELDS = (
+    "backend",
+    "role_agents",
+    "role_models",
+    "panel_seats",
+    "cli_models",
+    "cli_timeouts",
+    "cli_enabled",
+    "openrouter_enabled",
+    "openrouter_models",
+    "budgets",
+    "risk_boundary",
+    "composer",
+    "rounds_per_consent",
+    "integration_review_enabled",
+    "ui",
+)
+
+
+class SettingsProfile(BaseModel):
+    """Versioned, non-secret settings that can move between installations.
+
+    Workspaces, sandbox roots, delivery paths, uploads, session state, and API
+    keys do not exist in this schema.  Unknown fields are rejected instead of
+    being ignored so a misleading or unsafe profile cannot appear to import.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    profile_version: Literal[SETTINGS_PROFILE_VERSION] = SETTINGS_PROFILE_VERSION
+    name: str = "Gang of 8 settings"
+    settings: dict[str, object]
+
+    @field_validator("settings")
+    @classmethod
+    def portable_settings_only(cls, value: dict[str, object]) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ValueError("profile settings must be an object")
+        unknown = sorted(set(value) - set(PORTABLE_SETTINGS_FIELDS))
+        if unknown:
+            raise ValueError(
+                "profile contains non-portable or unknown settings: " + ", ".join(unknown)
+            )
+
+        # Validate every supplied value through the real Settings model.  A
+        # profile may be partial for forward-compatible hand-authored presets;
+        # nested composer/UI objects retain their normal defaults.
+        candidate = Settings().model_dump()
+        for key, item in value.items():
+            if isinstance(candidate[key], dict) and isinstance(item, dict):
+                candidate[key].update(item)
+            else:
+                candidate[key] = item
+        validated = Settings.model_validate(candidate).model_dump()
+        return {key: validated[key] for key in value}
+
+
+def portable_settings_data(settings: Settings) -> dict:
+    """Return only the explicitly portable portion of effective settings."""
+    data = settings.model_dump()
+    return {key: data[key] for key in PORTABLE_SETTINGS_FIELDS}
+
+
+def make_settings_profile(
+    settings: Settings, name: str = "Gang of 8 settings"
+) -> SettingsProfile:
+    return SettingsProfile(name=name, settings=portable_settings_data(settings))
+
+
+def apply_settings_profile(current: Settings, profile: SettingsProfile) -> Settings:
+    """Overlay a validated portable profile without touching machine state."""
+    merged = current.model_dump()
+    for key, value in profile.settings.items():
+        # Profile maps represent the complete selection.  Replacing them is
+        # important: loading a profile must remove stale seat/model/role pins.
+        merged[key] = value
+    merged["settings_version"] = SETTINGS_SCHEMA_VERSION
+    return Settings.model_validate(merged)
+
+
+def default_settings_profile_path() -> Path:
+    return Path(__file__).with_name("default-settings.json")
+
+
+def load_default_settings_profile() -> SettingsProfile:
+    data = json.loads(default_settings_profile_path().read_text(encoding="utf-8"))
+    return SettingsProfile.model_validate(data)
+
+
 def _settings_path(data_dir: Optional[Path] = None) -> Path:
     return (Path(data_dir) if data_dir else config.DATA_DIR) / "settings.json"
 
@@ -102,13 +195,22 @@ def migrate_settings_data(data: dict) -> dict:
     return out
 
 
-def load_settings(data_dir: Optional[Path] = None) -> Settings:
+def load_settings(
+    data_dir: Optional[Path] = None, *, use_packaged_default: bool = False
+) -> Settings:
     """Return the effective settings: config/env defaults overlaid with any
     values present in settings.json. Absent or partial files are tolerated —
     with no file the result equals the pure config/env defaults."""
     settings = Settings()  # config/env defaults via field default_factories
     path = _settings_path(data_dir)
     if not path.exists():
+        if use_packaged_default:
+            try:
+                return apply_settings_profile(settings, load_default_settings_profile())
+            except (json.JSONDecodeError, OSError, ValueError):
+                # A damaged package must not make the application unstartable.
+                # The explicit Load defaults endpoint will surface the error.
+                pass
         return settings
     try:
         stored = json.loads(path.read_text(encoding="utf-8"))

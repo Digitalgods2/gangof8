@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from . import config
+from . import assembly, config
 from .models import Goal, GoalMilestone, utcnow
 
 
@@ -287,6 +287,9 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "OUTPUTS: <comma-separated exclusive relative files, or NONE>\n"
         "RELEASE: <subset of OUTPUTS that the user should receive, or NONE>\n"
         "REQUIRES: <files that MUST physically exist before this package starts, or NONE>\n"
+        "ASSEMBLY: <HTML_INLINE for deterministic single-file HTML assembly, or NONE>\n"
+        "TEMPLATE: <an accepted upstream HTML template path, OWNER for one compact "
+        "glue-only author call, or NONE>\n"
         "INTERFACE: <the API/data/DOM contract this package provides or consumes>\n"
         "CHECK: <optional static check: exactly 'node --check <file.js>' or "
         "'python -m py_compile <file.py>'>\n"
@@ -294,6 +297,7 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "AFTER: <comma-separated 1-based package numbers, or NONE>\n"
         "CONTRACTS: <comma-separated 1-based package numbers, or NONE>\n"
         "TASK: <...>\nOUTPUTS: <...>\nRELEASE: <...>\nREQUIRES: <...>\n"
+        "ASSEMBLY: <...>\nTEMPLATE: <...>\n"
         "INTERFACE: <...>\nCHECK: <...>\n\n"
         "OUTPUTS is a staging contract. Two parallel packages may not own the same "
         "path. Use CONTRACTS when a package can author against another package's "
@@ -305,12 +309,22 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "the assembled system. A broad build should normally start most owners in the "
         "first wave. REQUIRES must list only hard physical inputs; do not list a future "
         "package output when CONTRACTS is enough. Every package must include OWNER, "
-        "AFTER, CONTRACTS, OUTPUTS, RELEASE, REQUIRES, and INTERFACE. Nothing is delivered per "
+        "AFTER, CONTRACTS, OUTPUTS, RELEASE, REQUIRES, ASSEMBLY, TEMPLATE, and "
+        "INTERFACE. Nothing is delivered per "
         "package; validated outputs remain private staging inputs. RELEASE is the "
         "explicit final-delivery manifest: normally only a final integration/package "
         "declares it, and every RELEASE path must also appear in that package's "
         "OUTPUTS. If the goal asks for a single file, RELEASE must name exactly that "
         "one file. All RELEASE files are reviewed and moved together at the end.\n\n"
+        "For a single-file HTML release assembled from staged CSS/JavaScript, use "
+        "ASSEMBLY: HTML_INLINE. Prefer an earlier package that owns a compact HTML "
+        "shell/template and set TEMPLATE to that accepted path; the template uses one "
+        "literal '<!-- GANGOF8:STYLE path -->' or '<!-- GANGOF8:SCRIPT path -->' "
+        "directive for every source named in REQUIRES. The coordinator expands those "
+        "accepted files directly without sending or truncating their bodies through a "
+        "model. Use TEMPLATE: OWNER only when the integration owner genuinely must author "
+        "the small DOM/bootstrap shell. Non-assembly packages use ASSEMBLY: NONE and "
+        "TEMPLATE: NONE.\n\n"
         f"GOAL:\n{goal_text}"
     )
 
@@ -323,6 +337,8 @@ _TASK_RE = re.compile(r"^\s*TASK\s*:\s*(.*)$", re.IGNORECASE)
 _OUTPUTS_RE = re.compile(r"^\s*OUTPUTS?\s*:\s*(.*)$", re.IGNORECASE)
 _RELEASE_RE = re.compile(r"^\s*RELEASES?\s*:\s*(.*)$", re.IGNORECASE)
 _REQUIRES_RE = re.compile(r"^\s*REQUIRES?\s*:\s*(.*)$", re.IGNORECASE)
+_ASSEMBLY_RE = re.compile(r"^\s*ASSEMBLY\s*:\s*(.*)$", re.IGNORECASE)
+_TEMPLATE_RE = re.compile(r"^\s*TEMPLATE\s*:\s*(.*)$", re.IGNORECASE)
 _CHECK_RE = re.compile(r"^\s*CHECK\s*:\s*(.*)$", re.IGNORECASE)
 _OWNER_RE = re.compile(r"^\s*OWNER\s*:\s*(.*)$", re.IGNORECASE)
 _AFTER_RE = re.compile(r"^\s*AFTER\s*:\s*(.*)$", re.IGNORECASE)
@@ -417,6 +433,8 @@ def parse_milestones(text: str) -> list[GoalMilestone]:
     after: list[int] = []
     contract_after: list[int] = []
     interface = ""
+    assembly_mode = ""
+    assembly_template = ""
     outputs_declared = False
     outputs_none = False
     release_declared = False
@@ -425,7 +443,7 @@ def parse_milestones(text: str) -> list[GoalMilestone]:
 
     def flush() -> None:
         nonlocal title, task_lines, outputs, release_files, requires, checks, owner, after, contract_after
-        nonlocal interface
+        nonlocal interface, assembly_mode, assembly_template
         nonlocal outputs_declared, outputs_none, release_declared
         nonlocal contract_errors, in_task
         if title is not None:
@@ -437,6 +455,7 @@ def parse_milestones(text: str) -> list[GoalMilestone]:
                 interface_contract=interface,
                 required_files=outputs, release_files=release_files,
                 release_declared=release_declared, dependencies=requires,
+                assembly_mode=assembly_mode, assembly_template=assembly_template,
                 acceptance_commands=checks,
                 contract_declared=outputs_declared,
                 requires_delivery=bool(outputs) and not outputs_none,
@@ -444,6 +463,7 @@ def parse_milestones(text: str) -> list[GoalMilestone]:
             ))
         title, task_lines, outputs, release_files, requires, checks = None, [], [], [], [], []
         owner, after, contract_after, interface = "", [], [], ""
+        assembly_mode, assembly_template = "", ""
         outputs_declared, outputs_none, release_declared = False, False, False
         contract_errors, in_task = [], False
 
@@ -495,9 +515,29 @@ def parse_milestones(text: str) -> list[GoalMilestone]:
             requires, errors, _ = _relative_paths(req.group(1))
             contract_errors.extend(errors)
             continue
+        assembly_match = _ASSEMBLY_RE.match(line)
+        if assembly_match and title is not None:
+            assembly_mode = assembly.normalize_mode(assembly_match.group(1))
+            continue
+        template_match = _TEMPLATE_RE.match(line)
+        if template_match and title is not None:
+            assembly_template = assembly.normalize_template(template_match.group(1))
+            if assembly_template and assembly_template != assembly.OWNER_TEMPLATE:
+                parsed, errors, _ = _relative_paths(assembly_template)
+                contract_errors.extend(errors)
+                assembly_template = parsed[0] if len(parsed) == 1 else ""
+                if len(parsed) != 1 and not errors:
+                    contract_errors.append("TEMPLATE must name exactly one relative file")
+            continue
         check = _CHECK_RE.match(line)
         if check and title is not None and check.group(1).strip():
-            checks.append(check.group(1).strip())
+            command = check.group(1).strip()
+            # ``CHECK: NONE`` explicitly declares that no automatic static
+            # command exists. Persisting the sentinel made valid packages fail.
+            if command.strip("` ").lower() not in {
+                "none", "n/a", "na", "-", "not applicable", "no check", "no checks",
+            }:
+                checks.append(command)
             continue
         contract = _INTERFACE_RE.match(line)
         if contract and title is not None:
@@ -548,7 +588,7 @@ def compose_milestone_task(goal: Goal, index: int) -> str:
                 outputs = ", ".join(dependency.required_files) or "no file outputs"
                 parts.append(
                     f"- Package {dependency.index + 1}: {dependency.title} "
-                    f"(owner {dependency.owner or 'unassigned'}; status {dependency.status}; "
+                    f"(owner {dependency.owner or 'unassigned'}; "
                     f"future outputs: {outputs})"
                 )
                 parts.append(
@@ -603,6 +643,14 @@ def compose_milestone_task(goal: Goal, index: int) -> str:
             "\nRUNTIME DEPENDENCIES — validate against these delivered files:"
         )
         parts.extend(f"- {name}" for name in ms.dependencies)
+    if ms.assembly_mode:
+        parts.append("\nDETERMINISTIC ASSEMBLY CONTRACT:")
+        parts.append(f"- Mode: {ms.assembly_mode}")
+        parts.append(f"- Template: {ms.assembly_template or assembly.OWNER_TEMPLATE}")
+        parts.append(
+            "Dependency bodies are expanded directly from accepted staging bytes. "
+            "Do not request, copy, summarize, or re-emit those files through the model."
+        )
     if ms.acceptance_commands:
         parts.append("\nREQUIRED ACCEPTANCE CHECKS:")
         parts.extend(f"- {command}" for command in ms.acceptance_commands)
@@ -611,10 +659,10 @@ def compose_milestone_task(goal: Goal, index: int) -> str:
         parts.append("")
         parts.append(
             "OTHER OWNED PACKAGES — they may run in parallel; they are explicitly OUT "
-            "of scope for this owner:"
+            "of scope for this owner. These are assignments, not live status indicators:"
         )
         parts.extend(
-            f"- Package {m.index + 1}: {m.title} — {m.owner or 'unassigned'} ({m.status})"
+            f"- Package {m.index + 1}: {m.title} — owner {m.owner or 'unassigned'}"
             for m in other_packages
         )
     else:

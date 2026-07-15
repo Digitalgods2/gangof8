@@ -139,8 +139,8 @@ def test_adapter_call_interrupted_by_cancel(monkeypatch):
         cancellation.clear(sid)
 
 
-def test_productive_stream_can_run_longer_than_stall_window(monkeypatch):
-    """Coding has no total wall clock: each real output chunk refreshes liveness."""
+def test_productive_stream_cannot_extend_the_hard_deadline(monkeypatch):
+    """Real token progress is visible but never turns a deadline into infinity."""
     import time
 
     class _StreamResponse:
@@ -172,12 +172,11 @@ def test_productive_stream_can_run_longer_than_stall_window(monkeypatch):
     monkeypatch.setattr(orm.httpx, "Client", _StreamingClient)
     cancellation.set_call_kind("coding")
     try:
-        out = OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key").call(
-            Role.code_generator, "write it", timeout_s=1)
+        with pytest.raises(AgentError, match="timed out after 1s"):
+            OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key").call(
+                Role.code_generator, "write it", timeout_s=1)
     finally:
         cancellation.set_call_kind(None)
-    assert out.content == "hello world"
-    assert out.duration_ms >= 1100  # total exceeded 1s; no output gap did
 
 
 def test_routine_stream_uses_total_wall_clock_deadline(monkeypatch):
@@ -211,7 +210,7 @@ def test_routine_stream_uses_total_wall_clock_deadline(monkeypatch):
         cancellation.set_call_kind(None)
 
 
-def test_silent_stream_is_closed_by_model_progress_watchdog(monkeypatch):
+def test_silent_stream_is_closed_by_independent_progress_watchdog(monkeypatch):
     import threading
 
     closed = threading.Event()
@@ -242,11 +241,12 @@ def test_silent_stream_is_closed_by_model_progress_watchdog(monkeypatch):
             closed.set()
 
     monkeypatch.setattr(orm.httpx, "Client", _StalledClient)
+    monkeypatch.setattr(orm.config, "OPENROUTER_OUTPUT_STALL_TIMEOUT", 1)
     adapter = OpenRouterAdapter("qwen", "qwen/test", lambda: "sk-or-key")
     cancellation.set_call_kind("coding")
     try:
         with pytest.raises(AgentError, match="stalled: no model output for 1s"):
-            adapter.call(Role.code_generator, "write it", timeout_s=1)
+            adapter.call(Role.code_generator, "write it", timeout_s=5)
     finally:
         cancellation.set_call_kind(None)
     assert closed.is_set()

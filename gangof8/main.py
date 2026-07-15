@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from . import __version__, config, goals, reporting, security
 from .models import Role
 from .service import GangOf8Service
+from .settings import SettingsProfile
 
 # The trinity of local CLI seats whose call timeout is user-tunable in Settings.
 _CLI_TIMEOUT_SEATS = ("gemini", "claude", "codex")
@@ -477,6 +478,40 @@ def put_settings(body: SettingsPatch) -> dict:
     out["effective_backend"] = service.backend
     out["note"] = "saved — backend/role changes apply to new sessions"
     return out
+
+
+@app.get("/settings/profile")
+def export_settings_profile() -> dict:
+    """Export one portable JSON profile: no secrets, workspaces, or paths."""
+    return service.settings_profile().model_dump()
+
+
+@app.post("/settings/profile")
+def import_settings_profile(body: SettingsProfile) -> dict:
+    """Load a portable profile while preserving installation-local state."""
+    try:
+        service.import_settings_profile(body)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {
+        "loaded": True,
+        "profile": service.settings_profile().model_dump(),
+        "note": "profile loaded; API keys, workspaces, and sandbox location were unchanged",
+    }
+
+
+@app.post("/settings/profile/default")
+def apply_default_settings_profile() -> dict:
+    """Load the versioned default-settings.json bundled with the app."""
+    try:
+        service.load_default_settings_profile()
+    except (ValueError, OSError) as e:
+        raise HTTPException(status_code=500, detail=f"packaged settings profile is invalid: {e}")
+    return {
+        "loaded": True,
+        "profile": service.settings_profile().model_dump(),
+        "note": "packaged defaults loaded; API keys, workspaces, and sandbox location were unchanged",
+    }
 
 
 @app.get("/settings/seats")
