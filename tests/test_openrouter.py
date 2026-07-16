@@ -383,7 +383,15 @@ def test_disabled_cli_roles_inherit_other_enabled_clis(tmp_path, monkeypatch):
 
 
 def test_only_gemini_enabled_inherits_every_role(tmp_path, monkeypatch):
+    import shutil
+
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Panel derivation intentionally includes installed CLI executables only.
+    # Make Gemini's availability explicit so this settings test is independent
+    # of which AI CLIs happen to be installed on the test runner.
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/gemini" if name == "gemini" else None
+    )
     svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({
         "backend": "cli",
