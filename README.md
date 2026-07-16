@@ -382,7 +382,10 @@ registered or invoked and all of its roles are redistributed round-robin across
 the remaining enabled seats. A single enabled model therefore inherits the
 entire role map. If every model is disabled, new task submission fails with a
 clear prompt to enable at least one. OpenRouter seats still need an API key to
-answer calls.
+answer calls. Role-specific model pins remain attached to their originally
+configured provider: an inherited Gemini role never receives a Claude, Codex,
+or OpenRouter model identifier, and the original pin becomes active again if
+that provider is re-enabled.
 
 Backend and roster changes apply to new sessions. A running or paused session
 keeps the backend, panel, timeouts, and workflow version with which it started.

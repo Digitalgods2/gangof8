@@ -192,6 +192,12 @@ class GangOf8Service:
         else:
             self.role_agents = config.ROLE_AGENTS_BY_BACKEND[self.backend]
 
+        # Keep the user's declared/default mapping separate from the effective
+        # mapping after disabled-seat inheritance. Per-role model pins belong
+        # to the provider they were configured for; they must not follow an
+        # inherited role onto a different vendor's adapter.
+        self.configured_role_agents = dict(self.role_agents)
+
         # Push governance/composer tunables into the config module so the loop,
         # classifier and composer (which read config.* at call time) honour
         # settings. With no settings.json these equal the existing config
@@ -350,7 +356,8 @@ class GangOf8Service:
                 role = Role(role_name)
             except ValueError:
                 continue  # a stale pin for a role that no longer exists
-            if self.role_agents.get(role) == agent:
+            if (self.role_agents.get(role) == agent
+                    and self.configured_role_agents.get(role) == agent):
                 out[role_name] = model.strip()
         return out
 
@@ -454,7 +461,7 @@ class GangOf8Service:
         backend/role mapping/registry. Some changes (backend, role mapping)
         affect new sessions; in-flight sessions keep their own backend."""
         merged = self.settings.model_dump()
-        old_role_agents = dict(self.role_agents or {})
+        old_role_agents = dict(self.configured_role_agents or {})
         for key, value in (patch or {}).items():
             if key not in merged:
                 continue
@@ -478,7 +485,7 @@ class GangOf8Service:
                     role = Role(role_name)
                 except ValueError:
                     continue
-                if self.role_agents.get(role) == old_role_agents.get(role):
+                if self.configured_role_agents.get(role) == old_role_agents.get(role):
                     kept[role_name] = model
             if kept != self.settings.role_models:
                 self.settings.role_models = kept
@@ -2363,6 +2370,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         files = self._goal_release_files(goal)
         goal.release_files = files
         if not files:
+            if goals.requires_delivery_contract(goal.text):
+                goal.status = "paused"
+                goal.release_status = "failed"
+                goal.last_error = "final release has no verified output files"
+                self.store.log_event(
+                    "-", "goal_release_blocked",
+                    {"goal_id": goal.goal_id, "reason": goal.last_error},
+                )
+                return
             goal.status = "completed"
             goal.release_status = "released"
             self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
@@ -3103,6 +3119,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             raise KeyError(f"goal {goal_id} not found")
         if goal.status != "paused":
             raise ValueError(f"cannot resume a goal in status '{goal.status}'")
+        if not goal.milestones:
+            replanning = self.goals.replan(goal_id)
+            if replanning is None:
+                raise ValueError("goal changed while attempting to restart planning")
+            self.store.log_event("-", "goal_replanning", {"goal_id": goal_id})
+            if background:
+                self._pool.submit(self._plan_and_start_safely, goal_id)
+                return self.get_goal(goal_id) or replanning.model_dump()
+            self._plan_and_start(goal_id)
+            return self.get_goal(goal_id) or replanning.model_dump()
         self._reopen_paused_assembly_provider(goal_id)
         recovered = self._recover_verified_goal_packages(goal_id)
         goal = self.goals.get(goal_id) or goal
@@ -3111,7 +3137,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "-", "goal_packages_recovered",
                 {"goal_id": goal_id, "packages": recovered},
             )
-        if all(m.status == "done" for m in goal.milestones) and goal.delivery_mode == "final_batch":
+        if (goal.milestones
+                and all(m.status == "done" for m in goal.milestones)
+                and goal.delivery_mode == "final_batch"):
             retry_defects = list(goal.release_defects)
             previous_release = (
                 self.manager.load(goal.release_session_id)

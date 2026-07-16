@@ -463,6 +463,58 @@ def test_unparseable_plan_degrades_to_single_milestone(tmp_path):
     assert "analysis-only milestone" in goal.plan_rationale
 
 
+def test_resume_empty_delivery_goal_replans_instead_of_releasing(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="Build and deliver index.html into C:\\tmp",
+        status="paused",
+        collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        milestones=[],
+        last_error="planner did not produce a delivery contract",
+        build_roster=["mock"],
+    )
+    service.goals.save(goal)
+    plan = (
+        "PACKAGE 1: Web app\nOWNER: mock\nAFTER: NONE\nCONTRACTS: NONE\n"
+        "TASK: Build and deliver index.html.\nOUTPUTS: index.html\n"
+        "RELEASE: index.html\nREQUIRES: NONE\n"
+        "INTERFACE: PROVIDES the complete web app\n"
+    )
+    service.registry.register(_PlannerSeat(plan=plan))
+    started = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.append(current.goal_id),
+    )
+
+    out = service.resume_goal(goal.goal_id, background=False)
+
+    assert out["status"] == "running"
+    assert len(out["milestones"]) == 1
+    assert out["release_status"] == "not_started"
+    assert started == [goal.goal_id]
+
+
+def test_delivery_goal_with_empty_release_fails_closed(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="Build and deliver index.html into C:\\tmp",
+        status="running",
+        collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        staging_root=str(tmp_path / "empty-stage"),
+        milestones=[],
+    )
+
+    service._prepare_goal_release(goal)
+
+    assert goal.status == "paused"
+    assert goal.release_status == "failed"
+    assert goal.release_files == []
+    assert goal.last_error == "final release has no verified output files"
+
+
 def test_cancelled_milestone_pauses_goal_and_resume_retries(svc):
     # a goal mid-flight whose current milestone session got cancelled
     goal = Goal(text="Decide storage and retention", status="running", milestones=[
