@@ -359,7 +359,9 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "one file. All RELEASE files are reviewed and moved together at the end.\n\n"
         "For a single-file HTML release assembled from staged CSS/JavaScript, use "
         "ASSEMBLY: HTML_INLINE. Prefer an earlier package that owns a compact HTML "
-        "shell/template and set TEMPLATE to that accepted path; the template uses one "
+        "shell/template and set TEMPLATE to that accepted path. That exact upstream "
+        "TEMPLATE path must also appear in REQUIRES, and its owner "
+        "must appear in AFTER. The template uses one "
         "literal '<!-- GANGOF8:STYLE path -->' or '<!-- GANGOF8:SCRIPT path -->' "
         "standalone directive for every source named in REQUIRES. Never put a directive "
         "inside an existing <style> or <script> element because expansion creates the "
@@ -370,9 +372,43 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "TEMPLATE: NONE. Deterministic assembly is concatenation, not integration. Before "
         "it, include a non-assembly integration/QA package owned by a frontier coding "
         "model. That package must use AFTER for every runtime producer, REQUIRES their "
-        "actual outputs, and explicitly check every user-visible mode and control against "
-        "the combined implementation.\n\n"
+        "actual outputs, explicitly identify integration, QA, acceptance, quality, or "
+        "verification in its title/task, and check every user-visible mode and control "
+        "against the combined implementation. It must produce a runtime HTML/CSS/JS "
+        "artifact that final assembly lists in REQUIRES; a prose QA report does not "
+        "integrate the runtime graph.\n\n"
         f"GOAL:\n{goal_text}"
+    )
+
+
+def plan_repair_prompt(
+    goal_text: str,
+    panel: Optional[list[str]],
+    rejected_plan: str,
+    validation_errors: list[str],
+    attempt: int,
+) -> str:
+    """Ask for a complete replacement after deterministic plan validation.
+
+    The prior response and exact validator output are deliberately preserved.
+    The architect therefore repairs the graph it actually proposed instead of
+    guessing why a generic retry was requested.  The normal planning contract
+    remains the authority and is repeated in full on every fresh adapter call.
+    """
+    errors = "\n".join(f"- {error}" for error in validation_errors)
+    prior = (rejected_plan or "<empty response>").strip()
+    return (
+        f"{plan_prompt(goal_text, panel)}\n\n"
+        "PLAN REPAIR REQUIRED\n"
+        f"This is repair attempt {attempt}. Your previous plan was rejected by "
+        "the deterministic coordinator. Return a COMPLETE REPLACEMENT PLAN in "
+        "the exact PACKAGE format above; do not return a patch, commentary, or "
+        "explanation. You may add, remove, reorder, or merge packages, but the "
+        "replacement must eliminate every error below without weakening any "
+        "acceptance or release requirement.\n\n"
+        f"VALIDATION ERRORS:\n{errors}\n\n"
+        f"REJECTED PLAN:\n{prior}\n\n"
+        "Now return only the complete corrected PACKAGE plan."
     )
 
 
