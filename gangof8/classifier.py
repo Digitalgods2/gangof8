@@ -104,6 +104,24 @@ _EXECUTABLE_ARTIFACT = re.compile(
     re.IGNORECASE,
 )
 
+# ``attachment_context()`` appends source bodies to the user's instruction.
+# Classifying action/risk words across that body mistakes ordinary code such as
+# ``element.remove()`` or ``send()`` for a request to perform an external side
+# effect. Keep directive intent separate while still letting the attachment's
+# filename/content provide a strong code-artifact signal.
+_ATTACHMENTS_MARKER = "\n\nAttachments provided by the user:"
+_ATTACHED_CODE_FILE = re.compile(
+    r"^--- Attached [^:\r\n]+ file:\s*[^\r\n]+\."
+    r"(?:py|js|ts|tsx|jsx|go|rs|java|rb|php|c|cpp|h|hpp|cs|html|css|scss|"
+    r"sh|bat|ps1|sql)\s*---\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CODE_REVISION_WORDS = [
+    "fix", "improve", "refactor", "repair", "patch", "rewrite", "update",
+    "change", "modify", "correct", "debug", "optimize", "complete",
+    "return", "provide", "deliver", "add", "integrate",
+]
+
 
 def wants_matched_output(text: str) -> bool:
     """True when the task asks for the output to MATCH a referenced source (a
@@ -119,17 +137,34 @@ def _any(words: list[str], lower: str) -> bool:
 
 def classify(text: str, role_agents: dict | None = None) -> Classification:
     lower = text.lower()
+    directive_text = text.split(_ATTACHMENTS_MARKER, 1)[0]
+    directive_lower = directive_text.lower()
     notes: list[str] = []
 
-    action = _any(ACTION_WORDS, lower)
-    code = _any(CODE_WORDS, lower) or bool(_FILE_ARTIFACT.search(text))
-    execs = _any(EXEC_WORDS, lower)
+    # Side-effect intent must come from the user's directive, never tokens that
+    # merely occur inside an attached implementation. An attached code file
+    # paired with a revision/delivery verb is explicitly coding work even if
+    # the directive also says to remove a bug or obsolete handler.
+    action = _any(ACTION_WORDS, directive_lower)
+    attached_code = bool(_ATTACHED_CODE_FILE.search(text))
+    attachment_revision = attached_code and _any(
+        _CODE_REVISION_WORDS, directive_lower
+    )
+    code = (
+        _any(CODE_WORDS, lower)
+        or bool(_FILE_ARTIFACT.search(text))
+        or attached_code
+    )
+    execs = _any(EXEC_WORDS, directive_lower)
     design = _any(DESIGN_WORDS, lower)
     research = _any(RESEARCH_WORDS, lower)
     content = _any(CONTENT_WORDS, lower)
-    external_read = _any(EXTERNAL_READ_WORDS, lower)
+    external_read = _any(EXTERNAL_READ_WORDS, directive_lower)
 
-    if action:
+    if attachment_revision:
+        task_type = TaskType.code
+        notes.append("attached code artifact with explicit revision/delivery intent")
+    elif action:
         task_type = TaskType.action
         notes.append("matched action words (external side effects implied)")
     elif code:

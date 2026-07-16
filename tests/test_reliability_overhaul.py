@@ -20,16 +20,16 @@ from gangof8.sessions import SessionManager
 from gangof8 import validation
 
 
-def test_explicit_timeout_is_a_cap_and_retry_is_bounded():
+def test_explicit_routine_timeout_is_a_cap_but_authoring_defaults_unlimited():
     session = Session(
         session_id="s_timeout", cli_timeouts={"claude": 320},
         task=Task(task_id="t", session_id="s_timeout", text="build"))
     assert loop._effective_agent_timeout(session, "claude", 900) == 320
     assert loop._effective_agent_timeout(session, "gemini", 360) == 360
-    assert loop._effective_agent_timeout(session, "claude", config.PANEL_RETRY_TIMEOUT) == 180
+    assert loop._effective_agent_timeout(session, "claude", config.PANEL_RETRY_TIMEOUT) == 0
     assert loop._effective_agent_timeout(
         session, "claude", config.FRONTIER_AUTHOR_TIMEOUT
-    ) == 320
+    ) == 0
 
 
 def test_final_batch_package_suppresses_even_late_repair_promotes(tmp_path):

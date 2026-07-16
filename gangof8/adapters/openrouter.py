@@ -92,8 +92,8 @@ class OpenRouterAdapter:
         # request alive forever with transport-level trickles, which is exactly
         # how the live Qwen call ran for 16 minutes under a nominal 360-second
         # limit. Reads are therefore unbounded here and the watchdog below owns
-        # the real hard deadline. Streaming still supplies truthful progress,
-        # but token trickles never extend the stage's finite wall-clock bound.
+        # an opted-in hard deadline. Streaming supplies truthful progress and
+        # the no-output watchdog still detects a genuinely stalled provider.
         transport_timeout = httpx.Timeout(
             None,
             connect=30.0,
@@ -121,9 +121,7 @@ class OpenRouterAdapter:
             cancellation.report_progress(output_chars[0], "model output streaming")
 
         def _watch_deadline() -> None:
-            if timeout_s <= 0:
-                return
-            deadline_s = max(1.0, float(timeout_s))
+            deadline_s = max(1.0, float(timeout_s)) if timeout_s > 0 else None
             stall_s = float(config.OPENROUTER_OUTPUT_STALL_TIMEOUT)
             while not finished.wait(0.5):
                 with progress_lock:
@@ -134,7 +132,7 @@ class OpenRouterAdapter:
                     stalled.set()
                     _abort()
                     return
-                if elapsed >= deadline_s:
+                if deadline_s is not None and elapsed >= deadline_s:
                     deadline_reason[0] = "timed out"
                     stalled.set()
                     _abort()

@@ -527,6 +527,7 @@ def package_output_prompt(
     assigned_files: list[str],
     output_authors: dict[str, str],
     feedback: str = "",
+    staged_context: str = "",
 ) -> str:
     """Focused exact-output authoring prompt for an accountable work package."""
     assigned = [name.replace("\\", "/") for name in assigned_files]
@@ -544,6 +545,14 @@ def package_output_prompt(
     retry = (
         "\nTARGETED CORRECTION FROM THE COORDINATOR:\n" + feedback.strip() + "\n"
         if feedback.strip() else ""
+    )
+    accepted_context = (
+        "\nACTUAL ACCEPTED STAGING BYTES AND API SURFACES:\n"
+        + staged_context.strip()
+        + "\n\nTreat these bytes as authoritative. The prose interface is only a "
+          "summary; match the implemented signatures, units, DOM hooks, and load "
+          "order exactly.\n"
+        if staged_context.strip() else ""
     )
     if session.assembly_mode == assembly.HTML_INLINE:
         sources = [
@@ -580,6 +589,7 @@ def package_output_prompt(
         f"{responsibility}\n\n"
         "PACKAGE AND INTERFACE CONTEXT:\n"
         f"{_package_task_context(session)}\n\n"
+        f"{accepted_context}"
         "EXACT OUTPUT ASSIGNMENTS:\n"
         f"{assignment_lines}\n\n"
         f"YOUR ASSIGNED OUTPUTS: {exact}\n"

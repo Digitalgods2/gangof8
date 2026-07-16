@@ -30,6 +30,14 @@ function createLatestRequestGate() {
   };
 }
 
+// Settings maps are replacement-valued on the server. A one-seat dashboard
+// toggle must therefore send the complete latest map, not just one key.
+function seatSettingsPatch(settings, mapName, seat, enabled) {
+  const current = settings && typeof settings[mapName] === "object"
+    ? settings[mapName] : {};
+  return {[mapName]: {...current, [seat]: !!enabled}};
+}
+
 // A package's durable milestone points only at its newest attempt. Keep older
 // attempts associated with the goal so a resumed run can steer away from a
 // historical failure screen and into the replacement session.
@@ -116,5 +124,6 @@ function packageAttemptState(session, goal, sessions = []) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     createLatestRequestGate, goalSessionIds, goalRenderSignature, packageAttemptState,
+    seatSettingsPatch,
   };
 }

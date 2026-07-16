@@ -43,22 +43,23 @@ def test_protocol_filenames_strip_all_outer_presentation_quotes():
     assert canonical_protocol_filename("'assets/Benny\'s-theme.css'") == "assets/Benny's-theme.css"
 
 
-def test_frontier_timeout_is_finite_and_uses_the_stage_policy():
+def test_frontier_implementation_has_no_default_coordinator_deadline():
     session = _code_session()
     session.cli_timeouts = {"claude": 30}
     assert loop._effective_agent_timeout(
         session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == config.FRONTIER_AUTHOR_TIMEOUT
-    assert 0 < config.FRONTIER_AUTHOR_TIMEOUT <= 600
-    assert 0 < config.PACKAGE_AUTHOR_DEADLINE <= 360
-    assert 0 < config.FRONTIER_VERIFY_TIMEOUT <= 600
+    assert config.FRONTIER_AUTHOR_TIMEOUT == 0
+    assert config.PACKAGE_AUTHOR_DEADLINE == 0
+    assert config.FRONTIER_VERIFY_TIMEOUT == 0
 
 
 def test_settings_timeout_never_caps_any_coding_stage():
     session = _code_session()
     session.cli_timeouts = {"claude": 320, "codex": 320, "gemini": 320}
-    assert loop._effective_agent_timeout(session, "claude", config.LEAD_TIMEOUT) == 600
-    assert loop._effective_agent_timeout(session, "codex", config.JUDGE_TIMEOUT) == 480
-    assert loop._effective_agent_timeout(session, "gemini", config.PANEL_AUTHOR_TIMEOUT) == 360
+    assert loop._effective_agent_timeout(session, "claude", config.LEAD_TIMEOUT) == 0
+    assert loop._effective_agent_timeout(session, "codex", config.JUDGE_TIMEOUT) == 0
+    assert loop._effective_agent_timeout(session, "gemini", config.PANEL_AUTHOR_TIMEOUT) == 0
+    assert loop._effective_agent_timeout(session, "gemini", config.JUDGE_TIMEOUT) == 480
 
 
 def test_substantial_build_auto_routes_but_small_fix_does_not():

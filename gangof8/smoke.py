@@ -56,9 +56,14 @@ function _style(){
 }
 function _el(){
   return { getContext: () => _ctx, addEventListener: _add, removeEventListener: _noop,
+    dispatchEvent: () => true,
     appendChild: _noop, append:_noop, prepend:_noop, removeChild: _noop, remove:_noop,
     replaceChildren:_noop, insertAdjacentElement:_noop, insertAdjacentHTML:_noop,
-    setAttribute: _noop, getAttribute: () => null,
+    setAttribute: _noop, getAttribute: () => null, removeAttribute: _noop,
+    hasAttribute: () => false, toggleAttribute: () => false,
+    querySelector: () => _el(), querySelectorAll: () => [],
+    getElementsByTagName: () => [], getElementsByClassName: () => [],
+    closest: () => null, matches: () => false, contains: () => false,
     style: _style(), classList: { add:_noop, remove:_noop, toggle:_noop, contains: () => false },
     getBoundingClientRect: () => ({ left:0, top:0, right:800, bottom:600, width:800, height:600 }),
     focus: _noop, blur: _noop, requestPointerLock: _noop, textContent: "", innerHTML: "",
@@ -92,6 +97,13 @@ const _ctx = new Proxy({}, { get(t, k){
 }});
 const _listeners = {};
 function _add(type, fn){ (_listeners[type] = _listeners[type] || []).push(fn); }
+const _runtimeErrors = [];
+function _captureError(e){
+  _runtimeErrors.push(e && e.message ? e.message : String(e));
+}
+function _throwCaptured(){
+  if (_runtimeErrors.length) throw new Error(_runtimeErrors.shift());
+}
 const _audio = () => ({ state:"running", resume:()=>Promise.resolve(), suspend:_noop,
   currentTime:0, sampleRate:44100, destination:{},
   createOscillator:()=>({ frequency:{ setValueAtTime:_noop, linearRampToValueAtTime:_noop, exponentialRampToValueAtTime:_noop, value:0 },
@@ -132,6 +144,8 @@ _def("ResizeObserver", function(){ return { observe:_noop, unobserve:_noop, disc
 _def("IntersectionObserver", function(){ return { observe:_noop, unobserve:_noop, disconnect:_noop, takeRecords:()=>[] }; });
 _def("MutationObserver", function(){ return { observe:_noop, disconnect:_noop, takeRecords:()=>[] }; });
 _def("screen", { width:800, height:600, orientation:{ lock:_noop } });
+_def("visualViewport", { width:800, height:600, scale:1, offsetLeft:0, offsetTop:0,
+  pageLeft:0, pageTop:0, addEventListener:_add, removeEventListener:_noop });
 // Browser globals scripts legitimately call BARE (they resolve to window.* in a
 // browser). Missing these here FALSELY rejected valid games as crashers — e.g.
 // "addEventListener is not defined" / "getComputedStyle is not defined" killed
@@ -155,8 +169,10 @@ _def("Audio", function(){ return _el(); });
 _def("OffscreenCanvas", function(){ return _el(); });
 _def("DOMRect", function(){ return { x:0, y:0, width:0, height:0, top:0, left:0, right:0, bottom:0 }; });
 _def("document", { getElementById: _el, querySelector: _el, querySelectorAll: () => [],
-  createElement: _el, createElementNS: _el, getElementsByTagName: () => [ _el() ],
+  createElement: _el, createElementNS: _el, createDocumentFragment: _el,
+  getElementsByTagName: () => [ _el() ],
   getElementsByClassName: () => [], addEventListener:_add, removeEventListener:_noop,
+  dispatchEvent: () => true,
   body: _el(), documentElement: _el(), head: _el(), readyState:"complete",
   fonts: { add:_noop, ready: Promise.resolve(), load: () => Promise.resolve() }, hidden:false });
 _def("window", new Proxy({
@@ -167,9 +183,17 @@ _def("window", new Proxy({
   AudioContext:_audioCtor, webkitAudioContext:_audioCtor,
   localStorage: globalThis.localStorage, matchMedia: globalThis.matchMedia, navigator: globalThis.navigator,
   performance: globalThis.performance, location:{ href:"", reload:_noop }, onload:null,
+  visualViewport:globalThis.visualViewport,
   getComputedStyle: () => ({ getPropertyValue: () => "" }), scrollTo:_noop, alert:_noop, focus:_noop,
   document: globalThis.document
-}, { get(t,k){ return k in t ? t[k] : (globalThis[k] !== undefined ? globalThis[k] : _noop); }, set(t,k,v){ t[k]=v; return true; } }));
+}, { get(t,k){ return k in t ? t[k] : (globalThis[k] !== undefined ? globalThis[k] : _noop); },
+  set(t,k,v){
+    t[k]=v;
+    // In a browser, `window` is the global object: assigning window.Foo makes
+    // the classic-script identifier Foo resolvable in later script tags.
+    if (typeof k === "string" && k !== "window") _def(k, v);
+    return true;
+  } }));
 
 let _sigs = [];  // one draw-signature per pumped frame (for motion detection)
 function _ev(extra){
@@ -181,11 +205,18 @@ function _ev(extra){
   b.target = global.document.body; b.currentTarget = global.document.body;
   return b;
 }
-function _fire(map, type){ (map[type]||[]).slice().forEach(fn => { try { fn(_ev()); } catch(e){} }); }
+function _fire(map, type){
+  (map[type]||[]).slice().forEach(fn => { try { fn(_ev()); } catch(e){ _captureError(e); } });
+  _throwCaptured();
+}
 function _fireType(type, ev){
-  (_listeners[type]||[]).slice().forEach(fn => { try { fn(ev); } catch(e){} });
+  (_listeners[type]||[]).slice().forEach(fn => { try { fn(ev); } catch(e){ _captureError(e); } });
   const on = "on" + type;
-  [global.window, global.document].forEach(o => { try { if (o && typeof o[on] === "function") o[on](ev); } catch(e){} });
+  [global.window, global.document].forEach(o => {
+    try { if (o && typeof o[on] === "function") o[on](ev); }
+    catch(e){ _captureError(e); }
+  });
+  _throwCaptured();
 }
 function _pressKey(kind, key, code){ _fireType(kind, _ev({ key:key, code:code })); }
 // Drive the game the way a player would — press keys, click, tap — so we can see
@@ -203,7 +234,10 @@ function _step(){
   _frameOps = [];
   if (_rafState.cb){ const cb = _rafState.cb; _rafState.cb = null; cb(_now); }  // may throw
   const batch = _timers.splice(0);
-  for (let i = 0; i < batch.length && i < 60; i++){ try { batch[i](); } catch(e){} }
+  for (let i = 0; i < batch.length && i < 60; i++){
+    try { batch[i](); } catch(e){ _captureError(e); }
+  }
+  _throwCaptured();
   _now += 16;
   _sigs.push(_frameOps.join("|"));
 }
@@ -212,26 +246,27 @@ try {
 __SCRIPT__
   _fire(_listeners, "DOMContentLoaded");
   _fire(_listeners, "load");
-  if (typeof global.window.onload === "function") { try { global.window.onload(); } catch(e){} }
+  if (typeof global.window.onload === "function") {
+    try { global.window.onload(); } catch(e){ _captureError(e); }
+    _throwCaptured();
+  }
   // Phase A — load + first frames must not throw (a crasher fails HERE).
   for (let i = 0; i < 12; i++) _step();
-  console.log("SMOKE_OK");
-  // Phase B — gameplay probe: drive input and watch for on-screen motion. LENIENT:
-  // a throw here does NOT fail the file, it only limits what we can assess. A game
+  // Phase B — gameplay probe: drive input and watch for on-screen motion.
+  // A throw here fails the file because players execute these handlers. A game
   // that renders a CHANGING picture is "dynamic"; one that draws the same frame
   // forever despite input is "static/frozen".
   let dynamic = "na";
-  try {
-    _sigs = [];
-    _simInput();
-    for (let f = 0; f < 90; f++){
-      if (f === 15 || f === 45 || f === 70) _simInput();
-      if (f === 30){ [" ","ArrowLeft","ArrowRight","a","d"].forEach(k => _pressKey("keyup", k, k)); }
-      _step();
-    }
-    const drew = _sigs.filter(s => s.length > 0);
-    if (drew.length >= 3) dynamic = (new Set(drew).size >= 2) ? "true" : "false";
-  } catch (e) { /* probe error — keep whatever we assessed */ }
+  _sigs = [];
+  _simInput();
+  for (let f = 0; f < 90; f++){
+    if (f === 15 || f === 45 || f === 70) _simInput();
+    if (f === 30){ [" ","ArrowLeft","ArrowRight","a","d"].forEach(k => _pressKey("keyup", k, k)); }
+    _step();
+  }
+  const drew = _sigs.filter(s => s.length > 0);
+  if (drew.length >= 3) dynamic = (new Set(drew).size >= 2) ? "true" : "false";
+  console.log("SMOKE_OK");
   console.log("SMOKE_DYNAMIC:" + dynamic);
 } catch (e) {
   console.log("SMOKE_THREW:" + (e && e.message ? e.message : String(e)));
@@ -252,8 +287,8 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25,
       script) — those never block.
     - dynamic: True  → rendered a CHANGING picture under simulated input (live);
                False → drew, but the same frame forever despite input (frozen);
-               None  → couldn't assess motion (not enough drawing, or a throw
-                       during the probe). None never counts against a file."""
+               None  → couldn't assess motion because there was not enough drawing.
+                       Runtime errors during the probe fail the file."""
     suffix = (suffix or "").lower()
     if suffix not in _WEB_SUFFIXES:
         return True, False, "not a runnable web file", None

@@ -32,6 +32,69 @@ def test_parse_edit_contract():
     assert action.args["new"] == 'print("new")'
 
 
+def test_parse_frontier_fenced_edit_contract():
+    text = """\
+===== EDIT: arcade.html =====
+OLD:
+```js
+    this.playerX = 0;
+    this.playerBullets = [];
+```
+NEW:
+```js
+    this.playerX = 0;
+    this.playerY = PLAYER_Y;
+    this.playerBullets = [];
+```
+"""
+    action = artifacts.parse_proposals("s_1", text)[0]
+    assert action.kind == "edit_file"
+    assert action.filename == "arcade.html"
+    assert action.args["old"] == "    this.playerX = 0;\n    this.playerBullets = [];"
+    assert "this.playerY = PLAYER_Y" in action.args["new"]
+
+
+def test_parse_frontier_outer_fenced_edit_contract():
+    text = """\
+```js
+===== EDIT: arcade.html =====
+OLD:
+    this.playerX = WIDTH / 2;
+    this.playerBullets = [];
+NEW:
+    this.playerX = WIDTH / 2;
+    this.playerY = PLAYER_Y;
+    this.playerBullets = [];
+```
+"""
+    action = artifacts.parse_proposals("s_1", text)[0]
+    assert action.kind == "edit_file"
+    assert action.filename == "arcade.html"
+    assert action.args["old"].endswith("this.playerBullets = [];")
+    assert "this.playerY = PLAYER_Y" in action.args["new"]
+
+
+def test_parse_frontier_outer_fenced_file_edit_contract():
+    text = """\
+```
+FILE: arcade.html
+OLD:
+    if (hitPlayer) {
+      this.lives--;
+    }
+NEW:
+    if (hitPlayer && this.playerFlash <= 0) {
+      this.lives--;
+    }
+```
+"""
+    action = artifacts.parse_proposals("s_1", text)[0]
+    assert action.kind == "edit_file"
+    assert action.filename == "arcade.html"
+    assert action.args["old"].startswith("    if (hitPlayer)")
+    assert "playerFlash <= 0" in action.args["new"]
+
+
 def test_clean_artifact_body_keeps_single_html_document():
     raw = """Here is the file:
 <!doctype html>

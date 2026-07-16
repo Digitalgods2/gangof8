@@ -156,6 +156,50 @@ def test_script_over_csv_stays_code():
     assert cls.task_type == TaskType.code
 
 
+def test_attached_arcade_repair_is_code_not_action():
+    """Regression: action-like method names inside the attached arcade source
+    must not override the user's explicit Centipede/Asteroids repair
+    request. The real run was routed as a generic action, bypassing the coding
+    author and runtime/output gates."""
+    task = (
+        "using this code, fix the centipede and centipede game, they are both "
+        "very poor clones of the originals, additionally add sound when "
+        "accelerating the ship in asteroid, return a completed arcade html "
+        "with all the improvements."
+        "\n\nAttachments provided by the user:\n"
+        "--- Attached text file: arcade.html ---\n"
+        "<!doctype html><script>\n"
+        "function teardown(node) { node.remove(); }\n"
+        "function sendScore() { return fetch('/score', {method: 'POST'}); }\n"
+        "</script>"
+    )
+
+    cls = classify(task)
+
+    assert cls.task_type == TaskType.code
+    assert cls.produces_output is True
+    assert cls.tools_allowed is True
+    assert cls.needs_design is True
+    assert cls.risk.value == "none"
+    assert "attached code artifact" in cls.rationale
+
+
+def test_delete_attached_code_file_remains_an_action():
+    """Attachment awareness must not turn a real destructive request into a
+    code edit merely because the deleted file has an executable extension."""
+    task = (
+        "Delete the attached obsolete file."
+        "\n\nAttachments provided by the user:\n"
+        "--- Attached text file: arcade.html ---\n"
+        "<!doctype html><script>console.log('old')</script>"
+    )
+
+    cls = classify(task)
+
+    assert cls.task_type == TaskType.action
+    assert cls.risk.value == "high"
+
+
 # --- Fix 2: matched-set intent ------------------------------------------------
 
 

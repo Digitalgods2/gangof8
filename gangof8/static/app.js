@@ -59,6 +59,102 @@ function collapsible(key, summary, body, defaultOpen) {
 // Colorize a unified diff (promote preview) line by line.
 
 // ---- top-bar utilities: hard refresh, save-as-file, open-a-file --------------
+let headerSeatSaveBusy = false;
+
+function headerSeatStatus(message, bad = false) {
+  const status = document.getElementById("aiSeatToggleStatus");
+  if (!status) return;
+  status.textContent = message || "";
+  status.title = message || "";
+  status.classList.toggle("error", !!bad);
+}
+
+function renderHeaderSeatToggles(settings, busy = headerSeatSaveBusy) {
+  const group = document.getElementById("aiSeatToggles");
+  if (!group || !settings) return;
+  group.setAttribute("aria-busy", busy ? "true" : "false");
+  group.querySelectorAll("input[data-settings-map][data-seat]").forEach(input => {
+    const mapName = input.dataset.settingsMap;
+    const values = settings[mapName] || {};
+    const enabled = mapName === "cli_enabled"
+      ? values[input.dataset.seat] !== false
+      : values[input.dataset.seat] === true;
+    input.checked = enabled;
+    input.disabled = !!busy;
+    input.closest("label")?.classList.toggle("on", enabled);
+  });
+}
+
+async function _settingsResponseError(response) {
+  let detail = "";
+  try {
+    const body = await response.json();
+    detail = body.detail ? String(body.detail) : JSON.stringify(body);
+  } catch (_) {
+    detail = await response.text().catch(() => "");
+  }
+  return detail || `HTTP ${response.status}`;
+}
+
+async function _freshSettings() {
+  const response = await fetch("/settings", {cache: "no-store"});
+  if (!response.ok) throw new Error(await _settingsResponseError(response));
+  return response.json();
+}
+
+function _syncSettingsPanelSeat(mapName, seat, enabled) {
+  const className = mapName === "cli_enabled" ? "cli_enable" : "or_enable";
+  const panelInput = document.querySelector(`.${className}[data-seat="${seat}"]`);
+  if (panelInput) panelInput.checked = enabled;
+}
+
+async function toggleHeaderSeat(input) {
+  if (!input || headerSeatSaveBusy) return;
+  const desired = input.checked;
+  const previous = !desired;
+  const mapName = input.dataset.settingsMap;
+  const seat = input.dataset.seat;
+  const brand = input.closest("label")?.textContent.trim() || seat;
+  let latest = null;
+  headerSeatSaveBusy = true;
+  const optimistic = Object.assign(
+    {}, settingsCache || {}, seatSettingsPatch(settingsCache || {}, mapName, seat, desired)
+  );
+  renderHeaderSeatToggles(optimistic, true);
+  headerSeatStatus("saving…");
+  try {
+    // Fetch immediately before writing: the server replaces settings maps, so
+    // the patch must merge this one checkbox into the complete current map.
+    latest = await _freshSettings();
+    const patch = seatSettingsPatch(latest, mapName, seat, desired);
+    const response = await fetch("/settings", {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(patch),
+    });
+    if (!response.ok) throw new Error(await _settingsResponseError(response));
+    settingsCache = await response.json();
+    applyUiPreferences(settingsCache.ui);
+    const savedMap = settingsCache[mapName] || {};
+    const savedEnabled = mapName === "cli_enabled"
+      ? savedMap[seat] !== false : savedMap[seat] === true;
+    _syncSettingsPanelSeat(mapName, seat, savedEnabled);
+    headerSeatStatus("saved ✓");
+  } catch (error) {
+    if (latest) settingsCache = latest;
+    else input.checked = previous;
+    headerSeatStatus(`Could not update ${brand}: ${error.message || error}`, true);
+  } finally {
+    headerSeatSaveBusy = false;
+    renderHeaderSeatToggles(settingsCache || latest || {}, false);
+  }
+}
+
+function bindHeaderSeatToggles() {
+  document.querySelectorAll("#aiSeatToggles input[data-settings-map][data-seat]")
+    .forEach(input => input.addEventListener("change", () => void toggleHeaderSeat(input)));
+}
+
 function hardRefresh() {
   // Reload bypassing cache, like Ctrl/Cmd+F5 (a cache-bust param forces a fresh
   // fetch even when the browser would otherwise serve a stale index.html).
@@ -553,6 +649,8 @@ function goalCard(g) {
   const done = ms.filter(m => m.status === "done").length;
   const running = g.active_packages ?? ms.filter(m => m.status === "running").length;
   const owners = new Set(ms.map(m => m.owner).filter(Boolean)).size;
+  const contributors = g.contributor_count ?? 0;
+  const expectedContributors = g.expected_contributor_count ?? 0;
   const displayStatus = g.display_status || g.status;
   const icons = {done: "✓", running: "▶", pending: "○", failed: "×",
     awaiting_approval: "!", awaiting_input: "?", cancelled: "×", draining: "◌"};
@@ -589,7 +687,8 @@ function goalCard(g) {
     (live || g.status === "paused" ? `<button class="gbtn ghost" onclick="cancelGoal('${esc(g.goal_id)}', event)">Cancel</button>` : "") +
     (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "");
   const aggregate = g.delivery_mode === "final_batch"
-    ? `<div class="sub">Build team · ${owners} model${owners === 1 ? "" : "s"} · ${running} active` +
+    ? `<div class="sub">Build team · ${contributors}/${expectedContributors || "?"} contributing models` +
+      ` · ${owners} planned owner${owners === 1 ? "" : "s"} · ${running} active` +
       `${g.active_agent_calls ? ` · ${g.active_agent_calls} model call${g.active_agent_calls === 1 ? "" : "s"}` : ""}` +
       `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
       `${g.pending_inputs ? ` · ${g.pending_inputs} question blocked` : ""}` +
@@ -1317,7 +1416,7 @@ const TIPS = {
   poll: "How often the dashboard refreshes session state, in milliseconds.",
   collapse: "Collapse the contributions / disagreements sections by default once a session has finished.",
   workspace: "The active workspace is the real project directory the council reads and (with approval) writes into. With no workspace active, files go to a throwaway per-session sandbox. New sessions capture whichever workspace is active when they start.",
-  cli_models: "The local CLI seats (claude, codex, gemini) and the exact model each one runs. Leave '(CLI default)' to inherit that CLI's own configured model, or pin one from the live catalog. Unchecking a seat drops it from the council and its roles fall back to an enabled OpenRouter model.",
+  cli_models: "The local CLI seats (claude, codex, gemini) and the exact model each one runs. Leave '(CLI default)' to inherit that CLI's own configured model, or pin one from the live catalog. Unchecking a seat drops it from the council and redistributes its roles across every remaining enabled seat.",
   gemini_key: "Optional. With a key the gemini seat runs through Google's SDK (faster and more reliable on Windows than the headless CLI), the gemini dropdown switches to Google's own model list, image vision works, and web_search gains Google Search grounding. Stored locally in data/secrets.json (gitignored) — never sent anywhere but Google.",
   openrouter_key: "Needed only for the pay-per-token OpenRouter seats below. Stored locally in data/secrets.json (gitignored); an OPENROUTER_API_KEY environment variable always wins over the stored value.",
   openrouter_models: "Extra panel seats that run through OpenRouter, one per VENDOR (DeepSeek, z.ai, Alibaba/Qwen, Moonshot/Kimi). Each offers that vendor's live models in a dropdown — 👁 vision, 🧠 reasoning, 🔧 tools/coding, newest first — or pick 'custom slug…' to paste an exact id. Enable a seat and it joins every panel round and becomes selectable in Role mapping. Billed per token by OpenRouter.",
@@ -1382,6 +1481,7 @@ async function openSettings() {
   ]);
   settingsCache = settings;
   applyUiPreferences(settings.ui);
+  renderHeaderSeatToggles(settings);
   seatsCache = seatsResp.seats || [];
   wsCache = wsResp;
   orKey = keyResp || {present: false};
@@ -1404,7 +1504,9 @@ async function loadUiPreferences() {
     const settings = await api("/settings");
     settingsCache = settings;
     applyUiPreferences(settings.ui);
-  } catch (_) {
+    renderHeaderSeatToggles(settings);
+  } catch (error) {
+    headerSeatStatus(`Could not load AI seats: ${error.message || error}`, true);
     // The dashboard remains usable with the built-in visual defaults.
   }
 }
@@ -1556,7 +1658,7 @@ function renderSettings(s, seats) {
         return `
         <div class="field" style="align-items:center;flex-wrap:wrap">
           <label style="margin:0;flex:0 0 92px;display:flex;align-items:center;gap:6px"
-                 title="Uncheck to drop this local CLI seat and run its roles on an OpenRouter model instead.">
+                 title="Uncheck to drop this local CLI seat and redistribute its roles across the remaining enabled models.">
             <input type="checkbox" class="cli_enable" data-seat="${esc(x.name)}" ${x.enabled === false ? "" : "checked"}>
             <b>${esc(x.name)}</b></label>
           <select class="cli_model_sel" data-seat="${esc(x.name)}" style="flex:1;min-width:240px"
@@ -1569,7 +1671,7 @@ function renderSettings(s, seats) {
           </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
                  spellcheck="false" placeholder="exact model id" style="flex:1;min-width:220px;display:none">
           <label class="sub" style="flex:0 0 auto;display:flex;align-items:center;gap:5px;margin:0"
-                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). Coding stages use separate finite author, lead, judge, repair, and release deadlines; every call remains user-cancellable.">⏱
+                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). Code authoring is unlimited by default; frontier seats are unlimited at every coding stage and remain user-cancellable.">⏱
             <input type="number" class="cli_timeout" data-seat="${esc(x.name)}" min="30" max="3600" step="10"
                    value="${escAttr(String(_to))}" placeholder="${escAttr(String(_tod))}" style="width:74px">s</label>
         </div>`;}).join("")}
@@ -1577,8 +1679,8 @@ function renderSettings(s, seats) {
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
-      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). Coding calls use finite author/lead/judge/codifier/release stage deadlines. Cancel still terminates their CLI process immediately.</div>
-      <div class="sub">Uncheck a seat to run <b>OpenRouter-only</b>: its roles fall back to an enabled OpenRouter model (below), and it leaves the panel. Needs an OpenRouter key and at least one enabled OpenRouter seat — otherwise the seat stays on so the council always has a lead.</div>
+      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). Code authoring is unlimited by default; frontier seats are unlimited at every coding stage. Cancel still terminates their CLI process immediately.</div>
+      <div class="sub">Unchecking a seat removes its adapter and redistributes its roles across all remaining enabled local and OpenRouter models. Enable at least one model; OpenRouter seats also require the API key below to run.</div>
     </div>
 
     <div class="sset s-gemkey">
@@ -1703,6 +1805,7 @@ async function _refreshSettingsAfterProfile(message) {
   settingsCache = settings;
   seatsCache = seatsResp.seats || [];
   applyUiPreferences(settings.ui);
+  renderHeaderSeatToggles(settings);
   openSections = {};
   renderSettings(settingsCache, seatsCache);
   _profileNote(message);
@@ -1874,6 +1977,7 @@ async function saveSettings() {
     note.textContent = "saved ✓";
     settingsCache = await r.json();
     applyUiPreferences(settingsCache.ui);
+    renderHeaderSeatToggles(settingsCache);
     openSections = {};
     pollLoop();
     loadHealth();  // header backend label may have changed
@@ -2083,6 +2187,7 @@ async function emptyWorkspace() {
 
 loadHealth();
 loadWorkspace();
+bindHeaderSeatToggles();
 bindComposerControls();
 bindComposerDrag();
 // deep link: /#<session_id> re-opens that session; otherwise the hero greets

@@ -180,6 +180,7 @@ class LogStore:
             goal_epoch, goal_milestone, goal_release = None, None, False
             active_agent_calls: list[dict] = []
             agent_calls, agent_call_attempts = 0, 0
+            successful_agent_calls: dict[str, int] = {}
             agent_attempt_duration_ms = 0
             package_output_authors: dict[str, str] = {}
             package_output_attempts: dict[str, int] = {}
@@ -199,6 +200,7 @@ class LogStore:
                 active_agent_calls = list(data.get("active_agent_calls") or [])
                 agent_calls = int(data.get("agent_calls") or 0)
                 agent_call_attempts = int(data.get("agent_call_attempts") or agent_calls)
+                successful_agent_calls = dict(data.get("successful_agent_calls") or {})
                 agent_attempt_duration_ms = int(
                     data.get("agent_attempt_duration_ms") or 0
                 )
@@ -232,6 +234,7 @@ class LogStore:
                     "active_agent_calls": active_agent_calls,
                     "agent_calls": agent_calls,
                     "agent_call_attempts": agent_call_attempts,
+                    "successful_agent_calls": successful_agent_calls,
                     "agent_attempt_duration_ms": agent_attempt_duration_ms,
                     "package_output_authors": package_output_authors,
                     "package_output_attempts": package_output_attempts,

@@ -103,6 +103,8 @@ def compose_prompt(session: Session) -> str:
         "coordinator did. Trust it as fact: if an action shows APPLIED, that file "
         "WAS written — report it as done with high confidence. You have NO "
         "filesystem access, so never claim a file is missing/unconfirmed and "
+        "never claim that a file was written, edited, or delivered unless the "
+        "Actions performed list records the corresponding action as APPLIED; "
         "never say you ran Glob/find/ls (you cannot) — rely on this record.\n"
         "Do NOT reproduce, paste, or continue any file contents — the files are "
         "already written. DESCRIBE what was built and how to use it (e.g. open the "

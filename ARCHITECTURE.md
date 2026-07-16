@@ -71,7 +71,10 @@ the human beside the voted winner; only an explicit "Use integration" decision
 replaces the default winner before write/promote actions are executed.
 
 `gangof8/artifacts.py` owns marker parsing and cleanup of model-emitted file
-bodies. `gangof8/smoke.py` owns the headless runtime check for web files.
+bodies. `gangof8/smoke.py` owns the fast headless runtime check for web files.
+`gangof8/browser_acceptance.py` owns the fail-closed real-browser release gate
+for interactive HTML. Final-batch approval carries the verified staging hashes;
+rollback-protected promotion rechecks source, prepared, and destination bytes.
 
 ## Persistence
 

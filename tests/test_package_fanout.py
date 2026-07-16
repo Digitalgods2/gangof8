@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -74,29 +75,29 @@ def _council() -> tuple[Council, CouncilMember]:
     return Council(members=[lead, owner]), lead
 
 
-def test_package_assignments_are_exact_structural_paths():
+def test_package_assignments_keep_cohesive_outputs_with_owner():
     session = _session()
     council, _lead = _council()
 
     assignments = loop._package_output_assignments(session, council)
 
     assert list(assignments) == FILES
-    assert [member.agent for member in assignments.values()] == [
-        "codex", "gemini", "qwen", "grok",
-    ]
-    assert all(len(files) == 1 for _member, files in loop._package_author_jobs(assignments))
+    assert [member.agent for member in assignments.values()] == ["codex"] * len(FILES)
+    assert loop._package_author_jobs(assignments)[0][1] == FILES
+    assert len(loop._package_author_jobs(assignments)) == 1
 
     prompt = rounds.package_output_prompt(
         session,
         assignments["css/theme.css"],
         0,
-        ["css/theme.css"],
+        FILES,
         {name: member.agent for name, member in assignments.items()},
+        staged_context="===== ACCEPTED DEPENDENCY: src/core.js =====\nconst dtUnit = 'seconds';",
     )
     assert "OVERALL GOAL" not in prompt
     assert "NON-BLOCKING INTERFACE INPUTS" in prompt
-    assert "YOUR ASSIGNED OUTPUTS: css/theme.css" in prompt
-    assert "byte" not in prompt.lower()
+    assert "YOUR ASSIGNED OUTPUTS: " + ", ".join(FILES) in prompt
+    assert "const dtUnit = 'seconds'" in prompt
     template_prompt = rounds.package_output_prompt(
         session,
         assignments["index.template.html"],
@@ -143,7 +144,26 @@ def test_goal_package_preserves_healthy_sibling_seats_as_helpers(tmp_path, monke
     assert session.package_helpers == ["gemini", "qwen"]
 
 
-def test_multi_output_package_calls_authors_concurrently(tmp_path):
+def test_package_author_receives_hash_bound_dependency_bytes(tmp_path):
+    workspace = tmp_path / "stage"
+    source = workspace / "src" / "core.js"
+    source.parent.mkdir(parents=True)
+    source.write_text("globalThis.CLOCK_UNIT = 'seconds';\n", encoding="utf-8")
+    session = _session()
+    session.workspace_root = str(workspace)
+    session.runtime_dependencies = ["src/core.js"]
+    session.dependency_hashes = {
+        "src/core.js": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+
+    context = loop._accepted_dependency_context(session, tmp_path / "data")
+
+    assert "ACCEPTED DEPENDENCY: src/core.js" in context
+    assert session.dependency_hashes["src/core.js"] in context
+    assert "CLOCK_UNIT = 'seconds'" in context
+
+
+def test_multi_output_package_uses_one_atomic_owner_call(tmp_path):
     session = _session()
     council, lead = _council()
     session.council = council
@@ -153,16 +173,12 @@ def test_multi_output_package_calls_authors_concurrently(tmp_path):
     entered: set[str] = set()
     prompts: dict[str, str] = {}
     lock = threading.Lock()
-    all_entered = threading.Event()
 
     def call(member, prompt, timeout_s=None):
         del timeout_s
         with lock:
             entered.add(member.agent)
             prompts[member.agent] = prompt
-            if len(entered) == len(FILES):
-                all_entered.set()
-        assert all_entered.wait(2), "package author calls were serialized"
         match = re.search(r"YOUR ASSIGNED OUTPUTS: ([^\n]+)", prompt)
         assert match
         filenames = [name.strip() for name in match.group(1).split(",")]
@@ -197,10 +213,8 @@ def test_multi_output_package_calls_authors_concurrently(tmp_path):
     )
 
     assert paused is False
-    assert entered == {"codex", "gemini", "qwen", "grok"}
-    assert session.package_output_authors == dict(zip(
-        FILES, ["codex", "gemini", "qwen", "grok"], strict=True,
-    ))
+    assert entered == {"codex"}
+    assert session.package_output_authors == {name: "codex" for name in FILES}
     assert all(session.package_output_attempts[name] == 1 for name in FILES)
     adopted = [
         action.filename for action in session.proposed_actions
@@ -233,20 +247,96 @@ def test_build_team_timeout_is_not_retried_against_same_author(tmp_path):
     assert "timed out" in session.package_call_failures["codex"]
 
 
-def test_package_author_wave_reserves_shared_deadline_for_recovery():
+def test_owner_timeout_fans_missing_outputs_out_to_enabled_helpers(tmp_path):
+    session = _session()
+    session.required_files = ["index.html", "css/arcade.css", "js/portal.js"]
+    session.package_helpers = ["gemini", "deepseek", "glm"]
+    council, lead = _council()
+    session.council = council
+    store = LogStore(tmp_path)
+    calls: dict[str, list[str]] = {}
+
+    def call(member, prompt, timeout_s=None):
+        del timeout_s
+        match = re.search(r"YOUR ASSIGNED OUTPUTS: ([^\n]+)", prompt)
+        assert match
+        filenames = [name.strip() for name in match.group(1).split(",")]
+        calls[member.agent] = filenames
+        if member.agent == "codex":
+            raise AgentError("codex CLI timed out after 120s")
+        blocks = []
+        for filename in filenames:
+            if filename.endswith(".html"):
+                content = "<!doctype html><html><body></body></html>"
+            elif filename.endswith(".css"):
+                content = ":root { color-scheme: dark; }"
+            else:
+                content = "globalThis.portalReady = true;"
+            blocks.append(f"ARTIFACT: {filename}\n{content}\nEND_ARTIFACT")
+        return Contribution(
+            round=0,
+            role=member.role,
+            agent=member.agent,
+            content="\n".join(blocks),
+        )
+
+    paused = loop._run_panel_rounds(
+        session,
+        SessionManager(store),
+        council,
+        lead,
+        call,
+        call,
+        Governance(store),
+        store,
+        None,
+        "unused",
+        time.monotonic(),
+    )
+
+    assert paused is False
+    assert calls == {
+        "codex": ["index.html", "css/arcade.css", "js/portal.js"],
+        "gemini": ["index.html"],
+        "deepseek": ["css/arcade.css"],
+        "glm": ["js/portal.js"],
+    }
+    assert session.package_output_authors == {
+        "index.html": "gemini",
+        "css/arcade.css": "deepseek",
+        "js/portal.js": "glm",
+    }
+    assert session.package_output_attempts == {
+        "index.html": 2,
+        "css/arcade.css": 2,
+        "js/portal.js": 2,
+    }
+    for filename, helper in session.package_output_authors.items():
+        assert [
+            (entry["agent"], entry["kind"], entry["status"])
+            for entry in session.package_output_history[filename]
+        ] == [
+            ("codex", "primary", "failed"),
+            (helper, "failover", "completed"),
+        ]
+    assert "timed out" in session.package_call_failures["codex"]
+    assert {
+        action.filename for action in session.proposed_actions
+        if action.role == Role.implementer
+    } == set(session.required_files)
+
+
+def test_package_authoring_has_no_default_wall_clock_cutoff():
     session = _session()
     member = CouncilMember(role=Role.panelist, agent="codex", active=True)
-    session.package_deadline_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=loop.config.PACKAGE_AUTHOR_DEADLINE)
-    ).isoformat()
 
     timeout = loop._package_author_timeout(session, member)
 
-    assert timeout == loop.config.PACKAGE_AUTHOR_WAVE_TIMEOUT
-    assert timeout <= loop.config.PACKAGE_AUTHOR_DEADLINE / 3 + 1
+    assert timeout == 0
+    assert loop._package_seconds_remaining(session) is None
 
 
-def test_timed_out_assignee_reassigns_only_its_exact_output(tmp_path):
+def test_atomic_package_never_mixes_helper_authorship(tmp_path):
     session = _session()
     council, lead = _council()
     session.council = council
@@ -261,8 +351,6 @@ def test_timed_out_assignee_reassigns_only_its_exact_output(tmp_path):
         match = re.search(r"YOUR ASSIGNED OUTPUTS: ([^\n]+)", prompt)
         assert match
         filenames = [name.strip() for name in match.group(1).split(",")]
-        if member.agent == "qwen":
-            raise AgentError("qwen provider timed out")
         blocks = []
         for filename in filenames:
             if filename.endswith(".html"):
@@ -294,24 +382,12 @@ def test_timed_out_assignee_reassigns_only_its_exact_output(tmp_path):
     )
 
     assert paused is False
-    assert calls == {"codex": 2, "gemini": 1, "qwen": 1, "grok": 1}
-    assert session.package_output_authors["js/core/portal.js"] == "codex"
-    assert session.package_output_attempts == {
-        "index.template.html": 1,
-        "css/theme.css": 1,
-        "js/core/portal.js": 2,
-        "js/core/engine.js": 1,
-    }
-    portal_history = session.package_output_history["js/core/portal.js"]
-    assert [(item["agent"], item["kind"], item["status"])
-            for item in portal_history] == [
-        ("qwen", "primary", "failed"),
-        ("codex", "failover", "completed"),
-    ]
-    assert "timed out" in portal_history[0]["reason"]
+    assert calls == {"codex": 1}
+    assert session.package_output_authors == {name: "codex" for name in FILES}
+    assert session.package_output_attempts == {name: 1 for name in FILES}
     assert all(
-        len(session.package_output_history[filename]) == 1
-        for filename in FILES if filename != "js/core/portal.js"
+        session.package_output_history[filename][0]["agent"] == "codex"
+        for filename in FILES
     )
     adopted = {
         action.filename for action in session.proposed_actions

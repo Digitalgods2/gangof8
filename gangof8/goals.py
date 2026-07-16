@@ -261,7 +261,16 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
     """Ask the architect for an owned dependency graph in a strict format."""
     seats = list(dict.fromkeys(s for s in (panel or []) if s))
     roster = ", ".join(seats) or "the available council"
-    target_count = min(len(seats), config.GOAL_MAX_MILESTONES) if seats else 2
+    low_goal = (goal_text or "").lower()
+    needs_zero_call_assembly = (
+        ("single-file" in low_goal or "single file" in low_goal)
+        and ("html" in low_goal or "web" in low_goal or "browser" in low_goal)
+    )
+    target_count = (
+        min(len(seats) + (1 if needs_zero_call_assembly else 0),
+            config.GOAL_MAX_MILESTONES)
+        if seats else 2
+    )
     return (
         "You are the ARCHITECT for a BUILD TEAM. Decompose the goal into bounded, "
         "owned work packages. Models are collaborators, not competing authors: each "
@@ -273,12 +282,11 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "meaningful packages and assign every enabled model once before assigning a "
         f"second package. Never exceed {config.GOAL_MAX_MILESTONES}. For genuinely "
         "small work, use fewer packages instead of inventing duplicate edits. "
-        "Package ownership means accountability, not that one model must personally "
-        "author every output. A coherent package may declare several exclusive output "
-        "paths: the coordinator assigns those exact paths across enabled implementation "
-        "sub-agents concurrently, then adopts them under the named owner's contract. "
-        "Do not consume the top-level package limit merely to split independent files "
-        "that share one package interface. Do split responsibilities that need distinct "
+        "Package ownership is atomic: the named owner personally authors every output "
+        "in that package so tightly coupled HTML, CSS, and JavaScript cannot be blindly "
+        "mixed from unrelated implementations. Seven-model parallelism happens across "
+        "packages, not within one cohesive package. Group only files whose interfaces "
+        "must be designed together. Split responsibilities that need distinct "
         "dependency edges, acceptance behavior, or integration contracts. "
         "Claude and Codex, whenever enabled, must each own a substantive coding "
         "package that produces source files; review, judging, documentation, or a "
@@ -307,15 +315,16 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "ASSEMBLY: <...>\nTEMPLATE: <...>\n"
         "INTERFACE: <...>\nCHECK: <...>\n\n"
         "OUTPUTS is a staging contract. Two parallel packages may not own the same "
-        "path. Use CONTRACTS when a package can author against another package's "
-        "declared API/DOM/data contract; CONTRACTS never blocks scheduling. This is "
-        "the normal choice for sibling modules, clients of a shared API, and UI/code "
-        "that can be reconciled during integration. Use AFTER only when actual verified "
+        "path. CONTRACTS never blocks scheduling and is only safe for descriptive work "
+        "that does not execute against a future implementation. Any HTML, CSS, or "
+        "JavaScript package that consumes another package's runtime API, DOM, timing, "
+        "input, audio, or data behavior MUST use AFTER and list the provider outputs in "
+        "REQUIRES so it receives the actual accepted bytes. Use AFTER whenever verified "
         "bytes are indispensable before authoring can begin: final assembly, generated "
         "schemas, migrations, revisions of another owner's file, or tests that execute "
         "the assembled system. A broad build should normally start most owners in the "
         "first wave. REQUIRES must list only hard physical inputs; do not list a future "
-        "package output when CONTRACTS is enough. Every package must include OWNER, "
+        "package output only for genuinely non-runtime CONTRACTS work. Every package must include OWNER, "
         "AFTER, CONTRACTS, OUTPUTS, RELEASE, REQUIRES, ASSEMBLY, TEMPLATE, and "
         "INTERFACE. Nothing is delivered per "
         "package; validated outputs remain private staging inputs. RELEASE is the "
@@ -333,7 +342,11 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "accepted files directly without sending or truncating their bodies through a "
         "model. Use TEMPLATE: OWNER only when the integration owner genuinely must author "
         "the small DOM/bootstrap shell. Non-assembly packages use ASSEMBLY: NONE and "
-        "TEMPLATE: NONE.\n\n"
+        "TEMPLATE: NONE. Deterministic assembly is concatenation, not integration. Before "
+        "it, include a non-assembly integration/QA package owned by a frontier coding "
+        "model. That package must use AFTER for every runtime producer, REQUIRES their "
+        "actual outputs, and explicitly check every user-visible mode and control against "
+        "the combined implementation.\n\n"
         f"GOAL:\n{goal_text}"
     )
 
@@ -582,6 +595,13 @@ def compose_milestone_task(goal: Goal, index: int) -> str:
     ]
     if build_team:
         parts.append(f"PACKAGE OWNER: {ms.owner or 'assigned council member'}")
+        if ms.acceptance_detail:
+            parts.extend([
+                "",
+                "RETRY CORRECTION â€” the previous attempt was rejected. Do not repeat "
+                "it; correct the concrete failure against the current accepted staging bytes:",
+                ms.acceptance_detail,
+            ])
         contract_inputs = [
             goal.milestones[d] for d in ms.contract_depends_on
             if 0 <= d < len(goal.milestones) and d != index
@@ -613,9 +633,14 @@ def compose_milestone_task(goal: Goal, index: int) -> str:
             "ALREADY COMPLETED — these files exist in the project folder; build "
             "on them, do not recreate them:"
         )
+        if goal.staging_root:
+            parts.append(f"Shared staging root: {Path(goal.staging_root).resolve()}")
         for m in done:
             accepted = m.accepted_files or m.files
-            files = f" (accepted: {', '.join(Path(f).name for f in accepted[:6])})" if accepted else ""
+            files = (
+                f" (accepted paths: {', '.join(str(Path(f).resolve()) for f in accepted[:6])})"
+                if accepted else ""
+            )
             parts.append(f"- Milestone {m.index + 1}: {m.title}{files}")
             if m.summary:
                 parts.append(f"  Outcome: {m.summary[:config.GOAL_SUMMARY_MAX_CHARS]}")

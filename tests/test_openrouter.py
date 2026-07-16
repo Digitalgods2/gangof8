@@ -306,9 +306,11 @@ def test_enabling_seat_registers_openrouter_adapter(tmp_path, monkeypatch):
     svc.update_settings({"backend": "cli", "openrouter_enabled": {"kimi": True}})
     assert "kimi" in svc.registry.names()
     assert isinstance(svc.registry._adapters["kimi"], OpenRouterAdapter)
-    # an assigned-but-not-enabled seat is still registered (referenced in role map)
+    # An assigned-but-disabled seat is remapped and never registered merely
+    # because a stale custom role map references it.
     svc.update_settings({"role_agents": {"researcher": "glm", "summarizer": "claude"}})
-    assert isinstance(svc.registry._adapters["glm"], OpenRouterAdapter)
+    assert "glm" not in svc.registry.names()
+    assert svc.role_agents[Role.researcher] != "glm"
 
 
 def test_model_slug_override_is_used(tmp_path, monkeypatch):
@@ -342,16 +344,16 @@ def test_seat_unavailable_without_key(tmp_path, monkeypatch):
 _CLI = {"claude", "codex", "gemini"}
 
 
-def test_disabling_cli_seat_falls_back_to_openrouter(tmp_path, monkeypatch):
+def test_disabling_cli_seat_falls_back_to_enabled_roster(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     svc = GangOf8Service(data_dir=tmp_path)
     svc.set_openrouter_key("sk-or-key")
     svc.update_settings({"backend": "cli",
                          "openrouter_enabled": {"kimi": True, "qwen": True},
                          "cli_enabled": {"claude": False}})
-    # every role that was on claude is remapped onto an enabled OpenRouter seat
+    # Every role that was on claude is remapped across enabled local/remote seats.
     assert "claude" not in svc.role_agents.values()
-    assert svc.role_agents[Role.lead] in ("kimi", "qwen")
+    assert svc.role_agents[Role.lead] in ("codex", "gemini", "kimi", "qwen")
     # claude is no longer registered; the fallback seat is; and it left the panel
     assert "claude" not in svc.registry.names()
     assert "kimi" in svc.registry.names()
@@ -370,12 +372,43 @@ def test_disabling_all_clis_runs_openrouter_only(tmp_path, monkeypatch):
     assert set(svc.role_agents.values()) <= {"deepseek", "glm"}
 
 
-def test_disabling_cli_without_openrouter_is_noop(tmp_path, monkeypatch):
+def test_disabled_cli_roles_inherit_other_enabled_clis(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     svc = GangOf8Service(data_dir=tmp_path)
-    # nothing to fall back to → the disable is ignored so the lead still exists
+    # No OpenRouter seat is needed: the remaining enabled local seats inherit.
     svc.update_settings({"backend": "cli", "cli_enabled": {"claude": False}})
-    assert svc.role_agents[Role.lead] == "claude"
+    assert svc.role_agents[Role.lead] in {"codex", "gemini"}
+    assert "claude" not in svc.role_agents.values()
+    assert "claude" not in svc.registry.names()
+
+
+def test_only_gemini_enabled_inherits_every_role(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = GangOf8Service(data_dir=tmp_path)
+    svc.update_settings({
+        "backend": "cli",
+        "cli_enabled": {"claude": False, "codex": False, "gemini": True},
+        "openrouter_enabled": {
+            "deepseek": False, "glm": False, "qwen": False, "kimi": False,
+        },
+    })
+    assert set(svc.role_agents.values()) == {"gemini"}
+    assert set(svc.registry.names()) == {"gemini"}
+    assert svc.panel == ["gemini"]
+
+
+def test_all_models_disabled_rejects_task_without_invoking_adapter(tmp_path):
+    svc = GangOf8Service(data_dir=tmp_path)
+    svc.update_settings({
+        "backend": "cli",
+        "cli_enabled": {"claude": False, "codex": False, "gemini": False},
+        "openrouter_enabled": {
+            "deepseek": False, "glm": False, "qwen": False, "kimi": False,
+        },
+    })
+    assert svc.registry.names() == []
+    with pytest.raises(ValueError, match="no AI models are enabled"):
+        svc.run("do something")
 
 
 def test_put_settings_endpoint_persists_cli_enabled(client):
@@ -396,6 +429,18 @@ def test_put_settings_endpoint_persists_cli_enabled(client):
     cli = {s["name"]: s for s in client.get("/settings/seats").json()["seats"]
            if s["kind"] == "cli"}
     assert cli["claude"]["enabled"] is False            # seats endpoint reflects it
+
+
+def test_settings_api_single_enabled_model_resolves_entire_role_map(client):
+    response = client.put("/settings", json={
+        "backend": "cli",
+        "cli_enabled": {"claude": False, "codex": False, "gemini": True},
+        "openrouter_enabled": {
+            "deepseek": False, "glm": False, "qwen": False, "kimi": False,
+        },
+    })
+    assert response.status_code == 200
+    assert set(response.json()["resolved_role_agents"].values()) == {"gemini"}
 
 
 def test_seats_reports_cli_enabled_flag(tmp_path, monkeypatch):

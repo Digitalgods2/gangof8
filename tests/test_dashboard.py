@@ -92,6 +92,46 @@ def test_header_lockup_is_served_and_referenced(client):
     assert 'rel="icon"' in page  # the existing favicon is independent of the header lockup
 
 
+def test_header_has_immediate_ai_brand_seat_toggles(client):
+    page = client.get("/").text
+    assert 'id="aiSeatToggles"' in page
+    for brand in ("OpenAI", "Anthropic", "Gemini", "DeepSeek", "GLM", "Qwen", "Kimi"):
+        assert f">{brand}</label>" in page
+    assert page.count('data-settings-map="cli_enabled"') == 3
+    assert page.count('data-settings-map="openrouter_enabled"') == 4
+
+    app_js = client.get("/app.js").text
+    assert 'fetch("/settings", {cache: "no-store"})' in app_js
+    assert 'method: "PUT"' in app_js
+    assert "seatSettingsPatch(latest, mapName, seat, desired)" in app_js
+    assert "renderHeaderSeatToggles(settingsCache)" in app_js
+    assert "Could not update ${brand}" in app_js
+
+
+def test_header_seat_patch_preserves_every_other_map_value(client):
+    if shutil.which("node") is None:
+        pytest.skip("node not on PATH")
+    script = r"""
+const {seatSettingsPatch} = require('./gangof8/static/dashboard-utils.js');
+const settings = {
+  cli_enabled: {claude:true, codex:true, gemini:false},
+  openrouter_enabled: {deepseek:true, glm:false, qwen:true, kimi:false},
+};
+const cliPatch = seatSettingsPatch(settings, 'cli_enabled', 'codex', false);
+if (JSON.stringify(cliPatch.cli_enabled) !== JSON.stringify({claude:true,codex:false,gemini:false}))
+  throw new Error('CLI siblings were lost');
+const orPatch = seatSettingsPatch(settings, 'openrouter_enabled', 'glm', true);
+if (JSON.stringify(orPatch.openrouter_enabled) !== JSON.stringify({deepseek:true,glm:true,qwen:true,kimi:false}))
+  throw new Error('OpenRouter siblings were lost');
+if (!settings.cli_enabled.codex || settings.openrouter_enabled.glm)
+  throw new Error('source settings were mutated');
+"""
+    completed = subprocess.run(
+        ["node", "-e", script], cwd=os.getcwd(), capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_dashboard_assets_served(client):
     page = client.get("/").text
     assert 'src="/dashboard-utils.js"' in page
