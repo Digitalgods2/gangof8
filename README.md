@@ -12,9 +12,10 @@ moving finished work into a real project.
 The name describes the intended full roster: one coordinator plus seven model
 seats. The bundled roster can combine three local CLI seats (Claude, Codex, and
 Gemini) with four optional OpenRouter seats (DeepSeek, GLM, Qwen, and Kimi).
-Seats can be enabled, disabled, remapped, and model-pinned in Settings. New
-runs snapshot the enabled roster; disabling seats is the supported way to use a
-smaller council.
+Seats can be enabled, disabled, remapped, and model-pinned in Settings. The
+dashboard header also exposes all seven brands as immediate checkboxes, so the
+working roster can be changed without opening Settings. New runs snapshot the
+enabled roster; disabling seats is the supported way to use a smaller council.
 
 The repository ships a versioned portable settings profile. A fresh
 installation uses it when no `settings.json` exists, and any installation can
@@ -35,10 +36,10 @@ build goal.
 | Start it with | Any normal prompt | `/goal <objective>`, or a substantial build brief auto-routed from `/tasks` |
 | Best for | Questions, research, reviews, designs, and bounded deliverables | Multi-file builds, overhauls, and long objectives |
 | Council behavior | Every enabled seat produces an independent take or candidate | The architect creates owned work packages with dependencies |
-| Model ownership | Competing whole solutions, followed by blind selection | One named model is accountable for each package; exact sibling outputs can fan out to enabled authors |
-| Concurrency | Panel calls, smoke checks, and judge waves run in parallel | Contract-linked packages start together; only hard artifact dependencies wait |
-| Integration | Blind best-of-N plus a strong finishing/chair pass | Shared staging makes completed package files available downstream |
-| Delivery | A governed `promote` action for the session | One aggregate diff and one `Approve final batch` decision |
+| Model ownership | Competing whole solutions, followed by blind selection | One named model atomically authors each cohesive package; models run in parallel across packages |
+| Concurrency | Panel calls, smoke checks, and judge waves run in parallel | Descriptive contract work may overlap; runtime consumers wait for accepted provider bytes |
+| Integration | Blind best-of-N plus a strong finishing/chair pass | A hard-after QA owner inspects actual staging before deterministic assembly |
+| Delivery | A governed `promote` action for the session | Browser/semantic acceptance, then one hash-bound diff and approval |
 
 This distinction preserves the reason for using several models. A tournament
 is useful when several independent answers improve selection. A build team is
@@ -50,6 +51,19 @@ Substantial production briefs no longer depend on the user remembering the
 multi-surface implementation requests and return a goal response with
 `auto_routed: true`. Short fixes, questions, attachment-driven work, and bounded
 deliverables remain ordinary sessions.
+
+Attached source code is classified from the user's directive, not from
+incidental method names inside the attachment. Requests to fix, improve, or
+return an attached implementation therefore enter the code workflow and its
+authoring policy; genuine destructive directives remain governed actions.
+
+For file-producing code, content, design, and explicit revision tasks, prose is
+never accepted as proof of completion. Success requires an executed file write,
+edit, or delivery action followed by artifact verification. If the owner fails
+or every model returns a stub, the run terminates as `failed_verification` with
+low confidence before a summarizer can claim that a missing file was delivered.
+External actions such as send, delete, and deploy continue through their own
+governance ledger rather than pretending to be file deliverables.
 
 ## Frontier implementation policy
 
@@ -64,7 +78,7 @@ capacity second when they are enabled:
 - a failed frontier candidate goes back to the same model for implementation
   repair before judging; returning later only as a judge does not satisfy the
   author quorum;
-- frontier authoring and release-verification calls have finite hard deadlines
+- frontier authoring and release verification have no coordinator hard deadline
   by default and remain immediately cancellable by the user;
 - a selected implementation is checked against an explicit requirement list
   and judge-defect register by a different frontier release engineer; and
@@ -73,8 +87,9 @@ capacity second when they are enabled:
   can apply surgical code repairs, but the repaired result must pass a second
   confirmation inspection.
 
-Disabling Claude or Codex in Settings intentionally removes that seat from the
-required quorum. This is the supported way to request a smaller council.
+Disabling Claude or Codex in the header or Settings intentionally removes that
+seat from the required quorum. This is the supported way to request a smaller
+council.
 
 ### Deterministic final assembly
 
@@ -92,7 +107,10 @@ Assembly uses no byte or character thresholds. Expanded source is never sent
 through skill-result truncation, model context, or generic artifact repair.
 Malformed, nested, missing, duplicate, undeclared, changed, non-UTF-8, or unsafe inline sources
 fail the explicit assembly gate before delivery. The final assembled file is
-then hash-checked and smoke-validated deterministically.
+then hash-checked and smoke-validated deterministically, exercised in a real
+browser when interactive, and reviewed against the semantic acceptance list by
+an independent frontier engineer. Assembly integrity is never treated as a
+quality verdict.
 
 ## How an ordinary task works
 
@@ -162,17 +180,19 @@ The planner defines each package with:
 
 For a broad build, the planner is instructed to use the enabled council across
 distinct areas of responsibility. A small job may reasonably need fewer
-packages; the coordinator does not manufacture duplicate work solely to fill
-the roster. Claude and Codex are explicitly assigned source-producing packages
-when enabled, with a frontier seat preferred for final integration. Missing
-owners are normalized across enabled seats, inferred file
+packages. When a broad plan has enough work packages for the enabled roster,
+duplicate owner assignments are repaired so every enabled AI gets a real
+model-authored package before any owner gets a second; zero-call assembly does
+not count as participation. Claude and Codex are explicitly assigned
+source-producing packages when enabled, with a frontier seat preferred for
+final integration. Missing owners are normalized across enabled seats, inferred file
 dependencies are added, repeated output paths are sequenced, and cyclic hard
 dependency plans are rejected. A hard `AFTER`/`REQUIRES` edge means verified
-file bytes must exist before the owner can start. A `CONTRACTS` edge gives the
-owner the upstream API, DOM, or data contract immediately and does not block
-scheduling. Sibling modules should normally use contracts; final assembly,
-generated schemas, cross-package revisions, and integrated tests remain hard
-dependencies.
+file bytes must exist before the owner can start. `CONTRACTS` remains
+nonblocking only for descriptive work. HTML, CSS, and JavaScript consumers are
+automatically promoted to hard dependencies and receive the exact accepted
+provider bytes and SHA-256 hashes, so method names, time units, input semantics,
+DOM hooks, and load order cannot drift behind matching prose.
 
 ### 2. The source is copied into private staging
 
@@ -200,21 +220,17 @@ background, so a broad plan normally puts most or all enabled owners into its
 first execution wave. Each package session remains accountable to its named
 owner rather than convening another seven-way candidate tournament.
 
-For a package with several independent output paths, the coordinator assigns
-whole paths across the owner and enabled implementation sub-agents and launches
-those calls concurrently. The owner authors at least one output and remains
-accountable for the package contract; helpers cannot overwrite or claim a path
-assigned to someone else. The coordinator adopts the assigned artifacts in
-contract order, and a lead model does not silently rewrite them. Assignment is
-based on exact output structure—not guessed response sizes, byte counts, or
-token thresholds. Existing-file revisions still use the owner and a surgical
-edit path.
+Every output path in a package goes to its accountable owner in one cohesive
+authoring call. Tightly coupled HTML, CSS, and JavaScript are never round-robin
+mixed and then mislabeled as integrated. Seven-model throughput comes from
+independent packages running concurrently. Existing-file revisions still use
+the owner and a surgical edit path.
 
-Each author receives the package/interface sections of the goal plus the exact
-file assignment map, instead of every author receiving another copy of the full
-product brief. A completed response that misses an artifact envelope or exact
-path can receive one focused correction from that file's assigned author. A
-timed-out or errored author is not immediately repeated.
+Each owner receives the package/interface sections, its exact output map, and
+the actual hash-bound bytes of every hard dependency. A completed response that
+misses an artifact envelope or exact path can receive one focused correction.
+A timed-out or errored owner is not immediately repeated or replaced by a
+mixture of sibling authors.
 
 Artifact boundaries are explicit and path-exact:
 
@@ -233,9 +249,9 @@ trailing presentation headings, followed by the normal syntax gate.
 
 Completed package files are hashed and accepted into shared staging. Hard
 downstream owners read the actual verified bytes produced by upstream owners.
-Contract-linked owners work in parallel from the declared interface; the final
-integration owner reconciles their staged implementations against those
-contracts.
+Runtime-linked owners wait for the accepted implementation and bind to its real
+surface. A non-assembly integration/QA owner must sit after a broad runtime
+graph; deterministic HTML assembly is concatenation, not integration.
 
 When a standalone JavaScript package intentionally consumes an upstream
 runtime that is still being built, Gang of 8 records its dynamic runtime check
@@ -259,7 +275,8 @@ discarded both when a new plan is parsed and when an older persisted package is
 verified. The deterministic HTML smoke harness supplies standard layout APIs
 such as `ResizeObserver`, `IntersectionObserver`, `MutationObserver`, and the
 CSS `style.setProperty()` surface so missing test doubles do not trigger an
-expensive model rewrite. A detected application exception still fails the gate.
+expensive model rewrite. Key, pointer, timer, animation-frame, and load-handler
+exceptions all fail the gate, including failures that occur only after input.
 
 Cross-package runtime defects are attributed separately. If staged dependency
 files conflict before the current package loads, the current owner is not asked
@@ -291,18 +308,25 @@ suggested by a late repair or salvage response. After every package has passed,
 Gang of 8 creates one release session containing only the planner's explicit
 `RELEASE` manifest. Package `OUTPUTS` remain in staging unless they are also
 named in `RELEASE`; this is how a single-file app releases `arcade.html` without
-also moving its source modules, build scripts, and QA files. If no destination
+also moving its source modules, build scripts, and QA files. Deterministic
+assembly first proves source integrity, then continues into real-browser and
+independent frontier semantic acceptance. Interactive HTML fails closed when a
+Chromium/Edge/Chrome acceptance run cannot be performed. The browser blocks
+external requests, drives controls/keyboard/pointer input separately, sustains
+runtime, captures page/console failures, and detects wholesale DOM/CSS selector
+mismatches. If no destination
 was provided, the app asks for one folder at this point. The dashboard then
 shows one aggregate diff and two decisions:
 
 - `Approve final batch`
 - `Deny`
 
-Approval performs a fresh preflight before touching the destination. Every
-staged file must still be present and non-empty, and every destination file
-must still match the existence/hash baseline shown during review. Gang of 8
-prepares the replacements and backups first, then replaces the files. If a
-later replacement fails, it attempts to restore the files already replaced.
+Approval is bound to the SHA-256 of every byte that passed the final gate.
+Promotion rejects any staging drift after verification or approval, verifies
+the prepared transaction copy, and verifies the destination after replacement.
+Every destination file must also match the existence/hash baseline shown during
+review. If a later replacement or hash check fails, Gang of 8 attempts to
+restore the files already replaced.
 
 This is a rollback-protected multi-file transaction, not a claim that a normal
 filesystem can provide a truly atomic cross-file commit. Target drift, locked
@@ -351,6 +375,15 @@ call. Settings supports:
 - changing complexity budgets and round-consent cadence; and
 - enabling or disabling Council integration review.
 
+The header lists the seven brands—OpenAI, Anthropic, Gemini, DeepSeek, GLM,
+Qwen, and Kimi—with a checkbox beside each. Each switch saves immediately
+through the same settings API. When a seat is disabled, its adapter is not
+registered or invoked and all of its roles are redistributed round-robin across
+the remaining enabled seats. A single enabled model therefore inherits the
+entire role map. If every model is disabled, new task submission fails with a
+clear prompt to enable at least one. OpenRouter seats still need an API key to
+answer calls.
+
 Backend and roster changes apply to new sessions. A running or paused session
 keeps the backend, panel, timeouts, and workflow version with which it started.
 Persisted goals created before the build-team overhaul keep their legacy
@@ -360,18 +393,15 @@ final-batch delivery.
 ## Timeouts, failures, and recovery
 
 The per-seat timeout shown in Settings is a routine/non-code guardrail and does
-not cap any session classified as code. Coding calls use their stage policies:
-current defaults include a 360-second non-frontier panel authoring ceiling, a
-180-second focused protocol-correction ceiling, one 360-second shared package
-authoring deadline split into at most three 120-second author waves, a
-600-second lead timeout, a
-480-second judge timeout, a 600-second codifier timeout, a 600-second frontier
-author timeout, and a 300-second frontier release-verification timeout. Every
-stage value is a total hard deadline. OpenRouter additionally closes a coding
-request after 180 seconds with no answer or reasoning tokens; transport
-comments and keep-alives do not count as progress. Registered HTTP connections
-and CLI processes also stop immediately when the user cancels the session or
-goal.
+not cap any session classified as code. Code-authoring and package-recovery
+calls have no coordinator wall-clock deadline by default: a productive model is
+allowed to finish. Operators can opt into author/package deadlines with the
+environment variables below. Frontier seats in coding sessions stay unlimited
+at lead, judge, codifier, repair, and release-review stages too; stage limits
+still apply to non-frontier seats. OpenRouter closes a request after 180 seconds
+with no answer or reasoning tokens; transport comments and keep-alives do not
+count as progress. Registered HTTP connections and CLI processes also stop
+immediately when the user cancels the session or goal.
 
 Gang of 8 handles failures as follows:
 
@@ -382,12 +412,12 @@ Gang of 8 handles failures as follows:
   transient error is re-called as the same implementation owner; a missing or
   non-runnable required frontier candidate stops delivery instead of degrading
   silently;
-- all authors in a build package share one wall-clock deadline, including time
-  queued for a concurrency slot; each wave receives at most one third of that
-  deadline, so one wedged provider cannot consume the recovery window;
+- package authoring is not cut off by elapsed wall time unless an operator opts
+  into `GANGOF8_PACKAGE_AUTHOR_DEADLINE`; an opted-in deadline includes queue
+  time and is divided across author/recovery waves;
 - a timeout/error is never retried against the same author. Only its unresolved
   exact paths may be reassigned once to a healthy sibling, which must author new
-  artifacts under the remaining shared deadline. Completed sibling outputs are
+  artifacts during the recovery wave. Completed sibling outputs are
   preserved, and the original and delivering authors remain in the audit trail;
 - a completed protocol/path miss can receive one focused exact-path correction;
   no assignment or timeout decision uses guessed file byte or token counts;
@@ -422,10 +452,11 @@ shows its accountable owner, exact-output author count, effective session
 state, session attempt count, total model-call attempts, blockers, and active
 model calls. The goal/session read-only APIs also expose the current
 file-to-author map, append-only per-file author history, attempt counts, author
-failures, shared deadline, package wall time, and aggregate elapsed time across
+failures, optional deadline, package wall time, and aggregate elapsed time across
 successful and failed model attempts. Streaming calls
 report output characters and whether they are
-waiting for first output; calls show their finite hard deadline, and streaming
+waiting for first output; calls show either their hard deadline or "no hard
+deadline", and streaming
 providers also show the independent no-output limit. The goal card exposes the
 `draining` state, aggregates approval/input blockers, and selects the actionable
 session, so a cancelled goal cannot continue to look like an active
@@ -776,13 +807,13 @@ Common environment variables:
 | `GANGOF8_SANDBOX_KEEP` | Recent inactive sandboxes retained | `25` |
 | `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
 | `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
-| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Package/panel authoring hard deadline, seconds | `360` |
-| `GANGOF8_PANEL_RETRY_TIMEOUT` | Focused package recovery call, seconds | `180` |
+| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Optional package/panel authoring hard deadline; `0` disables | `0` |
+| `GANGOF8_PANEL_RETRY_TIMEOUT` | Optional focused recovery hard deadline; `0` disables | `0` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
-| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Frontier author hard deadline, seconds | `600` |
-| `GANGOF8_PACKAGE_AUTHOR_DEADLINE` | Shared wall-clock deadline for all primary, correction, and distinct-author failover waves in one package; each wave is capped at one third | `360` |
+| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Optional frontier-author hard deadline; `0` disables | `0` |
+| `GANGOF8_PACKAGE_AUTHOR_DEADLINE` | Optional shared package deadline; `0` disables, positive values are split across author/recovery waves | `0` |
 | `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls for non-build-team frontier tournament authors | `1` |
-| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Independent frontier release hard deadline, seconds | `300` |
+| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Optional independent frontier release deadline; `0` disables | `0` |
 | `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
 | `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Independent no-model-output stall deadline, seconds | `180` |
 | `GANGOF8_CODIFIER_TIMEOUT` | Strong finishing pass timeout, seconds | `600` |
@@ -868,10 +899,11 @@ semaphores remain the actual resource controls.
 
 ### I only see four council members
 
-Open Settings and inspect the enabled CLI and OpenRouter seats. An OpenRouter
-seat needs both an API key and its enabled toggle. A disabled or unavailable
-seat will not appear in a new run. Settings changes do not alter a session that
-has already started.
+Inspect the seven checkboxes in the dashboard header, or open Settings for model
+details. An OpenRouter seat needs both an API key and its enabled toggle. A
+disabled or unavailable seat will not appear in a new run, and disabled role
+holders are reassigned to enabled models. Roster changes do not alter a session
+that has already started.
 
 For an ordinary task, every configured available seat should be convened. For
 a `/goal`, the center session has one accountable package owner by design. The
@@ -882,10 +914,9 @@ graph permits it.
 ### Claude timed out after reading a file
 
 Start a new session after updating/restarting the app. New Claude/Codex author
-calls use a 600-second hard deadline and release-verifier calls use 300 seconds;
-source-read/search follow-ups retain the stage deadline. A persisted session
-created by older code keeps its original timeout snapshot. User cancellation
-still terminates an in-flight CLI process.
+and release-verifier calls have no coordinator hard deadline by default. A
+positive environment override can opt into a limit. User cancellation still
+terminates an in-flight CLI process immediately.
 
 ### I am being asked to approve every output file
 

@@ -34,6 +34,36 @@ EDIT_MARKER = re.compile(
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 
+# Frontier reviewers sometimes return the same exact-edit contract using
+# labeled fenced blocks instead of merge-conflict markers.  This is still a
+# deterministic surgical edit: the executor requires OLD to occur uniquely in
+# the target before replacing it.  Accept the common form so a usable repair is
+# not discarded merely because the model decorated its headings.
+FENCED_EDIT_MARKER = re.compile(
+    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*"
+    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n"
+    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"[ \t]*```[^\r\n]*\r?\n(?P<old>.*?)\r?\n[ \t]*```[ \t]*\r?\n"
+    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"[ \t]*```[^\r\n]*\r?\n(?P<new>.*?)\r?\n[ \t]*```[ \t]*",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
+# Another common Markdown presentation wraps the whole labeled edit in one code
+# fence. Keep this form strict (one outer fence, explicit OLD/NEW labels) so the
+# replacement boundary is unambiguous and ordinary prose is never parsed as an
+# edit.
+OUTER_FENCED_EDIT_MARKER = re.compile(
+    r"^[ \t]*```[^\r\n]*\r?\n"
+    r"[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:EDIT|FILE)(?:\*\*)?[ \t]*:[ \t]*"
+    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n"
+    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"(?P<old>.*?)\r?\n"
+    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"(?P<new>.*?)\r?\n[ \t]*```[ \t]*",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+
 # 'RUNTESTS: <command>' proposes a free test run; command optional.
 RUNTESTS_MARKER = re.compile(
     r"^[ \t]*(?:\*\*)?RUN_?TESTS(?:\*\*)?[ \t]*:[ \t]*(?P<cmd>.*?)[ \t]*$",
@@ -51,7 +81,8 @@ PROMOTE_MARKER = re.compile(
 # are not swallowed into the file body. A colon is required so ordinary prose in
 # a file body is not mistaken for a block boundary.
 BLOCK_START = re.compile(
-    r"^[ \t]*(?:\*\*)?(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
+    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?"
+    r"(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -116,6 +147,20 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
             session_id=sid, kind="write_file", role=role,
             filename=fn, content=body, args={"filename": fn, "content": body})))
     for m in EDIT_MARKER.finditer(text):
+        fn = canonical_protocol_filename(m.group("file"))
+        if not fn:
+            continue
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="edit_file", role=role, filename=fn,
+            args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
+    for m in FENCED_EDIT_MARKER.finditer(text):
+        fn = canonical_protocol_filename(m.group("file"))
+        if not fn:
+            continue
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="edit_file", role=role, filename=fn,
+            args={"filename": fn, "old": m.group("old"), "new": m.group("new")})))
+    for m in OUTER_FENCED_EDIT_MARKER.finditer(text):
         fn = canonical_protocol_filename(m.group("file"))
         if not fn:
             continue

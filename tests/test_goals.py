@@ -165,7 +165,8 @@ def test_parse_contract_dependencies_as_non_blocking_edges():
 def test_plan_prompt_reserves_after_for_real_bytes():
     prompt = goals_mod.plan_prompt("Build an app", ["claude", "codex"])
     assert "CONTRACTS never blocks scheduling" in prompt
-    assert "Use AFTER only when actual verified bytes are indispensable" in prompt
+    assert "MUST use AFTER" in prompt
+    assert "Deterministic assembly is concatenation, not integration" in prompt
     assert "A broad build should normally start most owners in the first wave" in prompt
 
 
@@ -288,6 +289,88 @@ def test_hard_file_requirement_still_infers_blocking_provider(tmp_path):
     assert normalized[1].contract_depends_on == []
 
 
+def test_runtime_contract_is_promoted_to_real_byte_dependency(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["claude", "codex"])
+    packages = [
+        GoalMilestone(index=0, title="runtime", task_text="runtime", owner="claude",
+                      required_files=["src/core.js"], contract_declared=True),
+        GoalMilestone(index=1, title="game", task_text="game", owner="codex",
+                      required_files=["src/game.js"], contract_depends_on=[0],
+                      contract_declared=True),
+    ]
+
+    normalized, errors = service._normalize_work_packages(packages)
+
+    assert not errors
+    assert normalized[1].depends_on == [0]
+    assert normalized[1].contract_depends_on == []
+    assert normalized[1].dependencies == ["src/core.js"]
+
+
+def test_broad_build_plan_repairs_duplicate_owners_to_use_every_enabled_ai(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["alpha", "beta", "gamma"])
+    packages = [
+        GoalMilestone(index=0, title="a", task_text="a", owner="alpha",
+                      required_files=["a.py"], contract_declared=True),
+        GoalMilestone(index=1, title="b", task_text="b", owner="alpha",
+                      required_files=["b.py"], contract_declared=True),
+        GoalMilestone(index=2, title="c", task_text="c", owner="beta",
+                      required_files=["c.py"], contract_declared=True),
+    ]
+
+    normalized, errors = service._normalize_work_packages(packages, "Build an application")
+
+    assert not errors
+    assert {package.owner for package in normalized} == {"alpha", "beta", "gamma"}
+
+
+def test_runtime_graph_cannot_flow_directly_into_zero_call_assembly(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["alpha", "beta", "gamma"])
+    packages = [
+        GoalMilestone(index=0, package_id="wp_1", title="core", task_text="core",
+                      owner="alpha", required_files=["src/core.js"], contract_declared=True),
+        GoalMilestone(index=1, package_id="wp_2", title="game", task_text="game",
+                      owner="beta", required_files=["src/game.js"], contract_declared=True),
+        GoalMilestone(index=2, package_id="wp_3", title="release", task_text="assemble",
+                      owner="gamma", required_files=["index.html"], release_files=["index.html"],
+                      release_declared=True, dependencies=["src/core.js", "src/game.js"],
+                      assembly_mode=assembly.HTML_INLINE, assembly_template=assembly.OWNER_TEMPLATE,
+                      contract_declared=True),
+    ]
+
+    _normalized, errors = service._normalize_work_packages(packages, "Build an arcade application")
+
+    assert any("without a hard-after non-assembly integration/QA package" in error
+               for error in errors)
+
+
+def test_hard_after_integration_package_satisfies_runtime_release_graph(tmp_path):
+    service = GangOf8Service(
+        data_dir=tmp_path / "data", panel=["alpha", "beta", "gamma"])
+    packages = [
+        GoalMilestone(index=0, package_id="wp_1", title="core", task_text="core",
+                      owner="alpha", required_files=["src/core.js"], contract_declared=True),
+        GoalMilestone(index=1, package_id="wp_2", title="game", task_text="game",
+                      owner="beta", required_files=["src/game.js"], contract_depends_on=[0],
+                      contract_declared=True),
+        GoalMilestone(index=2, package_id="wp_3", title="Integration QA",
+                      task_text="Verify the combined runtime", owner="gamma",
+                      required_files=["src/integration.js"], contract_depends_on=[0, 1],
+                      contract_declared=True),
+        GoalMilestone(index=3, package_id="wp_4", title="release", task_text="assemble",
+                      owner="gamma", required_files=["index.html"], release_files=["index.html"],
+                      release_declared=True,
+                      dependencies=["src/core.js", "src/game.js", "src/integration.js"],
+                      assembly_mode=assembly.HTML_INLINE, assembly_template=assembly.OWNER_TEMPLATE,
+                      contract_declared=True),
+    ]
+
+    normalized, errors = service._normalize_work_packages(packages, "Build an arcade application")
+
+    assert not errors
+    assert normalized[2].depends_on == [0, 1]
+
+
 def test_contract_linked_owner_receives_pending_interface_without_future_bytes():
     goal = Goal(text="Build an arcade", collaboration_mode="build_team", milestones=[
         GoalMilestone(index=0, title="Runtime", task_text="Build runtime", owner="claude",
@@ -305,6 +388,18 @@ def test_contract_linked_owner_receives_pending_interface_without_future_bytes()
     assert "status running" not in text
     assert "(running)" not in text
     assert "not live status indicators" in text
+
+
+def test_rejected_package_receives_concrete_retry_failure():
+    goal = Goal(text="Build an arcade", collaboration_mode="build_team", milestones=[
+        GoalMilestone(index=0, title="Runtime", task_text="Build runtime", owner="claude",
+                      acceptance_detail="pointer x/y never updates from mouse input"),
+    ])
+
+    text = goals_mod.compose_milestone_task(goal, 0)
+
+    assert "RETRY CORRECTION" in text
+    assert "pointer x/y never updates" in text
 
 
 def test_compose_milestone_task_frames_scope():
@@ -343,6 +438,10 @@ def test_goal_runs_all_milestones_and_completes(svc):
     second = svc.get(goal.milestones[1].session_id)
     assert "AVAILABLE IN THE SHARED GOAL STAGING WORKSPACE" in second["task"]["text"]
     assert "Storage decision" in second["task"]["text"]
+    view = svc.get_goal(goal.goal_id)
+    assert view["build_roster"] == ["mock"]
+    assert view["contributing_agents"] == ["mock"]
+    assert view["participation_complete"] is True
 
 
 def test_build_package_round_names_owner_instead_of_claiming_full_panel(svc):
@@ -445,6 +544,9 @@ def test_resume_adopts_verified_completed_attempt_before_spending_again(
         collaboration_mode="build_team", delivery_mode="final_batch",
         work_package_id="wp_1", work_package_owner="qwen",
         required_files=["src/audio.js"],
+        verified_output_hashes={
+            "src/audio.js": hashlib.sha256(source.read_bytes()).hexdigest(),
+        },
         task=Task(task_id="t", session_id="s_verified", text="audio"),
         final=FinalAnswer(answer="audio complete", confidence="high"),
         proposed_actions=[ProposedAction(
@@ -461,6 +563,41 @@ def test_resume_adopts_verified_completed_attempt_before_spending_again(
     assert out["milestones"][0]["session_id"] == "s_verified"
     assert (stage / "src" / "audio.js").read_text(encoding="utf-8").startswith("globalThis")
     assert started == [1]
+
+
+def test_recovery_rejects_completed_attempt_whose_verified_bytes_changed(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    goal = Goal(
+        text="recover", status="paused", staging_root=str(stage),
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="qwen", title="audio",
+            task_text="audio", status="failed", required_files=["src/audio.js"],
+            contract_declared=True, requires_delivery=True,
+        )],
+    )
+    service.goals.save(goal)
+    source = tmp_path / "result.js"
+    source.write_text("verified", encoding="utf-8")
+    verified = hashlib.sha256(source.read_bytes()).hexdigest()
+    from gangof8.models import ProposedAction
+    prior = Session(
+        session_id="s_tampered", status=SessionStatus.done, outcome="succeeded",
+        goal_id=goal.goal_id, collaboration_mode="build_team", delivery_mode="final_batch",
+        work_package_id="wp_1", work_package_owner="qwen",
+        required_files=["src/audio.js"], verified_output_hashes={"src/audio.js": verified},
+        task=Task(task_id="t", session_id="s_tampered", text="audio"),
+        proposed_actions=[ProposedAction(
+            session_id="s_tampered", kind="write_file", role=Role.implementer,
+            filename="src/audio.js", status="executed", result_path=str(source),
+        )],
+    )
+    service.store.save_session(prior)
+    source.write_text("changed after verification", encoding="utf-8")
+
+    assert service._recover_verified_goal_packages(goal.goal_id) == []
+    assert not (stage / "src" / "audio.js").exists()
 
 
 def test_stale_session_from_retried_milestone_cannot_advance(svc):
@@ -748,6 +885,157 @@ def test_assembly_template_failure_reopens_only_its_upstream_owner(tmp_path, mon
     assert reopened.milestones[0].invalidated_session_ids == ["s_bad_template"]
 
 
+def test_resume_reopens_legacy_non_self_contained_stylesheet_owner(
+        tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stylesheet_hash = hashlib.sha256(b"@import url('font.css');\n").hexdigest()
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_styles", owner="gemini", title="styles",
+                task_text="author styles", status="done", session_id="s_bad_styles",
+                contract_declared=True, requires_delivery=True,
+                required_files=["css/theme.css"],
+                accepted_files=["stage/css/theme.css"],
+                accepted_hashes={"css/theme.css": stylesheet_hash},
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="failed", session_id="s_assembly",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["arcade.html"],
+                dependencies=["index.template.html", "css/theme.css"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_assembly", status=SessionStatus.failed,
+        outcome="failed_verification", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        runtime_dependencies=["index.template.html", "css/theme.css"],
+        quality_gate={
+            "verdict": "FAIL", "stage": "deterministic_assembly",
+            "detail": (
+                "inline stylesheet contains @import and is not self-contained: "
+                "css/theme.css"
+            ),
+        },
+        stop_reason="deterministic assembly contract failed",
+        task=Task(task_id="t_assembly", session_id="s_assembly", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done"
+                    for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    provider = service.goals.get(goal.goal_id).milestones[0]
+    assert provider.status == "pending"
+    assert provider.session_id is None
+    assert provider.invalidated_session_ids == ["s_bad_styles"]
+    assert provider.accepted_hashes == {}
+
+
+def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    (stage / "js").mkdir(parents=True)
+    input_source = (
+        "addEventListener('keydown',()=>{if(window.ArcadePortal&&window.ArcadePortal.input)"
+        "window.ArcadePortal.input.actions.fire=true;});\n"
+    )
+    portal_source = "window.ArcadePortal={input:{held:{}}};\n"
+    (stage / "js" / "input.js").write_text(input_source, encoding="utf-8")
+    (stage / "js" / "portal.js").write_text(portal_source, encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_core", owner="codex", title="core",
+                task_text="author core", status="done", session_id="s_bad_core",
+                contract_declared=True, requires_delivery=True,
+                required_files=["js/input.js", "js/portal.js"],
+                accepted_files=[str(stage / "js" / "input.js"), str(stage / "js" / "portal.js")],
+                accepted_hashes={
+                    "js/input.js": hashlib.sha256(input_source.encode()).hexdigest(),
+                    "js/portal.js": hashlib.sha256(portal_source.encode()).hexdigest(),
+                },
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="failed", session_id="s_assembly_runtime",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["arcade.html"],
+                dependencies=["js/input.js", "js/portal.js"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.html",
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_assembly_runtime", status=SessionStatus.failed,
+        outcome="failed_verification", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.html",
+            "sources": ["js/input.js", "js/portal.js"],
+        },
+        unresolved=[
+            "artifact verification failed: arcade.html: does not run â€” "
+            "Cannot set properties of undefined (setting 'fire')"
+        ],
+        stop_reason="artifact verification failed; no file was delivered",
+        task=Task(task_id="t_runtime", session_id="s_assembly_runtime", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    assert provider.session_id is None
+    assert provider.invalidated_session_ids == ["s_bad_core"]
+    assert provider.accepted_hashes == {}
+    assert "js/portal.js" in provider.acceptance_detail
+    assert "arcadeportal.input paths [actions, actions.fire]" in provider.acceptance_detail
+    persisted = Session.model_validate(service.store.load_session("s_assembly_runtime"))
+    assert persisted.quality_gate["fault_scope"] == "dependency"
+    assert persisted.quality_gate["fault_path"] == "js/portal.js"
+
+
 def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(tmp_path):
     service = GangOf8Service(data_dir=tmp_path / "data")
     goal = Goal(
@@ -817,11 +1105,19 @@ def test_goal_stages_every_package_then_uses_one_final_batch_approval(tmp_path):
     pending = [a for a in release.approvals if a.status == "pending"]
     assert len(pending) == 1
     assert [a.kind for a in release.proposed_actions] == ["promote_batch"]
+    release_action = release.proposed_actions[0]
+    verified_hashes = json.loads(release_action.args["source_hashes"])
+    assert verified_hashes["report.md"] == release.release_verified_hashes["report.md"]
     svc.approve(release.session_id, pending[0].approval_id, True)
     g = svc.goals.get(goal.goal_id)
     assert g.status == "completed"
     assert [m.status for m in g.milestones] == ["done", "done"]
     assert (est / "report.md").exists()
+    assert hashlib.sha256((est / "report.md").read_bytes()).hexdigest() == verified_hashes["report.md"]
+    provenance = g.milestones[0].output_provenance["report.md"]
+    assert provenance["sha256"] == verified_hashes["report.md"]
+    assert provenance["agent"] == "mock"
+    assert provenance["method"] == "model_authored"
 
 
 def test_final_batch_detects_destination_drift_before_writing(tmp_path):
@@ -839,11 +1135,38 @@ def test_final_batch_detects_destination_drift_before_writing(tmp_path):
     action = ProposedAction(
         session_id="s_batch", kind="promote_batch", role=Role.implementer,
         args={"files": json.dumps(["a.txt"]),
-              "baselines": json.dumps({"a.txt": baseline})})
+              "baselines": json.dumps({"a.txt": baseline}),
+              "source_hashes": json.dumps({
+                  "a.txt": hashlib.sha256(b"new").hexdigest(),
+              })})
     (dest / "a.txt").write_text("someone else's change", encoding="utf-8")
     with pytest.raises(executor.ExecutionError, match="project changed after final review"):
         executor.execute(session, action, tmp_path / "data")
     assert (dest / "a.txt").read_text(encoding="utf-8") == "someone else's change"
+
+
+def test_final_batch_rejects_staging_drift_after_approval(tmp_path):
+    from gangof8 import executor
+    from gangof8.models import ProposedAction, Role, Session, Task
+
+    stage, dest = tmp_path / "stage", tmp_path / "dest"
+    stage.mkdir(); dest.mkdir()
+    (stage / "a.txt").write_text("verified", encoding="utf-8")
+    verified = hashlib.sha256(b"verified").hexdigest()
+    session = Session(
+        session_id="s_stage_drift", workspace_root=str(stage), established_root=str(dest),
+        task=Task(task_id="t", session_id="s_stage_drift", text="release"))
+    action = ProposedAction(
+        session_id="s_stage_drift", kind="promote_batch", role=Role.implementer,
+        args={"files": json.dumps(["a.txt"]),
+              "baselines": json.dumps({"a.txt": None}),
+              "source_hashes": json.dumps({"a.txt": verified})})
+    (stage / "a.txt").write_text("mutated after approval", encoding="utf-8")
+
+    with pytest.raises(executor.ExecutionError, match="changed after verification/approval"):
+        executor.execute(session, action, tmp_path / "data")
+
+    assert not (dest / "a.txt").exists()
 
 
 def test_final_batch_rolls_back_if_a_later_replace_fails(tmp_path, monkeypatch):
@@ -864,7 +1187,11 @@ def test_final_batch_rolls_back_if_a_later_replace_fails(tmp_path, monkeypatch):
     action = ProposedAction(
         session_id="s_rollback", kind="promote_batch", role=Role.implementer,
         args={"files": json.dumps(["a.txt", "b.txt"]),
-              "baselines": json.dumps(baselines)})
+              "baselines": json.dumps(baselines),
+              "source_hashes": json.dumps({
+                  name: hashlib.sha256(f"new-{name}".encode()).hexdigest()
+                  for name in ("a.txt", "b.txt")
+              })})
     real_replace = skills.os.replace
     calls = 0
 

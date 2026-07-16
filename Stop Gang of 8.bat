@@ -7,4 +7,5 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8790 ^| findstr LISTENING') 
     set "found=1"
 )
 if defined found (echo Gang of 8 stopped.) else (echo Nothing was running on port 8790.)
+if /i "%~1"=="--no-wait" exit /b 0
 timeout /t 2 /nobreak >nul

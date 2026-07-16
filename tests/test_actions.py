@@ -148,10 +148,13 @@ def test_collects_multifile_artifacts_after_blank_lines(tmp_path):
     assert writes[1].content == "second body"
 
 
-def test_draft_without_marker_proposes_nothing(tmp_path):
+def test_draft_without_marker_fails_an_output_task_truthfully(tmp_path):
     service = GangOf8Service(data_dir=tmp_path)  # plain MockAdapter draft has no marker
     session = service.run(TASK, source="test")
-    assert session.status == SessionStatus.done
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
+    assert session.final.confidence == "low"
+    assert "did not produce or modify" in session.final.answer
     assert session.proposed_actions == []
     assert session.files_changed == []
 

@@ -76,35 +76,45 @@ ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead se
 # The lead authors whole files in one shot, so give it markedly more headroom than
 # a quick specialist call before timing out.
 LEAD_TIMEOUT = 600
-# Ordinary package/panel authors receive this bounded call. Frontier authors get
-# a larger but still finite hard deadline so a wedged provider cannot hold a
-# package or release gate indefinitely.
-PANEL_AUTHOR_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_AUTHOR_TIMEOUT", "360"))
-# A focused non-frontier protocol/filename recovery uses a shorter window.
-PANEL_RETRY_TIMEOUT = int(os.environ.get("GANGOF8_PANEL_RETRY_TIMEOUT", "180"))
+# Code authors are user-cancellable and API authors have a no-output stall
+# watchdog, so productive generation is not stopped by a guessed wall clock.
+# Set either environment value above zero only when an installation explicitly
+# wants a hard authoring deadline; zero means no coordinator deadline.
+PANEL_AUTHOR_TIMEOUT = max(
+    0, int(os.environ.get("GANGOF8_PANEL_AUTHOR_TIMEOUT", "0"))
+)
+PANEL_RETRY_TIMEOUT = max(
+    0, int(os.environ.get("GANGOF8_PANEL_RETRY_TIMEOUT", "0"))
+)
 FRONTIER_AUTHOR_SEATS = tuple(
     s.strip() for s in os.environ.get("GANGOF8_FRONTIER_AUTHOR_SEATS", "claude,codex").split(",")
     if s.strip()
 )
 FRONTIER_AUTHOR_TIMEOUT = max(
-    1, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "600"))
+    0, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "0"))
 )
-# One wall-clock deadline covers every author and any focused protocol retry in
-# a work package.  Parallel fan-out therefore cannot turn into serial N x timeout
-# behavior when a provider wedges or a local concurrency slot is queued.
+# An optional wall-clock deadline can cover a whole package. It is disabled by
+# default because a productive owner must be allowed to finish; cancellation and
+# the OpenRouter no-output stall watchdog remain active. Positive values opt in.
 PACKAGE_AUTHOR_DEADLINE = max(
-    1, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "360"))
+    0, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "0"))
 )
-# Package authoring has three bounded waves: primary authors, a focused
-# correction or reassignment, and (when still useful) one final exact-path
-# correction.  Deriving the per-wave liveness cap from the shared deadline
-# leaves recovery headroom without guessing at file byte/token sizes.
-PACKAGE_AUTHOR_WAVE_TIMEOUT = max(1, math.ceil(PACKAGE_AUTHOR_DEADLINE / 3))
+# When an operator opts into a package deadline, preserve recovery headroom by
+# dividing it across the three author/correction waves. Zero stays unlimited.
+PACKAGE_AUTHOR_WAVE_TIMEOUT = (
+    max(1, math.ceil(PACKAGE_AUTHOR_DEADLINE / 3))
+    if PACKAGE_AUTHOR_DEADLINE > 0 else 0
+)
 FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
     os.environ.get("GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS", "1")
 )
+# Semantic release review is implementation work performed by a frontier model,
+# so it follows the same default policy as frontier authoring: no coordinator
+# wall-clock deadline. A positive environment value remains an explicit operator
+# opt-in; zero keeps the call user-cancellable and lets provider-stall handling
+# remain authoritative.
 FRONTIER_VERIFY_TIMEOUT = max(
-    1, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "300"))
+    0, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
 )
 OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
     1, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))

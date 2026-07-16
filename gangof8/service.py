@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +19,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import assembly, cancellation, config, executor, goals, intake, reporting, rounds, smoke
+from . import (
+    assembly,
+    browser_acceptance,
+    cancellation,
+    config,
+    executor,
+    goals,
+    intake,
+    reporting,
+    rounds,
+    smoke,
+)
 from .artifacts import parse_proposals
 from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
@@ -191,25 +203,27 @@ class GangOf8Service:
         config.ROUNDS_PER_CONSENT = self.settings.rounds_per_consent
         config.BUDGETS_BY_COMPLEXITY = budgets_overrides(self.settings)
 
-        # Local CLI seats the user disabled in Settings fall back to an enabled
-        # OpenRouter seat, so the council can run OpenRouter-only. Skipped for an
-        # explicit role map (tests/embedders manage their own registration).
+        # Roles owned by a disabled seat inherit across every remaining enabled
+        # seat. This makes a one-model configuration real instead of quietly
+        # retaining an adapter for a seat the user turned off. Explicit
+        # constructor maps are trusted (tests/embedders own registration).
         if self.backend == "cli" and not self._explicit_role_agents:
-            self.role_agents = self._apply_cli_disable(self.role_agents)
+            self.role_agents = self._apply_seat_disables(self.role_agents)
 
         self.registry = AgentRegistry()
         if self.backend == "cli":
-            # OpenRouter seats: enabled ones + any referenced in the role map.
+            # A disabled OpenRouter seat is never registered merely because a
+            # stale/custom role mapping references it.
             enabled = {n for n, on in (self.settings.openrouter_enabled or {}).items() if on}
-            referenced = {a for a in self.role_agents.values() if a in config.OPENROUTER_SEATS}
-            for seat in sorted(enabled | referenced):
+            for seat in sorted(enabled):
                 self._register_openrouter(seat)
             # CLI adapters for every non-OpenRouter agent in the role map,
             # pinned to the model chosen in Settings (else the CLI's default).
             # gemini also gets the key getter so a Settings-stored key (not
             # just the env var) unlocks its SDK path.
             for agent in sorted(set(self.role_agents.values())):
-                if agent not in config.OPENROUTER_SEATS:
+                if (agent not in config.OPENROUTER_SEATS
+                        and (self._explicit_role_agents or self._seat_enabled(agent))):
                     self.registry.register(CliAdapter(
                         agent=agent, model=(self.settings.cli_models or {}).get(agent),
                         role_models=self._role_pins_for(agent),
@@ -224,6 +238,19 @@ class GangOf8Service:
         ce = self.settings.cli_enabled or {}
         return {s for s in ("claude", "codex", "gemini") if ce.get(s, True) is False}
 
+    def _seat_enabled(self, seat: str) -> bool:
+        """Whether a known user-toggleable seat is enabled.
+
+        Unknown/custom adapter names stay enabled for embedder compatibility.
+        Availability/authentication is separate: this enforces the user's
+        switch, not whether a CLI happens to be on PATH.
+        """
+        if seat in ("claude", "codex", "gemini"):
+            return bool((self.settings.cli_enabled or {}).get(seat, True))
+        if seat in config.OPENROUTER_SEATS:
+            return bool((self.settings.openrouter_enabled or {}).get(seat, False))
+        return True
+
     def _openrouter_fallbacks(self) -> list[str]:
         """Enabled OpenRouter seats (with a resolvable slug), in a stable order —
         the pool a disabled CLI seat's roles fall back to."""
@@ -231,18 +258,25 @@ class GangOf8Service:
         return [n for n in config.OPENROUTER_SEATS
                 if enabled.get(n) and self._openrouter_slug(n)]
 
-    def _apply_cli_disable(self, base: dict) -> dict:
-        """Reassign every role held by a disabled CLI seat to an enabled
-        OpenRouter seat (round-robin, so the lead and talents don't all collapse
-        onto one model). No-op unless there is at least one OpenRouter seat to
-        fall back to — a disable with nothing to replace it is ignored so a role
-        (especially the lead) is never left with no seat."""
-        disabled = self._disabled_cli_seats()
+    def _enabled_role_fallbacks(self) -> list[str]:
+        """All enabled seats in stable council order for role inheritance."""
+        local = [seat for seat in ("claude", "codex", "gemini")
+                 if self._seat_enabled(seat)]
+        return local + self._openrouter_fallbacks()
+
+    def _apply_seat_disables(self, base: dict) -> dict:
+        """Move roles from disabled seats onto the enabled roster round-robin.
+
+        If every seat is disabled there is intentionally no invented fallback:
+        disabled adapters remain unregistered and task submission fails clearly
+        until the user enables at least one model.
+        """
+        disabled = {agent for agent in set(base.values()) if not self._seat_enabled(agent)}
         if not disabled:
-            return base
-        pool = self._openrouter_fallbacks()
+            return dict(base)
+        pool = self._enabled_role_fallbacks()
         if not pool:
-            return base
+            return dict(base)
         out = dict(base)
         i = 0
         for role, agent in base.items():
@@ -263,7 +297,14 @@ class GangOf8Service:
             # adapters, possibly after construction
             return list(self._explicit_panel)
         if self.settings.panel_seats:
-            return [s for s in self.settings.panel_seats if s in self.registry.names()]
+            disabled_cli = self._disabled_cli_seats() if self.backend == "cli" else set()
+            return [
+                seat for seat in self.settings.panel_seats
+                if (seat in self.registry.names()
+                    and seat not in disabled_cli
+                    and (seat not in config.OPENROUTER_SEATS
+                         or bool((self.settings.openrouter_enabled or {}).get(seat))))
+            ]
         seats = list(config.PANEL_SEATS_BY_BACKEND.get(self.backend, ["mock"]))
         if self.backend == "cli":
             disabled = self._disabled_cli_seats()
@@ -477,6 +518,9 @@ class GangOf8Service:
         """Create a session, stamping the backend, the active workspace root
         (so file skills operate in that project; None ⇒ per-session sandbox),
         and folding any attachment text into the task the council reads."""
+        if self.backend == "cli" and not self.registry.names():
+            raise ValueError(
+                "no AI models are enabled; enable at least one model before starting a task")
         full_text = (text or "") + attachment_context(self.uploads, attachments or [])
         session = intake.receive(full_text, source, self.manager, budgets)
         session.backend = self.backend
@@ -828,6 +872,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         for agent in sorted(needed):
             if agent in self.registry.names() or agent in ("mock", "unknown"):
                 continue
+            if not self._seat_enabled(agent):
+                # Never resurrect a disabled adapter while loading an older
+                # session. The missing seat remains a visible run failure.
+                continue
             if agent in config.OPENROUTER_SEATS:
                 self._register_openrouter(agent)
             else:
@@ -1152,6 +1200,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.unresolved = []
         session.tools_called = []
         session.agent_calls = 0
+        session.successful_agent_calls = {}
         session.final = None
         session.stop_reason = None
         session.current_round = 0
@@ -1186,6 +1235,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             collaboration_mode="build_team",
             delivery_mode="final_batch",
             background=background,
+            build_roster=list(self.panel),
             established_root=established,
             delivery_root=delivery,
         )
@@ -1263,7 +1313,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                              {"goal_id": goal.goal_id, "files": copied, "root": str(stage)})
 
     def _normalize_work_packages(
-        self, milestones: list[GoalMilestone], goal_text: str = ""
+        self, milestones: list[GoalMilestone], goal_text: str = "",
+        roster: Optional[list[str]] = None,
     ) -> tuple[list[GoalMilestone], list[str]]:
         """Assign owners and normalize hard versus contract dependency edges.
 
@@ -1271,7 +1322,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         verified bytes exist. ``contract_depends_on`` gives an owner the upstream
         interface immediately and never blocks its start.
         """
-        seats = list(dict.fromkeys(s for s in self.panel if s))
+        seats = list(dict.fromkeys(s for s in (roster if roster is not None else self.panel) if s))
         errors: list[str] = []
         planner_named_owners = any(m.owner for m in milestones)
         for i, package in enumerate(milestones):
@@ -1303,10 +1354,51 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             ".jsx", ".py", ".go", ".rs", ".java", ".c", ".cc", ".cpp",
             ".h", ".hpp", ".cs", ".rb", ".php", ".vue", ".svelte", ".swift",
         }
+        runtime_interface_suffixes = {
+            ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx",
+            ".jsx", ".vue", ".svelte",
+        }
+
+        # Prose-only parallel contracts are unsafe for coupled runtime files.
+        # The provider may choose different method names, clock units, DOM hooks,
+        # or coordinate semantics while still satisfying the same vague prose.
+        # Promote those edges to hard artifact dependencies and put the actual
+        # accepted files in the consumer's runtime context. CONTRACTS remains a
+        # non-blocking option for genuinely descriptive/non-runtime work.
+        for consumer in milestones:
+            consumer_is_runtime = any(
+                Path(name).suffix.lower() in runtime_interface_suffixes
+                for name in consumer.required_files
+            )
+            if not consumer_is_runtime:
+                continue
+            promoted: list[int] = []
+            for dependency_index in consumer.contract_depends_on:
+                provider = milestones[dependency_index]
+                provider_is_runtime = any(
+                    Path(name).suffix.lower() in runtime_interface_suffixes
+                    for name in provider.required_files
+                )
+                if not provider_is_runtime:
+                    continue
+                if dependency_index not in consumer.depends_on:
+                    consumer.depends_on.append(dependency_index)
+                for output in provider.required_files:
+                    if output not in consumer.dependencies:
+                        consumer.dependencies.append(output)
+                promoted.append(dependency_index)
+            if promoted:
+                consumer.contract_depends_on = [
+                    dependency_index
+                    for dependency_index in consumer.contract_depends_on
+                    if dependency_index not in promoted
+                ]
+
         code_indices = [
             i for i, package in enumerate(milestones)
-            if any(Path(name).suffix.lower() in code_suffixes
-                   for name in package.required_files)
+            if (not package.assembly_mode
+                and any(Path(name).suffix.lower() in code_suffixes
+                        for name in package.required_files))
         ]
         frontier = [seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in seats]
         targets = sorted(
@@ -1332,6 +1424,48 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             milestones[target_i].owner = seat
             if old_i is not None and displaced:
                 milestones[old_i].owner = displaced
+
+        # Repair duplicate planner assignments deterministically so every
+        # enabled AI owns one model-authored package before anyone gets a
+        # second. Zero-call deterministic assembly does not count as an AI
+        # contribution.
+        if (len(seats) > 1 and len(milestones) >= len(seats)
+                and goals.requires_delivery_contract(goal_text)):
+            authored_indices = [
+                index for index, package in enumerate(milestones)
+                if not package.assembly_mode
+            ]
+            if len(authored_indices) < len(seats):
+                errors.append(
+                    "build plan has fewer model-authored packages than enabled AIs "
+                    f"({len(authored_indices)} packages for {len(seats)} seats); "
+                    "deterministic assembly does not count as participation"
+                )
+            counts = {
+                seat: sum(milestones[index].owner == seat for index in authored_indices)
+                for seat in seats
+            }
+            missing_owners = [seat for seat in seats if counts.get(seat, 0) == 0]
+            for missing_owner in missing_owners:
+                candidate_index = next(
+                    (
+                        index for index in reversed(authored_indices)
+                        if counts.get(milestones[index].owner, 0) > 1
+                    ),
+                    None,
+                )
+                if candidate_index is None:
+                    continue
+                displaced = milestones[candidate_index].owner
+                milestones[candidate_index].owner = missing_owner
+                counts[missing_owner] = counts.get(missing_owner, 0) + 1
+                counts[displaced] = counts.get(displaced, 0) - 1
+            missing_owners = [seat for seat in seats if counts.get(seat, 0) == 0]
+            if missing_owners:
+                errors.append(
+                    "build plan cannot assign every enabled AI a model-authored package: "
+                    + ", ".join(missing_owners)
+                )
 
         providers: dict[str, int] = {}
         for i, package in enumerate(milestones):
@@ -1399,6 +1533,38 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             elif package.assembly_template:
                 errors.append(
                     f"{package.package_id} declares TEMPLATE without an ASSEMBLY mode"
+                )
+
+        # Concatenation cannot be the only integration stage for a broad runtime
+        # graph. Require a real, non-assembly QA/integration owner after multiple
+        # producers; that owner receives their accepted bytes via the hard edges
+        # normalized above. This catches the old graph where seven incompatible
+        # implementations flowed straight into a zero-call HTML assembler.
+        integration_markers = ("integration", "integrate", "acceptance", "qa", "quality", "verify")
+        for release in milestones:
+            if self._assembly_contract(release)[0] != assembly.HTML_INLINE:
+                continue
+            runtime_upstream = [
+                dependency_index for dependency_index in release.depends_on
+                if any(
+                    Path(name).suffix.lower() in runtime_interface_suffixes
+                    for name in milestones[dependency_index].required_files
+                )
+            ]
+            if len(runtime_upstream) < 2:
+                continue
+            integrators = []
+            for dependency_index in runtime_upstream:
+                candidate = milestones[dependency_index]
+                label = f"{candidate.title} {candidate.task_text}".lower()
+                if (not candidate.assembly_mode
+                        and len(candidate.depends_on) >= 2
+                        and any(marker in label for marker in integration_markers)):
+                    integrators.append(candidate)
+            if not integrators:
+                errors.append(
+                    f"{release.package_id} assembly follows multiple runtime producers "
+                    "without a hard-after non-assembly integration/QA package"
                 )
 
         # Backward-compatible deterministic inference for a planner that predates
@@ -1506,7 +1672,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if agent:
                 try:
                     result = self.registry.call(
-                        agent, role, goals.plan_prompt(goal.text, self.panel),
+                        agent, role, goals.plan_prompt(
+                            goal.text, goal.build_roster or self.panel),
                         timeout_s=config.GOAL_PLAN_TIMEOUT)
                     milestones = goals.parse_milestones(result.content or "")
                     goal.planned_by = agent
@@ -1533,7 +1700,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 goal.plan_rationale = rationale or goal.last_error
                 self.goals.save_owned(goal, token)
                 return self.goals.get(goal.goal_id) or goal
-            milestones, graph_errors = self._normalize_work_packages(milestones, goal.text)
+            milestones, graph_errors = self._normalize_work_packages(
+                milestones, goal.text, roster=goal.build_roster or self.panel)
             if graph_errors:
                 goal.status = "paused"
                 goal.last_error = "; ".join(graph_errors)[:300]
@@ -1700,6 +1868,45 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             hashes[name.replace("\\", "/")] = digest
         return accepted, list(dict.fromkeys(missing)), hashes
 
+    @staticmethod
+    def _accepted_output_provenance(
+        session: Session, required: list[str], hashes: dict[str, str],
+    ) -> dict[str, dict]:
+        """Bind accepted hashes to the real author or deterministic transform."""
+        records: dict[str, dict] = {}
+        assembly_result = dict(session.assembly_result or {})
+        deterministic = bool(assembly_result)
+        model_calls = int(assembly_result.get("model_calls") or 0)
+        for raw_name in required:
+            name = raw_name.replace("\\", "/")
+            history = session.package_output_history.get(name) or []
+            authored = next(
+                (entry for entry in reversed(history)
+                 if entry.get("status") == "completed" and entry.get("agent")),
+                None,
+            )
+            if deterministic:
+                record = {
+                    "sha256": hashes.get(name, ""),
+                    "session_id": session.session_id,
+                    "method": (
+                        "model_template+deterministic_assembly"
+                        if model_calls else "deterministic_assembly"
+                    ),
+                    "agent": authored.get("agent") if model_calls and authored else None,
+                    "template_hash": assembly_result.get("template_hash", ""),
+                    "source_hashes": dict(assembly_result.get("source_hashes") or {}),
+                }
+            else:
+                record = {
+                    "sha256": hashes.get(name, ""),
+                    "session_id": session.session_id,
+                    "method": "model_authored",
+                    "agent": authored.get("agent") if authored else None,
+                }
+            records[name] = record
+        return records
+
     def _goal_acceptance(self, session: Session, milestone: GoalMilestone) -> tuple[bool, list[str], str]:
         if session.outcome != "succeeded":
             detail = session.stop_reason or session.outcome or "session did not succeed"
@@ -1755,12 +1962,36 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             raise ValueError("final delivery folder has not been selected")
         files = list(session.required_files)
         baselines = self._release_baselines(files, destination)
+        stage = Path(session.workspace_root or "")
+        source_hashes = dict(session.release_verified_hashes)
+        missing_seals = [name for name in files if not source_hashes.get(name)]
+        if missing_seals:
+            raise ValueError(
+                "cannot authorize release without final verified hashes: "
+                + ", ".join(missing_seals)
+            )
+        for name in files:
+            try:
+                path = executor.resolve_in_workspace(stage, name)
+                if not path.is_file():
+                    raise OSError("staged file is missing")
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                if actual != source_hashes[name]:
+                    raise OSError("staged bytes changed after final verification")
+            except (OSError, executor.ExecutionError) as exc:
+                raise ValueError(
+                    f"cannot authorize an unhashable staged release file {name}: {exc}"
+                ) from exc
         action = ProposedAction(
             session_id=session.session_id,
             kind="promote_batch",
             role=Role.implementer,
             filename=f"final batch ({len(files)} files)",
-            args={"files": json.dumps(files), "baselines": json.dumps(baselines)},
+            args={
+                "files": json.dumps(files),
+                "baselines": json.dumps(baselines),
+                "source_hashes": json.dumps(source_hashes),
+            },
         )
         session.proposed_actions = [action]
         approval = self.governance.authorize_action(session, action)
@@ -1777,15 +2008,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     def _verify_goal_release(self, goal: Goal, session: Session) -> bool:
         """Verify an assembled batch deterministically or by an independent frontier."""
+        session.release_verified_hashes = {}
         release_packages = [package for package in goal.milestones if package.release_files]
+        stage = Path(goal.staging_root)
         deterministic_release = bool(release_packages) and all(
             self._assembly_contract(package)[0] == assembly.HTML_INLINE
             for package in release_packages
         )
+        deterministic_preflight: dict = {}
         if deterministic_release:
             failures: list[str] = []
             verified_hashes: dict[str, str] = {}
-            stage = Path(goal.staging_root)
             expected = {
                 name: package.accepted_hashes.get(name, "")
                 for package in release_packages for name in package.release_files
@@ -1808,7 +2041,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 )
                 if testable and not ran:
                     failures.append(f"{name}: {detail}")
-            session.quality_gate = {
+            deterministic_preflight = {
                 "verdict": "FAIL" if failures else "PASS",
                 "stage": "deterministic_assembly_release",
                 "verifier": "coordinator",
@@ -1816,38 +2049,117 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "hashes": verified_hashes,
                 "remaining_defects": failures,
             }
+            session.quality_gate = dict(deterministic_preflight)
             self.store.log_event(
                 session.session_id, "deterministic_release_verified",
                 {"verdict": session.quality_gate["verdict"],
                  "files": list(session.required_files), "failures": failures},
             )
-            if not failures:
-                session.outcome = "succeeded"
+            if failures:
+                session.unresolved.extend(failures)
+                session.stop_reason = "deterministic final-batch verification failed"
+                session.outcome = "failed_verification"
+                self.manager.transition(session, SessionStatus.composing)
+                session.final = FinalAnswer(
+                    answer="The deterministic assembly changed or failed its runtime check and was not released.",
+                    confidence="low", risks_unresolved=list(session.unresolved),
+                    next_action="Restore the accepted staged inputs and resume the goal.",
+                )
+                self.manager.transition(session, SessionStatus.failed)
                 self.store.save_session(session)
-                return True
-            session.unresolved.extend(failures)
-            session.stop_reason = "deterministic final-batch verification failed"
-            session.outcome = "failed_verification"
-            self.manager.transition(session, SessionStatus.composing)
-            session.final = FinalAnswer(
-                answer="The deterministic assembly changed or failed its runtime check and was not released.",
-                confidence="low", risks_unresolved=list(session.unresolved),
-                next_action="Restore the accepted staged inputs and resume the goal.",
-            )
-            self.manager.transition(session, SessionStatus.failed)
-            self.store.save_session(session)
-            return False
+                return False
+            # Integrity is necessary, but it is not semantic acceptance. Continue
+            # into the independent checklist below; deterministic concatenation
+            # must never bypass product-quality review again.
+
+        def run_browser_acceptance() -> tuple[list[dict], list[str]]:
+            evidence: list[dict] = []
+            failures: list[str] = []
+            for name in session.required_files:
+                if Path(name).suffix.lower() not in {".html", ".htm"}:
+                    continue
+                try:
+                    path = executor.resolve_in_workspace(stage, name)
+                    result = browser_acceptance.browser_acceptance(path)
+                except (OSError, executor.ExecutionError) as exc:
+                    failures.append(f"{name}: browser acceptance could not start ({exc})")
+                    continue
+                record = {
+                    "file": name,
+                    "passed": result.passed,
+                    "interactive": result.interactive,
+                    "testable": result.testable,
+                    "detail": result.detail,
+                    "browser": result.browser,
+                    "errors": list(result.errors),
+                }
+                evidence.append(record)
+                if result.interactive and not result.passed:
+                    failures.append(f"{name}: {result.detail}")
+            return evidence, failures
+
+        browser_evidence, browser_failures = run_browser_acceptance()
+        self.store.log_event(
+            session.session_id,
+            "browser_release_verified",
+            {
+                "verdict": "FAIL" if browser_failures else "PASS",
+                "files": len(browser_evidence),
+                "failures": browser_failures,
+            },
+        )
+
+        def seal_verified_hashes() -> dict[str, str]:
+            sealed: dict[str, str] = {}
+            for name in session.required_files:
+                path = executor.resolve_in_workspace(stage, name)
+                if not path.is_file():
+                    raise OSError(f"verified release file disappeared: {name}")
+                sealed[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            session.release_verified_hashes = sealed
+            session.quality_gate["verified_hashes"] = dict(sealed)
+            return sealed
 
         enabled_frontier = [
             seat for seat in config.FRONTIER_AUTHOR_SEATS
             if seat in self.panel and seat in self.registry.names()
         ]
         if not enabled_frontier:
+            if not deterministic_release and not browser_failures:
+                session.quality_gate = {
+                    "verdict": "SKIPPED", "detail": "no frontier seat is enabled",
+                    "browser_acceptance": browser_evidence,
+                }
+                try:
+                    seal_verified_hashes()
+                except (OSError, executor.ExecutionError) as exc:
+                    browser_failures = [f"could not seal verified release bytes: {exc}"]
+                else:
+                    self.store.save_session(session)
+                    return True
+            detail = (
+                "; ".join(browser_failures)
+                if browser_failures else
+                "deterministic assembly passed integrity checks, but no independent "
+                "frontier seat is enabled for semantic acceptance"
+            )
             session.quality_gate = {
-                "verdict": "SKIPPED", "detail": "no frontier seat is enabled",
+                "verdict": "FAIL", "detail": detail,
+                "deterministic_preflight": deterministic_preflight,
+                "browser_acceptance": browser_evidence,
             }
+            session.unresolved.append(detail)
+            session.stop_reason = "semantic final-batch verification unavailable"
+            session.outcome = "failed_verification"
+            self.manager.transition(session, SessionStatus.composing)
+            session.final = FinalAnswer(
+                answer="The assembled batch passed integrity checks but was not released without semantic review.",
+                confidence="low", risks_unresolved=list(session.unresolved),
+                next_action="Enable an independent frontier seat and resume the goal.",
+            )
+            self.manager.transition(session, SessionStatus.failed)
             self.store.save_session(session)
-            return True
+            return False
         release_owners = {
             package.owner for package in goal.milestones if package.release_files
         }
@@ -1875,8 +2187,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return False
 
         member = CouncilMember(role=Role.panelist, agent=verifier_name, active=True)
-        stage = Path(goal.staging_root)
-
         def read_files() -> list[tuple[str, str]]:
             loaded: list[tuple[str, str]] = []
             for name in session.required_files:
@@ -1887,8 +2197,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         files = read_files()
         total_edits = 0
         for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
+            if attempt:
+                browser_evidence, browser_failures = run_browser_acceptance()
+            release_defect_register = list(dict.fromkeys(
+                [*goal.release_defects, *browser_failures]
+            ))
             prompt = rounds.frontier_release_prompt(
-                session, files, repair_attempt=attempt)
+                session, files, defect_register=release_defect_register,
+                repair_attempt=attempt)
             try:
                 answer = _agent_call(
                     session, self.registry, self.store, member, prompt,
@@ -1904,6 +2220,23 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 }
                 break
             verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
+            edits = [action for action in parse_proposals(
+                session.session_id, answer.content, Role.implementer)
+                if action.kind == "edit_file"
+                and action.filename in session.required_files
+            ]
+            # A verifier cannot truthfully PASS the current bytes while also
+            # supplying edits they require. Apply those edits first, then demand
+            # the normal clean-room confirmation pass.
+            if verdict == "PASS" and edits:
+                verdict = "FAIL"
+                defects.append(
+                    "frontier verifier supplied implementation repairs that must "
+                    "be applied and confirmed before PASS"
+                )
+            if browser_failures:
+                verdict = "FAIL"
+                defects = list(dict.fromkeys(browser_failures + defects))
             expected = {
                 f"R{i}" for i in range(
                     1, len(rounds.acceptance_requirements(session.task.text)) + 1)
@@ -1921,7 +2254,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "missing_checks": missing_checks,
                 "attempt": attempt + 1,
                 "repairs_applied": total_edits,
+                "browser_acceptance": browser_evidence,
             }
+            if deterministic_preflight:
+                session.quality_gate["deterministic_preflight"] = deterministic_preflight
             self.store.log_event(
                 session.session_id, "frontier_final_batch_verdict",
                 {"agent": verifier_name, "verdict": verdict,
@@ -1929,16 +2265,42 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                  "attempt": attempt + 1},
             )
             if verdict == "PASS":
+                if deterministic_release and total_edits:
+                    # A frontier repair changes the assembled bytes. Persist the
+                    # new accepted hash explicitly so release provenance remains
+                    # truthful instead of silently relying on the pre-repair hash.
+                    for package in release_packages:
+                        for name in package.release_files:
+                            try:
+                                path = executor.resolve_in_workspace(stage, name)
+                                package.accepted_hashes[name] = hashlib.sha256(
+                                    path.read_bytes()
+                                ).hexdigest()
+                                package.output_provenance[name] = {
+                                    "sha256": package.accepted_hashes[name],
+                                    "session_id": session.session_id,
+                                    "method": "frontier_release_repair",
+                                    "agent": verifier_name,
+                                    "source_hashes": dict(
+                                        deterministic_preflight.get("hashes") or {}
+                                    ),
+                                }
+                            except (OSError, executor.ExecutionError):
+                                pass
+                try:
+                    seal_verified_hashes()
+                except (OSError, executor.ExecutionError) as exc:
+                    session.quality_gate["verdict"] = "FAIL"
+                    session.quality_gate["detail"] = (
+                        f"could not seal verified release bytes: {exc}"
+                    )
+                    break
                 session.outcome = "succeeded"
+                goal.release_defects = []
                 self.store.save_session(session)
                 return True
             if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
                 break
-            edits = [action for action in parse_proposals(
-                session.session_id, answer.content, Role.implementer)
-                if action.kind == "edit_file"
-                and action.filename in session.required_files
-            ]
             applied = 0
             for action in edits:
                 action.args["target"] = "workspace"
@@ -1977,6 +2339,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             "; ".join(session.quality_gate.get("remaining_defects") or [])
             or "semantic acceptance did not pass"
         )
+        retry_defects = list(session.quality_gate.get("remaining_defects") or [])
+        if detail and detail not in retry_defects:
+            retry_defects.append(detail)
+        goal.release_defects = list(dict.fromkeys(
+            [*goal.release_defects, *retry_defects]
+        ))
         session.unresolved.append(f"frontier final-batch verifier rejected release: {detail}")
         session.stop_reason = "frontier final-batch verification failed"
         session.outcome = "failed_verification"
@@ -2044,31 +2412,179 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             goal.release_status = "awaiting_approval"
             self._authorize_goal_release(session)
 
-    def _invalidate_assembly_template_provider(
+    @staticmethod
+    def _assembly_runtime_interface_hint(
+        loaded_sources: list[tuple[str, str]],
+    ) -> str:
+        """Describe browser-global paths earlier scripts require at runtime.
+
+        Runtime errors such as ``cannot set ... fire`` reveal only the final
+        property and caused expensive whole-package retries to add one field
+        while dropping another.  Recover the complete cross-file surface from
+        the accepted consumers, including aliases such as
+        ``var portalInput = window.ArcadePortal.input``.
+        """
+        requirements: list[tuple[str, list[str]]] = []
+        direct = re.compile(
+            r"(?:window\.)?ArcadePortal\.input"
+            r"((?:\.[A-Za-z_$][\w$]*)+)"
+        )
+        alias_decl = re.compile(
+            r"\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+            r"(?:window\.)?ArcadePortal\.input\b"
+        )
+
+        for source_name, text in loaded_sources:
+            paths: set[str] = set()
+            matches = list(direct.finditer(text))
+            aliases = set(alias_decl.findall(text))
+            for alias in aliases:
+                matches.extend(re.finditer(
+                    rf"\b{re.escape(alias)}((?:\.[A-Za-z_$][\w$]*)+)",
+                    text,
+                ))
+            for match in matches:
+                pieces = [piece for piece in match.group(1).split(".") if piece]
+                for size in range(1, len(pieces) + 1):
+                    paths.add(".".join(pieces[:size]))
+            if paths:
+                ordered = sorted(paths, key=lambda path: (path.count("."), path))
+                requirements.append((source_name, ordered[:14]))
+
+        if not requirements:
+            return ""
+        clauses = [
+            f"{name} requires ArcadePortal.input paths [{', '.join(paths)}]"
+            for name, paths in requirements[:3]
+        ]
+        return "cross-file interface mismatch: " + "; ".join(clauses)
+
+    def _assembly_runtime_failure_target(self, session: Session) -> tuple[str, str]:
+        """Locate the first accepted script that makes an assembled runtime fail.
+
+        Deterministic assembly preserves a declared load order. Replaying those
+        accepted JavaScript sources cumulatively identifies the dependency that
+        introduces a load/input-pump failure without sending the expanded HTML
+        back through a model context window.
+        """
+        if not session.workspace_root:
+            return "", ""
+        sources = list((session.assembly_result or {}).get("sources") or [])
+        combined = ""
+        loaded_sources: list[tuple[str, str]] = []
+        for name in sources:
+            normalized = str(name).replace("\\", "/")
+            if Path(normalized).suffix.lower() not in {".js", ".mjs"}:
+                continue
+            try:
+                path = executor.resolve_in_workspace(
+                    Path(session.workspace_root), normalized,
+                )
+                text = path.read_text(encoding="utf-8")
+            except (OSError, executor.ExecutionError, UnicodeError):
+                continue
+            combined = (combined + "\n\n" + text).strip()
+            ran, testable, detail, _dynamic = smoke.smoke_source(combined, ".js")
+            if testable and not ran:
+                hint = (
+                    self._assembly_runtime_interface_hint(loaded_sources)
+                    if "undefined" in detail.lower() else ""
+                )
+                return normalized, f"{hint}; {detail}" if hint else detail
+            loaded_sources.append((normalized, text))
+        return "", ""
+
+    def _assembly_failure_target(self, session: Session) -> tuple[str, str]:
+        """Return the accepted input responsible for an assembly failure.
+
+        New sessions persist structured blame from ``AssemblyError``.  The
+        marker fallback keeps already-paused goals created by older versions
+        recoverable without guessing from arbitrary model text.
+        """
+        gate = session.quality_gate or {}
+        if gate.get("stage") != "deterministic_assembly":
+            runtime_failure = next(
+                (
+                    issue for issue in reversed(session.unresolved)
+                    if "artifact verification failed" in issue.lower()
+                    and "does not run" in issue.lower()
+                ),
+                "",
+            )
+            if session.assembly_mode == assembly.HTML_INLINE and runtime_failure:
+                runtime_path, runtime_detail = self._assembly_runtime_failure_target(session)
+                if runtime_path:
+                    session.quality_gate = {
+                        "verdict": "FAIL",
+                        "stage": "deterministic_assembly",
+                        "detail": (
+                            "assembled runtime became invalid at accepted dependency "
+                            f"{runtime_path}: {runtime_detail}"
+                        ),
+                        "fault_scope": "dependency",
+                        "fault_path": runtime_path,
+                    }
+                    self.store.save_session(session)
+                    return "dependency", runtime_path
+            return "", ""
+        scope = str(gate.get("fault_scope") or "").lower()
+        path = str(gate.get("fault_path") or "").replace("\\", "/")
+        detail = str(gate.get("detail") or "").lower()
+        if not scope:
+            integrity_markers = (
+                "assembly dependency is missing",
+                "assembly dependency has no accepted hash",
+                "assembly dependency changed after acceptance",
+            )
+            dependency_markers = (
+                "assembly dependency is not utf-8 text",
+                "cannot inline ",
+                "inline stylesheet contains @import",
+            )
+            if any(marker in detail for marker in integrity_markers):
+                scope = "integrity"
+            elif any(marker in detail for marker in dependency_markers):
+                scope = "dependency"
+            elif any(marker in detail for marker in (
+                "template", "directive", "external script",
+                "stylesheet reference", "complete document",
+            )):
+                scope = "template"
+        if scope == "template":
+            path = session.assembly_template.replace("\\", "/")
+        elif scope == "dependency" and not path:
+            path = next(
+                (name.replace("\\", "/") for name in session.runtime_dependencies
+                 if name.replace("\\", "/").lower() in detail),
+                "",
+            )
+        return scope, path
+
+    def _invalidate_assembly_input_provider(
         self, goal: Goal, session: Session, assembly_index: int,
     ) -> Optional[GoalMilestone]:
-        """Attribute a deterministic template-contract failure upstream.
+        """Attribute deterministic assembly failure to its accepted input owner.
 
-        The final assembly package cannot repair an accepted template it does
-        not own. Mark the owning package retryable and blacklist only the
-        structurally invalid attempt so resume preserves every healthy sibling.
+        The final assembly package cannot repair an accepted template or source
+        file it does not own. Blacklist only the invalid upstream attempt so a
+        retry preserves every healthy sibling package.
         """
         if (session.assembly_mode != assembly.HTML_INLINE
-                or not session.assembly_template
-                or session.assembly_template == assembly.OWNER_TEMPLATE
-                or (session.quality_gate or {}).get("stage") != "deterministic_assembly"):
+                or not session.assembly_template):
+            return None
+        scope, invalid_input = self._assembly_failure_target(session)
+        if (scope == "template"
+                and session.assembly_template == assembly.OWNER_TEMPLATE):
+            return None
+        if scope not in {"template", "dependency"} or not invalid_input:
             return None
         detail = str((session.quality_gate or {}).get("detail") or "").lower()
-        if not any(marker in detail for marker in (
-            "template", "directive", "external script", "stylesheet reference",
-            "complete document",
-        )):
-            return None
-        template = session.assembly_template.replace("\\", "/")
         provider = next(
             (package for package in goal.milestones
              if package.index != assembly_index
-             and template in {name.replace("\\", "/") for name in package.required_files}),
+             and invalid_input in {
+                 name.replace("\\", "/") for name in package.required_files
+             }),
             None,
         )
         if provider is None:
@@ -2080,17 +2596,23 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         provider.accepted_files = []
         provider.accepted_hashes = {}
         provider.acceptance_detail = (
-            f"invalidated by deterministic assembly: {detail}"
+            f"invalidated by deterministic assembly {scope}: {detail}"
         )[:300]
+        event = (
+            "assembly_template_provider_invalidated"
+            if scope == "template" else
+            "assembly_dependency_provider_invalidated"
+        )
         self.store.log_event(
             session.session_id,
-            "assembly_template_provider_invalidated",
+            event,
             {
                 "goal_id": goal.goal_id,
                 "assembly_package": assembly_index + 1,
                 "provider_package": provider.index + 1,
                 "provider_session_id": provider.session_id,
-                "template": template,
+                "fault_scope": scope,
+                "input": invalid_input,
                 "reason": detail[:300],
             },
         )
@@ -2153,6 +2675,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     milestone.accepted_hashes = {
                         name: hashes[name] for name in milestone.required_files if name in hashes
                     }
+                    milestone.output_provenance = self._accepted_output_provenance(
+                        session, milestone.required_files, milestone.accepted_hashes
+                    )
                     milestone.summary = (session.final.answer if session.final else "")[
                         : config.GOAL_SUMMARY_MAX_CHARS]
                     self.store.log_event(session.session_id, "goal_milestone_done",
@@ -2183,7 +2708,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             schedule_ready = goal.status == "running"
                 elif session.status == SessionStatus.failed:
                     milestone.status = "failed"
-                    invalidated_provider = self._invalidate_assembly_template_provider(
+                    invalidated_provider = self._invalidate_assembly_input_provider(
                         goal, session, idx)
                     if invalidated_provider is not None:
                         # This is an ownership-attribution correction, not a
@@ -2196,18 +2721,25 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         milestone.session_id = None
                         goal.status = "running"
                         goal.current_index = invalidated_provider.index
+                        fault_scope, fault_path = self._assembly_failure_target(session)
                         goal.last_error = (
-                            f"rebuilding invalid assembly template from package "
-                            f"{invalidated_provider.index + 1}"
+                            f"rebuilding invalid assembly {fault_scope} {fault_path} "
+                            f"from package {invalidated_provider.index + 1}"
                         )
                         if self.goals.save_owned(goal, token):
                             schedule_ready = True
                         self.store.log_event(
-                            "-", "assembly_template_rebuild_scheduled",
+                            "-", (
+                                "assembly_template_rebuild_scheduled"
+                                if fault_scope == "template" else
+                                "assembly_dependency_rebuild_scheduled"
+                            ),
                             {
                                 "goal_id": goal.goal_id,
                                 "provider_package": invalidated_provider.index + 1,
                                 "assembly_package": idx + 1,
+                                "fault_scope": fault_scope,
+                                "input": fault_path,
                             },
                         )
                     else:
@@ -2322,6 +2854,21 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 })
                 package_views.append(package_data)
             data["milestones"] = package_views
+            contributing_agents = set()
+            if goal.planned_by:
+                contributing_agents.add(goal.planned_by)
+            for item in related:
+                contributing_agents.update(
+                    (item.get("successful_agent_calls") or {}).keys()
+                )
+            expected_roster = list(goal.build_roster or [])
+            data["contributing_agents"] = sorted(contributing_agents)
+            data["contributor_count"] = len(contributing_agents)
+            data["expected_contributor_count"] = len(expected_roster)
+            data["participation_complete"] = (
+                set(expected_roster).issubset(contributing_agents)
+                if expected_roster else None
+            )
             if goal.status in ("cancelled", "completed", "failed"):
                 display_status = goal.status
             elif approvals:
@@ -2401,6 +2948,60 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event("-", "goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
             return goal.model_dump()
 
+    def _reopen_paused_assembly_provider(self, goal_id: str) -> bool:
+        """Repair blame for an assembly failure recorded before resume.
+
+        This also upgrades paused goals written before structured assembly
+        faults existed. The rejected assembler remains retryable, while only
+        the accepted package that owns the bad input is invalidated.
+        """
+        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        if goal is None:
+            return False
+        token = goal.worker_lease
+        scheduled: Optional[dict] = None
+        try:
+            assembly_package = goal.current
+            if (assembly_package is None or assembly_package.status != "failed"
+                    or not assembly_package.session_id):
+                return False
+            session = self.manager.load(assembly_package.session_id)
+            if session is None:
+                return False
+            provider = self._invalidate_assembly_input_provider(
+                goal, session, assembly_package.index)
+            if provider is None:
+                return False
+            fault_scope, fault_path = self._assembly_failure_target(session)
+            provider.status = "pending"
+            provider.session_id = None
+            assembly_package.status = "pending"
+            assembly_package.session_id = None
+            goal.current_index = provider.index
+            goal.last_error = (
+                f"rebuilding invalid assembly {fault_scope} {fault_path} "
+                f"from package {provider.index + 1}"
+            )
+            if not self.goals.save_owned(goal, token):
+                return False
+            scheduled = {
+                "goal_id": goal.goal_id,
+                "provider_package": provider.index + 1,
+                "assembly_package": assembly_package.index + 1,
+                "fault_scope": fault_scope,
+                "input": fault_path,
+            }
+            return True
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+            if scheduled:
+                event = (
+                    "assembly_template_rebuild_scheduled"
+                    if scheduled["fault_scope"] == "template" else
+                    "assembly_dependency_rebuild_scheduled"
+                )
+                self.store.log_event("-", event, scheduled)
+
     def _recover_verified_goal_packages(self, goal_id: str) -> list[str]:
         """Adopt completed package attempts that lost their goal commit.
 
@@ -2428,11 +3029,34 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             for package in goal.milestones:
                 if package.status == "done":
                     continue
-                match = next((session for session in candidates.get(package.package_id, [])
-                              if session.work_package_owner == package.owner
-                              and session.session_id not in package.invalidated_session_ids
-                              and set(package.required_files).issubset(
-                                  set(session.required_files))), None)
+                match = None
+                for candidate in candidates.get(package.package_id, []):
+                    if (candidate.work_package_owner != package.owner
+                            or candidate.session_id in package.invalidated_session_ids
+                            or not set(package.required_files).issubset(
+                                set(candidate.required_files))):
+                        continue
+                    sealed = candidate.verified_output_hashes
+                    latest = {
+                        action.filename.replace("\\", "/"): Path(action.result_path)
+                        for action in candidate.proposed_actions
+                        if (action.role != Role.panelist
+                            and action.kind in ("write_file", "edit_file")
+                            and action.status == "executed" and action.result_path)
+                    }
+                    try:
+                        intact = all(
+                            sealed.get(name)
+                            and name in latest
+                            and hashlib.sha256(latest[name].read_bytes()).hexdigest()
+                            == sealed[name]
+                            for name in package.required_files
+                        )
+                    except OSError:
+                        intact = False
+                    if intact:
+                        match = candidate
+                        break
                 if match is None:
                     continue
                 accepted, missing, hashes = self._goal_stage_manifest(
@@ -2448,6 +3072,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 package.accepted_hashes = {
                     name: hashes[name] for name in package.required_files if name in hashes
                 }
+                package.output_provenance = self._accepted_output_provenance(
+                    match, package.required_files, package.accepted_hashes
+                )
                 package.acceptance_detail = "recovered verified output from completed attempt"
                 package.summary = (match.final.answer if match.final else "")[
                     : config.GOAL_SUMMARY_MAX_CHARS]
@@ -2476,6 +3103,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             raise KeyError(f"goal {goal_id} not found")
         if goal.status != "paused":
             raise ValueError(f"cannot resume a goal in status '{goal.status}'")
+        self._reopen_paused_assembly_provider(goal_id)
         recovered = self._recover_verified_goal_packages(goal_id)
         goal = self.goals.get(goal_id) or goal
         if recovered:
@@ -2484,9 +3112,33 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 {"goal_id": goal_id, "packages": recovered},
             )
         if all(m.status == "done" for m in goal.milestones) and goal.delivery_mode == "final_batch":
+            retry_defects = list(goal.release_defects)
+            previous_release = (
+                self.manager.load(goal.release_session_id)
+                if goal.release_session_id else None
+            )
+            if previous_release is not None:
+                retry_defects.extend(
+                    previous_release.quality_gate.get("remaining_defects") or []
+                )
+                for contribution in previous_release.contributions:
+                    for action in parse_proposals(
+                        previous_release.session_id, contribution.content,
+                        Role.implementer,
+                    ):
+                        if (action.kind != "edit_file"
+                                or action.filename not in goal.release_files):
+                            continue
+                        old = str(action.args.get("old") or "")[:500]
+                        new = str(action.args.get("new") or "")[:500]
+                        retry_defects.append(
+                            f"pending prior frontier repair for {action.filename}: "
+                            f"replace exact OLD [{old}] with NEW [{new}]"
+                        )
             goal = self.goals.resume(goal_id)
             if goal is None:
                 raise ValueError("goal changed while attempting to resume final release")
+            goal.release_defects = list(dict.fromkeys(retry_defects))
             goal.release_session_id = None
             goal.release_status = "not_started"
             goal.last_error = ""

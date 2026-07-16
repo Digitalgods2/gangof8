@@ -48,6 +48,16 @@ _COMMENT_DIRECTIVE_RE = re.compile(
 class AssemblyError(ValueError):
     """An assembly contract is unsafe, incomplete, or no longer reproducible."""
 
+    def __init__(
+        self, message: str, *, fault_scope: str = "", fault_path: str = "",
+    ) -> None:
+        super().__init__(message)
+        # Preserve machine-readable blame alongside the human diagnostic. A
+        # final assembler cannot repair an already-accepted upstream file, so
+        # the goal coordinator uses these fields to reopen the actual owner.
+        self.fault_scope = fault_scope
+        self.fault_path = fault_path.replace("\\", "/")
+
 
 @dataclass(frozen=True)
 class AssemblyResult:
@@ -140,23 +150,30 @@ def validate_template_directives(template: str) -> tuple[str, ...]:
             if directive is None or not standalone:
                 raise AssemblyError(
                     "HTML inline template contains a malformed or non-standalone "
-                    "assembly directive"
+                    "assembly directive", fault_scope="template",
                 )
             kind = directive.group("kind").lower()
             name = directive.group("path").strip().strip("`\"'").replace("\\", "/")
             if containers:
                 raise AssemblyError(
                     f"assembly directive for {name} must be standalone; it is nested "
-                    f"inside <{containers[-1]}>"
+                    f"inside <{containers[-1]}>", fault_scope="template",
                 )
             suffix = Path(name).suffix.lower()
             if kind == "style" and suffix != ".css":
-                raise AssemblyError(f"STYLE directive requires a CSS dependency: {name}")
+                raise AssemblyError(
+                    f"STYLE directive requires a CSS dependency: {name}",
+                    fault_scope="template",
+                )
             if kind == "script" and suffix != ".js":
-                raise AssemblyError(f"SCRIPT directive requires a JavaScript dependency: {name}")
+                raise AssemblyError(
+                    f"SCRIPT directive requires a JavaScript dependency: {name}",
+                    fault_scope="template",
+                )
             if name in seen:
                 raise AssemblyError(
-                    f"assembly template references a dependency more than once: {name}"
+                    f"assembly template references a dependency more than once: {name}",
+                    fault_scope="template",
                 )
             seen.append(name)
             continue
@@ -172,7 +189,10 @@ def validate_template_directives(template: str) -> tuple[str, ...]:
         else:
             containers.append(kind)
     if marker_count != len(seen):
-        raise AssemblyError("HTML inline template contains a malformed assembly directive")
+        raise AssemblyError(
+            "HTML inline template contains a malformed assembly directive",
+            fault_scope="template",
+        )
     return tuple(seen)
 
 
@@ -182,18 +202,30 @@ def load_accepted_text(
     """Load one manifest-bound UTF-8 file after verifying its accepted hash."""
     path = executor.resolve_in_workspace(root, name)
     if not path.is_file():
-        raise AssemblyError(f"assembly dependency is missing: {name}")
+        raise AssemblyError(
+            f"assembly dependency is missing: {name}",
+            fault_scope="integrity", fault_path=name,
+        )
     raw = path.read_bytes()
     actual_hash = hashlib.sha256(raw).hexdigest()
     expected_hash = expected_hashes.get(name)
     if not expected_hash:
-        raise AssemblyError(f"assembly dependency has no accepted hash: {name}")
+        raise AssemblyError(
+            f"assembly dependency has no accepted hash: {name}",
+            fault_scope="integrity", fault_path=name,
+        )
     if actual_hash != expected_hash:
-        raise AssemblyError(f"assembly dependency changed after acceptance: {name}")
+        raise AssemblyError(
+            f"assembly dependency changed after acceptance: {name}",
+            fault_scope="integrity", fault_path=name,
+        )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise AssemblyError(f"assembly dependency is not UTF-8 text: {name}") from exc
+        raise AssemblyError(
+            f"assembly dependency is not UTF-8 text: {name}",
+            fault_scope="dependency", fault_path=name,
+        ) from exc
     return text, actual_hash
 
 
@@ -204,7 +236,8 @@ def _validated_source(
     closing = re.compile(rf"</\s*{kind}\b", re.IGNORECASE)
     if closing.search(text):
         raise AssemblyError(
-            f"cannot inline {name} exactly because it contains a closing </{kind}> token"
+            f"cannot inline {name} exactly because it contains a closing </{kind}> token",
+            fault_scope="dependency", fault_path=name,
         )
     return text, actual_hash
 
@@ -222,34 +255,58 @@ def materialize_html_inline(
     """
     normalized_sources = [name.replace("\\", "/") for name in sources]
     if not normalized_sources:
-        raise AssemblyError("HTML inline assembly declares no dependency sources")
+        raise AssemblyError(
+            "HTML inline assembly declares no dependency sources",
+            fault_scope="manifest",
+        )
     if len(set(normalized_sources)) != len(normalized_sources):
-        raise AssemblyError("HTML inline assembly dependency manifest contains duplicates")
+        raise AssemblyError(
+            "HTML inline assembly dependency manifest contains duplicates",
+            fault_scope="manifest",
+        )
     allowed = set(normalized_sources)
     seen: list[str] = []
     hashes: dict[str, str] = {}
 
     validate_template_directives(template)
     if _SCRIPT_SRC_RE.search(template) or _STYLESHEET_LINK_RE.search(template):
-        raise AssemblyError("HTML inline template contains an external script or stylesheet reference")
+        raise AssemblyError(
+            "HTML inline template contains an external script or stylesheet reference",
+            fault_scope="template",
+        )
 
     def replace(match: re.Match[str]) -> str:
         kind = match.group("kind").lower()
         name = match.group("path").strip().strip("`\"'").replace("\\", "/")
         if name not in allowed:
-            raise AssemblyError(f"assembly template references undeclared dependency: {name}")
+            raise AssemblyError(
+                f"assembly template references undeclared dependency: {name}",
+                fault_scope="template",
+            )
         if name in seen:
-            raise AssemblyError(f"assembly template references a dependency more than once: {name}")
+            raise AssemblyError(
+                f"assembly template references a dependency more than once: {name}",
+                fault_scope="template",
+            )
         suffix = Path(name).suffix.lower()
         if kind == "style" and suffix != ".css":
-            raise AssemblyError(f"STYLE directive requires a CSS dependency: {name}")
+            raise AssemblyError(
+                f"STYLE directive requires a CSS dependency: {name}",
+                fault_scope="template",
+            )
         if kind == "script" and suffix != ".js":
-            raise AssemblyError(f"SCRIPT directive requires a JavaScript dependency: {name}")
+            raise AssemblyError(
+                f"SCRIPT directive requires a JavaScript dependency: {name}",
+                fault_scope="template",
+            )
         source, digest = _validated_source(
             Path(staging_root), name, expected_hashes, kind
         )
         if kind == "style" and _CSS_IMPORT_RE.search(source):
-            raise AssemblyError(f"inline stylesheet contains @import and is not self-contained: {name}")
+            raise AssemblyError(
+                f"inline stylesheet contains @import and is not self-contained: {name}",
+                fault_scope="dependency", fault_path=name,
+            )
         seen.append(name)
         hashes[name] = digest
         attr = escape(name, quote=True)
@@ -257,11 +314,20 @@ def materialize_html_inline(
 
     content = _DIRECTIVE_RE.sub(replace, template)
     if _UNRESOLVED_DIRECTIVE_RE.search(content):
-        raise AssemblyError("HTML inline template contains a malformed assembly directive")
+        raise AssemblyError(
+            "HTML inline template contains a malformed assembly directive",
+            fault_scope="template",
+        )
     missing = [name for name in normalized_sources if name not in seen]
     if missing:
-        raise AssemblyError("assembly template omitted dependencies: " + ", ".join(missing))
+        raise AssemblyError(
+            "assembly template omitted dependencies: " + ", ".join(missing),
+            fault_scope="template",
+        )
     low = content.lower()
     if "<html" not in low or "</html>" not in low:
-        raise AssemblyError("assembled HTML template is not a complete document")
+        raise AssemblyError(
+            "assembled HTML template is not a complete document",
+            fault_scope="template",
+        )
     return AssemblyResult(content=content, sources=tuple(seen), source_hashes=hashes)

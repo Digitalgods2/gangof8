@@ -10,6 +10,7 @@ dependencies = [
     "httpx>=0.27",          # OpenRouter adapter (runtime HTTP client)
     "google-genai>=1.0",    # gemini SDK: vision/text calls + Google Search grounding (web_search)
     "pypdf>=4",             # PDF attachment text extraction (uploads)
+    "playwright>=1.50",     # fail-closed real-browser acceptance for interactive HTML
 ]
 
 [project.scripts]

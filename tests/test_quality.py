@@ -35,6 +35,20 @@ def test_compose_prompt_includes_authoritative_action_outcomes():
     assert "authoritative" in prompt.lower()
 
 
+def test_compose_prompt_forbids_unrecorded_file_success_claims():
+    from gangof8.composer import compose_prompt
+
+    session = Session(
+        session_id="s_no_output",
+        task=Task(task_id="t", session_id="s_no_output", text="write report.md"),
+    )
+
+    prompt = compose_prompt(session)
+
+    assert "unless the Actions performed list records" in prompt
+    assert "Actions performed (authoritative):\n(none)" in prompt
+
+
 def test_compose_prompt_omits_ledger_and_rulings_ceremony():
     """The verdict/ruling/ledger ceremony is gone from composition — the prompt
     stays lean even when legacy sessions still carry truth claims."""

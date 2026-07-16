@@ -287,6 +287,100 @@ def test_stub_detection_matches_the_live_failure():
     assert rounds.reply_is_stub(LIVE_STUB) is True
 
 
+def test_stub_panel_and_failed_lead_cannot_false_success_an_output_task(tmp_path):
+    """Regression for the live failure: Gemini-style stubs plus a dead lead
+    must not let the composer claim that an output file was written."""
+
+    class StubGemini:
+        name = "gemini"
+
+        def __init__(self):
+            self.calls = []
+
+        def call(self, role, prompt, timeout_s, images=None):
+            del prompt, timeout_s, images
+            self.calls.append(role)
+            return AdapterResult(content=LIVE_STUB, duration_ms=1)
+
+    class FailedLeadAndLyingComposer:
+        name = "failed-lead"
+
+        def __init__(self):
+            self.calls = []
+
+        def call(self, role, prompt, timeout_s, images=None):
+            del prompt, timeout_s, images
+            self.calls.append(role)
+            if role == Role.lead:
+                raise AgentError("lead backend disabled")
+            return AdapterResult(
+                content=(
+                    "ANSWER: report.md was written successfully.\n"
+                    "CONFIDENCE: high\nASSUMPTIONS:\n- none\nRISKS:\n- none\n"
+                    "NEXT_ACTION: none"
+                ),
+                duration_ms=1,
+            )
+
+    gemini = StubGemini()
+    failed = FailedLeadAndLyingComposer()
+    svc = GangOf8Service(
+        data_dir=tmp_path,
+        panel=["gemini"],
+        role_agents={Role.lead: "failed-lead", Role.summarizer: "failed-lead"},
+    )
+    svc.registry.register(gemini)
+    svc.registry.register(failed)
+
+    session = svc.run("Write report.md containing a launch checklist.", source="test")
+
+    assert session.classification.produces_output is True
+    assert session.status == SessionStatus.failed
+    assert session.outcome == "failed_verification"
+    assert session.quality_gate["stage"] == "required_output"
+    assert session.final.confidence == "low"
+    assert "did not produce or modify" in session.final.answer
+    assert "available implementation author" in session.final.next_action
+    assert session.files_changed == []
+    assert not [
+        action for action in session.proposed_actions
+        if action.kind in ("write_file", "edit_file", "promote")
+        and action.status == "executed"
+    ]
+    assert Role.panelist in gemini.calls
+    assert failed.calls == [Role.lead], "the output gate must run before composition"
+    assert "required_output_gate_failed" in _events(svc, session)
+
+
+def test_output_gate_covers_code_content_and_explicit_revisions(tmp_path):
+    from gangof8 import loop
+    from gangof8.logstore import LogStore
+    from gangof8.models import Classification, Complexity, Risk, TaskType
+    from gangof8.sessions import SessionManager
+
+    session = SessionManager(LogStore(tmp_path)).create("task", source="test")
+    session.classification = Classification(
+        task_type=TaskType.content,
+        complexity=Complexity.standard,
+        risk=Risk.none,
+        produces_output=True,
+    )
+    assert loop._requires_file_output(session)
+
+    session.classification.produces_output = False
+    session.classification.task_type = TaskType.code
+    assert loop._requires_file_output(session)
+
+    session.classification.task_type = TaskType.question
+    session.revision_targets = ["app.py"]
+    assert loop._requires_file_output(session)
+
+    session.revision_targets = []
+    session.classification.task_type = TaskType.action
+    session.classification.produces_output = True
+    assert not loop._requires_file_output(session)
+
+
 def test_short_direct_answer_is_not_a_stub():
     # the mock lead's legitimate short answer has no deferral phrasing
     from gangof8.adapters.mock import LEAD_ANSWER

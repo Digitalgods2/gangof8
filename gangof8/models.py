@@ -333,6 +333,9 @@ class GoalMilestone(BaseModel):
     files: list[str] = []             # accepted, delivered files only (legacy name)
     accepted_files: list[str] = []    # explicit manifest; never sandbox drafts
     accepted_hashes: dict[str, str] = {}  # relative delivery path -> SHA-256
+    # Accepted-byte provenance by relative output path. Deterministic transforms
+    # identify source hashes and never falsely credit a zero-call owner as author.
+    output_provenance: dict[str, dict] = {}
     # Downstream deterministic validation can prove that an otherwise completed
     # upstream attempt violated its template contract. Resume must not silently
     # recover that exact session as verified work again.
@@ -355,6 +358,9 @@ class Goal(BaseModel):
     milestones: list[GoalMilestone] = []
     current_index: int = 0
     planned_by: str = ""      # agent that authored the milestone plan
+    # Enabled build participants frozen when the goal is created. Settings may
+    # change while a long goal runs; its promised collaboration roster may not.
+    build_roster: list[str] = []
     plan_rationale: str = ""
     last_error: str = ""      # why the goal paused/failed, for the UI
     # Workflow versioning is explicit so goals persisted before the build-team
@@ -368,6 +374,9 @@ class Goal(BaseModel):
     release_session_id: Optional[str] = None
     release_status: str = "not_started"  # not_started | awaiting_target | awaiting_approval | released | denied | failed
     release_files: list[str] = []
+    # Semantic defects and unapplied frontier repairs survive a release retry;
+    # otherwise an inconsistent second reading can silently forget a known bug.
+    release_defects: list[str] = []
     # A goal-level epoch invalidates a planner/milestone worker that belonged to
     # an earlier cancelled or retried run.  The short-lived lease is persisted
     # by GoalStore while planning/advancing metadata.
@@ -401,9 +410,8 @@ class Session(BaseModel):
     delivery_mode: str = "immediate"
     work_package_id: str = ""
     work_package_owner: str = ""
-    # A package owner remains accountable, but independently authored outputs
-    # can be assigned to other enabled seats.  Assignments are exact paths,
-    # never inferred from file size or arbitrary response-length thresholds.
+    # Other enabled seats remain visible for roster/provenance reporting, while
+    # the current owner authors the package's cohesive output set atomically.
     package_helpers: list[str] = []
     package_output_authors: dict[str, str] = {}
     package_output_attempts: dict[str, int] = {}
@@ -420,6 +428,14 @@ class Session(BaseModel):
     # Persist the real author/runtime funnel and semantic release gate.
     candidate_metrics: dict = {}
     quality_gate: dict = {}
+    # Package artifact hashes captured by the deterministic verifier. Recovery
+    # may adopt a completed attempt only when its current result paths still
+    # match this seal.
+    verified_output_hashes: dict[str, str] = {}
+    # Exact staging hashes sealed only after final release verification passes.
+    # Final approval/promotion is bound to these bytes; any repair or drift must
+    # clear/recompute the seal through the full release gate.
+    release_verified_hashes: dict[str, str] = {}
     # Contract-linked JavaScript can be authored before its provider exists.
     # Runtime validation is deferred until integration for these exact pending
     # package outputs; static checks still run immediately.
@@ -485,6 +501,9 @@ class Session(BaseModel):
     unresolved: list[str] = []
     final: Optional[FinalAnswer] = None
     agent_calls: int = 0
+    # Successful registry calls by real agent. Synthetic coordinator summaries
+    # and zero-call deterministic transforms never count as AI participation.
+    successful_agent_calls: dict[str, int] = {}
     # Unlike ``agent_calls`` (completed calls used by the budget), this audit
     # counter never rolls back when a call times out, errors, or asks for input.
     agent_call_attempts: int = 0

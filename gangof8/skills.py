@@ -409,13 +409,17 @@ def _promote(session: Session, action: ProposedAction, data_dir: Path) -> str:
     return str(dst)
 
 
-def _batch_manifest(action: ProposedAction) -> tuple[list[str], dict[str, Optional[str]]]:
+def _batch_manifest(
+    action: ProposedAction,
+) -> tuple[list[str], dict[str, Optional[str]], dict[str, str]]:
     try:
         files = json.loads(action.args.get("files", "[]"))
         baselines = json.loads(action.args.get("baselines", "{}"))
+        source_hashes = json.loads(action.args.get("source_hashes", "{}"))
     except (json.JSONDecodeError, TypeError) as e:
         raise ExecutionError(f"invalid final-batch manifest: {e}") from e
-    if not isinstance(files, list) or not isinstance(baselines, dict):
+    if (not isinstance(files, list) or not isinstance(baselines, dict)
+            or not isinstance(source_hashes, dict)):
         raise ExecutionError("invalid final-batch manifest shape")
     normalized: list[str] = []
     for raw in files:
@@ -425,14 +429,20 @@ def _batch_manifest(action: ProposedAction) -> tuple[list[str], dict[str, Option
         name = raw.replace("\\", "/")
         if name not in normalized:
             normalized.append(name)
-    return normalized, baselines
+    missing_hashes = [name for name in normalized if not source_hashes.get(name)]
+    if missing_hashes:
+        raise ExecutionError(
+            "final-batch manifest is not bound to verified staged bytes: "
+            + ", ".join(missing_hashes)
+        )
+    return normalized, baselines, source_hashes
 
 
 def batch_promote_diff(session: Session, data_dir: Path, action: ProposedAction) -> str:
     """One aggregate review document for every file in the final release."""
     import difflib
 
-    files, _ = _batch_manifest(action)
+    files, _, source_hashes = _batch_manifest(action)
     if not session.workspace_root:
         return "(goal staging workspace is unavailable)"
     dest_root = session.delivery_root or session.established_root
@@ -457,14 +467,16 @@ def batch_promote_diff(session: Session, data_dir: Path, action: ProposedAction)
             )) or "(no textual difference)"
         except OSError as e:
             diff = f"(could not preview: {e})"
-        blocks.append(f"===== {name} =====\n{diff}")
+        blocks.append(
+            f"===== {name} (verified SHA-256 {source_hashes[name]}) =====\n{diff}"
+        )
     header = f"FINAL BATCH: {len(files)} file(s)\n\n"
     return (header + "\n\n".join(blocks))[: config.BATCH_PROMOTE_DIFF_MAX_CHARS]
 
 
 def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Validate and release all staged files as one rollback-protected unit."""
-    files, baselines = _batch_manifest(action)
+    files, baselines, source_hashes = _batch_manifest(action)
     if not files:
         raise ExecutionError("final batch is empty")
     if not session.workspace_root:
@@ -482,6 +494,11 @@ def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> 
         dst = resolve_in_workspace(dest, name)
         if not src.is_file() or src.stat().st_size == 0:
             raise ExecutionError(f"staged release file is missing/empty: {name}")
+        actual_source = hashlib.sha256(src.read_bytes()).hexdigest()
+        if actual_source != source_hashes[name]:
+            raise ExecutionError(
+                f"staged release changed after verification/approval: {name}"
+            )
         expected = baselines.get(name)
         if expected is None:
             if dst.exists():
@@ -510,6 +527,11 @@ def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> 
             prepared = resolve_in_workspace(tx / "prepared", name)
             prepared.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(sources[name], prepared)
+            prepared_hash = hashlib.sha256(prepared.read_bytes()).hexdigest()
+            if prepared_hash != source_hashes[name]:
+                raise ExecutionError(
+                    f"staged release changed while preparing transaction: {name}"
+                )
             if dst.is_file():
                 backup = resolve_in_workspace(backups, name)
                 backup.parent.mkdir(parents=True, exist_ok=True)
@@ -524,6 +546,11 @@ def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> 
             temps.append(temp)
             os.replace(temp, dst)
             replaced.append(name)
+            released_hash = hashlib.sha256(dst.read_bytes()).hexdigest()
+            if released_hash != source_hashes[name]:
+                raise ExecutionError(
+                    f"released file hash mismatch after copy: {name}"
+                )
     except Exception as e:  # noqa: BLE001 - rollback must contain any filesystem failure
         rollback_errors: list[str] = []
         for name in reversed(replaced):

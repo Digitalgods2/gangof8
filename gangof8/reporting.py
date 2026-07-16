@@ -109,6 +109,7 @@ def run_summary(session: Any) -> dict:
 
     return {
         "agent_calls": data.get("agent_calls", len(contributions)),
+        "successful_agent_calls": data.get("successful_agent_calls") or {},
         "agent_call_attempts": data.get(
             "agent_call_attempts", data.get("agent_calls", len(contributions))
         ),
@@ -142,7 +143,7 @@ _TIMELINE = {
     "agent_call_failed": ("!", "Model call failed"),
     "agent_call_discarded": ("!", "Late model response discarded"),
     "package_deadline_started": (">", "Shared package deadline started"),
-    "package_author_fanout_started": (">>", "Exact-output authors dispatched"),
+    "package_author_fanout_started": (">>", "Atomic package owner dispatched"),
     "package_output_reassigned": ("↻", "Exact output reassigned"),
     "package_artifact_author_rejected": ("!", "Wrong package author rejected"),
     "frontier_author_recovery_started": ("↻", "Frontier author recovering"),
@@ -156,6 +157,9 @@ _TIMELINE = {
     "assembly_template_rejected": ("!", "Assembly template rejected"),
     "assembly_template_provider_invalidated": ("!", "Upstream template attempt invalidated"),
     "assembly_template_rebuild_scheduled": (">>", "Upstream template rebuild scheduled"),
+    "assembly_dependency_provider_invalidated": ("!", "Upstream dependency attempt invalidated"),
+    "assembly_dependency_rebuild_scheduled": (">>", "Upstream dependency rebuild scheduled"),
+    "assembly_dependency_repair_applied": ("+", "Assembly dependencies repaired and reverified"),
     "assembly_skill_request_rejected": ("!", "Assembly dependency read rejected"),
     "assembly_repair_skipped": (">", "Expanded artifact kept out of model repair"),
     "package_attempt_failed": ("!", "Package attempt failed"),

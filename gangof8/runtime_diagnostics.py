@@ -60,13 +60,15 @@ def collect_runtime_diagnostics(
             "build_team_same_author_timeout_recovery_attempts": 0,
             "build_team_distinct_author_failovers_per_output": 1,
             "routine_openrouter_policy": "total_wall_clock",
-            "coding_openrouter_policy": "hard_deadline_and_no_model_output_stall",
+            "coding_openrouter_policy": "no_hard_deadline_and_no_model_output_stall",
             "stream_progress_persisted": True,
             "note": (
                 "per-seat settings apply only to routine/non-code sessions; coding "
-                "uses finite stage deadlines; build-team authors share one package "
-                "deadline and timed-out authors are not repeated; OpenRouter enforces "
-                "an independent "
+                "authoring has no hard deadline by default and frontier seats "
+                "have no coordinator deadline at any coding stage; optional "
+                "environment limits can bound non-frontier stages; failed "
+                "authors are not repeated; OpenRouter "
+                "enforces an independent "
                 "no-model-output stall limit; all calls remain user-cancellable"
             ),
         },

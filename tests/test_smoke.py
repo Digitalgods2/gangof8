@@ -60,6 +60,38 @@ BROWSER_LAYOUT_APIS = "<!doctype html><html><body><canvas id='c'></canvas><scrip
                       "requestAnimationFrame(()=>cv.getContext('2d').fillRect(0,0,1,1));\n" \
                       "</script></body></html>"
 
+STANDARD_DOM_GLOBALS = "<!doctype html><html><body><script>\n" \
+                       "visualViewport.addEventListener('resize',()=>{});\n" \
+                       "const frag=document.createDocumentFragment();\n" \
+                       "frag.querySelectorAll('[data-game]');\n" \
+                       "document.dispatchEvent({type:'arcadeportal:state'});\n" \
+                       "document.body.removeAttribute('hidden');\n" \
+                       "document.body.hasAttribute('hidden');\n" \
+                       "document.body.toggleAttribute('hidden');\n" \
+                       "const button=document.createElement('button');\n" \
+                       "button.innerHTML='<span class=game-name></span>';\n" \
+                       "button.querySelector('.game-name').textContent='Frogger';\n" \
+                       "window.ArcadePortal={register(){}};\n" \
+                       "if(window.ArcadePortal) ArcadePortal.register('demo',class{});\n" \
+                       "</script></body></html>"
+
+KEY_HANDLER_CRASH = "<!doctype html><html><body><canvas></canvas><script>\n" \
+                    "addEventListener('keydown', e => { if(e.code === 'Space') missingSound.fire(); });\n" \
+                    "requestAnimationFrame(function tick(){ requestAnimationFrame(tick); });\n" \
+                    "</script></body></html>"
+
+POINTER_HANDLER_CRASH = "<!doctype html><html><body><canvas></canvas><script>\n" \
+                        "addEventListener('pointerdown', () => missingPointer.fire());\n" \
+                        "</script></body></html>"
+
+TIMER_CRASH = "<!doctype html><html><body><script>\n" \
+              "setInterval(() => missingTimer.tick(), 10);\n" \
+              "</script></body></html>"
+
+SAFE_CLOSEST = "<!doctype html><html><body><button>Sound</button><script>\n" \
+               "addEventListener('click', e => { const button=e.target.closest('button'); });\n" \
+               "</script></body></html>"
+
 
 def test_bare_browser_globals_do_not_falsely_crash():
     ran, testable, detail, _dyn = smoke.smoke_source(BARE_GLOBALS, ".html")
@@ -68,6 +100,29 @@ def test_bare_browser_globals_do_not_falsely_crash():
 
 def test_layout_observers_and_css_style_api_do_not_falsely_crash():
     ran, testable, detail, _dyn = smoke.smoke_source(BROWSER_LAYOUT_APIS, ".html")
+    assert ran is True and testable is True, detail
+
+
+def test_standard_dom_and_window_assigned_globals_do_not_falsely_crash():
+    ran, testable, detail, _dyn = smoke.smoke_source(STANDARD_DOM_GLOBALS, ".html")
+    assert ran is True and testable is True, detail
+
+
+@pytest.mark.parametrize("source", [KEY_HANDLER_CRASH, POINTER_HANDLER_CRASH])
+def test_input_handler_exception_blocks_smoke(source):
+    ran, testable, detail, _dyn = smoke.smoke_source(source, ".html")
+    assert ran is False and testable is True
+    assert "missing" in detail.lower() or "defined" in detail.lower()
+
+
+def test_timer_exception_blocks_smoke():
+    ran, testable, detail, _dyn = smoke.smoke_source(TIMER_CRASH, ".html")
+    assert ran is False and testable is True
+    assert "missing" in detail.lower() or "defined" in detail.lower()
+
+
+def test_realistic_closest_stub_does_not_falsely_reject_delegated_clicks():
+    ran, testable, detail, _dyn = smoke.smoke_source(SAFE_CLOSEST, ".html")
     assert ran is True and testable is True, detail
 
 

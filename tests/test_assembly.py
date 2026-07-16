@@ -7,11 +7,12 @@ import hashlib
 import pytest
 
 from gangof8 import assembly, goals, loop
+import gangof8.service as service_module
 from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (
     Contribution, Council, CouncilMember, Goal, GoalMilestone, ProposedAction,
-    Role, Session, Task,
+    Role, Session, SessionStatus, Task,
 )
 from gangof8.service import GangOf8Service
 from gangof8.sessions import SessionManager
@@ -105,9 +106,11 @@ def test_materializer_rejects_changed_or_html_unsafe_accepted_sources(tmp_path):
         "src/app.js": "globalThis.app = true;\n",
     })
     (root / "src" / "app.js").write_text("globalThis.app = false;\n", encoding="utf-8")
-    with pytest.raises(assembly.AssemblyError, match="changed after acceptance"):
+    with pytest.raises(assembly.AssemblyError, match="changed after acceptance") as changed:
         assembly.materialize_html_inline(
             _template(), root, ["assets/app.css", "src/app.js"], hashes)
+    assert changed.value.fault_scope == "integrity"
+    assert changed.value.fault_path == "src/app.js"
 
     hashes = _write_manifest(root, {
         "src/app.js": "const unsafe = '</script>';\n",
@@ -115,6 +118,21 @@ def test_materializer_rejects_changed_or_html_unsafe_accepted_sources(tmp_path):
     with pytest.raises(assembly.AssemblyError, match="cannot inline"):
         assembly.materialize_html_inline(
             _template(), root, ["assets/app.css", "src/app.js"], hashes)
+
+
+def test_materializer_identifies_non_self_contained_stylesheet_owner(tmp_path):
+    root = tmp_path / "stage"
+    hashes = _write_manifest(root, {
+        "assets/app.css": "@import url('https://example.test/font.css');\nbody {}\n",
+        "src/app.js": "globalThis.app = true;\n",
+    })
+
+    with pytest.raises(assembly.AssemblyError, match="contains @import") as raised:
+        assembly.materialize_html_inline(
+            _template(), root, ["assets/app.css", "src/app.js"], hashes)
+
+    assert raised.value.fault_scope == "dependency"
+    assert raised.value.fault_path == "assets/app.css"
 
 
 def test_materializer_rejects_directives_nested_in_script_or_style(tmp_path):
@@ -299,7 +317,31 @@ def test_pre_contract_single_file_package_is_structurally_inferred(tmp_path):
     )
 
 
-def test_deterministic_release_gate_never_calls_a_frontier_verifier(tmp_path):
+def test_zero_call_assembly_provenance_does_not_credit_nominal_owner(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    session = Session(
+        session_id="s_assembly_provenance",
+        task=Task(task_id="t", session_id="s_assembly_provenance", text="assemble"),
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "model_calls": 0,
+            "template_hash": "template-sha",
+            "source_hashes": {"src/app.js": "source-sha"},
+        },
+        package_output_history={
+            "index.html": [{"status": "completed", "agent": "claude"}],
+        },
+    )
+
+    records = service._accepted_output_provenance(
+        session, ["index.html"], {"index.html": "release-sha"})
+
+    assert records["index.html"]["method"] == "deterministic_assembly"
+    assert records["index.html"]["agent"] is None
+    assert records["index.html"]["source_hashes"] == {"src/app.js": "source-sha"}
+
+
+def test_deterministic_release_continues_into_semantic_frontier_review(tmp_path, monkeypatch):
     stage = tmp_path / "stage"
     stage.mkdir()
     release = "<!doctype html><html><body><main>ready</main></body></html>\n"
@@ -318,8 +360,116 @@ def test_deterministic_release_gate_never_calls_a_frontier_verifier(tmp_path):
         task=Task(task_id="t", session_id="s_release", text="release"),
     )
     service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex"]
+    monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
+
+    def semantic_pass(current, _registry, _store, member, _prompt, timeout_s=None):
+        del current, _registry, _store, timeout_s
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content="CHECK R1: PASS - inspected the final behavior\nVERDICT: PASS",
+        )
+
+    monkeypatch.setattr(service_module, "_agent_call", semantic_pass)
 
     assert service._verify_goal_release(goal, session)
-    assert session.agent_calls == 0
-    assert session.quality_gate["stage"] == "deterministic_assembly_release"
     assert session.quality_gate["verdict"] == "PASS"
+    assert session.quality_gate["verifier"] == "codex"
+    assert session.quality_gate["deterministic_preflight"]["verdict"] == "PASS"
+
+
+def test_frontier_pass_with_edits_applies_then_requires_clean_confirmation(
+    tmp_path, monkeypatch,
+):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    output = stage / "index.html"
+    output.write_text(
+        "<!doctype html><html><body><script>const player = { x: 0 };</script></body></html>",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    package = GoalMilestone(
+        index=0, package_id="wp_1", title="release", task_text="assemble",
+        owner="claude", required_files=["index.html"], release_files=["index.html"],
+        accepted_hashes={"index.html": digest}, assembly_mode=assembly.HTML_INLINE,
+        assembly_template=assembly.OWNER_TEMPLATE,
+    )
+    goal = Goal(
+        text="The release must initialize the player position.",
+        staging_root=str(stage), milestones=[package],
+    )
+    session = Session(
+        session_id="s_release_repair", status=SessionStatus.deliberating,
+        workspace_root=str(stage), required_files=["index.html"],
+        task=Task(task_id="t", session_id="s_release_repair", text=goal.text),
+    )
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex"]
+    monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
+    calls = []
+
+    def semantic_review(current, _registry, _store, member, _prompt, timeout_s=None):
+        del current, _registry, _store, member, _prompt, timeout_s
+        calls.append(1)
+        if len(calls) == 1:
+            content = (
+                "CHECK R1: PASS - repaired below\n"
+                "```text\n===== EDIT: index.html =====\n"
+                "OLD:\nconst player = { x: 0 };\n"
+                "NEW:\nconst player = { x: 0, y: 10 };\n```\n"
+                "VERDICT: PASS"
+            )
+        else:
+            content = "CHECK R1: PASS - current bytes initialize x and y\nVERDICT: PASS"
+        return Contribution(
+            round=0, role=Role.panelist, agent="codex", content=content,
+        )
+
+    monkeypatch.setattr(service_module, "_agent_call", semantic_review)
+
+    assert service._verify_goal_release(goal, session)
+    assert len(calls) == 2
+    assert "const player = { x: 0, y: 10 };" in output.read_text(encoding="utf-8")
+    assert session.quality_gate["verdict"] == "PASS"
+    assert session.quality_gate["repairs_applied"] == 1
+    assert goal.release_defects == []
+
+
+def test_semantic_frontier_can_block_clean_deterministic_assembly(tmp_path, monkeypatch):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    output = stage / "index.html"
+    output.write_text("<!doctype html><html><body><script>let ready=true;</script></body></html>",
+                      encoding="utf-8")
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    package = GoalMilestone(
+        index=0, package_id="wp_1", title="release", task_text="assemble",
+        owner="claude", required_files=["index.html"], release_files=["index.html"],
+        accepted_hashes={"index.html": digest}, assembly_mode=assembly.HTML_INLINE,
+        assembly_template=assembly.OWNER_TEMPLATE,
+    )
+    goal = Goal(text="The pause control must work", staging_root=str(stage), milestones=[package])
+    session = Session(
+        session_id="s_release_fail", status=SessionStatus.deliberating,
+        required_files=["index.html"],
+        task=Task(task_id="t", session_id="s_release_fail", text=goal.text),
+    )
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex"]
+    monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
+
+    def semantic_fail(current, _registry, _store, member, _prompt, timeout_s=None):
+        del current, _registry, _store, timeout_s
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content="CHECK R1: FAIL - no pause handler exists\n"
+                    "DEFECT: pause control is inert\nVERDICT: FAIL",
+        )
+
+    monkeypatch.setattr(service_module, "_agent_call", semantic_fail)
+
+    assert not service._verify_goal_release(goal, session)
+    assert session.quality_gate["deterministic_preflight"]["verdict"] == "PASS"
+    assert session.quality_gate["verdict"] == "FAIL"
+    assert session.status == SessionStatus.failed
