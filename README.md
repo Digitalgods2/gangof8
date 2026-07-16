@@ -194,6 +194,15 @@ automatically promoted to hard dependencies and receive the exact accepted
 provider bytes and SHA-256 hashes, so method names, time units, input semantics,
 DOM hooks, and load order cannot drift behind matching prose.
 
+If a generated package graph violates one of these deterministic contracts,
+the coordinator sends the complete rejected plan and every exact validation
+error back to the same architect for up to two constrained repair attempts.
+Each attempt receives the full planning timeout. Packages start only after a
+replacement graph passes the unchanged gate; repeated invalid plans pause with
+no package sessions or partial output. Cancelling during a repair revokes the
+planning lease and prevents later calls from resurrecting the goal. Set
+`GANGOF8_GOAL_PLAN_REPAIR_ATTEMPTS` to change the default repair limit of `2`.
+
 ### 2. The source is copied into private staging
 
 Each goal receives a persistent overlay at:

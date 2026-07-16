@@ -1224,7 +1224,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     def create_goal(self, text: str, background: bool = False) -> Goal:
         """Open a goal: the architect decomposes it into milestone-sized
-        deliverables ONCE, then milestone 1 runs as a normal session. With
+        deliverables, repairing a rejected contract when necessary, then the
+        ready package wave runs as normal sessions. With
         background=True the planning + first milestone run on a worker and the
         caller polls GET /goals/{id}."""
         raw = (text or "").strip()
@@ -1676,21 +1677,116 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             agent, role = self._goal_planner()
             milestones: list[GoalMilestone] = []
             rationale = ""
+            validation_errors: list[str] = []
+            call_error = ""
+            repair_count = 0
             if agent:
-                try:
-                    result = self.registry.call(
-                        agent, role, goals.plan_prompt(
-                            goal.text, goal.build_roster or self.panel),
-                        timeout_s=config.GOAL_PLAN_TIMEOUT)
-                    milestones = goals.parse_milestones(result.content or "")
+                prompt = goals.plan_prompt(goal.text, goal.build_roster or self.panel)
+                rejected_plan = ""
+                for attempt in range(config.GOAL_PLAN_REPAIR_ATTEMPTS + 1):
+                    # A model call can outlive a concurrent Cancel. Do not spend
+                    # another repair call or save stale state after ownership was
+                    # revoked while the adapter was blocked.
+                    persisted = self.goals.get(goal.goal_id)
+                    if (persisted is None or persisted.status != "planning"
+                            or persisted.worker_lease != token
+                            or persisted.epoch != goal.epoch):
+                        return persisted or goal
+                    try:
+                        result = self.registry.call(
+                            agent, role, prompt, timeout_s=config.GOAL_PLAN_TIMEOUT)
+                    except Exception as e:  # noqa: BLE001
+                        label = "plan repair call" if repair_count else "planning call"
+                        call_error = f"{label} failed ({str(e)[:200]})"
+                        break
+
+                    persisted = self.goals.get(goal.goal_id)
+                    if (persisted is None or persisted.status != "planning"
+                            or persisted.worker_lease != token
+                            or persisted.epoch != goal.epoch):
+                        return persisted or goal
+
                     goal.planned_by = agent
-                except Exception as e:  # noqa: BLE001
-                    rationale = f"planning call failed ({str(e)[:200]})"
+                    rejected_plan = result.content or ""
+                    candidate = goals.parse_milestones(rejected_plan)
+                    candidate_errors: list[str] = []
+                    if not candidate:
+                        if goals.requires_delivery_contract(goal.text):
+                            candidate_errors.append(
+                                "planner did not produce a delivery contract")
+                    else:
+                        invalid = [
+                            package for package in candidate
+                            if (not package.contract_declared or package.contract_error
+                                or (package.requires_delivery
+                                    and not package.required_files))
+                        ]
+                        for package in invalid:
+                            reasons: list[str] = []
+                            if not package.contract_declared:
+                                reasons.append("missing OUTPUTS declaration")
+                            if package.contract_error:
+                                reasons.append(package.contract_error)
+                            if package.requires_delivery and not package.required_files:
+                                reasons.append("delivery contract has no output files")
+                            identity = package.package_id or package.title
+                            candidate_errors.append(
+                                f"{identity} has an incomplete delivery contract: "
+                                + "; ".join(reasons)
+                            )
+                        if not candidate_errors:
+                            candidate, candidate_errors = self._normalize_work_packages(
+                                candidate, goal.text,
+                                roster=goal.build_roster or self.panel,
+                            )
+
+                    if not candidate_errors:
+                        milestones = candidate
+                        if repair_count:
+                            rationale = (
+                                "planner contract repaired automatically after "
+                                f"{repair_count} rejected attempt"
+                                f"{'s' if repair_count != 1 else ''}"
+                            )
+                            self.store.log_event(
+                                "-", "goal_plan_repaired",
+                                {"goal_id": goal.goal_id, "attempts": repair_count},
+                            )
+                        break
+
+                    validation_errors = candidate_errors
+                    if attempt >= config.GOAL_PLAN_REPAIR_ATTEMPTS:
+                        break
+                    repair_count += 1
+                    self.store.log_event(
+                        "-", "goal_plan_repair_requested",
+                        {
+                            "goal_id": goal.goal_id,
+                            "attempt": repair_count,
+                            "errors": validation_errors,
+                        },
+                    )
+                    prompt = goals.plan_repair_prompt(
+                        goal.text,
+                        goal.build_roster or self.panel,
+                        rejected_plan,
+                        validation_errors,
+                        repair_count,
+                    )
+            if not milestones and validation_errors:
+                goal.status = "paused"
+                detail = "; ".join(validation_errors)
+                if call_error:
+                    detail = f"{call_error}; prior plan errors: {detail}"
+                goal.last_error = detail[:300]
+                goal.plan_rationale = detail
+                self.goals.save_owned(goal, token)
+                return self.goals.get(goal.goal_id) or goal
             if not milestones:
                 if goals.requires_delivery_contract(goal.text):
                     goal.status = "paused"
                     goal.last_error = "planner did not produce a delivery contract"
-                    goal.plan_rationale = rationale or goal.last_error
+                    goal.plan_rationale = call_error or rationale or goal.last_error
                     self.goals.save_owned(goal, token)
                     return self.goals.get(goal.goal_id) or goal
                 milestones = [GoalMilestone(
@@ -1698,23 +1794,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     contract_declared=True, requires_delivery=False,
                 )]
                 rationale = (rationale or "plan was not parseable") + " - analysis-only milestone"
-            invalid = [m for m in milestones if not m.contract_declared or m.contract_error
-                       or (m.requires_delivery and not m.required_files)]
-            if invalid:
-                goal.status = "paused"
-                goal.last_error = ("planner supplied an incomplete delivery contract for: "
-                                   + ", ".join(m.title for m in invalid))[:300]
-                goal.plan_rationale = rationale or goal.last_error
-                self.goals.save_owned(goal, token)
-                return self.goals.get(goal.goal_id) or goal
-            milestones, graph_errors = self._normalize_work_packages(
-                milestones, goal.text, roster=goal.build_roster or self.panel)
-            if graph_errors:
-                goal.status = "paused"
-                goal.last_error = "; ".join(graph_errors)[:300]
-                goal.plan_rationale = rationale or goal.last_error
-                self.goals.save_owned(goal, token)
-                return self.goals.get(goal.goal_id) or goal
             goal.milestones = milestones
             self._seed_goal_stage(goal)
             goal.plan_rationale = rationale

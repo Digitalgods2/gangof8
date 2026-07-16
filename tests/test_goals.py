@@ -8,12 +8,13 @@ in-flight goals as paused (their workers died with the process).
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from gangof8 import assembly, goals as goals_mod
+from gangof8 import assembly, config, goals as goals_mod
 from gangof8.adapters.mock import MockAdapter
 from gangof8.models import Goal, GoalMilestone, Role, Session, SessionStatus, Task
 from gangof8.registry import AdapterResult
@@ -32,6 +33,43 @@ PROMOTE_DRAFT = (
     "ARTIFACT: report.md\n"
     "# Storage Recommendation\n\nUse SQLite.\n"
     "PROMOTE: report.md\n"
+)
+
+INVALID_ASSEMBLY_PLAN = (
+    "PACKAGE 1: Runtime core\nOWNER: gemini\nAFTER: NONE\nCONTRACTS: NONE\n"
+    "TASK: Implement the shared browser runtime.\nOUTPUTS: src/core.js\n"
+    "RELEASE: NONE\nREQUIRES: NONE\nASSEMBLY: NONE\nTEMPLATE: NONE\n"
+    "INTERFACE: PROVIDES the runtime API\nCHECK: node --check src/core.js\n"
+    "PACKAGE 2: Game module\nOWNER: gemini\nAFTER: NONE\nCONTRACTS: NONE\n"
+    "TASK: Implement a game module.\nOUTPUTS: src/game.js\n"
+    "RELEASE: NONE\nREQUIRES: NONE\nASSEMBLY: NONE\nTEMPLATE: NONE\n"
+    "INTERFACE: PROVIDES a playable game\nCHECK: node --check src/game.js\n"
+    "PACKAGE 3: Release\nOWNER: gemini\nAFTER: 1, 2\nCONTRACTS: NONE\n"
+    "TASK: Assemble the final single-file HTML.\nOUTPUTS: index.html\n"
+    "RELEASE: index.html\nREQUIRES: src/core.js, src/game.js\n"
+    "ASSEMBLY: HTML_INLINE\nTEMPLATE: css/theme.css\n"
+    "INTERFACE: PROVIDES the final application\nCHECK: NONE\n"
+)
+
+REPAIRED_ASSEMBLY_PLAN = (
+    "PACKAGE 1: Runtime core\nOWNER: gemini\nAFTER: NONE\nCONTRACTS: NONE\n"
+    "TASK: Implement the shared browser runtime.\nOUTPUTS: src/core.js\n"
+    "RELEASE: NONE\nREQUIRES: NONE\nASSEMBLY: NONE\nTEMPLATE: NONE\n"
+    "INTERFACE: PROVIDES the runtime API\nCHECK: node --check src/core.js\n"
+    "PACKAGE 2: Game module\nOWNER: gemini\nAFTER: NONE\nCONTRACTS: NONE\n"
+    "TASK: Implement a game module.\nOUTPUTS: src/game.js\n"
+    "RELEASE: NONE\nREQUIRES: NONE\nASSEMBLY: NONE\nTEMPLATE: NONE\n"
+    "INTERFACE: PROVIDES a playable game\nCHECK: node --check src/game.js\n"
+    "PACKAGE 3: Integration QA shell\nOWNER: gemini\nAFTER: 1, 2\nCONTRACTS: NONE\n"
+    "TASK: Integrate and verify both runtime producers and author the HTML shell.\n"
+    "OUTPUTS: shell.html\nRELEASE: NONE\nREQUIRES: src/core.js, src/game.js\n"
+    "ASSEMBLY: NONE\nTEMPLATE: NONE\n"
+    "INTERFACE: PROVIDES the verified integration shell\nCHECK: NONE\n"
+    "PACKAGE 4: Release\nOWNER: gemini\nAFTER: 3\nCONTRACTS: NONE\n"
+    "TASK: Assemble the verified final single-file HTML.\nOUTPUTS: index.html\n"
+    "RELEASE: index.html\nREQUIRES: src/core.js, src/game.js, shell.html\n"
+    "ASSEMBLY: HTML_INLINE\nTEMPLATE: shell.html\n"
+    "INTERFACE: PROVIDES the final application\nCHECK: NONE\n"
 )
 
 
@@ -54,6 +92,40 @@ class _PlannerSeat:
         if self._promoting and role in (Role.lead, Role.panelist) and "delivered into" in prompt:
             return AdapterResult(content=PROMOTE_DRAFT, duration_ms=1)
         return self._inner.call(role, prompt, timeout_s)
+
+
+class _SequencedPlannerSeat:
+    """Recording architect that returns each supplied plan, then repeats the last."""
+
+    name = "gemini"
+
+    def __init__(self, plans):
+        self.plans = list(plans)
+        self.prompts: list[str] = []
+        self.roles: list[Role] = []
+        self.timeouts: list[int] = []
+
+    def call(self, role, prompt, timeout_s, images=None):
+        self.prompts.append(prompt)
+        self.roles.append(role)
+        self.timeouts.append(timeout_s)
+        index = min(len(self.prompts) - 1, len(self.plans) - 1)
+        return AdapterResult(content=self.plans[index], duration_ms=1)
+
+
+class _BlockingRepairPlannerSeat(_SequencedPlannerSeat):
+    """Hold the second call so cancellation can revoke its planning lease."""
+
+    def __init__(self, plans):
+        super().__init__(plans)
+        self.repair_started = threading.Event()
+        self.release_repair = threading.Event()
+
+    def call(self, role, prompt, timeout_s, images=None):
+        if len(self.prompts) == 1:
+            self.repair_started.set()
+            self.release_repair.wait(timeout=5)
+        return super().call(role, prompt, timeout_s, images=images)
 
 
 @pytest.fixture()
@@ -168,6 +240,132 @@ def test_plan_prompt_reserves_after_for_real_bytes():
     assert "MUST use AFTER" in prompt
     assert "Deterministic assembly is concatenation, not integration" in prompt
     assert "A broad build should normally start most owners in the first wave" in prompt
+    assert "exact upstream TEMPLATE path must also appear in REQUIRES" in prompt
+    assert "runtime HTML/CSS/JS artifact that final assembly lists in REQUIRES" in prompt
+
+
+def test_invalid_assembly_plan_is_repaired_with_exact_validator_feedback(
+    tmp_path, monkeypatch,
+):
+    planner = _SequencedPlannerSeat([INVALID_ASSEMBLY_PLAN, REPAIRED_ASSEMBLY_PLAN])
+    service = GangOf8Service(
+        data_dir=tmp_path / "data",
+        role_agents={Role.architect: "gemini"},
+        panel=["gemini"],
+    )
+    service.registry.register(planner)
+    started: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_start_ready_packages",
+        lambda current, background: started.append(current.goal_id),
+    )
+
+    goal = service.create_goal(
+        "Build and deliver a complete single-file HTML arcade application")
+
+    template_error = "wp_3 TEMPLATE must be OWNER or one of REQUIRES"
+    integration_error = (
+        "wp_3 assembly follows multiple runtime producers without a hard-after "
+        "non-assembly integration/QA package"
+    )
+    assert goal.status == "running"
+    assert goal.planned_by == "gemini"
+    assert len(planner.prompts) == 2
+    assert planner.roles == [Role.architect, Role.architect]
+    assert planner.timeouts == [config.GOAL_PLAN_TIMEOUT, config.GOAL_PLAN_TIMEOUT]
+    assert template_error in planner.prompts[1]
+    assert integration_error in planner.prompts[1]
+    assert INVALID_ASSEMBLY_PLAN.strip() in planner.prompts[1]
+    assert "COMPLETE REPLACEMENT PLAN" in planner.prompts[1]
+    assert goal.plan_rationale == (
+        "planner contract repaired automatically after 1 rejected attempt")
+    assert goal.last_error == ""
+    assert goal.epoch == 1
+    assert started == [goal.goal_id]
+    assert len(goal.milestones) == 4
+    assert goal.milestones[2].depends_on == [0, 1]
+    assert set(goal.milestones[3].depends_on) == {0, 1, 2}
+    assert goal.milestones[3].assembly_template == "shell.html"
+    assert "shell.html" in goal.milestones[3].dependencies
+
+    events = [
+        json.loads(line)["event"]
+        for line in service.store.session_log_path("-").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events.index("goal_plan_repair_requested") < events.index("goal_plan_repaired")
+    assert events.index("goal_plan_repaired") < events.index("goal_planned")
+
+
+def test_invalid_plan_repair_is_bounded_and_never_starts_packages(tmp_path, monkeypatch):
+    planner = _SequencedPlannerSeat([INVALID_ASSEMBLY_PLAN])
+    service = GangOf8Service(
+        data_dir=tmp_path / "data",
+        role_agents={Role.architect: "gemini"},
+        panel=["gemini"],
+    )
+    service.registry.register(planner)
+    started: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_start_ready_packages",
+        lambda current, background: started.append(current.goal_id),
+    )
+
+    goal = service.create_goal(
+        "Build and deliver a complete single-file HTML arcade application")
+
+    assert goal.status == "paused"
+    assert goal.milestones == []
+    assert started == []
+    assert len(planner.prompts) == 1 + config.GOAL_PLAN_REPAIR_ATTEMPTS
+    assert all(timeout == config.GOAL_PLAN_TIMEOUT for timeout in planner.timeouts)
+    assert "TEMPLATE must be OWNER or one of REQUIRES" in goal.last_error
+    assert "without a hard-after non-assembly integration/QA package" in goal.plan_rationale
+    assert service.store.list_sessions() == []
+
+    events = [
+        json.loads(line)["event"]
+        for line in service.store.session_log_path("-").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events.count("goal_plan_repair_requested") == config.GOAL_PLAN_REPAIR_ATTEMPTS
+    assert "goal_plan_repaired" not in events
+    assert "goal_planned" not in events
+
+
+def test_cancel_during_plan_repair_cannot_resurrect_or_start_goal(tmp_path, monkeypatch):
+    planner = _BlockingRepairPlannerSeat(
+        [INVALID_ASSEMBLY_PLAN, INVALID_ASSEMBLY_PLAN, REPAIRED_ASSEMBLY_PLAN])
+    service = GangOf8Service(
+        data_dir=tmp_path / "data",
+        role_agents={Role.architect: "gemini"},
+        panel=["gemini"],
+    )
+    service.registry.register(planner)
+    started: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_start_ready_packages",
+        lambda current, background: started.append(current.goal_id),
+    )
+
+    created = service.create_goal(
+        "Build and deliver a complete single-file HTML arcade application",
+        background=True,
+    )
+    assert planner.repair_started.wait(timeout=2)
+
+    cancelled = service.cancel_goal(created.goal_id)
+    planner.release_repair.set()
+    service._pool.shutdown(wait=True)
+
+    goal = service.goals.get(created.goal_id)
+    assert cancelled["status"] == "cancelled"
+    assert goal is not None and goal.status == "cancelled"
+    assert goal.milestones == []
+    assert started == []
+    assert len(planner.prompts) == 2
+    assert service.store.list_sessions() == []
 
 
 def test_build_team_assigns_distinct_enabled_owners(tmp_path):

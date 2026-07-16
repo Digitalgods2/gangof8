@@ -434,12 +434,16 @@ MAX_PARALLEL_SMOKE = int(os.environ.get("GANGOF8_MAX_PARALLEL_SMOKE", "4"))
 # focused call (nothing to summarize). Cap how many files one task may produce.
 MAX_ARTIFACT_FILES = 8
 
-# Goal layer (/goal): a long-horizon objective decomposed ONCE by the architect
-# into milestone-sized deliverables, each run as a normal session. Bounded so a
-# runaway plan can't queue unbounded work; a goal bigger than this should be
-# split by the human.
+# Goal layer (/goal): a long-horizon objective decomposed by the architect into
+# milestone-sized deliverables, each run as a normal session. Invalid plans are
+# returned to that architect with the deterministic contract errors instead of
+# making the human manually retry an unchanged goal. Keep repair bounded so a
+# provider that repeatedly ignores the contract cannot loop forever.
 GOAL_MAX_MILESTONES = 8
-GOAL_PLAN_TIMEOUT = 600       # s for the single planning call (architect thinks hard)
+GOAL_PLAN_TIMEOUT = 600       # s per planning/repair call (architect thinks hard)
+GOAL_PLAN_REPAIR_ATTEMPTS = max(
+    0, int(os.environ.get("GANGOF8_GOAL_PLAN_REPAIR_ATTEMPTS", "2"))
+)
 GOAL_SUMMARY_MAX_CHARS = 700  # per completed milestone folded into the next one's task
 
 # search_project skill bounds: keep a search cheap and the result feed-back small.
