@@ -553,6 +553,40 @@ def test_role_model_pins_reach_only_the_mapped_seat(tmp_path):
     assert svc.registry._adapters["codex"].role_models == {}
 
 
+def test_inherited_role_uses_enabled_provider_model_not_disabled_provider_pin(tmp_path):
+    """Regression: disabling every seat except Gemini remaps architect to
+    Gemini, but a Claude architect pin must not be sent to Google's SDK."""
+    svc = GangOf8Service(data_dir=tmp_path)
+    svc.update_settings({
+        "backend": "cli",
+        "role_agents": {"architect": "claude", "critic": "gemini"},
+        "role_models": {
+            "architect": "claude-opus-4.8",
+            "critic": "gemini-2.5-pro",
+        },
+        "cli_models": {"gemini": "gemini-3.5-flash"},
+        "cli_enabled": {"claude": False, "codex": False, "gemini": True},
+        "openrouter_enabled": {
+            "deepseek": False, "glm": False, "qwen": False, "kimi": False,
+        },
+    })
+
+    assert svc.role_agents[Role.architect] == "gemini"
+    gemini = svc.registry._adapters["gemini"]
+    assert gemini.role_models == {"critic": "gemini-2.5-pro"}
+    assert svc.resolved_model("architect", "gemini") == "gemini-3.5-flash"
+
+    # The configured pin is preserved and becomes active again if its original
+    # provider is re-enabled.
+    svc.update_settings({"cli_enabled": {
+        "claude": True, "codex": False, "gemini": True,
+    }})
+    assert svc.role_agents[Role.architect] == "claude"
+    assert svc.registry._adapters["claude"].role_models == {
+        "architect": "claude-opus-4.8"
+    }
+
+
 def test_remapping_a_role_drops_its_stale_model_pin(tmp_path):
     """An API patch that remaps a role's seat WITHOUT sending role_models must
     drop that role's pin — the old seat's model id would otherwise ride along

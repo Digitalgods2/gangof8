@@ -197,6 +197,31 @@ class GoalStore:
             self._write(conn, goal)
         return goal
 
+    def replan(self, goal_id: str) -> Optional[Goal]:
+        """Atomically return an empty paused goal to the planning state.
+
+        A planner/provider failure can legitimately leave no milestones. Such a
+        goal must be planned again; treating ``all([])`` as a completed package
+        graph would otherwise release an empty build.
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT json FROM goals WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+            goal = self._decode(row[0]) if row else None
+            if (goal is None or goal.status != "paused" or goal.milestones
+                    or goal.worker_lease):
+                return None
+            goal.status = "planning"
+            goal.last_error = ""
+            goal.release_status = "not_started"
+            goal.release_files = []
+            goal.release_session_id = None
+            goal.updated_at = utcnow()
+            self._write(conn, goal)
+        return goal
+
     def park_active(self, goal_id: str, reason: str) -> Optional[Goal]:
         """Restart recovery: park running/planning work and revoke ownership."""
         with self._conn() as conn:
