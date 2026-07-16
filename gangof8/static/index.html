@@ -14,10 +14,18 @@
   <div class="blob a"></div><div class="blob b"></div><div class="blob c"></div>
 </div>
 <header>
-  <span class="brand"><img src="/gangof8-text.png" class="brand-lockup" alt="Gang of 8"></span>
-  <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
-  <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
-  <span class="bpill tagline">🔒 nothing executes without your approval</span>
+  <div class="header-top">
+    <span class="brand"><img src="/gangof8-text.png" class="brand-lockup" alt="Gang of 8"></span>
+    <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
+    <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
+    <span class="bpill tagline">🔒 nothing executes without your approval</span>
+    <div class="hgroup">
+      <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
+      <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
+      <button class="hbtn" title="Settings" onclick="openSettings()">⚙</button>
+      <button class="hbtn" title="Diagnostics" onclick="window.open('/diagnostics','_blank')">Diag</button>
+    </div>
+  </div>
   <div id="aiSeatToggles" class="ai-seat-toggles" role="group"
        aria-label="Enabled AI brands" aria-busy="true">
     <label><input type="checkbox" data-settings-map="cli_enabled" data-seat="codex" disabled>OpenAI</label>
@@ -28,12 +36,6 @@
     <label><input type="checkbox" data-settings-map="openrouter_enabled" data-seat="qwen" disabled>Qwen</label>
     <label><input type="checkbox" data-settings-map="openrouter_enabled" data-seat="kimi" disabled>Kimi</label>
     <span id="aiSeatToggleStatus" class="ai-seat-toggle-status" role="status" aria-live="polite"></span>
-  </div>
-  <div class="hgroup">
-    <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
-    <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
-    <button class="hbtn" title="Settings" onclick="openSettings()">⚙</button>
-    <button class="hbtn" title="Diagnostics" onclick="window.open('/diagnostics','_blank')">Diag</button>
   </div>
 </header>
 
