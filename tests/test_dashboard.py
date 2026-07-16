@@ -94,7 +94,9 @@ def test_header_lockup_is_served_and_referenced(client):
 
 def test_header_has_immediate_ai_brand_seat_toggles(client):
     page = client.get("/").text
+    assert '<div class="header-top">' in page
     assert 'id="aiSeatToggles"' in page
+    assert page.index('class="header-top"') < page.index('id="aiSeatToggles"')
     for brand in ("OpenAI", "Anthropic", "Gemini", "DeepSeek", "GLM", "Qwen", "Kimi"):
         assert f">{brand}</label>" in page
     assert page.count('data-settings-map="cli_enabled"') == 3
@@ -106,6 +108,10 @@ def test_header_has_immediate_ai_brand_seat_toggles(client):
     assert "seatSettingsPatch(latest, mapName, seat, desired)" in app_js
     assert "renderHeaderSeatToggles(settingsCache)" in app_js
     assert "Could not update ${brand}" in app_js
+
+    css = client.get("/app.css").text
+    assert ".header-top" in css
+    assert "justify-content:center" in css
 
 
 def test_header_seat_patch_preserves_every_other_map_value(client):
