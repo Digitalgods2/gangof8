@@ -198,3 +198,39 @@ def test_smoke_source_backward_compatible_four_tuple_unaffected():
     of existing call sites unpack exactly 4 values."""
     ran, testable, detail, dyn = smoke.smoke_source("var a; a.b.c = 1;", ".js")
     assert ran is False and testable is True and dyn is None
+
+
+def test_console_error_during_boot_fails_like_the_release_browser_gate():
+    """The final in-browser release gate counts ANY console.error as a defect.
+    The deterministic smoke gate must apply the same standard: a bundle whose
+    entry point logs "missing modules" (because an earlier module's defensive
+    guard silently bailed) is a failed boot even though nothing threw —
+    letting it pass here deferred a certain rejection to the far more
+    expensive frontier verification, where blame can no longer be bisected."""
+    src = (
+        "window.NS = window.NS || {};\n"
+        "(function(){ var W = window.NS.World; if(!W) return; window.NS.R = {}; })();\n"
+        "document.addEventListener('DOMContentLoaded', function(){\n"
+        "  if (!window.NS.R) console.error('[Game] Missing module(s)', {R: false});\n"
+        "});\n"
+    )
+    ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
+    assert ran is False and testable is True
+    assert "console error during boot" in detail
+    assert "Missing module(s)" in detail
+    # object arguments are serialized so the message keeps its evidence
+    assert '"R":false' in detail
+
+
+def test_console_error_free_boot_still_passes():
+    src = "window.x = 1; console.log('log and warn are fine'); console.warn('w');"
+    ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
+    assert ran is True and testable is True, detail
+
+
+def test_console_error_only_in_untriggered_path_passes():
+    """console.error inside a code path the boot never executes must not fail
+    the file — the standard is what actually happens during load/boot."""
+    src = "function reportProblem(){ console.error('never called'); }\nwindow.ok = 1;"
+    ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
+    assert ran is True and testable is True, detail
