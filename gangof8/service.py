@@ -2332,6 +2332,21 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
             if attempt:
                 browser_evidence, browser_failures = run_browser_acceptance()
+            if not browser_failures:
+                # The current real-browser run is the authority on
+                # browser-detected defects: register entries recorded by
+                # earlier runs describe a state that no longer exists, and
+                # feeding them to the verifier as open defects sends it
+                # hunting for problems that are already fixed. The bare
+                # no-usable-repair note is meta-history, not a defect.
+                goal.release_defects = [
+                    entry for entry in goal.release_defects
+                    if "browser acceptance failed" not in str(entry)
+                    and str(entry) != (
+                        "verifier rejected the batch without a usable "
+                        "implementation repair"
+                    )
+                ]
             release_defect_register = list(dict.fromkeys(
                 [*goal.release_defects, *browser_failures]
             ))
@@ -2477,6 +2492,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             or "semantic acceptance did not pass"
         )
         retry_defects = list(session.quality_gate.get("remaining_defects") or [])
+        # A verifier that FAILs specific acceptance checks without a usable
+        # repair leaves its whole critique inside `checks`; losing it here
+        # made the next verification start from scratch and stranded the
+        # goal with no path back to the responsible package.
+        for check in (session.quality_gate.get("checks") or []):
+            if (str(check.get("status") or "").upper() == "FAIL"
+                    and check.get("detail")):
+                entry = f"acceptance {check.get('id') or 'check'}: {check['detail']}"
+                if entry not in retry_defects:
+                    retry_defects.append(entry)
         if detail and detail not in retry_defects:
             retry_defects.append(detail)
         goal.release_defects = list(dict.fromkeys(
@@ -2853,6 +2878,73 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             "rules: " + ", ".join(missing[:24])
         )
         return target, detail
+
+    def _semantic_release_target(
+        self, release_session: Session, assembly_session: Session,
+    ) -> tuple[str, str]:
+        """Map a frontier verifier's FAILed acceptance checks to the staged
+        file whose code they criticize.
+
+        A verifier that fails the release on gameplay/content grounds (e.g.
+        "``LANES`` places river rows below the median") without a usable
+        inline repair used to strand the goal: the critique had no path back
+        to the package that owns the criticized code, so resume could only
+        re-run an identical verification. The check details quote the
+        identifiers they judged in backticks; the file that DECLARES such an
+        identifier (const/let/var/function/class) is deterministic to find,
+        and its owner package is the right recipient of the critique. Files
+        named outright in a detail count too. Returns ``(path, detail)`` with
+        the matched critiques verbatim, or ``("", "")`` when nothing maps
+        unambiguously.
+        """
+        checks = (release_session.quality_gate or {}).get("checks") or []
+        failed = [
+            check for check in checks
+            if str(check.get("status") or "").upper() == "FAIL"
+            and check.get("detail")
+        ]
+        if not failed or not assembly_session.workspace_root:
+            return "", ""
+        sources = list(
+            (assembly_session.assembly_result or {}).get("sources") or [])
+        template = (assembly_session.assembly_template or "").replace("\\", "/")
+        if template:
+            sources.append(template)
+        loaded: list[tuple[str, str]] = []
+        for name in sources:
+            normalized = str(name).replace("\\", "/")
+            try:
+                text = executor.resolve_in_workspace(
+                    Path(assembly_session.workspace_root), normalized,
+                ).read_text(encoding="utf-8", errors="replace")
+            except (OSError, executor.ExecutionError):
+                continue
+            loaded.append((normalized, text))
+        if not loaded:
+            return "", ""
+        votes: dict[str, list[str]] = {}
+        for check in failed:
+            detail_text = str(check["detail"])
+            entry = f"{check.get('id') or 'check'}: {detail_text}"
+            matched_files: set[str] = set()
+            for name, _text in loaded:
+                if name in detail_text or Path(name).name in detail_text:
+                    matched_files.add(name)
+            for ident in set(re.findall(r"`([A-Za-z_$][\w$]{2,})`", detail_text)):
+                definers = [
+                    name for name, text in loaded
+                    if re.search(
+                        rf"\b(?:const|let|var|function|class)\s+{re.escape(ident)}\b",
+                        text)
+                ]
+                if len(definers) == 1:
+                    matched_files.add(definers[0])
+            for name in matched_files:
+                votes.setdefault(name, []).append(entry)
+        if not votes:
+            return "", ""
+        blamed = max(votes, key=lambda name: len(votes[name]))
+        return blamed, " | ".join(dict.fromkeys(votes[blamed]))
 
     def _assembly_runtime_failure_target(self, session: Session) -> tuple[str, str]:
         """Locate the accepted script that makes an assembled runtime fail.
@@ -3580,7 +3672,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         token = goal.worker_lease
         scheduled: Optional[dict] = None
         try:
-            if goal.release_status != "failed_verification" or not goal.release_defects:
+            if goal.release_status != "failed_verification":
                 return ""
             if not (goal.milestones
                     and all(m.status == "done" for m in goal.milestones)):
@@ -3614,6 +3706,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         "release verification failed on the style contract and "
                         f"the staged inputs reproduce it: {style_detail}"
                     )
+            if not fault_path and goal.release_session_id:
+                release_session = self.manager.load(goal.release_session_id)
+                if release_session is not None:
+                    semantic_path, semantic_detail = self._semantic_release_target(
+                        release_session, session)
+                    if semantic_path:
+                        fault_path = semantic_path
+                        fault_detail = (
+                            "the release verifier failed acceptance checks that "
+                            f"criticize {semantic_path} — correct exactly what the "
+                            f"critique states: {semantic_detail}"
+                        )
             if not fault_path:
                 return ""
             session.quality_gate = {

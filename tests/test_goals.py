@@ -2164,3 +2164,111 @@ def test_release_prep_reassembles_when_accepted_assembly_inputs_were_rebuilt(tmp
     assert repaired.release_status == "not_started"
     assert repaired.release_session_id is None
     assert "stale" in repaired.last_error
+
+
+def test_resume_maps_verifier_critique_to_owning_package(tmp_path, monkeypatch):
+    """The final semantic gate can fail a release on gameplay grounds no
+    deterministic check can see (a real verifier correctly caught a Frogger
+    world whose road/river bands were inverted). Without a usable inline
+    repair that critique used to strand the goal — resume could only re-run
+    an identical verification. The critique quotes the identifiers it judged
+    (`LANES`); the file declaring such an identifier is deterministic to
+    find, and resume must reopen its owner package with the critique as the
+    retry correction."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    world_source = (
+        "window.Arcade = window.Arcade || {};\n"
+        "const LANES = [{row: 2, type: 'river'}, {row: 8, type: 'road'}];\n"
+        "window.Arcade.World = { LANES: LANES };\n"
+    )
+    (stage / "world.js").write_text(world_source, encoding="utf-8")
+    (stage / "index.template.html").write_text(
+        "<html><head></head><body>"
+        "<!-- GANGOF8:SCRIPT world.js --></body></html>",
+        encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_semantic_release",
+        release_defects=[],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_world", owner="kimi", title="world",
+                task_text="author world", status="done", session_id="s_world",
+                contract_declared=True, requires_delivery=True,
+                required_files=["world.js"],
+                accepted_hashes={
+                    "world.js": hashlib.sha256(world_source.encode()).hexdigest(),
+                },
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="done", session_id="s_asm_semantic",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], dependencies=["world.js"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+                release_files=["game.html"],
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_asm_semantic", status=SessionStatus.done,
+        outcome="succeeded", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.template.html",
+            "sources": ["world.js"],
+            "source_hashes": {
+                "world.js": hashlib.sha256(world_source.encode()).hexdigest(),
+            },
+        },
+        task=Task(task_id="t_sem", session_id="s_asm_semantic", text="assembly"),
+    ))
+    service.store.save_session(Session(
+        session_id="s_semantic_release", status=SessionStatus.failed,
+        outcome="failed_verification", goal_id=goal.goal_id,
+        goal_release=True, workspace_root=str(stage),
+        quality_gate={
+            "verifier": "codex", "verdict": "FAIL",
+            "checks": [
+                {"id": "R1", "status": "PASS", "detail": "single file"},
+                {"id": "R2", "status": "FAIL",
+                 "detail": "`LANES` places river rows above the road; classic "
+                           "order requires road first then river"},
+            ],
+            "remaining_defects": [],
+        },
+        task=Task(task_id="t_rel", session_id="s_semantic_release", text="release"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    assert "world.js" in provider.acceptance_detail
+    assert "LANES" in provider.acceptance_detail
+    assert "road first then river" in provider.acceptance_detail
+    assert repaired.milestones[1].status == "pending"
+    assert repaired.assembly_fault_streak == {"0:dependency:world.js": 1}
