@@ -1841,3 +1841,96 @@ def test_resume_reopens_culprit_package_after_failed_release_verification(tmp_pa
     assert repaired.release_status == "not_started"
     assert repaired.release_session_id is None
     assert repaired.assembly_fault_streak == {"0:dependency:js/painter.js": 1}
+
+
+def test_resume_reopens_stylesheet_package_after_style_contract_release_failure(tmp_path, monkeypatch):
+    """A style-contract release failure (rendered DOM classes mostly unmatched
+    by any stylesheet rule) is reproducible statically from the staged
+    template + stylesheets. Resume must reopen the stylesheet owner with the
+    exact unmatched class list instead of re-running a frontier verification
+    that a real goal watched decline to rewrite a stylesheet inline, twice."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    template_source = (
+        "<html><head>\n"
+        "<!-- GANGOF8:STYLE styles.css -->\n"
+        "</head><body>\n"
+        '<div class="hud hud-row"><span class="hud-label">Score</span>\n'
+        '<span class="hud-value hud-score">0</span></div>\n'
+        '<div class="overlay menu"><h1 class="title">Game</h1>\n'
+        '<button class="btn btn-primary">Start</button>\n'
+        '<p class="hint subtitle">press enter</p></div>\n'
+        "</body></html>\n"
+    )
+    css_source = ".menu { color: red; }\n"  # 1 of 11 classes covered
+    (stage / "index.template.html").write_text(template_source, encoding="utf-8")
+    (stage / "styles.css").write_text(css_source, encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_failed_release",
+        release_defects=[
+            "game.html: browser acceptance failed with 1 error(s): style "
+            "contract: only 1/11 DOM classes match any stylesheet rule"
+        ],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_shell", owner="gemini", title="shell",
+                task_text="author shell", status="done", session_id="s_shell",
+                contract_declared=True, requires_delivery=True,
+                required_files=["index.template.html", "styles.css"],
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="done", session_id="s_assembly_style",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"],
+                dependencies=["styles.css"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+                release_files=["game.html"],
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_assembly_style", status=SessionStatus.done,
+        outcome="succeeded", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.template.html",
+            "sources": ["styles.css"],
+        },
+        task=Task(task_id="t_style", session_id="s_assembly_style", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    assert "styles.css" in provider.acceptance_detail
+    assert "ONE contract" in provider.acceptance_detail
+    # the unmatched classes are named so the rebuild can converge
+    assert "hud-score" in provider.acceptance_detail
+    assert repaired.milestones[1].status == "pending"
+    assert repaired.release_status == "not_started"
+    assert repaired.assembly_fault_streak == {"0:dependency:styles.css": 1}
