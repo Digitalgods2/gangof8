@@ -318,11 +318,30 @@ def test_style_contract_flags_wholesale_dom_css_selector_mismatch():
     class Page:
         def evaluate(self, _script):
             return {
-                "used": [f"game-{index}" for index in range(10)],
-                "covered": ["game-0", "game-1"],
+                "used": [f".game-{index}" for index in range(10)],
+                "covered": [".game-0", ".game-1"],
             }
 
     errors = ba._style_contract_errors(Page())
 
     assert errors
-    assert "2/10 DOM classes" in errors[0]
+    assert "2/10 DOM class/id hooks" in errors[0]
+
+
+def test_style_contract_accepts_page_styled_through_id_selectors():
+    """Coverage counts id hooks alongside classes: a stylesheet that addresses
+    every element via #id selectors is a real stylesheet. A classes-only
+    version of this check rejected exactly such a page twice, even though it
+    rendered fully styled — the check polices wholesale misses, not which
+    selector idiom the author prefers."""
+    class Page:
+        def evaluate(self, _script):
+            return {
+                # markup carries decorative classes the sheet never names...
+                "used": [f".decor-{index}" for index in range(10)]
+                        + [f"#panel-{index}" for index in range(10)],
+                # ...but styles every element through its id
+                "covered": [f"#panel-{index}" for index in range(10)],
+            }
+
+    assert ba._style_contract_errors(Page()) == []

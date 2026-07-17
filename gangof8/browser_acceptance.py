@@ -247,7 +247,16 @@ def _exercise_pointer(page: Any) -> None:
 
 
 def _style_contract_errors(page: Any) -> list[str]:
-    """Detect a wholesale DOM/CSS contract miss without policing hook classes."""
+    """Detect a wholesale DOM/CSS contract miss without policing hook classes.
+
+    Coverage counts BOTH class and id hooks: elements are legitimately styled
+    through either, and a real stylesheet that addressed every element via
+    ``#id`` selectors was twice rejected by a classes-only version of this
+    check even though the page rendered fully styled. The check's job is
+    "does the stylesheet address this document at all", not which selector
+    idiom the author prefers. Mirrored statically by
+    ``service._style_contract_regression`` — keep the two in lockstep.
+    """
     if not hasattr(page, "evaluate"):
         return []
     try:
@@ -255,14 +264,18 @@ def _style_contract_errors(page: Any) -> list[str]:
             r"""() => {
               const used = new Set();
               document.querySelectorAll('[class]').forEach(el =>
-                el.classList.forEach(name => used.add(name)));
+                el.classList.forEach(name => used.add('.' + name)));
+              document.querySelectorAll('[id]').forEach(el =>
+                used.add('#' + el.id));
               const covered = new Set();
               function visit(rules) {
                 for (const rule of Array.from(rules || [])) {
                   if (rule.cssRules) visit(rule.cssRules);
                   if (!rule.selectorText) continue;
-                  const matches = rule.selectorText.match(/\.[_a-zA-Z][_a-zA-Z0-9-]*/g) || [];
-                  matches.forEach(token => covered.add(token.slice(1)));
+                  const classes = rule.selectorText.match(/\.[_a-zA-Z][_a-zA-Z0-9-]*/g) || [];
+                  classes.forEach(token => covered.add(token));
+                  const ids = rule.selectorText.match(/#[_a-zA-Z][_a-zA-Z0-9-]*/g) || [];
+                  ids.forEach(token => covered.add(token));
                 }
               }
               for (const sheet of Array.from(document.styleSheets)) {
@@ -285,8 +298,8 @@ def _style_contract_errors(page: Any) -> list[str]:
     missing = sorted(used - covered)[:12]
     return [
         "style contract: only "
-        f"{len(used & covered)}/{len(used)} DOM classes match any stylesheet rule; "
-        "unmatched examples: " + ", ".join(missing)
+        f"{len(used & covered)}/{len(used)} DOM class/id hooks match any "
+        "stylesheet rule; unmatched examples: " + ", ".join(missing)
     ]
 
 

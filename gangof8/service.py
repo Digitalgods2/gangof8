@@ -2814,11 +2814,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 encoding="utf-8", errors="replace")
         except (OSError, executor.ExecutionError):
             return "", ""
+        # Both class and id hooks count, exactly like the browser gate: a page
+        # fully styled through #id selectors is a styled page. Keep this in
+        # lockstep with browser_acceptance._style_contract_errors.
         used: set[str] = set()
         for quoted in re.finditer(r"class\s*=\s*\"([^\"]*)\"", html):
-            used.update(quoted.group(1).split())
+            used.update("." + name for name in quoted.group(1).split())
         for quoted in re.finditer(r"class\s*=\s*'([^']*)'", html):
-            used.update(quoted.group(1).split())
+            used.update("." + name for name in quoted.group(1).split())
+        for quoted in re.finditer(r"id\s*=\s*\"([^\"]+)\"", html):
+            used.add("#" + quoted.group(1).strip())
+        for quoted in re.finditer(r"id\s*=\s*'([^']+)'", html):
+            used.add("#" + quoted.group(1).strip())
         if len(used) < 8:
             return "", ""
         css_text = ""
@@ -2829,8 +2836,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             except (OSError, executor.ExecutionError):
                 continue
         covered = {
-            token.group(0)[1:]
-            for token in re.finditer(r"\.[_a-zA-Z][_a-zA-Z0-9-]*", css_text)
+            token.group(0)
+            for token in re.finditer(r"[.#][_a-zA-Z][_a-zA-Z0-9-]*", css_text)
         }
         matched = used & covered
         if len(matched) / len(used) >= 0.35:
@@ -2838,12 +2845,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         missing = sorted(used - covered)
         target = css_names[0]
         detail = (
-            f"{target} styles only {len(matched)} of the {len(used)} CSS "
-            f"classes that the template {template} actually uses. The template "
-            "markup and the stylesheet are ONE contract: keep the template's "
-            "existing class names and write real rules for them — do NOT "
-            "invent a different class scheme. Classes needing rules: "
-            + ", ".join(missing[:24])
+            f"{target} addresses only {len(matched)} of the {len(used)} "
+            f"class/id hooks that the template {template} actually uses. The "
+            "template markup and the stylesheet are ONE contract: keep the "
+            "template's existing class and id names and write real rules for "
+            "them — do NOT invent a different naming scheme. Hooks needing "
+            "rules: " + ", ".join(missing[:24])
         )
         return target, detail
 
