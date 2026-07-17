@@ -2024,3 +2024,143 @@ def test_resume_of_breaker_paused_goal_grants_one_more_review_cycle(tmp_path, mo
     assert "@import" in provider.acceptance_detail
     assert "DELETE the @import" in provider.acceptance_detail
     assert "font stacks" in provider.acceptance_detail
+
+
+def test_recovery_does_not_adopt_attempt_whose_dependencies_are_being_rebuilt(tmp_path):
+    """Recovery adopts completed package attempts that lost their goal commit —
+    but an attempt that completed against dependency bytes now being rebuilt
+    would resurrect a stale output. A real goal adopted an assembled HTML
+    expanded from a superseded stylesheet exactly this way, then headed into
+    a doomed frontier release of the fossil."""
+    from gangof8.models import ProposedAction
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    output = work / "game.html"
+    output.write_text("<html>assembled</html>", encoding="utf-8")
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    goal = Goal(
+        text="assemble", status="paused", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_css", owner="gemini", title="css",
+                task_text="author css", status="pending",
+                contract_declared=True, requires_delivery=True,
+                required_files=["styles.css"],
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="pending",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], dependencies=["styles.css"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    candidate = Session(
+        session_id="s_old_assembly", status=SessionStatus.done,
+        outcome="succeeded", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        required_files=["game.html"],
+        verified_output_hashes={"game.html": digest},
+        task=Task(task_id="t_old", session_id="s_old_assembly", text="assembly"),
+    )
+    candidate.proposed_actions.append(ProposedAction(
+        session_id="s_old_assembly", kind="write_file", role=Role.implementer,
+        filename="game.html", status="executed", result_path=str(output),
+        args={"filename": "game.html"},
+    ))
+    service.store.save_session(candidate)
+
+    recovered = service._recover_verified_goal_packages(goal.goal_id)
+
+    # wp_assembly must NOT be adopted while its dependency wp_css is pending
+    assert recovered == []
+    assert service.goals.get(goal.goal_id).milestones[1].status == "pending"
+
+
+def test_release_prep_reassembles_when_accepted_assembly_inputs_were_rebuilt(tmp_path, monkeypatch):
+    """Deterministic assembly records the exact source hashes it expanded. If
+    a provider package was rebuilt afterwards, the accepted HTML is a fossil
+    of superseded inputs; preparing a release from it re-verifies defects the
+    inputs no longer have. Release prep must reopen the assembly package
+    instead of opening (and paying for) a release session."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    new_css = ".menu { color: red; }\n"
+    (stage / "styles.css").write_text(new_css, encoding="utf-8")
+    (stage / "index.template.html").write_text(
+        "<html><head><!-- GANGOF8:STYLE styles.css --></head><body></body></html>",
+        encoding="utf-8")
+    new_css_hash = hashlib.sha256(new_css.encode()).hexdigest()
+    old_css_hash = hashlib.sha256(b"@import url('gone');").hexdigest()
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_stale_release",
+        release_defects=["game.html: style contract: only 1/11 DOM classes match"],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_css", owner="gemini", title="css",
+                task_text="author css", status="done", session_id="s_css_new",
+                contract_declared=True, requires_delivery=True,
+                required_files=["styles.css"],
+                accepted_hashes={"styles.css": new_css_hash},
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="done", session_id="s_stale_assembly",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], dependencies=["styles.css"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+                release_files=["game.html"],
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_stale_assembly", status=SessionStatus.done,
+        outcome="succeeded", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.template.html",
+            "sources": ["styles.css"],
+            # built from the OLD stylesheet bytes
+            "source_hashes": {"styles.css": old_css_hash},
+        },
+        task=Task(task_id="t_stale", session_id="s_stale_assembly", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    repaired = service.goals.get(goal.goal_id)
+    assert repaired.milestones[1].status == "pending"
+    assert started == [1]
+    assert repaired.release_status == "not_started"
+    assert repaired.release_session_id is None
+    assert "stale" in repaired.last_error
