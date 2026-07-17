@@ -5,3 +5,6 @@ data/
 .pytest_cache/
 .pytest_tmp*/
 pytest_tmp/
+gangof8-server.log
+.gangof8-server.pid
+*.egg-info/

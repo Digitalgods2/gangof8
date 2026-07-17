@@ -10,6 +10,7 @@ permission kernel + human approval. No secrets here.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,17 @@ from .models import Workspace
 
 class WorkspaceError(Exception):
     pass
+
+
+def _normalize_root(root: str) -> str:
+    """Backslash is a path separator on Windows but an ordinary filename
+    character everywhere else. A pasted Windows-style path (or a stray typo
+    like "/Users/me\\project") would otherwise resolve to a single bogus path
+    component containing a literal backslash instead of the intended nested
+    folder — so on macOS/Linux, treat "\\" as "/" before resolving."""
+    if sys.platform == "win32":
+        return root
+    return root.replace("\\", "/")
 
 
 class WorkspaceStore:
@@ -49,7 +61,7 @@ class WorkspaceStore:
         name = (name or "").strip()
         if not name:
             raise WorkspaceError("workspace name is required")
-        resolved = Path(root).expanduser().resolve()
+        resolved = Path(_normalize_root(root or "")).expanduser().resolve()
         if resolved.exists() and not resolved.is_dir():
             raise WorkspaceError(f"workspace root is not a directory: {resolved}")
         resolved.mkdir(parents=True, exist_ok=True)

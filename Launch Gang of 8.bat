@@ -2,6 +2,19 @@
 title Gang of 8 launcher
 cd /d "%~dp0"
 
+REM Already running? Constructing a second server process would run this
+REM app's crash-recovery step against the same data, which can park an
+REM in-flight goal even though nothing actually crashed. Just open the
+REM existing dashboard instead of starting a duplicate.
+set "already="
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8790 ^| findstr LISTENING') do set "already=1"
+if defined already (
+    echo Gang of 8 is already running — opening the existing dashboard.
+    start "" "http://127.0.0.1:8790/"
+    timeout /t 2 /nobreak >nul
+    exit /b 0
+)
+
 REM ---- backend: "cli" = real local agents (costs tokens) | "mock" = free/offline
 set "BACKEND=cli"
 

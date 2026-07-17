@@ -575,11 +575,26 @@ For a free, deterministic offline smoke run:
 
 Then open [http://127.0.0.1:8790/](http://127.0.0.1:8790/).
 
-On Windows, the repository also includes:
+Double-click (or double-click-equivalent) launchers are included for all
+three platforms. All of them select the `cli` backend by default — edit the
+`BACKEND` variable near the top of the script to switch to `mock` for a free,
+offline run — and only one instance can hold port 8790 at a time:
 
-- `Launch Gang of 8.bat` — starts the `cli` backend in a visible server window;
-- `Launch Gang of 8 (no window).vbs` — starts it hidden and opens the browser;
-- `Stop Gang of 8.bat` — terminates the process listening on port 8790.
+- **Windows**: `Launch Gang of 8.bat` (visible server window) or
+  `Launch Gang of 8 (no window).vbs` (hidden, opens the browser). Stop with
+  `Stop Gang of 8.bat`.
+- **macOS**: `Launch Gang of 8.command` (Terminal window) or
+  `Launch Gang of 8 (no window).command` (detached, no window left open).
+  Stop with `Stop Gang of 8.command`.
+- **Linux**: `./launch-gangof8.sh` (foreground) or
+  `./launch-gangof8-background.sh` (detached). Stop with
+  `./stop-gangof8.sh`. Run these from a terminal — most file managers don't
+  execute `.sh` files on double-click by default.
+
+Launching while an instance is already running opens the existing dashboard
+instead of starting a duplicate — a second `Service` would otherwise run its
+crash-recovery step against the same data and could park an in-flight
+goal/session the real instance is still actively working on.
 
 Check the running service without opening the dashboard:
 
@@ -589,8 +604,8 @@ Invoke-RestMethod http://127.0.0.1:8790/diagnostics
 ```
 
 The default programmatic backend is `mock` unless `--backend`, persisted
-Settings, or `GANGOF8_BACKEND` selects `cli`. The Windows launchers explicitly
-select `cli`.
+Settings, or `GANGOF8_BACKEND` selects `cli`. The launcher scripts above
+explicitly select `cli`.
 
 ## First-run checklist
 

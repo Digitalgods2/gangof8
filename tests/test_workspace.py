@@ -43,6 +43,17 @@ def test_store_add_list_activate_roundtrip(tmp_path):
     assert store.list() == []
 
 
+def test_store_normalizes_stray_backslashes_on_posix(tmp_path, monkeypatch):
+    # A pasted Windows-style path (or a typo) must not resolve to a bogus
+    # single component literally named "sub\\dir" — backslash is a normal
+    # filename character on macOS/Linux, not a separator.
+    monkeypatch.setattr("gangof8.workspaces.sys.platform", "darwin")
+    store = WorkspaceStore(tmp_path / "data")
+    ws = store.add("proj", str(tmp_path) + "\\sub\\dir")
+    assert ws.root == str((tmp_path / "sub" / "dir").resolve())
+    assert not (tmp_path.parent / f"{tmp_path.name}\\sub\\dir").exists()
+
+
 def test_store_rejects_blank_name_and_file_root(tmp_path):
     store = WorkspaceStore(tmp_path / "data")
     with pytest.raises(WorkspaceError):
