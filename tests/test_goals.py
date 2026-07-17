@@ -1279,11 +1279,122 @@ def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeyp
     assert provider.session_id is None
     assert provider.invalidated_session_ids == ["s_bad_core"]
     assert provider.accepted_hashes == {}
-    assert "js/portal.js" in provider.acceptance_detail
+    # Stack-based attribution blames js/input.js, not js/portal.js: the throw
+    # (`.actions.fire = true`) is a line inside input.js's own keydown
+    # callback. Bisection alone would blame portal.js merely because ITS
+    # addition is what first makes the combined bundle fail (input.js's
+    # `if (window.ArcadePortal && ...)` guard silently no-ops until portal.js
+    # defines window.ArcadePortal) — but that only identifies the trigger,
+    # not the file whose code actually threw. Either file is a defensible
+    # place to add a guard/adapter for this interface mismatch; the hint
+    # below still surfaces the ArcadePortal.input shape so a fix can land on
+    # whichever side is correct.
+    assert "js/input.js" in provider.acceptance_detail
     assert "arcadeportal.input paths [actions, actions.fire]" in provider.acceptance_detail
     persisted = Session.model_validate(service.store.load_session("s_assembly_runtime"))
     assert persisted.quality_gate["fault_scope"] == "dependency"
-    assert persisted.quality_gate["fault_path"] == "js/portal.js"
+    assert persisted.quality_gate["fault_path"] == "js/input.js"
+
+
+def test_assembly_runtime_failure_blames_file_that_defines_the_bug_not_the_bootstrap(tmp_path):
+    """A bug can sit dormant — merely DEFINED, never invoked — in an early
+    dependency until a later entry-point file's lifecycle wiring finally
+    calls it. Cumulative bisection alone would blame that later file, since
+    its addition is what first flips the combined bundle from clean to
+    failing; it never distinguishes "whichever file's inclusion triggered
+    execution" from "whichever file's own code threw". This is exactly the
+    shape of a real bug that cost 133 rebuild attempts of an innocent
+    integration file (`main.js`) before a human traced it by hand to a
+    jagged pixel-art array in an already-accepted `renderer.js`: the crash
+    lived inside a sprite-compiling function that only ran once the
+    integration file's DOMContentLoaded handler called it.
+    """
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    # early.js: defines a buggy function but never calls it itself — it just
+    # sits there, syntactically valid, semantically broken.
+    early_source = "function boom(){ var x; x.trim(); }\n"
+    # late.js: the "bootstrap" — wires boom() to DOMContentLoaded, the way a
+    # real main.js wires a renderer's init() to the page load lifecycle.
+    late_source = "document.addEventListener('DOMContentLoaded', function(){ boom(); });\n"
+    (stage / "early.js").write_text(early_source, encoding="utf-8")
+    (stage / "late.js").write_text(late_source, encoding="utf-8")
+    session = Session(
+        session_id="s_bootstrap_runtime", status=SessionStatus.failed,
+        workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.html",
+            "sources": ["early.js", "late.js"],
+        },
+        task=Task(task_id="t_bootstrap", session_id="s_bootstrap_runtime", text="assembly"),
+    )
+
+    path, detail = service._assembly_runtime_failure_target(session)
+
+    assert path == "early.js"
+    assert "trim" in detail.lower() or "undefined" in detail.lower()
+
+
+def test_assembly_fault_streak_pauses_goal_instead_of_looping_forever(tmp_path):
+    """The same upstream package being blamed for the same fault repeatedly
+    means attribution (or the underlying defect) isn't actually resolving
+    it — rebuilding it again is not going to help. Cap it and hand off to a
+    human instead of repeating indefinitely, the way one real build looped
+    133 times relaunching the same doomed retry.
+    """
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    (stage / "js").mkdir(parents=True)
+    bad_source = "window.Thing = {};\n"
+    (stage / "js" / "bad.js").write_text(bad_source, encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="running", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_core", owner="codex", title="core",
+                task_text="author core", status="done", session_id="s_core",
+                contract_declared=True, requires_delivery=True,
+                required_files=["js/bad.js"],
+                accepted_files=[str(stage / "js" / "bad.js")],
+                accepted_hashes={"js/bad.js": hashlib.sha256(bad_source.encode()).hexdigest()},
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="failed", session_id="s_assembly",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["arcade.html"], dependencies=["js/bad.js"],
+                assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+            ),
+        ],
+    )
+    session = Session(
+        session_id="s_assembly", status=SessionStatus.failed,
+        goal_id=goal.goal_id, workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        quality_gate={
+            "verdict": "FAIL", "stage": "deterministic_assembly",
+            "detail": "assembly dependency changed after acceptance: js/bad.js",
+            "fault_scope": "dependency", "fault_path": "js/bad.js",
+        },
+        task=Task(task_id="t_assembly", session_id="s_assembly", text="assemble"),
+    )
+
+    for _ in range(config.ASSEMBLY_FAULT_STREAK_LIMIT):
+        provider = service._invalidate_assembly_input_provider(goal, session, 1)
+        assert provider is not None
+        assert goal.status == "running"
+
+    provider = service._invalidate_assembly_input_provider(goal, session, 1)
+
+    assert provider is None
+    assert goal.status == "paused"
+    assert "js/bad.js" in goal.last_error
+    assert "package 1" in goal.last_error
 
 
 def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(tmp_path):

@@ -99,10 +99,23 @@ const _listeners = {};
 function _add(type, fn){ (_listeners[type] = _listeners[type] || []).push(fn); }
 const _runtimeErrors = [];
 function _captureError(e){
-  _runtimeErrors.push(e && e.message ? e.message : String(e));
+  // Keep the ORIGINAL stack — re-throwing a fresh Error() below would point
+  // at _throwCaptured's own line, destroying the one clue (source line
+  // number) that can later attribute the crash to the file that actually
+  // defines the throwing code, as opposed to whichever file's inclusion
+  // happened to trigger the lifecycle event that called it.
+  _runtimeErrors.push({
+    message: e && e.message ? e.message : String(e),
+    stack: e && e.stack ? e.stack : "",
+  });
 }
 function _throwCaptured(){
-  if (_runtimeErrors.length) throw new Error(_runtimeErrors.shift());
+  if (_runtimeErrors.length){
+    const entry = _runtimeErrors.shift();
+    const err = new Error(entry.message);
+    if (entry.stack) err.stack = entry.stack;
+    throw err;
+  }
 }
 const _audio = () => ({ state:"running", resume:()=>Promise.resolve(), suspend:_noop,
   currentTime:0, sampleRate:44100, destination:{},
@@ -270,12 +283,87 @@ __SCRIPT__
   console.log("SMOKE_DYNAMIC:" + dynamic);
 } catch (e) {
   console.log("SMOKE_THREW:" + (e && e.message ? e.message : String(e)));
+  console.log("SMOKE_STACK:" + (e && e.stack ? e.stack.replace(/\n/g, "|") : ""));
 }
 """
+
+# Number of lines in _HARNESS that precede the "__SCRIPT__" substitution point.
+# A captured stack trace's line number is relative to the WHOLE temp file we
+# hand to node, so this offset is what lets us translate "line 812 of the temp
+# file" back into "line 40 of the caller's own combined source" — see
+# `first_source_line` below.
+_HARNESS_PRELUDE_LINES = _HARNESS.split("__SCRIPT__")[0].count("\n")
 
 
 def is_web_file(path) -> bool:
     return Path(path).suffix.lower() in _WEB_SUFFIXES
+
+
+def _run_smoke(
+    text: str, suffix: str, timeout_s: int, prelude: str,
+) -> tuple[bool, bool, str, Optional[bool], int]:
+    """Shared implementation. Returns the public 4-tuple plus one extra: the
+    1-based source line (relative to ``text``/``prelude+text``, NOT the temp
+    file) where a captured runtime error's top stack frame landed, or 0 if
+    there was no failure or no attributable line."""
+    suffix = (suffix or "").lower()
+    if suffix not in _WEB_SUFFIXES:
+        return True, False, "not a runnable web file", None, 0
+    node = shutil.which("node")
+    if not node:
+        return True, False, "node not on PATH — runtime test skipped", None, 0
+    if suffix in (".js", ".mjs"):
+        # A module can intentionally extend globals defined by an earlier file
+        # (e.g. ``class Frogger extends Game`` after ``core.js``).  Running it
+        # alone turns a valid dependency into a false runtime failure, so the
+        # caller may provide the real load-order prelude from its staged project.
+        src = (prelude + "\n" + text) if prelude else text
+    else:
+        scripts = _SCRIPT_RE.findall(text or "")
+        if not scripts:
+            return True, False, "no <script> to execute", None, 0
+        src = "\n".join(scripts)
+    harness = _HARNESS.replace("__SCRIPT__", src)
+    fd, tmp = tempfile.mkstemp(suffix=".js", prefix="gangof8_smoke_")
+    os.close(fd)
+    try:
+        Path(tmp).write_text(harness, encoding="utf-8")
+        try:
+            r = subprocess.run([node, tmp], capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False, True, "runtime hung on load (possible infinite loop before first frame)", None, 0
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    out = (r.stdout or "") + (r.stderr or "")
+    if "SMOKE_OK" in out:
+        dm = re.search(r"SMOKE_DYNAMIC:(true|false|na)", out)
+        dynamic = {"true": True, "false": False, "na": None}.get(dm.group(1) if dm else "na")
+        if dynamic is False:
+            return True, True, "loads, but renders a static/frozen screen (no motion under input)", False, 0
+        return True, True, "ran clean" + (" and shows motion under input" if dynamic else ""), dynamic, 0
+    m = re.search(r"SMOKE_THREW:(.*)", out)
+    if m:
+        detail = "threw on load — " + m.group(1).strip()[:200]
+        return False, True, detail, None, _first_source_line(out)
+    return False, True, "did not run — " + (out.strip()[:200] or "no output"), None, 0
+
+
+def _first_source_line(out: str) -> int:
+    """Best-effort 1-based line number (relative to the caller's own source,
+    not the temp harness file) that a captured error's top stack frame
+    points at, or 0 if the stack was empty/unparseable."""
+    sm = re.search(r"SMOKE_STACK:(.*)", out)
+    if not sm:
+        return 0
+    stack = sm.group(1).replace("|", "\n")
+    frame = re.search(r":(\d+):\d+\)?\s*$", stack, re.M)
+    if not frame:
+        return 0
+    line = int(frame.group(1)) - _HARNESS_PRELUDE_LINES
+    return line if line > 0 else 0
 
 
 def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25,
@@ -289,48 +377,19 @@ def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25,
                False → drew, but the same frame forever despite input (frozen);
                None  → couldn't assess motion because there was not enough drawing.
                        Runtime errors during the probe fail the file."""
-    suffix = (suffix or "").lower()
-    if suffix not in _WEB_SUFFIXES:
-        return True, False, "not a runnable web file", None
-    node = shutil.which("node")
-    if not node:
-        return True, False, "node not on PATH — runtime test skipped", None
-    if suffix in (".js", ".mjs"):
-        # A module can intentionally extend globals defined by an earlier file
-        # (e.g. ``class Frogger extends Game`` after ``core.js``).  Running it
-        # alone turns a valid dependency into a false runtime failure, so the
-        # caller may provide the real load-order prelude from its staged project.
-        src = (prelude + "\n" + text) if prelude else text
-    else:
-        scripts = _SCRIPT_RE.findall(text or "")
-        if not scripts:
-            return True, False, "no <script> to execute", None
-        src = "\n".join(scripts)
-    harness = _HARNESS.replace("__SCRIPT__", src)
-    fd, tmp = tempfile.mkstemp(suffix=".js", prefix="gangof8_smoke_")
-    os.close(fd)
-    try:
-        Path(tmp).write_text(harness, encoding="utf-8")
-        try:
-            r = subprocess.run([node, tmp], capture_output=True, text=True, timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            return False, True, "runtime hung on load (possible infinite loop before first frame)", None
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-    out = (r.stdout or "") + (r.stderr or "")
-    if "SMOKE_OK" in out:
-        dm = re.search(r"SMOKE_DYNAMIC:(true|false|na)", out)
-        dynamic = {"true": True, "false": False, "na": None}.get(dm.group(1) if dm else "na")
-        if dynamic is False:
-            return True, True, "loads, but renders a static/frozen screen (no motion under input)", False
-        return True, True, "ran clean" + (" and shows motion under input" if dynamic else ""), dynamic
-    m = re.search(r"SMOKE_THREW:(.*)", out)
-    if m:
-        return False, True, "threw on load — " + m.group(1).strip()[:200], None
-    return False, True, "did not run — " + (out.strip()[:200] or "no output"), None
+    ran, testable, detail, dynamic, _line = _run_smoke(text, suffix, timeout_s, prelude)
+    return ran, testable, detail, dynamic
+
+
+def smoke_source_with_line(text: str, suffix: str = ".html", timeout_s: int = 25,
+                           prelude: str = "") -> tuple[bool, bool, str, Optional[bool], int]:
+    """Same as :func:`smoke_source`, plus the 1-based source line (relative to
+    ``prelude + text``) a runtime failure's top stack frame points at, or 0
+    when there was no failure or no attributable line. Lets a caller that
+    concatenates multiple files in a known order map a crash back to the
+    specific file that DEFINES the throwing code — as opposed to whichever
+    file's inclusion merely triggered the lifecycle event that called it."""
+    return _run_smoke(text, suffix, timeout_s, prelude)
 
 
 def smoke_test(path, timeout_s: int = 25, prelude: str = "") -> tuple[bool, bool, str, Optional[bool]]:

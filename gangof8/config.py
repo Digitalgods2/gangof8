@@ -120,6 +120,15 @@ OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
     1, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
 )
 FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
+# Cap on consecutive times deterministic-assembly failure attribution may
+# blame the SAME upstream package for the SAME fault before the goal pauses
+# for a human instead of rebuilding-and-retrying forever. A build that hit
+# this cap once genuinely needed a human: a real Frogger build looped 133
+# times relaunching the same "fix main.js" retry for a bug that actually
+# lived in an already-accepted renderer.js dependency.
+ASSEMBLY_FAULT_STREAK_LIMIT = int(
+    os.environ.get("GANGOF8_ASSEMBLY_FAULT_STREAK_LIMIT", "3")
+)
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom

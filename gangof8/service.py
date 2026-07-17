@@ -2555,18 +2555,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return "cross-file interface mismatch: " + "; ".join(clauses)
 
     def _assembly_runtime_failure_target(self, session: Session) -> tuple[str, str]:
-        """Locate the first accepted script that makes an assembled runtime fail.
+        """Locate the accepted script that makes an assembled runtime fail.
 
         Deterministic assembly preserves a declared load order. Replaying those
-        accepted JavaScript sources cumulatively identifies the dependency that
-        introduces a load/input-pump failure without sending the expanded HTML
-        back through a model context window.
+        accepted JavaScript sources cumulatively identifies the point at which
+        the bundle starts failing, without sending the expanded HTML back
+        through a model context window. But the file whose ADDITION first
+        flips the bundle from clean to failing is not necessarily the file
+        whose CODE threw — a bug can sit dormant in an earlier dependency
+        (only defined, never invoked) until a later entry-point file's
+        lifecycle wiring finally calls it. So once a failing prefix is found,
+        the captured stack trace's source line is mapped back through the
+        known per-file line ranges of THAT prefix to find which file's own
+        code was actually executing when it threw; that file is blamed
+        instead of the merely-triggering one whenever the mapping succeeds.
         """
         if not session.workspace_root:
             return "", ""
         sources = list((session.assembly_result or {}).get("sources") or [])
         combined = ""
         loaded_sources: list[tuple[str, str]] = []
+        # (start_line, end_line, name) 1-based inclusive ranges within `combined`
+        # for every file folded in so far, so a stack line can be mapped back.
+        ranges: list[tuple[int, int, str]] = []
         for name in sources:
             normalized = str(name).replace("\\", "/")
             if Path(normalized).suffix.lower() not in {".js", ".mjs"}:
@@ -2578,14 +2589,26 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 text = path.read_text(encoding="utf-8")
             except (OSError, executor.ExecutionError, UnicodeError):
                 continue
-            combined = (combined + "\n\n" + text).strip()
-            ran, testable, detail, _dynamic = smoke.smoke_source(combined, ".js")
+            # 1-based line number of the first character = newlines before it + 1.
+            # Holds regardless of whether the preceding text ends in "\n".
+            separator = "\n\n" if combined else ""
+            prefix = combined + separator
+            start = prefix.count("\n") + 1
+            combined = prefix + text
+            end = start + text.count("\n") - (1 if text.endswith("\n") else 0)
+            ranges.append((start, end, normalized))
+            ran, testable, detail, _dynamic, error_line = smoke.smoke_source_with_line(combined, ".js")
             if testable and not ran:
+                blamed = normalized
+                for range_start, range_end, range_name in ranges:
+                    if range_start <= error_line <= range_end:
+                        blamed = range_name
+                        break
                 hint = (
                     self._assembly_runtime_interface_hint(loaded_sources)
                     if "undefined" in detail.lower() else ""
                 )
-                return normalized, f"{hint}; {detail}" if hint else detail
+                return blamed, f"{hint}; {detail}" if hint else detail
             loaded_sources.append((normalized, text))
         return "", ""
 
@@ -2684,6 +2707,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         )
         if provider is None:
             return None
+        streak_key = f"{provider.index}:{scope}:{invalid_input}"
+        streak = goal.assembly_fault_streak.get(streak_key, 0) + 1
+        goal.assembly_fault_streak[streak_key] = streak
+        if streak > config.ASSEMBLY_FAULT_STREAK_LIMIT:
+            goal.status = "paused"
+            goal.last_error = (
+                f"assembly attribution has blamed package {provider.index + 1} "
+                f"for the same {scope} fault {streak - 1} times in a row without "
+                f"resolving it ({invalid_input}); pausing for human review instead "
+                "of rebuilding it again"
+            )[:300]
+            self.store.log_event(
+                session.session_id,
+                "assembly_fault_loop_detected",
+                {
+                    "goal_id": goal.goal_id,
+                    "provider_package": provider.index + 1,
+                    "fault_scope": scope,
+                    "input": invalid_input,
+                    "streak": streak,
+                },
+            )
+            return None
         if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
             provider.invalidated_session_ids.append(provider.session_id)
         provider.status = "failed"
@@ -2765,6 +2811,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         _, _, hashes = self._goal_delivery_manifest(
                             session, milestone.required_files)
                     milestone.status = "done"
+                    for key in [k for k in goal.assembly_fault_streak
+                                if k.startswith(f"{milestone.index}:")]:
+                        del goal.assembly_fault_streak[key]
                     milestone.files = list(files)
                     milestone.accepted_files = list(files)
                     milestone.accepted_hashes = {
@@ -2803,8 +2852,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             schedule_ready = goal.status == "running"
                 elif session.status == SessionStatus.failed:
                     milestone.status = "failed"
+                    goal_status_before_attribution = goal.status
                     invalidated_provider = self._invalidate_assembly_input_provider(
                         goal, session, idx)
+                    fault_loop_detected = (
+                        invalidated_provider is None
+                        and goal.status == "paused"
+                        and goal_status_before_attribution != "paused"
+                    )
                     if invalidated_provider is not None:
                         # This is an ownership-attribution correction, not a
                         # reason to make the human press Resume twice. Rebuild
@@ -2836,6 +2891,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                 "fault_scope": fault_scope,
                                 "input": fault_path,
                             },
+                        )
+                    elif fault_loop_detected:
+                        # goal.status/last_error were already set by the streak
+                        # breaker inside _invalidate_assembly_input_provider —
+                        # preserve that diagnostic instead of the generic one.
+                        self.goals.save_owned(goal, token)
+                        self.store.log_event(
+                            "-", "goal_paused",
+                            {"goal_id": goal.goal_id, "reason": goal.last_error},
                         )
                     else:
                         sibling_running = any(
@@ -3063,9 +3127,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             session = self.manager.load(assembly_package.session_id)
             if session is None:
                 return False
+            status_before_attribution = goal.status
             provider = self._invalidate_assembly_input_provider(
                 goal, session, assembly_package.index)
             if provider is None:
+                if goal.status == "paused" and status_before_attribution != "paused":
+                    # The streak breaker fired and set a diagnostic last_error;
+                    # persist it, or the next /resume just recomputes streak=1
+                    # and the cap never actually bites.
+                    self.goals.save_owned(goal, token)
                 return False
             fault_scope, fault_path = self._assembly_failure_target(session)
             provider.status = "pending"
