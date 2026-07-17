@@ -38,6 +38,46 @@ def _template() -> str:
     )
 
 
+def test_directive_missing_filename_names_the_problem_and_the_fix():
+    """A real build had a model write `<!-- GANGOF8:STYLE -->` with no
+    filename and repeat the IDENTICAL mistake three retries in a row: the old
+    message here was just "malformed or non-standalone assembly directive",
+    with no line, no quoted text, no example of the correct shape — nothing
+    for a retry to act on. The message must now be specific enough that a
+    model (or a human) can fix it without guessing.
+    """
+    template = (
+        "<!doctype html>\n<html><head>\n"
+        "<!-- GANGOF8:STYLE -->\n"
+        "</head><body></body></html>\n"
+    )
+    with pytest.raises(assembly.AssemblyError) as exc:
+        assembly.validate_template_directives(template)
+    message = str(exc.value)
+    assert "GANGOF8:STYLE -->" in message
+    assert "GANGOF8:STYLE name.css" in message
+    assert exc.value.fault_scope == "template"
+
+
+def test_directive_sharing_its_line_names_the_stray_content():
+    template = (
+        "<!doctype html>\n<html><head>\n"
+        "<!-- GANGOF8:STYLE assets/app.css --> extra text\n"
+        "</head><body></body></html>\n"
+    )
+    with pytest.raises(assembly.AssemblyError) as exc:
+        assembly.validate_template_directives(template)
+    message = str(exc.value)
+    assert "not standalone" in message
+    assert "extra text" in message
+
+
+def test_well_formed_directives_pass_validation():
+    assert assembly.validate_template_directives(_template()) == (
+        "assets/app.css", "src/app.js",
+    )
+
+
 def test_materializer_copies_every_accepted_source_exactly_once_without_slicing(tmp_path):
     root = tmp_path / "stage"
     features = [

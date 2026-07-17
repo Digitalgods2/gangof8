@@ -143,14 +143,31 @@ def validate_template_directives(template: str) -> tuple[str, ...]:
             line_start = template.rfind("\n", 0, token.start()) + 1
             next_line = template.find("\n", token.end())
             line_end = len(template) if next_line < 0 else next_line
-            standalone = (
-                not template[line_start:token.start()].strip()
-                and not template[token.end():line_end].strip()
-            )
-            if directive is None or not standalone:
+            before = template[line_start:token.start()]
+            after = template[token.end():line_end]
+            standalone = not before.strip() and not after.strip()
+            if directive is None:
+                # A model repeated the identical mistake three times in a row
+                # against the old generic "malformed or non-standalone"
+                # message here — it never said WHAT was wrong or what the
+                # fix looks like. Quote the actual bad text and the exact
+                # expected shape so a retry has something concrete to act on.
                 raise AssemblyError(
-                    "HTML inline template contains a malformed or non-standalone "
-                    "assembly directive", fault_scope="template",
+                    f"malformed assembly directive {raw.strip()!r} — expected exactly "
+                    "\"<!-- GANGOF8:STYLE name.css -->\" or "
+                    "\"<!-- GANGOF8:SCRIPT name.js -->\" with a real filename after "
+                    "STYLE/SCRIPT (this one is missing the filename argument, or has "
+                    "stray text inside the comment)",
+                    fault_scope="template",
+                )
+            if not standalone:
+                context = (before.strip() or after.strip())
+                raise AssemblyError(
+                    f"assembly directive {raw.strip()!r} is not standalone: it shares "
+                    f"its line with other content ({context!r}). Each directive must "
+                    "be the ONLY thing on its own line — put it on its own line with "
+                    "nothing else before or after it",
+                    fault_scope="template",
                 )
             kind = directive.group("kind").lower()
             name = directive.group("path").strip().strip("`\"'").replace("\\", "/")
