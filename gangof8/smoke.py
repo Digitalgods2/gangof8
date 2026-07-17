@@ -97,6 +97,23 @@ const _ctx = new Proxy({}, { get(t, k){
 }});
 const _listeners = {};
 function _add(type, fn){ (_listeners[type] = _listeners[type] || []).push(fn); }
+// console.error during boot is a FAILURE, exactly as the release browser gate
+// counts it. A module whose defensive guard silently bails (never attaching
+// its export) doesn't throw — the only runtime evidence is the entry point's
+// console.error("missing module") — and treating that as success let a broken
+// bundle sail through every deterministic gate only to die at the far more
+// expensive final in-browser verification, where blame can no longer be
+// bisected. console.log/warn stay untouched (log carries this protocol).
+const _consoleErrors = [];
+console.error = function(){
+  const parts = [];
+  for (let i = 0; i < arguments.length; i++){
+    const a = arguments[i];
+    if (typeof a === "string"){ parts.push(a); continue; }
+    try { parts.push(JSON.stringify(a)); } catch(e2){ parts.push(String(a)); }
+  }
+  _consoleErrors.push({ message: parts.join(" "), stack: (new Error()).stack || "" });
+};
 const _runtimeErrors = [];
 function _captureError(e){
   // Keep the ORIGINAL stack — re-throwing a fresh Error() below would point
@@ -279,8 +296,14 @@ __SCRIPT__
   }
   const drew = _sigs.filter(s => s.length > 0);
   if (drew.length >= 3) dynamic = (new Set(drew).size >= 2) ? "true" : "false";
-  console.log("SMOKE_OK");
-  console.log("SMOKE_DYNAMIC:" + dynamic);
+  if (_consoleErrors.length){
+    const first = _consoleErrors[0];
+    console.log("SMOKE_CONSOLE_ERROR:" + first.message.replace(/\n/g, " ").slice(0, 400));
+    console.log("SMOKE_STACK:" + (first.stack ? first.stack.replace(/\n/g, "|") : ""));
+  } else {
+    console.log("SMOKE_OK");
+    console.log("SMOKE_DYNAMIC:" + dynamic);
+  }
 } catch (e) {
   console.log("SMOKE_THREW:" + (e && e.message ? e.message : String(e)));
   console.log("SMOKE_STACK:" + (e && e.stack ? e.stack.replace(/\n/g, "|") : ""));
@@ -348,6 +371,12 @@ def _run_smoke(
     if m:
         detail = "threw on load — " + m.group(1).strip()[:200]
         return False, True, detail, None, _first_source_line(out)
+    ce = re.search(r"SMOKE_CONSOLE_ERROR:(.*)", out)
+    if ce:
+        # Same standard as the release browser gate: a boot that logs
+        # console.error is a failed boot, even when nothing threw.
+        detail = "console error during boot — " + ce.group(1).strip()[:300]
+        return False, True, detail, None, _first_source_line(out)
     return False, True, "did not run — " + (out.strip()[:200] or "no output"), None, 0
 
 
@@ -359,11 +388,14 @@ def _first_source_line(out: str) -> int:
     if not sm:
         return 0
     stack = sm.group(1).replace("|", "\n")
-    frame = re.search(r":(\d+):\d+\)?\s*$", stack, re.M)
-    if not frame:
-        return 0
-    line = int(frame.group(1)) - _HARNESS_PRELUDE_LINES
-    return line if line > 0 else 0
+    # Walk frames top-down and take the first that maps into the caller's own
+    # source. Frames that land inside the harness prelude (e.g. the
+    # console.error capture wrapper itself) map to <= 0 and are skipped.
+    for frame in re.finditer(r":(\d+):\d+\)?\s*$", stack, re.M):
+        line = int(frame.group(1)) - _HARNESS_PRELUDE_LINES
+        if line > 0:
+            return line
+    return 0
 
 
 def smoke_source(text: str, suffix: str = ".html", timeout_s: int = 25,

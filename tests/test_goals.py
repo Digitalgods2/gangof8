@@ -1324,7 +1324,9 @@ def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeyp
     # below still surfaces the ArcadePortal.input shape so a fix can land on
     # whichever side is correct.
     assert "js/input.js" in provider.acceptance_detail
-    assert "arcadeportal.input paths [actions, actions.fire]" in provider.acceptance_detail
+    # Case-preserved: this text is repeated to the rebuilding model, and
+    # identifiers like ArcadePortal must survive verbatim.
+    assert "ArcadePortal.input paths [actions, actions.fire]" in provider.acceptance_detail
     persisted = Session.model_validate(service.store.load_session("s_assembly_runtime"))
     assert persisted.quality_gate["fault_scope"] == "dependency"
     assert persisted.quality_gate["fault_path"] == "js/input.js"
@@ -1645,3 +1647,197 @@ def test_goal_api_rejects_empty_text(client):
 def test_goal_composer_hint_served(client):
     page = client.get("/").text
     assert "/goal" in page  # the composer advertises the command
+
+
+def test_assembly_runtime_failure_blames_module_that_silently_fails_to_attach_its_export(tmp_path):
+    """The no-throw failure shape a stack trace can never attribute: a module
+    reads a sibling module at script-load time, but the template's declared
+    order loads the sibling LATER, so a defensive guard silently bails and the
+    module never attaches its own export. Nothing throws; the only symptom is
+    the entry point's "missing modules" console.error — far from the culprit.
+    A real goal shipped exactly this (renderer.js reading Frogger.World before
+    world.js loaded), passed every deterministic gate, failed final browser
+    verification twice, and the blamed owner reproduced the same idiom because
+    the error text never stated the load-order constraint. The export probe
+    must blame the silently-bailing file and spell out that constraint."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    (stage / "js").mkdir(parents=True)
+    painter_source = (
+        "window.Arcade = window.Arcade || {};\n"
+        "(function(){\n"
+        "  var World = window.Arcade.World;\n"
+        "  if (!World) return;\n"
+        "  window.Arcade.Painter = { draw: function(){} };\n"
+        "})();\n"
+    )
+    world_source = (
+        "window.Arcade = window.Arcade || {};\n"
+        "window.Arcade.World = { lanes: [] };\n"
+    )
+    boot_source = (
+        "document.addEventListener('DOMContentLoaded', function(){\n"
+        "  if (!window.Arcade.Painter) console.error('[Arcade] missing modules');\n"
+        "});\n"
+    )
+    (stage / "js" / "painter.js").write_text(painter_source, encoding="utf-8")
+    (stage / "js" / "world.js").write_text(world_source, encoding="utf-8")
+    (stage / "js" / "boot.js").write_text(boot_source, encoding="utf-8")
+    session = Session(
+        session_id="s_silent_bail", status=SessionStatus.failed,
+        workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.html",
+            "sources": ["js/painter.js", "js/world.js", "js/boot.js"],
+        },
+        task=Task(task_id="t_silent", session_id="s_silent_bail", text="assembly"),
+    )
+
+    path, detail = service._assembly_runtime_failure_target(session)
+
+    assert path == "js/painter.js"
+    assert "never attached window.Arcade.Painter" in detail
+    assert "Arcade.World" in detail
+    assert "AFTER" in detail
+    # the fix constraint must be stated, not just the symptom
+    assert "lazily" in detail
+
+
+def test_export_probe_accepts_exports_attached_by_load_handlers(tmp_path):
+    """A module that legitimately attaches its export inside a
+    DOMContentLoaded/load handler is NOT a silent-bail defect; the probe runs
+    after those handlers and must stay quiet."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "late_attach.js").write_text(
+        "window.Arcade = window.Arcade || {};\n"
+        "window.addEventListener('load', function(){\n"
+        "  window.Arcade.Hud = { score: 0 };\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    session = Session(
+        session_id="s_late_attach", status=SessionStatus.failed,
+        workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.html",
+            "sources": ["late_attach.js"],
+        },
+        task=Task(task_id="t_late", session_id="s_late_attach", text="assembly"),
+    )
+
+    path, detail = service._assembly_runtime_failure_target(session)
+
+    assert path == ""
+    assert detail == ""
+
+
+def test_resume_reopens_culprit_package_after_failed_release_verification(tmp_path, monkeypatch):
+    """A release that failed browser verification cannot pass by re-verifying
+    the same staged bytes — a real goal burned two full frontier release
+    sessions on the identical console error because resume only re-ran the
+    release. Resume must instead reproduce the failure deterministically from
+    the staged assembly inputs and reopen the culprit package, exactly like an
+    assembly-time fault (streak accounting included)."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    (stage / "js").mkdir(parents=True)
+    painter_source = (
+        "window.Arcade = window.Arcade || {};\n"
+        "(function(){\n"
+        "  var World = window.Arcade.World;\n"
+        "  if (!World) return;\n"
+        "  window.Arcade.Painter = { draw: function(){} };\n"
+        "})();\n"
+    )
+    world_source = (
+        "window.Arcade = window.Arcade || {};\n"
+        "window.Arcade.World = { lanes: [] };\n"
+    )
+    (stage / "js" / "painter.js").write_text(painter_source, encoding="utf-8")
+    (stage / "js" / "world.js").write_text(world_source, encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="paused", current_index=2,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_failed_release",
+        release_defects=[
+            "arcade.html: browser acceptance failed with 1 error(s): "
+            "console error: [Arcade] missing modules"
+        ],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_painter", owner="qwen", title="painter",
+                task_text="author painter", status="done", session_id="s_painter",
+                contract_declared=True, requires_delivery=True,
+                required_files=["js/painter.js"],
+                accepted_hashes={
+                    "js/painter.js": hashlib.sha256(painter_source.encode()).hexdigest(),
+                },
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_world", owner="glm", title="world",
+                task_text="author world", status="done", session_id="s_world",
+                contract_declared=True, requires_delivery=True,
+                required_files=["js/world.js"],
+                accepted_hashes={
+                    "js/world.js": hashlib.sha256(world_source.encode()).hexdigest(),
+                },
+            ),
+            GoalMilestone(
+                index=2, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="done", session_id="s_assembly_done",
+                depends_on=[0, 1], contract_declared=True, requires_delivery=True,
+                required_files=["arcade.html"],
+                dependencies=["js/painter.js", "js/world.js"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.html",
+                release_files=["arcade.html"],
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_assembly_done", status=SessionStatus.done,
+        outcome="succeeded", goal_id=goal.goal_id,
+        goal_milestone=2, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.html",
+            "sources": ["js/painter.js", "js/world.js"],
+        },
+        task=Task(task_id="t_release", session_id="s_assembly_done", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    assert provider.session_id is None
+    assert provider.invalidated_session_ids == ["s_painter"]
+    assert "js/painter.js" in provider.acceptance_detail
+    assert "AFTER" in provider.acceptance_detail
+    assert repaired.milestones[2].status == "pending"
+    assert repaired.release_status == "not_started"
+    assert repaired.release_session_id is None
+    assert repaired.assembly_fault_streak == {"0:dependency:js/painter.js": 1}

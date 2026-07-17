@@ -68,6 +68,25 @@ from .uploads import UploadStore, attachment_context
 from .workspaces import WorkspaceError, WorkspaceStore
 
 
+# Shared browser-global namespace detection for assembled multi-file bundles.
+# Roots are established either as `<x>.NS = <x>.NS || {...}` (any receiver
+# alias — window, globalThis, or an IIFE's `global` parameter) or literally
+# `window.NS = {...}`; modules then attach exports as `NS.Member = ...` or
+# `window.NS.Member = ...`.
+_ASSEMBLY_NS_ROOT_RE = re.compile(
+    r"\b[\w$]+\.([A-Za-z_$][\w$]*)\s*=\s*[\w$]+\.\1\s*\|\|\s*\{"
+)
+_ASSEMBLY_WINDOW_ROOT_RE = re.compile(
+    r"\bwindow\.([A-Za-z_$][\w$]*)\s*=\s*\{"
+)
+
+
+def _assembly_member_assign_re(namespace: str) -> str:
+    """Pattern matching an export attachment `NS.Member =` (not `==`/`===`),
+    with an optional single receiver prefix such as `window.` or `global.`."""
+    return rf"\b(?:[\w$]+\.)?{re.escape(namespace)}\.([A-Za-z_$][\w$]*)\s*=(?!=)"
+
+
 # The "Enhance" button runs the lead model with this to amplify a raw prompt into
 # a sharper, more effective one — then returns ONLY the amplified prompt.
 AMPLIFY_PROMPT = """\
@@ -2411,6 +2430,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     break
                 session.outcome = "succeeded"
                 goal.release_defects = []
+                # The release is the only proof an assembly fault is truly
+                # resolved; the streak intentionally persists across provider
+                # rebuilds (see _maybe_advance_goal) and resets only here.
+                goal.assembly_fault_streak = {}
                 self.store.save_session(session)
                 return True
             if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
@@ -2582,6 +2605,100 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         ]
         return "cross-file interface mismatch: " + "; ".join(clauses)
 
+    @staticmethod
+    def _assembly_export_probe(ordered: list[tuple[str, str]]) -> str:
+        """Fail-loud probe appended to a combined bundle before smoking it.
+
+        Any shared-namespace export a file's own source assigns
+        (``window.NS.Member = ...`` / ``NS.Member = ...`` where some file
+        establishes ``window.NS``/``x.NS = x.NS || {}``) must actually EXIST
+        once the page has loaded. A module-pattern file whose defensive guard
+        bails at load — because a module it reads is loaded later in the
+        template order — neither throws nor logs: it just silently never
+        attaches its export, and the defect only surfaces as the entry
+        point's "missing modules" complaint, far from the culprit. The probe
+        turns that silence into a deterministic, attributable throw:
+        ``MISSING_EXPORT NS.Member (declared in file)``. It runs two timer
+        hops after the load event, so exports legitimately attached inside
+        DOMContentLoaded/load handlers are not false positives. Textual
+        detection can be fooled by an assignment mentioned only in a comment,
+        so this probe is used for attribution of already-failing bundles, and
+        the fault streak caps any misfire.
+        """
+        namespaces: set[str] = set()
+        for _name, text in ordered:
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_NS_ROOT_RE.finditer(text))
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_WINDOW_ROOT_RE.finditer(text))
+        if not namespaces:
+            return ""
+        checks: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for name, text in ordered:
+            for ns in sorted(namespaces):
+                for m in re.finditer(_assembly_member_assign_re(ns), text):
+                    member = m.group(1)
+                    if (ns, member) in seen:
+                        continue
+                    seen.add((ns, member))
+                    checks.append(
+                        f"if (!(window.{ns} && window.{ns}.{member} !== undefined)) "
+                        f"throw new Error(\"MISSING_EXPORT {ns}.{member} "
+                        f"(declared in {name})\");"
+                    )
+        if not checks:
+            return ""
+        return (
+            "\n;window.addEventListener('load', function(){ "
+            "setTimeout(function(){ setTimeout(function(){\n"
+            + "\n".join(checks)
+            + "\n}, 0); }, 0); });\n"
+        )
+
+    @staticmethod
+    def _describe_missing_export(
+        ns: str, member: str, declared_in: str, ordered: list[tuple[str, str]],
+    ) -> tuple[str, str]:
+        """Actionable blame for a module that silently failed to attach its
+        export: name the missing attachment and, when the source shows it, the
+        exact cross-module read whose provider loads later. This text lands
+        verbatim in the owner's RETRY CORRECTION prompt, so it must state the
+        constraint the rebuild has to satisfy — a bare symptom ("Renderer is
+        missing") historically made the owner wrap its module in a defensive
+        guard that silenced the crash and reproduced this very defect."""
+        order = [name for name, _text in ordered]
+        blamed_position = order.index(declared_in) if declared_in in order else -1
+        blamed_text = next(
+            (text for name, text in ordered if name == declared_in), "")
+        own = set(re.findall(_assembly_member_assign_re(ns), blamed_text))
+        reads = set(re.findall(
+            rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.([A-Za-z_$][\w$]*)\b", blamed_text,
+        )) - own
+        late: list[str] = []
+        for read in sorted(reads):
+            provider_position = next(
+                (position for position, (_name, text) in enumerate(ordered)
+                 if re.search(
+                     rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.{re.escape(read)}\s*=(?!=)",
+                     text)),
+                -1,
+            )
+            if provider_position > blamed_position >= 0:
+                late.append(f"{ns}.{read} (attached by {order[provider_position]})")
+        detail = (
+            f"{declared_in} never attached window.{ns}.{member}: its top-level "
+            "code bailed out before the assignment ran"
+        )
+        if late:
+            detail += (
+                ". Root cause: it reads " + ", ".join(late) + " — loaded AFTER "
+                "it in the template script order, so a script-load-time read "
+                "sees undefined. Attach exports unconditionally at load time; "
+                "look up other modules lazily inside functions when called"
+            )
+        return declared_in, detail
+
     def _assembly_runtime_failure_target(self, session: Session) -> tuple[str, str]:
         """Locate the accepted script that makes an assembled runtime fail.
 
@@ -2597,15 +2714,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         known per-file line ranges of THAT prefix to find which file's own
         code was actually executing when it threw; that file is blamed
         instead of the merely-triggering one whenever the mapping succeeds.
+
+        Each prefix also carries an export probe (see
+        ``_assembly_export_probe``): a module that silently fails to attach
+        its declared export — the no-throw shape a stack trace can never
+        attribute — is caught at exactly the prefix that reproduces its real
+        load environment, and blamed with the load-order constraint spelled
+        out for the rebuild prompt.
         """
         if not session.workspace_root:
             return "", ""
         sources = list((session.assembly_result or {}).get("sources") or [])
-        combined = ""
-        loaded_sources: list[tuple[str, str]] = []
-        # (start_line, end_line, name) 1-based inclusive ranges within `combined`
-        # for every file folded in so far, so a stack line can be mapped back.
-        ranges: list[tuple[int, int, str]] = []
+        ordered: list[tuple[str, str]] = []
         for name in sources:
             normalized = str(name).replace("\\", "/")
             if Path(normalized).suffix.lower() not in {".js", ".mjs"}:
@@ -2617,6 +2737,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 text = path.read_text(encoding="utf-8")
             except (OSError, executor.ExecutionError, UnicodeError):
                 continue
+            ordered.append((normalized, text))
+        combined = ""
+        loaded_sources: list[tuple[str, str]] = []
+        # (start_line, end_line, name) 1-based inclusive ranges within `combined`
+        # for every file folded in so far, so a stack line can be mapped back.
+        ranges: list[tuple[int, int, str]] = []
+        for position, (normalized, text) in enumerate(ordered):
             # 1-based line number of the first character = newlines before it + 1.
             # Holds regardless of whether the preceding text ends in "\n".
             separator = "\n\n" if combined else ""
@@ -2625,8 +2752,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             combined = prefix + text
             end = start + text.count("\n") - (1 if text.endswith("\n") else 0)
             ranges.append((start, end, normalized))
-            ran, testable, detail, _dynamic, error_line = smoke.smoke_source_with_line(combined, ".js")
+            probe = self._assembly_export_probe(ordered[:position + 1])
+            ran, testable, detail, _dynamic, error_line = smoke.smoke_source_with_line(
+                combined + probe, ".js")
             if testable and not ran:
+                export = re.search(
+                    r"MISSING_EXPORT ([\w$]+)\.([\w$]+) \(declared in (.+?)\)",
+                    detail,
+                )
+                if export:
+                    return self._describe_missing_export(
+                        export.group(1), export.group(2), export.group(3), ordered)
                 blamed = normalized
                 for range_start, range_end, range_name in ranges:
                     if range_start <= error_line <= range_end:
@@ -2724,7 +2860,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return None
         if scope not in {"template", "dependency"} or not invalid_input:
             return None
-        detail = str((session.quality_gate or {}).get("detail") or "").lower()
+        # Keep original case: this text is repeated to the rebuilding model,
+        # and identifiers like window.Frogger.Renderer must survive verbatim.
+        detail = str((session.quality_gate or {}).get("detail") or "")
         provider = next(
             (package for package in goal.milestones
              if package.index != assembly_index
@@ -2764,9 +2902,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         provider.files = []
         provider.accepted_files = []
         provider.accepted_hashes = {}
+        # 600, not 300: this exact text becomes the owner's RETRY CORRECTION
+        # prompt, and load-order faults need room to state the constraint the
+        # rebuild must satisfy — truncating it re-creates the blind rebuild
+        # that reproduced the same defect.
         provider.acceptance_detail = (
             f"invalidated by deterministic assembly {scope}: {detail}"
-        )[:300]
+        )[:600]
         event = (
             "assembly_template_provider_invalidated"
             if scope == "template" else
@@ -2839,9 +2981,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         _, _, hashes = self._goal_delivery_manifest(
                             session, milestone.required_files)
                     milestone.status = "done"
-                    for key in [k for k in goal.assembly_fault_streak
-                                if k.startswith(f"{milestone.index}:")]:
-                        del goal.assembly_fault_streak[key]
+                    # Deliberately NOT clearing assembly_fault_streak here: a
+                    # provider finishing a rebuild only means an attempt
+                    # completed, not that the bundle-level fault is fixed. A
+                    # real goal cycled release-fail -> blame renderer.js ->
+                    # rebuild "done" (streak wiped right here) -> same fault
+                    # again, so the loop breaker could never trip. The streak
+                    # now survives until the release actually verifies.
                     milestone.files = list(files)
                     milestone.accepted_files = list(files)
                     milestone.accepted_hashes = {
@@ -3195,6 +3341,97 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 )
                 self.store.log_event("-", event, scheduled)
 
+    def _reopen_release_regression_package(self, goal_id: str) -> str:
+        """Turn a failed final release verification back into a package rebuild.
+
+        Browser acceptance rejecting the assembled release means an ACCEPTED
+        package's staged output is defective — but the release loop can only
+        re-verify the same staged bytes, so resuming used to re-run another
+        identical, expensive frontier verification that could never pass (a
+        real goal burned two full release sessions on the exact same console
+        error). Instead, reproduce the failure deterministically from the
+        staged assembly inputs; when that pins a culprit file, reopen its
+        owner package (and the assembly package) exactly like an
+        assembly-time fault, with the same streak accounting.
+
+        Returns "reopened" (packages rescheduled), "breaker" (the fault
+        streak cap fired — stay paused for a human), or "" (could not
+        reproduce or attribute — fall back to the release retry loop).
+        """
+        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        if goal is None:
+            return ""
+        token = goal.worker_lease
+        scheduled: Optional[dict] = None
+        try:
+            if goal.release_status != "failed_verification" or not goal.release_defects:
+                return ""
+            if not (goal.milestones
+                    and all(m.status == "done" for m in goal.milestones)):
+                return ""
+            assembly_package = next(
+                (package for package in reversed(goal.milestones)
+                 if package.session_id
+                 and self._assembly_contract(package)[0] == assembly.HTML_INLINE),
+                None,
+            )
+            if assembly_package is None:
+                return ""
+            session = self.manager.load(assembly_package.session_id)
+            if session is None or session.assembly_mode != assembly.HTML_INLINE:
+                return ""
+            runtime_path, runtime_detail = self._assembly_runtime_failure_target(session)
+            if not runtime_path:
+                return ""
+            session.quality_gate = {
+                "verdict": "FAIL",
+                "stage": "deterministic_assembly",
+                "detail": (
+                    "release verification failed and the staged assembled runtime "
+                    f"reproduces it at accepted dependency {runtime_path}: "
+                    f"{runtime_detail}"
+                ),
+                "fault_scope": "dependency",
+                "fault_path": runtime_path,
+            }
+            self.store.save_session(session)
+            provider = self._invalidate_assembly_input_provider(
+                goal, session, assembly_package.index)
+            if provider is None:
+                if "pausing for human review" in (goal.last_error or ""):
+                    # The streak breaker fired inside the invalidation call;
+                    # persist its diagnostic so repeated resumes cannot
+                    # silently reset the cap and grind the same rebuild.
+                    self.goals.save_owned(goal, token)
+                    return "breaker"
+                return ""
+            provider.status = "pending"
+            provider.session_id = None
+            assembly_package.status = "pending"
+            assembly_package.session_id = None
+            goal.current_index = provider.index
+            goal.release_status = "not_started"
+            goal.release_session_id = None
+            goal.last_error = (
+                f"release verification failed; rebuilding {runtime_path} "
+                f"from package {provider.index + 1}"
+            )
+            if not self.goals.save_owned(goal, token):
+                return ""
+            scheduled = {
+                "goal_id": goal.goal_id,
+                "provider_package": provider.index + 1,
+                "assembly_package": assembly_package.index + 1,
+                "fault_scope": "dependency",
+                "input": runtime_path,
+            }
+            return "reopened"
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+            if scheduled:
+                self.store.log_event(
+                    "-", "release_regression_rebuild_scheduled", scheduled)
+
     def _recover_verified_goal_packages(self, goal_id: str) -> list[str]:
         """Adopt completed package attempts that lost their goal commit.
 
@@ -3317,6 +3554,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if (goal.milestones
                 and all(m.status == "done" for m in goal.milestones)
                 and goal.delivery_mode == "final_batch"):
+            # A release that failed verification cannot pass by re-verifying
+            # the same staged bytes. Reproduce the failure deterministically
+            # and reopen the culprit package first; only fall back to the
+            # frontier release-repair loop when nothing can be attributed.
+            regression = self._reopen_release_regression_package(goal_id)
+            if regression == "breaker":
+                return self.get_goal(goal_id) or goal.model_dump()
+            if regression == "reopened":
+                goal = self.goals.resume(goal_id)
+                if goal is None:
+                    raise ValueError("goal changed while attempting to resume")
+                self.store.log_event(
+                    "-", "goal_resumed",
+                    {"goal_id": goal_id, "epoch": goal.epoch})
+                self._start_ready_packages(goal, background=background)
+                return self.get_goal(goal_id) or goal.model_dump()
             retry_defects = list(goal.release_defects)
             previous_release = (
                 self.manager.load(goal.release_session_id)
