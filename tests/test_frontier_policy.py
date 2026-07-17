@@ -78,8 +78,11 @@ def test_normalizer_moves_claude_and_codex_onto_code_packages(tmp_path):
     service = GangOf8Service(data_dir=tmp_path / "data")
     service.panel = ["gemini", "claude", "codex"]
     packages = [
+        # review.md is a released artifact too: two natural artifacts keep
+        # this a legitimately multi-package plan under Phase 1 right-sizing.
         GoalMilestone(index=0, title="review", task_text="review", owner="claude",
-                      required_files=["review.md"], contract_declared=True),
+                      required_files=["review.md"], release_files=["review.md"],
+                      release_declared=True, contract_declared=True),
         GoalMilestone(index=1, title="engine", task_text="implement", owner="gemini",
                       required_files=["src/engine.js"], contract_declared=True),
         GoalMilestone(index=2, title="release", task_text="integrate", owner="gemini",

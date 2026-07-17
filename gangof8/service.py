@@ -340,9 +340,15 @@ class GangOf8Service:
 
     def _effective_panel(self) -> list[str]:
         """The seats that contribute every round. Explicit ctor arg › settings
-        roster › backend default (installed CLI agents + enabled, keyed
-        OpenRouter seats). Degrades gracefully: no OpenRouter key ⇒ CLI-only;
-        a seat with no registered adapter is dropped."""
+        roster › backend default. Degrades gracefully: no OpenRouter key ⇒
+        CLI-only; a seat with no registered adapter is dropped.
+
+        The backend default is governed by config.PANEL_MODE
+        (ARCHITECTURE-REVIEW.md, Phase 1): "duo" convenes a lead author plus
+        one independent frontier reviewer; "council" convenes every
+        configured seat plus enabled OpenRouter seats. An explicit
+        settings.panel_seats roster is the user's choice and always wins.
+        """
         import shutil
 
         if self._explicit_panel is not None:
@@ -362,12 +368,31 @@ class GangOf8Service:
         if self.backend == "cli":
             disabled = self._disabled_cli_seats()
             seats = [s for s in seats if shutil.which(s) and s not in disabled]
-            if self.secrets.has("openrouter"):
+            if config.PANEL_MODE == "council" and self.secrets.has("openrouter"):
                 seats += sorted(
                     n for n, on in (self.settings.openrouter_enabled or {}).items()
                     if on and self._openrouter_slug(n)
                 )
+        if config.PANEL_MODE != "council":
+            seats = seats[:config.DUO_PANEL_SIZE]
         return [s for s in seats if s in self.registry.names()]
+
+    def _default_build_roster(self) -> list[str]:
+        """Frontier seats author goals by default (ARCHITECTURE-REVIEW.md P2).
+
+        Measured across two build goals, the budget OpenRouter seats
+        introduced most seam defects while the frontier seats spent their
+        calls detecting, attributing, and repairing them — capability
+        converted into supervision burden. Budget seats join a goal only via
+        GANGOF8_GOAL_FULL_ROSTER=1 or an explicit per-goal roster.
+        """
+        if config.GOAL_FULL_ROSTER:
+            return list(self.panel)
+        frontier = [
+            seat for seat in self.panel
+            if seat not in config.OPENROUTER_SEATS
+        ]
+        return frontier or list(self.panel)
 
     def _openrouter_slug(self, seat: str) -> Optional[str]:
         """Effective model slug for a seat: a user override (settings) wins over
@@ -1290,7 +1315,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             collaboration_mode="build_team",
             delivery_mode="final_batch",
             background=background,
-            build_roster=list(self.panel),
+            build_roster=self._default_build_roster(),
             established_root=established,
             delivery_root=delivery,
         )
@@ -1480,47 +1505,35 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if old_i is not None and displaced:
                 milestones[old_i].owner = displaced
 
-        # Repair duplicate planner assignments deterministically so every
-        # enabled AI owns one model-authored package before anyone gets a
-        # second. Zero-call deterministic assembly does not count as an AI
-        # contribution.
-        if (len(seats) > 1 and len(milestones) >= len(seats)
-                and goals.requires_delivery_contract(goal_text)):
-            authored_indices = [
-                index for index, package in enumerate(milestones)
-                if not package.assembly_mode
-            ]
-            if len(authored_indices) < len(seats):
-                errors.append(
-                    "build plan has fewer model-authored packages than enabled AIs "
-                    f"({len(authored_indices)} packages for {len(seats)} seats); "
-                    "deterministic assembly does not count as participation"
-                )
-            counts = {
-                seat: sum(milestones[index].owner == seat for index in authored_indices)
-                for seat in seats
-            }
-            missing_owners = [seat for seat in seats if counts.get(seat, 0) == 0]
-            for missing_owner in missing_owners:
-                candidate_index = next(
-                    (
-                        index for index in reversed(authored_indices)
-                        if counts.get(milestones[index].owner, 0) > 1
-                    ),
-                    None,
-                )
-                if candidate_index is None:
-                    continue
-                displaced = milestones[candidate_index].owner
-                milestones[candidate_index].owner = missing_owner
-                counts[missing_owner] = counts.get(missing_owner, 0) + 1
-                counts[displaced] = counts.get(displaced, 0) - 1
-            missing_owners = [seat for seat in seats if counts.get(seat, 0) == 0]
-            if missing_owners:
-                errors.append(
-                    "build plan cannot assign every enabled AI a model-authored package: "
-                    + ", ".join(missing_owners)
-                )
+        # Right-sizing (ARCHITECTURE-REVIEW.md, Phase 1): the deliverable's
+        # structure caps the team; the roster never shapes the plan. The old
+        # rule here did the opposite — it REJECTED plans that failed to give
+        # "every enabled AI a model-authored package", which is how one HTML
+        # file became 9 staged files across 8 owners, and every defect in two
+        # days of forensics lived on a seam between those owners. A seat left
+        # unassigned costs nothing; an unnecessary package costs seams.
+        release_paths = {
+            name.replace("\\", "/")
+            for package in milestones for name in package.release_files
+        }
+        # Only FILE-AUTHORING packages create seams on the artifact; a prose
+        # step with no outputs (a decision, a policy recommendation) is a
+        # legitimate separate package even in a single-artifact goal.
+        # GANGOF8_GOAL_FULL_ROSTER=1 is an explicit operator choice of team
+        # mode and bypasses the cap.
+        file_packages = [
+            package for package in milestones if package.required_files
+        ]
+        if (not config.GOAL_FULL_ROSTER
+                and len(release_paths) == 1 and len(file_packages) > 1):
+            errors.append(
+                "right-sizing violation: the deliverable is one artifact "
+                f"({next(iter(release_paths))}) but the plan splits its "
+                f"authorship across {len(file_packages)} file-producing "
+                "packages. A single-artifact deliverable is EXACTLY ONE "
+                "file-authoring package whose owner writes the complete file "
+                "— no template package, no staged fragments, no assembly step"
+            )
 
         providers: dict[str, int] = {}
         for i, package in enumerate(milestones):

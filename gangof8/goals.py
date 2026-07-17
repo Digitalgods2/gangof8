@@ -283,40 +283,47 @@ class GoalStore:
 
 
 def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
-    """Ask the architect for an owned dependency graph in a strict format."""
+    """Ask the architect for an owned dependency graph in a strict format.
+
+    Right-sizing is the first law of this prompt (ARCHITECTURE-REVIEW.md):
+    the roster serves the task, never the reverse. The previous version
+    computed a target package count from the roster size and ordered the
+    planner to "assign every enabled model once" — which split a one-file
+    game into 9 staged files across 8 owners, and every observed defect in
+    two days of forensics lived on a seam between those owners.
+    """
     seats = list(dict.fromkeys(s for s in (panel or []) if s))
     roster = ", ".join(seats) or "the available council"
-    low_goal = (goal_text or "").lower()
-    needs_zero_call_assembly = (
-        ("single-file" in low_goal or "single file" in low_goal)
-        and ("html" in low_goal or "web" in low_goal or "browser" in low_goal)
-    )
-    target_count = (
-        min(len(seats) + (1 if needs_zero_call_assembly else 0),
-            config.GOAL_MAX_MILESTONES)
-        if seats else 2
-    )
+    frontier = [s for s in seats if s in config.FRONTIER_AUTHOR_SEATS] or seats[:1]
     return (
-        "You are the ARCHITECT for a BUILD TEAM. Decompose the goal into bounded, "
-        "owned work packages. Models are collaborators, not competing authors: each "
-        "must own a distinct component, contract, integration surface, test, or "
-        "performance responsibility. Prefer separate modules/files and explicit "
-        "interfaces so independent packages can run in parallel without clobbering "
-        "one shared file. Later packages consume real staged outputs.\n\n"
-        f"Enabled build-team roster: {roster}. For a broad build, create {target_count} "
-        "meaningful packages and assign every enabled model once before assigning a "
-        f"second package. Never exceed {config.GOAL_MAX_MILESTONES}. For genuinely "
-        "small work, use fewer packages instead of inventing duplicate edits. "
+        "You are the ARCHITECT for a BUILD TEAM. Decompose the goal into the "
+        "FEWEST bounded, owned work packages that the deliverable's real "
+        "structure allows. Every package boundary is an interface two owners "
+        "can disagree about — load order, naming, coordinate systems, styling "
+        "hooks — and every seam you create must be paid for in integration "
+        "and verification. A package exists because the deliverable needs it, "
+        "NEVER to give an available model something to do.\n\n"
+        "RIGHT-SIZING RULES (checked deterministically; violations are "
+        "rejected):\n"
+        "- If the deliverable is a SINGLE artifact (one HTML file, one "
+        "script, one document), the plan is EXACTLY ONE package: one owner "
+        "authors the complete file end to end. No template package, no "
+        "staged fragments, no assembly step, no separate QA package.\n"
+        "- Multi-artifact deliverables get at most one package per natural "
+        "artifact boundary, and fewer whenever files are tightly coupled — "
+        "files that share a runtime contract belong to ONE owner.\n"
+        f"- Never exceed {config.GOAL_MAX_MILESTONES} packages.\n\n"
+        f"Enabled build-team roster: {roster}. Prefer "
+        f"{', '.join(frontier)} for every package that authors code and for "
+        "integration/release. It is correct and expected to leave most of "
+        "the roster unassigned; an unassigned seat costs nothing, while an "
+        "unnecessary package costs seams. "
         "Package ownership is atomic: the named owner personally authors every output "
         "in that package so tightly coupled HTML, CSS, and JavaScript cannot be blindly "
-        "mixed from unrelated implementations. Seven-model parallelism happens across "
-        "packages, not within one cohesive package. Group only files whose interfaces "
-        "must be designed together. Split responsibilities that need distinct "
-        "dependency edges, acceptance behavior, or integration contracts. "
-        "Claude and Codex, whenever enabled, must each own a substantive coding "
-        "package that produces source files; review, judging, documentation, or a "
-        "later rescue role does not satisfy that requirement. Prefer one of them "
-        "for the final integration/release package as well.\n\n"
+        "mixed from unrelated implementations. Parallelism happens across "
+        "packages, not within one cohesive package. Group files whose interfaces "
+        "must be designed together. Split only responsibilities that need distinct "
+        "dependency edges, acceptance behavior, or integration contracts.\n\n"
         "The legacy heading MILESTONE 1: is accepted, but prefer PACKAGE headings below.\n\n"
         "Answer in EXACTLY this format, nothing before, between, or after:\n"
         "PACKAGE 1: <short title>\n"
@@ -357,8 +364,11 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "declares it, and every RELEASE path must also appear in that package's "
         "OUTPUTS. If the goal asks for a single file, RELEASE must name exactly that "
         "one file. All RELEASE files are reviewed and moved together at the end.\n\n"
-        "For a single-file HTML release assembled from staged CSS/JavaScript, use "
-        "ASSEMBLY: HTML_INLINE. Prefer an earlier package that owns a compact HTML "
+        "ASSEMBLY: HTML_INLINE exists ONLY for a genuinely multi-package plan "
+        "whose release is one HTML file built from several owners' staged "
+        "CSS/JavaScript — never for a single-package plan, where the owner "
+        "simply writes the complete file and ASSEMBLY is NONE. When it is "
+        "used: prefer an earlier package that owns a compact HTML "
         "shell/template and set TEMPLATE to that accepted path. That exact upstream "
         "TEMPLATE path must also appear in REQUIRES, and its owner "
         "must appear in AFTER. The template uses one "

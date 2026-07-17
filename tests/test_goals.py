@@ -247,6 +247,10 @@ def test_plan_prompt_reserves_after_for_real_bytes():
 def test_invalid_assembly_plan_is_repaired_with_exact_validator_feedback(
     tmp_path, monkeypatch,
 ):
+    # Multi-owner assembly of one HTML file is team mode — an explicit
+    # operator opt-in since ARCHITECTURE-REVIEW.md Phase 1; default goals
+    # right-size a single-artifact deliverable to one authoring package.
+    monkeypatch.setattr(config, "GOAL_FULL_ROSTER", True)
     planner = _SequencedPlannerSeat([INVALID_ASSEMBLY_PLAN, REPAIRED_ASSEMBLY_PLAN])
     service = GangOf8Service(
         data_dir=tmp_path / "data",
@@ -298,6 +302,7 @@ def test_invalid_assembly_plan_is_repaired_with_exact_validator_feedback(
 
 
 def test_invalid_plan_repair_is_bounded_and_never_starts_packages(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "GOAL_FULL_ROSTER", True)
     planner = _SequencedPlannerSeat([INVALID_ASSEMBLY_PLAN])
     service = GangOf8Service(
         data_dir=tmp_path / "data",
@@ -505,7 +510,12 @@ def test_runtime_contract_is_promoted_to_real_byte_dependency(tmp_path):
     assert normalized[1].dependencies == ["src/core.js"]
 
 
-def test_broad_build_plan_repairs_duplicate_owners_to_use_every_enabled_ai(tmp_path):
+def test_unassigned_seats_are_allowed_and_duplicate_owners_stand(tmp_path):
+    """ARCHITECTURE-REVIEW.md Phase 1 inverts the old doctrine this test used
+    to encode: the normalizer previously reassigned owners so every enabled
+    seat got a package. An unassigned seat costs nothing; an unnecessary
+    package (or a package moved to a weaker owner for coverage) costs seams —
+    measured at 283 calls for one file. Duplicate owners now stand."""
     service = GangOf8Service(data_dir=tmp_path / "data", panel=["alpha", "beta", "gamma"])
     packages = [
         GoalMilestone(index=0, title="a", task_text="a", owner="alpha",
@@ -519,7 +529,7 @@ def test_broad_build_plan_repairs_duplicate_owners_to_use_every_enabled_ai(tmp_p
     normalized, errors = service._normalize_work_packages(packages, "Build an application")
 
     assert not errors
-    assert {package.owner for package in normalized} == {"alpha", "beta", "gamma"}
+    assert [package.owner for package in normalized] == ["alpha", "alpha", "beta"]
 
 
 def test_runtime_graph_cannot_flow_directly_into_zero_call_assembly(tmp_path):
@@ -542,7 +552,8 @@ def test_runtime_graph_cannot_flow_directly_into_zero_call_assembly(tmp_path):
                for error in errors)
 
 
-def test_hard_after_integration_package_satisfies_runtime_release_graph(tmp_path):
+def test_hard_after_integration_package_satisfies_runtime_release_graph(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "GOAL_FULL_ROSTER", True)
     service = GangOf8Service(
         data_dir=tmp_path / "data", panel=["alpha", "beta", "gamma"])
     packages = [
@@ -2272,3 +2283,100 @@ def test_resume_maps_verifier_critique_to_owning_package(tmp_path, monkeypatch):
     assert "road first then river" in provider.acceptance_detail
     assert repaired.milestones[1].status == "pending"
     assert repaired.assembly_fault_streak == {"0:dependency:world.js": 1}
+
+
+def test_single_artifact_plan_must_be_exactly_one_package(tmp_path):
+    """ARCHITECTURE-REVIEW.md Phase 1: a single-artifact deliverable is one
+    package with one owner. The old validator did the opposite — it REJECTED
+    plans that failed to give every enabled seat a package, which split a
+    one-file game into 9 staged files across 8 owners; every defect observed
+    in two days of forensics was a seam between those owners."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    milestones = [
+        GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="shell",
+            task_text="author shell", contract_declared=True,
+            requires_delivery=True, required_files=["styles.css"],
+        ),
+        GoalMilestone(
+            index=1, package_id="wp_2", owner="codex", title="game",
+            task_text="author game", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            depends_on=[0], release_files=["game.html"],
+        ),
+    ]
+
+    _normalized, errors = service._normalize_work_packages(
+        milestones, "build a single-file html game", roster=["claude", "codex"])
+
+    assert any("right-sizing violation" in error for error in errors)
+    assert any("EXACTLY ONE file-authoring package" in error for error in errors)
+
+
+def test_single_package_plan_for_single_artifact_is_accepted(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    milestones = [
+        GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="game",
+            task_text="author the complete game", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            release_files=["game.html"],
+        ),
+    ]
+
+    _normalized, errors = service._normalize_work_packages(
+        milestones, "build a single-file html game", roster=["claude", "codex"])
+
+    assert errors == []
+
+
+def test_multi_artifact_plans_are_not_capped_to_one_package(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    milestones = [
+        GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="backend",
+            task_text="author backend", contract_declared=True,
+            requires_delivery=True, required_files=["server.py"],
+            release_files=["server.py"],
+        ),
+        GoalMilestone(
+            index=1, package_id="wp_2", owner="codex", title="frontend",
+            task_text="author frontend", contract_declared=True,
+            requires_delivery=True, required_files=["index.html"],
+            release_files=["index.html"],
+        ),
+    ]
+
+    _normalized, errors = service._normalize_work_packages(
+        milestones, "build a web app", roster=["claude", "codex"])
+
+    assert errors == []
+
+
+def test_plan_prompt_right_sizes_instead_of_feeding_the_roster():
+    """The prompt must demand the FEWEST packages and state the one-artifact
+    rule; it must not compute a package quota from the roster size or demand
+    that every seat be assigned."""
+    prompt = goals_mod.plan_prompt(
+        "build a single-file html game",
+        ["claude", "codex", "gemini", "qwen", "glm", "kimi", "deepseek"],
+    )
+    assert "FEWEST" in prompt
+    assert "EXACTLY ONE package" in prompt
+    assert "assign every enabled model" not in prompt
+    # no roster-derived package quota of the old form "create 8 meaningful"
+    assert "create 8" not in prompt
+
+
+def test_default_build_roster_excludes_budget_seats(tmp_path, monkeypatch):
+    """Goals default to frontier seats (ARCHITECTURE-REVIEW.md P2); budget
+    OpenRouter seats join only by explicit opt-in."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    monkeypatch.setattr(
+        service, "panel",
+        ["claude", "codex", "gemini", "qwen", "glm", "kimi", "deepseek"])
+
+    assert service._default_build_roster() == ["claude", "codex", "gemini"]
+
+    monkeypatch.setattr(config, "GOAL_FULL_ROSTER", True)
+    assert len(service._default_build_roster()) == 7

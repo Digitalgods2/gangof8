@@ -237,17 +237,28 @@ OPENROUTER_SEATS: dict[str, dict[str, str]] = {
 # session's mapping receive it explicitly instead of reading this).
 ROLE_AGENTS = ROLE_AGENTS_BY_BACKEND.get(BACKEND, ROLE_AGENTS_MOCK)
 
-# The PANEL: seats that contribute EVERY round in parallel before the lead
-# synthesizes — diversity of intelligence is the point. Enabled OpenRouter
-# seats are appended at runtime (service._effective_panel) when a key exists.
+# The PANEL: seats that contribute in parallel before the lead synthesizes.
+# Enabled OpenRouter seats are appended at runtime (service._effective_panel)
+# only in council mode.
 PANEL_SEATS_BY_BACKEND: dict[str, list[str]] = {
     "mock": ["mock"],
     "cli": ["claude", "codex", "gemini"],
 }
-# Full roster policy: the configured panel is the council.  A Gang of 8 run
-# convenes every configured panel seat; never silently tier or auto-bench seats
-# to reduce latency.  Seat failures remain visible in that round's health data,
-# while speed comes from concurrent calls and reduced downstream ceremony.
+# Right-sizing policy (ARCHITECTURE-REVIEW.md, Phase 1): the roster serves the
+# task. Default panel mode is "duo" — a lead author plus one independent
+# frontier reviewer — because measured runs showed the full council burning
+# hundreds of calls on seam defects the extra seats introduced (283 calls for
+# one file; five of seven seats contributed one call each). "council" convenes
+# every configured seat plus enabled OpenRouter seats for users who explicitly
+# want candidate diversity. An explicit settings.panel_seats roster always
+# wins over either mode.
+PANEL_MODE = os.environ.get("GANGOF8_PANEL_MODE", "duo").strip().lower()
+# How many seats a duo panel convenes (lead + reviewers).
+DUO_PANEL_SIZE = 2
+# Goals default to a frontier-only build roster; set to 1 to let enabled
+# budget (OpenRouter) seats join every goal as before.
+GOAL_FULL_ROSTER = os.environ.get(
+    "GANGOF8_GOAL_FULL_ROSTER", "").strip().lower() in {"1", "true", "yes"}
 # Rounds proceed automatically; after this many without ROUND: DONE the run
 # pauses and asks the human whether to go another block of rounds.
 ROUNDS_PER_CONSENT = 3
