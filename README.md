@@ -347,6 +347,21 @@ to keep the final batch in staging instead of delivering it.
 
 ## Council roster and model configuration
 
+**Right-sizing defaults** (see `ARCHITECTURE-REVIEW.md`): the roster serves
+the task. By default the panel runs in **duo** mode — a lead author plus one
+independent frontier reviewer — and goals are planned against a
+frontier-only build roster with the fewest packages the deliverable's real
+structure allows (a single-file deliverable is exactly one authoring
+package). Opt into the full council per install with environment variables:
+
+- `GANGOF8_PANEL_MODE=council` — convene every configured seat, plus enabled
+  OpenRouter seats, on ordinary tasks (default: `duo`).
+- `GANGOF8_GOAL_FULL_ROSTER=1` — let enabled budget seats join build-team
+  goals and allow multi-owner assembly of a single release artifact
+  (default: frontier seats only, one owner per artifact).
+
+An explicit seat roster chosen in Settings always wins over either mode.
+
 The real `cli` backend can register these local seats when their commands are
 installed and authenticated:
 

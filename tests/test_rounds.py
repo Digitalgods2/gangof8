@@ -699,6 +699,9 @@ def test_cli_panel_degrades_without_openrouter_key(tmp_path, monkeypatch):
 def test_cli_panel_appends_enabled_keyed_openrouter_seats(tmp_path, monkeypatch):
     import shutil
 
+    # Budget seats join the default panel only in council mode since
+    # ARCHITECTURE-REVIEW.md Phase 1; duo is the default.
+    monkeypatch.setattr(config, "PANEL_MODE", "council")
     monkeypatch.setattr(shutil, "which", lambda n: f"/bin/{n}" if n in ("claude", "codex") else None)
     svc = GangOf8Service(data_dir=tmp_path, backend="cli")
     svc.secrets.set("openrouter", "sk-test-key")
