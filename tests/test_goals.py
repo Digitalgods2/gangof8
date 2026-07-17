@@ -965,6 +965,40 @@ def test_restart_parks_inflight_goals_as_paused(tmp_path):
     assert [m.session_id for m in parked.milestones] == [None, None]
 
 
+def test_second_instance_does_not_park_goal_while_first_is_live(tmp_path, monkeypatch):
+    """A second launch (double-clicked launcher, an accidental duplicate
+    `serve`) constructs its own Service object BEFORE it ever tries to bind
+    the port and fails — so without this guard, the mere act of launching a
+    redundant process is enough to park an in-flight goal the real,
+    already-running server is actively working on. Only a real standalone
+    start (no injected data_dir) probes the port; see the guard in
+    GangOf8Service.__init__."""
+    import socket
+
+    data = tmp_path / "data"
+    monkeypatch.setattr(config, "DATA_DIR", data)
+
+    svc1 = GangOf8Service()  # the real, already-running dashboard server
+    goal = Goal(text="long build", status="running", milestones=[
+        GoalMilestone(index=0, title="m1", task_text="t", status="running",
+                      session_id="s_gone", contract_declared=True),
+    ])
+    svc1.goals.save(goal)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    monkeypatch.setenv("GANGOF8_PORT", str(port))
+    try:
+        svc2 = GangOf8Service()  # simulated accidental double-launch
+    finally:
+        listener.close()
+
+    survived = svc2.goals.get(goal.goal_id)
+    assert survived.status == "running", "an active owner is live — must not be parked"
+
+
 def test_goal_api_aggregates_package_attempts_and_blockers(tmp_path):
     from gangof8.models import ApprovalRequest
 

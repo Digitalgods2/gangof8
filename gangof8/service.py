@@ -170,8 +170,36 @@ class GangOf8Service:
         # restart), leaving sessions stuck in a live state with no worker to
         # advance or cancel them. Finalize those now so they can't linger as
         # un-cancellable "deliberating" ghosts.
-        self._reconcile_orphans()
-        self._reconcile_goal_orphans()
+        #
+        # This must NOT run if another process already owns this data dir and
+        # is actively serving it — e.g. a second launch (double-clicked
+        # launcher, a stray `cli.py <subcommand>`) that hasn't yet failed to
+        # bind the port. Without this guard, constructing a throwaway Service
+        # object is enough to park a goal/session an already-running server is
+        # actively working on, even though nothing actually crashed. Only a
+        # real standalone start (no injected data_dir) probes the ambient
+        # port — tests and embedders use isolated data dirs and must stay
+        # deterministic regardless of what else happens to be running on the
+        # host.
+        if data_dir is not None or not self._another_instance_is_live():
+            self._reconcile_orphans()
+            self._reconcile_goal_orphans()
+
+    def _another_instance_is_live(self) -> bool:
+        """True if something is already listening on the dashboard port —
+        a plain TCP probe, so it works the same on Windows/macOS/Linux with
+        no OS-specific process APIs. The real server always binds before any
+        client request can reach it, so a successful connect here means a
+        live owner already exists for this data dir."""
+        import os
+        import socket
+
+        port = int(os.environ.get("GANGOF8_PORT", "8790"))
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            return False
 
     def _apply_settings(self, backend: Optional[str] = None) -> None:
         """(Re)derive backend, role mapping and registry from

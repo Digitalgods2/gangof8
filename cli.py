@@ -94,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["GANGOF8_BACKEND"] = args.backend
         if args.allow_remote:
             os.environ["GANGOF8_ALLOW_REMOTE"] = "1"
+        # Lets the Service constructed during app import (below, via uvicorn's
+        # string-based app resolution) detect whether another instance already
+        # owns this port — see Service._another_instance_is_live.
+        os.environ["GANGOF8_PORT"] = str(args.port)
         try:
             security.validate_bind_host(args.host)
         except ValueError as e:

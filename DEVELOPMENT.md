@@ -1,7 +1,10 @@
 # Development
 
-Gang of 8 targets Python 3.12 or later. Create an isolated environment and
-install the project with its development tools:
+Gang of 8 targets Python 3.12 or later and runs on Windows, macOS, and Linux.
+Create an isolated environment and install the project with its development
+tools:
+
+**Windows (PowerShell)**
 
 ```powershell
 python -m venv .venv
@@ -9,7 +12,17 @@ python -m venv .venv
 .venv\Scripts\python -m pip install -e ".[dev]"
 ```
 
+**macOS / Linux**
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e ".[dev]"
+```
+
 Run the local verification commands before committing:
+
+**Windows (PowerShell)**
 
 ```powershell
 .venv\Scripts\python -m ruff check gangof8 tests
@@ -18,8 +31,47 @@ node --check gangof8\static\dashboard-utils.js
 node --check gangof8\static\app.js
 ```
 
+**macOS / Linux**
+
+```bash
+.venv/bin/python -m ruff check gangof8 tests
+.venv/bin/python -m pytest tests -q
+node --check gangof8/static/dashboard-utils.js
+node --check gangof8/static/app.js
+```
+
 GitHub Actions runs the Ruff correctness checks and the full test suite for
 pull requests and changes to `main`.
+
+## Running the dashboard
+
+Double-click launchers are provided for all three platforms (all default to
+`--backend cli`; edit the `BACKEND` variable in the script to switch to
+`mock` for free/offline use):
+
+- **Windows**: `Launch Gang of 8.bat` (visible console) or
+  `Launch Gang of 8 (no window).vbs` (hidden). Stop with `Stop Gang of 8.bat`.
+- **macOS**: `Launch Gang of 8.command` (Terminal window) or
+  `Launch Gang of 8 (no window).command` (detached). Stop with
+  `Stop Gang of 8.command`.
+- **Linux**: `./launch-gangof8.sh` (foreground) or
+  `./launch-gangof8-background.sh` (detached). Stop with `./stop-gangof8.sh`.
+  Run these from a terminal — most file managers don't execute `.sh` files on
+  double-click by default.
+
+All variants bind to `127.0.0.1:8790` and only one instance can hold that
+port at a time; the background/no-window variants free the port from any
+previous instance before starting.
+
+### Cross-platform path handling
+
+Backslash (`\`) is a path separator only on Windows — on macOS/Linux it's an
+ordinary filename character. A pasted Windows-style path (or a typo like
+`/Users/me\project`) will silently resolve to a bogus single directory named
+literally `me\project` instead of failing loudly, unless normalized first.
+`WorkspaceStore.add()` (`gangof8/workspaces.py`) normalizes stray backslashes
+to `/` on non-Windows platforms before resolving; keep this in mind if you add
+another entry point that accepts a raw filesystem path from user input.
 
 ## Reliability follow-up: bound failed model calls
 
