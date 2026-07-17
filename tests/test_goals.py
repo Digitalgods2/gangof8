@@ -1934,3 +1934,93 @@ def test_resume_reopens_stylesheet_package_after_style_contract_release_failure(
     assert repaired.milestones[1].status == "pending"
     assert repaired.release_status == "not_started"
     assert repaired.assembly_fault_streak == {"0:dependency:styles.css": 1}
+
+
+def test_resume_of_breaker_paused_goal_grants_one_more_review_cycle(tmp_path, monkeypatch):
+    """The fault-streak breaker pauses "for human review" — so an explicit
+    human resume IS that review. Without this, a breaker-paused goal was a
+    dead end (resume re-ran the doomed assembly once and re-paused on the
+    same cap). Resume must drop capped streaks to one below the limit,
+    reopen the blamed provider with the corrective guidance, and leave the
+    breaker armed so the very next identical fault re-pauses."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "styles.css").write_text(
+        "@import url('https://fonts.example/retro.css');\n.menu{color:red}\n",
+        encoding="utf-8")
+    (stage / "index.template.html").write_text(
+        "<html><head><!-- GANGOF8:STYLE styles.css --></head><body></body></html>",
+        encoding="utf-8")
+    limit = config.ASSEMBLY_FAULT_STREAK_LIMIT
+    goal = Goal(
+        text="assemble", status="paused", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        last_error=(
+            "assembly attribution has blamed package 1 for the same dependency "
+            "fault 3 times in a row without resolving it (styles.css); pausing "
+            "for human review instead of rebuilding it again"
+        ),
+        assembly_fault_streak={f"0:dependency:styles.css": limit + 1},
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_shell", owner="gemini", title="shell",
+                task_text="author shell", status="done", session_id="s_shell",
+                contract_declared=True, requires_delivery=True,
+                required_files=["index.template.html", "styles.css"],
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_assembly", owner="codex", title="assembly",
+                task_text="assemble", status="failed", session_id="s_asm_import",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], dependencies=["styles.css"],
+                assembly_mode=assembly.HTML_INLINE,
+                assembly_template="index.template.html",
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    service.store.save_session(Session(
+        session_id="s_asm_import", status=SessionStatus.failed,
+        outcome="failed_verification", goal_id=goal.goal_id,
+        goal_milestone=1, work_package_id="wp_assembly",
+        work_package_owner="codex", workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE,
+        assembly_template="index.template.html",
+        assembly_result={
+            "mode": assembly.HTML_INLINE,
+            "template": "index.template.html",
+            "sources": ["styles.css"],
+        },
+        quality_gate={
+            "verdict": "FAIL", "stage": "deterministic_assembly",
+            # the pre-prescriptive message shape a saved session carries
+            "detail": "inline stylesheet contains @import and is not self-contained: styles.css",
+            "fault_scope": "dependency", "fault_path": "styles.css",
+        },
+        task=Task(task_id="t_import", session_id="s_asm_import", text="assembly"),
+    ))
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+            and all(current.milestones[d].status == "done" for d in package.depends_on)
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    # exactly one more cycle: reduced to limit-1 by review, +1 by the reopen
+    assert repaired.assembly_fault_streak == {"0:dependency:styles.css": limit}
+    # the saved symptom-only message gained the prescriptive fix
+    assert "@import" in provider.acceptance_detail
+    assert "DELETE the @import" in provider.acceptance_detail
+    assert "font stacks" in provider.acceptance_detail

@@ -321,7 +321,12 @@ def materialize_html_inline(
         )
         if kind == "style" and _CSS_IMPORT_RE.search(source):
             raise AssemblyError(
-                f"inline stylesheet contains @import and is not self-contained: {name}",
+                f"inline stylesheet contains @import and is not self-contained: "
+                f"{name}. The release is ONE self-contained HTML file that must "
+                "render with zero network fetches: DELETE the @import line "
+                "entirely (do not comment it out, do not swap in another URL) "
+                "and use widely installed font stacks instead, e.g. "
+                "font-family: 'Courier New', monospace",
                 fault_scope="dependency", fault_path=name,
             )
         seen.append(name)
