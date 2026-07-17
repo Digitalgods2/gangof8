@@ -382,6 +382,13 @@ class Goal(BaseModel):
     # by GoalStore while planning/advancing metadata.
     epoch: int = 0
     worker_lease: str = ""
+    # Counts consecutive times assembly-failure attribution has blamed the
+    # SAME upstream package for the SAME fault, keyed by
+    # "{provider_index}:{scope}:{path}". A defect that attribution keeps
+    # misidentifying (or a genuinely unfixable one) would otherwise repeat
+    # this rebuild-and-retry cycle indefinitely; see
+    # ``Service._assembly_fault_streak_exceeded``.
+    assembly_fault_streak: dict[str, int] = {}
     created_at: str = Field(default_factory=utcnow)
     updated_at: str = Field(default_factory=utcnow)
 

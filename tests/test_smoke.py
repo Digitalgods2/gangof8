@@ -175,3 +175,26 @@ def test_js_module_smoke_uses_declared_load_order_prelude():
 def test_bare_js_crash_caught():
     ran, testable, detail, _dyn = smoke.smoke_source("var a; a.b.c = 1;", ".js")
     assert ran is False and testable is True
+
+
+def test_smoke_source_with_line_reports_the_throwing_line():
+    """The error line matters when a caller (service._assembly_runtime_failure_target)
+    needs to map a crash back to which concatenated file actually threw, as
+    opposed to whichever file's inclusion merely triggered execution."""
+    src = "function ok(){ return 1; }\nfunction boom(){\n  var x;\n  x.trim();\n}\nboom();"
+    ran, testable, detail, _dyn, line = smoke.smoke_source_with_line(src, ".js")
+    assert ran is False and testable is True, detail
+    assert src.splitlines()[line - 1].strip() == "x.trim();"
+
+
+def test_smoke_source_with_line_is_zero_on_clean_run():
+    ran, testable, detail, _dyn, line = smoke.smoke_source_with_line("var x = 1 + 1;", ".js")
+    assert ran is True and testable is True, detail
+    assert line == 0
+
+
+def test_smoke_source_backward_compatible_four_tuple_unaffected():
+    """smoke_source's public signature/behavior must stay untouched — dozens
+    of existing call sites unpack exactly 4 values."""
+    ran, testable, detail, dyn = smoke.smoke_source("var a; a.b.c = 1;", ".js")
+    assert ran is False and testable is True and dyn is None
