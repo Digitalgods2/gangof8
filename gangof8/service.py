@@ -2657,8 +2657,48 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         )
 
     @staticmethod
+    def _late_namespace_reads(
+        blamed: str, ordered: list[tuple[str, str]],
+    ) -> list[str]:
+        """Shared-namespace members the blamed file reads whose attaching file
+        loads LATER in the declared order — the deterministic signature of a
+        load-order hazard, e.g. ``["Frogger.World (attached by world.js)"]``."""
+        namespaces: set[str] = set()
+        for _name, text in ordered:
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_NS_ROOT_RE.finditer(text))
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_WINDOW_ROOT_RE.finditer(text))
+        order = [name for name, _text in ordered]
+        blamed_position = order.index(blamed) if blamed in order else -1
+        if blamed_position < 0:
+            return []
+        blamed_text = ordered[blamed_position][1]
+        late: list[str] = []
+        for ns in sorted(namespaces):
+            own = set(re.findall(_assembly_member_assign_re(ns), blamed_text))
+            reads = set(re.findall(
+                rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.([A-Za-z_$][\w$]*)\b",
+                blamed_text,
+            )) - own
+            for read in sorted(reads):
+                provider_position = next(
+                    (position for position, (_name, text) in enumerate(ordered)
+                     if re.search(
+                         rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.{re.escape(read)}"
+                         rf"\s*=(?!=)",
+                         text)),
+                    -1,
+                )
+                if provider_position > blamed_position:
+                    late.append(
+                        f"{ns}.{read} (attached by {order[provider_position]})")
+        return late
+
+    @classmethod
     def _describe_missing_export(
-        ns: str, member: str, declared_in: str, ordered: list[tuple[str, str]],
+        cls, ns: str, member: str, declared_in: str,
+        ordered: list[tuple[str, str]],
     ) -> tuple[str, str]:
         """Actionable blame for a module that silently failed to attach its
         export: name the missing attachment and, when the source shows it, the
@@ -2667,25 +2707,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         constraint the rebuild has to satisfy — a bare symptom ("Renderer is
         missing") historically made the owner wrap its module in a defensive
         guard that silenced the crash and reproduced this very defect."""
-        order = [name for name, _text in ordered]
-        blamed_position = order.index(declared_in) if declared_in in order else -1
-        blamed_text = next(
-            (text for name, text in ordered if name == declared_in), "")
-        own = set(re.findall(_assembly_member_assign_re(ns), blamed_text))
-        reads = set(re.findall(
-            rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.([A-Za-z_$][\w$]*)\b", blamed_text,
-        )) - own
-        late: list[str] = []
-        for read in sorted(reads):
-            provider_position = next(
-                (position for position, (_name, text) in enumerate(ordered)
-                 if re.search(
-                     rf"\b(?:[\w$]+\.)?{re.escape(ns)}\.{re.escape(read)}\s*=(?!=)",
-                     text)),
-                -1,
-            )
-            if provider_position > blamed_position >= 0:
-                late.append(f"{ns}.{read} (attached by {order[provider_position]})")
+        late = cls._late_namespace_reads(declared_in, ordered)
         detail = (
             f"{declared_in} never attached window.{ns}.{member}: its top-level "
             "code bailed out before the assignment ran"
@@ -2768,10 +2790,27 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     if range_start <= error_line <= range_end:
                         blamed = range_name
                         break
-                hint = (
-                    self._assembly_runtime_interface_hint(loaded_sources)
-                    if "undefined" in detail.lower() else ""
-                )
+                hints: list[str] = []
+                if "undefined" in detail.lower():
+                    legacy = self._assembly_runtime_interface_hint(loaded_sources)
+                    if legacy:
+                        hints.append(legacy)
+                    # A THROWN "undefined" crash needs the same load-order
+                    # constraint as a silent bail: telling the owner only the
+                    # symptom made one rebuild oscillate between the two
+                    # shapes — guard added (silent bail), guard removed
+                    # (throw) — without ever deferring the read.
+                    late = self._late_namespace_reads(blamed, ordered)
+                    if late:
+                        hints.append(
+                            f"load-order hazard: {blamed} reads "
+                            + ", ".join(late)
+                            + " — loaded AFTER it in the template script "
+                            "order, so a script-load-time read sees undefined; "
+                            "look up other modules lazily inside functions "
+                            "when called, not at the top of the file"
+                        )
+                hint = "; ".join(hints)
                 return blamed, f"{hint}; {detail}" if hint else detail
             loaded_sources.append((normalized, text))
         return "", ""
