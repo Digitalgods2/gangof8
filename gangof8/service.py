@@ -2495,8 +2495,69 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.store.save_session(session)
         return False
 
+    def _mark_stale_assembly_packages(self, goal: Goal) -> bool:
+        """Reopen any done assembly package whose accepted output was built
+        from input bytes other packages have since rebuilt.
+
+        Deterministic assembly records the exact source/template hashes it
+        expanded (``assembly_result``). If a provider package was rebuilt
+        afterwards, the accepted HTML is a fossil of superseded inputs —
+        releasing it re-verifies (and re-fails on) defects the inputs no
+        longer have. One real goal recovered a stale assembly this way and
+        was headed into a frontier release of an HTML expanded from the old
+        stylesheet. Mutates the goal only; callers own persistence and
+        scheduling. Returns True when a package was reopened.
+        """
+        current_accepted: dict[str, str] = {}
+        for package in goal.milestones:
+            if package.status == "done":
+                current_accepted.update(package.accepted_hashes)
+        reopened = False
+        for package in goal.milestones:
+            if package.status != "done" or not package.session_id:
+                continue
+            if self._assembly_contract(package)[0] != assembly.HTML_INLINE:
+                continue
+            session = self.manager.load(package.session_id)
+            if session is None:
+                continue
+            recorded = dict(
+                (session.assembly_result or {}).get("source_hashes") or {})
+            template_name = (session.assembly_template or "").replace("\\", "/")
+            template_hash = str(
+                (session.assembly_result or {}).get("template_hash") or "")
+            if template_name and template_hash:
+                recorded.setdefault(template_name, template_hash)
+            stale = sorted(
+                name for name, digest in recorded.items()
+                if current_accepted.get(name) not in (None, digest)
+            )
+            if not stale:
+                continue
+            package.status = "pending"
+            package.session_id = None
+            goal.current_index = package.index
+            goal.release_status = "not_started"
+            goal.release_session_id = None
+            goal.last_error = (
+                "accepted assembly output is stale — inputs were rebuilt "
+                "after acceptance (" + ", ".join(stale[:6]) + "); reassembling"
+            )
+            self.store.log_event(
+                "-", "assembly_reopened_stale_inputs",
+                {"goal_id": goal.goal_id, "package": package.index + 1,
+                 "stale": stale[:12]},
+            )
+            reopened = True
+        return reopened
+
     def _prepare_goal_release(self, goal: Goal) -> None:
         """Create the final review session after every package has staged cleanly."""
+        if self._mark_stale_assembly_packages(goal):
+            # A pending assembly package now exists; the caller's normal
+            # scheduling path rebuilds it from current inputs before any
+            # release session is opened or paid for.
+            return
         files = self._goal_release_files(goal)
         goal.release_files = files
         if not files:
@@ -3134,7 +3195,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         elif goal.delivery_mode != "final_batch":
                             goal.status = "completed"
                             self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
-                        self.goals.save_owned(goal, token)
+                        if self.goals.save_owned(goal, token):
+                            # Release prep may instead have reopened a stale
+                            # assembly package; that rebuild must be scheduled,
+                            # not left waiting for a human resume.
+                            schedule_ready = goal.status == "running" and any(
+                                m.status == "pending" for m in goal.milestones
+                            )
                     else:
                         goal.current_index = min(remaining)
                         if self.goals.save_owned(goal, token):
@@ -3611,8 +3678,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         or not session.work_package_id):
                     continue
                 candidates.setdefault(session.work_package_id, []).append(session)
+            current_accepted: dict[str, str] = {}
+            for done_package in goal.milestones:
+                if done_package.status == "done":
+                    current_accepted.update(done_package.accepted_hashes)
             for package in goal.milestones:
                 if package.status == "done":
+                    continue
+                if any(
+                    goal.milestones[dependency].status != "done"
+                    for dependency in package.depends_on
+                    if 0 <= dependency < len(goal.milestones)
+                ):
+                    # An attempt that completed against dependency bytes now
+                    # being rebuilt would resurrect a stale output — a real
+                    # goal adopted an assembled HTML expanded from a
+                    # superseded stylesheet exactly this way.
                     continue
                 match = None
                 for candidate in candidates.get(package.package_id, []):
@@ -3620,6 +3701,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             or candidate.session_id in package.invalidated_session_ids
                             or not set(package.required_files).issubset(
                                 set(candidate.required_files))):
+                        continue
+                    if any(
+                        current_accepted.get(name) not in (None, digest)
+                        for name, digest in candidate.dependency_hashes.items()
+                    ):
+                        # The attempt consumed input bytes that differ from the
+                        # currently accepted ones; its output is not equivalent
+                        # to what a fresh run would produce.
                         continue
                     sealed = candidate.verified_output_hashes
                     latest = {
@@ -3759,6 +3848,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             goal.last_error = ""
             self._prepare_goal_release(goal)
             self.goals.save(goal)
+            if goal.status == "running" and any(
+                    m.status == "pending" for m in goal.milestones):
+                # Release prep reopened a stale assembly package instead of
+                # opening a release session; start its rebuild now.
+                self._start_ready_packages(goal, background=background)
             return self.get_goal(goal_id) or goal.model_dump()
         if goal.current is None:  # defensive: nothing left to run
             goal.status = "completed"
