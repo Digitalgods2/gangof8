@@ -2721,6 +2721,71 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             )
         return declared_in, detail
 
+    @staticmethod
+    def _style_contract_regression(session: Session) -> tuple[str, str]:
+        """Statically reproduce the release browser gate's style-contract check.
+
+        The browser gate fails a release whose rendered DOM classes are mostly
+        unmatched by any stylesheet rule (coverage < 0.35 with >= 8 classes in
+        use). That comparison needs no browser: class tokens in the staged
+        template's markup vs class tokens in the staged stylesheets' selectors.
+        Reproducing it here lets a failed release reopen the stylesheet's
+        owner package with the exact unmatched class list, instead of praying
+        the frontier verifier rewrites a whole stylesheet inline — which a
+        real goal watched it decline to do, twice.
+
+        Returns ``(css_path, detail)`` when the staged inputs reproduce the
+        defect, else ``("", "")``.
+        """
+        if not session.workspace_root:
+            return "", ""
+        sources = list((session.assembly_result or {}).get("sources") or [])
+        css_names = [
+            str(name).replace("\\", "/") for name in sources
+            if Path(str(name)).suffix.lower() == ".css"
+        ]
+        template = (session.assembly_template or "").replace("\\", "/")
+        if not css_names or not template:
+            return "", ""
+        root = Path(session.workspace_root)
+        try:
+            html = executor.resolve_in_workspace(root, template).read_text(
+                encoding="utf-8", errors="replace")
+        except (OSError, executor.ExecutionError):
+            return "", ""
+        used: set[str] = set()
+        for quoted in re.finditer(r"class\s*=\s*\"([^\"]*)\"", html):
+            used.update(quoted.group(1).split())
+        for quoted in re.finditer(r"class\s*=\s*'([^']*)'", html):
+            used.update(quoted.group(1).split())
+        if len(used) < 8:
+            return "", ""
+        css_text = ""
+        for name in css_names:
+            try:
+                css_text += "\n" + executor.resolve_in_workspace(
+                    root, name).read_text(encoding="utf-8", errors="replace")
+            except (OSError, executor.ExecutionError):
+                continue
+        covered = {
+            token.group(0)[1:]
+            for token in re.finditer(r"\.[_a-zA-Z][_a-zA-Z0-9-]*", css_text)
+        }
+        matched = used & covered
+        if len(matched) / len(used) >= 0.35:
+            return "", ""
+        missing = sorted(used - covered)
+        target = css_names[0]
+        detail = (
+            f"{target} styles only {len(matched)} of the {len(used)} CSS "
+            f"classes that the template {template} actually uses. The template "
+            "markup and the stylesheet are ONE contract: keep the template's "
+            "existing class names and write real rules for them — do NOT "
+            "invent a different class scheme. Classes needing rules: "
+            + ", ".join(missing[:24])
+        )
+        return target, detail
+
     def _assembly_runtime_failure_target(self, session: Session) -> tuple[str, str]:
         """Locate the accepted script that makes an assembled runtime fail.
 
@@ -3419,19 +3484,32 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             session = self.manager.load(assembly_package.session_id)
             if session is None or session.assembly_mode != assembly.HTML_INLINE:
                 return ""
+            fault_path = ""
+            fault_detail = ""
             runtime_path, runtime_detail = self._assembly_runtime_failure_target(session)
-            if not runtime_path:
+            if runtime_path:
+                fault_path = runtime_path
+                fault_detail = (
+                    "release verification failed and the staged assembled runtime "
+                    f"reproduces it at accepted dependency {runtime_path}: "
+                    f"{runtime_detail}"
+                )
+            elif any("style contract" in str(d) for d in goal.release_defects):
+                style_path, style_detail = self._style_contract_regression(session)
+                if style_path:
+                    fault_path = style_path
+                    fault_detail = (
+                        "release verification failed on the style contract and "
+                        f"the staged inputs reproduce it: {style_detail}"
+                    )
+            if not fault_path:
                 return ""
             session.quality_gate = {
                 "verdict": "FAIL",
                 "stage": "deterministic_assembly",
-                "detail": (
-                    "release verification failed and the staged assembled runtime "
-                    f"reproduces it at accepted dependency {runtime_path}: "
-                    f"{runtime_detail}"
-                ),
+                "detail": fault_detail,
                 "fault_scope": "dependency",
-                "fault_path": runtime_path,
+                "fault_path": fault_path,
             }
             self.store.save_session(session)
             provider = self._invalidate_assembly_input_provider(
@@ -3452,7 +3530,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             goal.release_status = "not_started"
             goal.release_session_id = None
             goal.last_error = (
-                f"release verification failed; rebuilding {runtime_path} "
+                f"release verification failed; rebuilding {fault_path} "
                 f"from package {provider.index + 1}"
             )
             if not self.goals.save_owned(goal, token):
@@ -3462,7 +3540,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "provider_package": provider.index + 1,
                 "assembly_package": assembly_package.index + 1,
                 "fault_scope": "dependency",
-                "input": runtime_path,
+                "input": fault_path,
             }
             return "reopened"
         finally:
