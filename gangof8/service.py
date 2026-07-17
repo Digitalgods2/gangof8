@@ -3006,12 +3006,23 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         provider.files = []
         provider.accepted_files = []
         provider.accepted_hashes = {}
+        guidance = ""
+        if "@import" in detail and "DELETE the @import" not in detail:
+            # Sessions saved before the assembler's message became
+            # prescriptive carry only the symptom; a real owner re-added its
+            # Google-Fonts @import three times in a row on that text alone.
+            guidance = (
+                " Fix: the release is ONE self-contained HTML file with zero "
+                "network fetches — DELETE the @import line entirely and use "
+                "widely installed font stacks instead, e.g. font-family: "
+                "'Courier New', monospace."
+            )
         # 600, not 300: this exact text becomes the owner's RETRY CORRECTION
         # prompt, and load-order faults need room to state the constraint the
         # rebuild must satisfy — truncating it re-creates the blind rebuild
         # that reproduced the same defect.
         provider.acceptance_detail = (
-            f"invalidated by deterministic assembly {scope}: {detail}"
+            f"invalidated by deterministic assembly {scope}: {detail}{guidance}"
         )[:600]
         event = (
             "assembly_template_provider_invalidated"
@@ -3385,6 +3396,33 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event("-", "goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
             return goal.model_dump()
 
+    def _grant_streak_review_retry(self, goal_id: str) -> None:
+        """An explicit human resume of a breaker-paused goal IS the human
+        review the breaker paused for. Without this, such a goal was a dead
+        end: resume would re-run the doomed assembly once and re-pause on the
+        same cap. Grant exactly one more attribution cycle by dropping every
+        capped streak to one below the limit — the next identical fault
+        re-pauses immediately, so an unattended loop stays impossible."""
+        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        if goal is None:
+            return
+        token = goal.worker_lease
+        try:
+            limit = config.ASSEMBLY_FAULT_STREAK_LIMIT
+            reduced = {
+                key: min(value, max(limit - 1, 0))
+                for key, value in goal.assembly_fault_streak.items()
+            }
+            if reduced != goal.assembly_fault_streak:
+                goal.assembly_fault_streak = reduced
+                self.goals.save_owned(goal, token)
+                self.store.log_event(
+                    "-", "assembly_fault_streak_review_retry",
+                    {"goal_id": goal_id, "streak": dict(reduced)},
+                )
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+
     def _reopen_paused_assembly_provider(self, goal_id: str) -> bool:
         """Repair blame for an assembly failure recorded before resume.
 
@@ -3660,6 +3698,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 return self.get_goal(goal_id) or replanning.model_dump()
             self._plan_and_start(goal_id)
             return self.get_goal(goal_id) or replanning.model_dump()
+        if "pausing for human review" in (goal.last_error or ""):
+            self._grant_streak_review_retry(goal_id)
         self._reopen_paused_assembly_provider(goal_id)
         recovered = self._recover_verified_goal_packages(goal_id)
         goal = self.goals.get(goal_id) or goal
