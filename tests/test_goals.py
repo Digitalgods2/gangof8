@@ -2380,3 +2380,82 @@ def test_default_build_roster_excludes_budget_seats(tmp_path, monkeypatch):
 
     monkeypatch.setattr(config, "GOAL_FULL_ROSTER", True)
     assert len(service._default_build_roster()) == 7
+
+
+def test_release_verifier_transport_failure_is_unavailable_not_rejected(tmp_path, monkeypatch):
+    """A verifier CLI that exits or reports capacity did NOT judge the batch.
+    A real release recorded "verifier rejected release" over a codex "model
+    is at capacity" outage — for a game that had just PASSED real-browser
+    acceptance. Transport failures must retry with backoff and then report
+    the verifier as UNAVAILABLE (retryable via resume), never as a
+    rejection, and never pollute the release defect register."""
+    from gangof8 import service as service_module
+
+    monkeypatch.setattr(config, "RELEASE_VERIFIER_TRANSPORT_BACKOFF", 0.0)
+
+    class _AuthorSeat:
+        name = "claude"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="ok", duration_ms=1)
+
+    class _CapacitySeat:
+        name = "codex"
+        calls = 0
+
+        def call(self, role, prompt, timeout_s, images=None):
+            _CapacitySeat.calls += 1
+            raise RuntimeError("codex CLI exited 1: Selected model is at capacity")
+
+    class _BrowserPass:
+        passed = True
+        interactive = True
+        testable = True
+        detail = "passed real-browser input and sustained-runtime checks (chrome)"
+        browser = "chrome"
+        errors = ()
+
+    monkeypatch.setattr(
+        service_module.browser_acceptance, "browser_acceptance",
+        lambda path, **kw: _BrowserPass())
+
+    service = GangOf8Service(
+        data_dir=tmp_path / "data", panel=["claude", "codex"])
+    service.registry.register(_AuthorSeat())
+    service.registry.register(_CapacitySeat())
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "frogger.html").write_text(
+        "<html><body><script>window.ok=1;</script></body></html>",
+        encoding="utf-8")
+    goal = Goal(
+        text="build a single-file frogger", status="running", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="claude", title="game",
+                task_text="author the game", status="done",
+                contract_declared=True, requires_delivery=True,
+                required_files=["frogger.html"], release_files=["frogger.html"],
+                release_declared=True,
+                accepted_hashes={"frogger.html": hashlib.sha256(
+                    (stage / "frogger.html").read_bytes()).hexdigest()},
+            ),
+        ],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    assert goal.status == "paused"
+    assert goal.release_status == "failed_verification"
+    assert goal.last_error == "frontier release verifier unavailable"
+    # retried: initial call + RELEASE_VERIFIER_TRANSPORT_RETRIES
+    assert _CapacitySeat.calls == 1 + config.RELEASE_VERIFIER_TRANSPORT_RETRIES
+    release = service.manager.load(goal.release_session_id)
+    assert release.quality_gate["verdict"] == "UNAVAILABLE"
+    assert "did not run" in release.quality_gate["detail"]
+    # the outage is not a defect of the batch: register stays clean
+    assert goal.release_defects == []
+    assert any("NOT judged" in item for item in release.unresolved)

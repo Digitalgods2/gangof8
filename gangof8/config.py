@@ -120,6 +120,13 @@ OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
     1, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
 )
 FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
+# A verifier CLI that exits or reports capacity did NOT judge the batch.
+# Retry the call (rotating through eligible independent seats) before
+# reporting the verifier as unavailable — never as a rejection.
+RELEASE_VERIFIER_TRANSPORT_RETRIES = int(
+    os.environ.get("GANGOF8_RELEASE_VERIFIER_TRANSPORT_RETRIES", "2"))
+RELEASE_VERIFIER_TRANSPORT_BACKOFF = float(
+    os.environ.get("GANGOF8_RELEASE_VERIFIER_TRANSPORT_BACKOFF", "20"))
 # Cap on consecutive times deterministic-assembly failure attribution may
 # blame the SAME upstream package for the SAME fault before the goal pauses
 # for a human instead of rebuilding-and-retrying forever. A build that hit
