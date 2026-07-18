@@ -403,7 +403,7 @@ def test_deterministic_release_continues_into_semantic_frontier_review(tmp_path,
     service.panel = ["claude", "codex"]
     monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
 
-    def semantic_pass(current, _registry, _store, member, _prompt, timeout_s=None):
+    def semantic_pass(current, _registry, _store, member, _prompt, timeout_s=None, **_kwargs):
         del current, _registry, _store, timeout_s
         return Contribution(
             round=0, role=member.role, agent=member.agent,
@@ -449,7 +449,7 @@ def test_frontier_pass_with_edits_applies_then_requires_clean_confirmation(
     monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
     calls = []
 
-    def semantic_review(current, _registry, _store, member, _prompt, timeout_s=None):
+    def semantic_review(current, _registry, _store, member, _prompt, timeout_s=None, **_kwargs):
         del current, _registry, _store, member, _prompt, timeout_s
         calls.append(1)
         if len(calls) == 1:
@@ -499,7 +499,7 @@ def test_semantic_frontier_can_block_clean_deterministic_assembly(tmp_path, monk
     service.panel = ["claude", "codex"]
     monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
 
-    def semantic_fail(current, _registry, _store, member, _prompt, timeout_s=None):
+    def semantic_fail(current, _registry, _store, member, _prompt, timeout_s=None, **_kwargs):
         del current, _registry, _store, timeout_s
         return Contribution(
             round=0, role=member.role, agent=member.agent,

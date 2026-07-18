@@ -59,6 +59,13 @@ class CliAdapter:
     # bound (loop._agent_call). HTTP-backed adapters set this False and share a
     # larger bound of their own.
     local_process = True
+    # The registry may pass an explicit working directory (a disposable review
+    # copy of release files) so an agentic CLI inspecting "its workspace" sees
+    # the real bytes under review instead of the empty neutral sandbox — a
+    # codex release verifier FAILed a passing game with "frogger.html is
+    # absent from the workspace" for exactly that reason.
+    supports_cwd = True
+    _cwd_override: Optional[str] = None
 
     def __init__(self, agent: str, name: Optional[str] = None, model: Optional[str] = None,
                  api_key_getter=None, role_models: Optional[dict] = None):
@@ -101,7 +108,14 @@ class CliAdapter:
         return None, "no non-generative authentication status command"
 
     def call(self, role: Role, prompt: str, timeout_s: int,
-             images: list[dict] | None = None) -> AdapterResult:
+             images: list[dict] | None = None,
+             cwd: Optional[str] = None) -> AdapterResult:
+        if cwd and self._cwd_override != cwd:
+            # call-local clone, same pattern as the role-model pin below: the
+            # adapter instance is shared across fan-out threads.
+            clone = copy.copy(self)
+            clone._cwd_override = cwd
+            return clone.call(role, prompt, timeout_s, images)
         pinned = self.role_models.get(getattr(role, "value", str(role)))
         if pinned and pinned != self.model:
             # The runner methods read self.model, and this adapter instance is
@@ -160,7 +174,7 @@ class CliAdapter:
             proc = subprocess.Popen(
                 [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                cwd=_neutral_cwd(),
+                cwd=self._cwd_override or _neutral_cwd(),
             )
         except (OSError, FileNotFoundError) as e:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e

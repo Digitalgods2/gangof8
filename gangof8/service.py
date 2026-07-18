@@ -2339,6 +2339,27 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 loaded.append((name, path.read_text(encoding="utf-8", errors="replace")))
             return loaded
 
+        review_root = Path(config.SANDBOX_ROOT) / f"release-review-{session.session_id}"
+
+        def write_review_copy() -> str:
+            """A disposable directory holding the exact release bytes, used as
+            the verifier CLI's working directory. Agentic CLIs inspect "their
+            workspace" with tools and trust it over inline prompt text — codex
+            FAILed a passing game with "frogger.html is absent from the
+            workspace" because it ran from the empty neutral sandbox. A copy
+            (not the staging dir itself) so a verifier's shell experiments can
+            never mutate accepted staged bytes."""
+            import shutil as _shutil
+            if review_root.exists():
+                _shutil.rmtree(review_root, ignore_errors=True)
+            review_root.mkdir(parents=True, exist_ok=True)
+            for name in session.required_files:
+                source = executor.resolve_in_workspace(stage, name)
+                target = review_root / name.replace("\\", "/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+            return str(review_root)
+
         files = read_files()
         total_edits = 0
         for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
@@ -2364,7 +2385,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             ))
             prompt = rounds.frontier_release_prompt(
                 session, files, defect_register=release_defect_register,
-                repair_attempt=attempt)
+                repair_attempt=attempt) + (
+                "\n\nWORKSPACE NOTE: your working directory contains the exact "
+                "release file bytes under review — identical to the inline "
+                "copies above. Inspect them with your tools freely. Never "
+                "report a file as missing without listing the directory first."
+            )
+            review_cwd = write_review_copy()
             # A verifier CLI that exits, times out, or reports capacity did NOT
             # judge the batch — a real release recorded "verifier rejected
             # release" over a codex "model is at capacity" outage, for a game
@@ -2382,6 +2409,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     answer = _agent_call(
                         session, self.registry, self.store, member, prompt,
                         timeout_s=config.FRONTIER_VERIFY_TIMEOUT,
+                        cwd=review_cwd,
                     )
                     verifier_name = seat
                     break
