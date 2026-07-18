@@ -22,6 +22,9 @@ class LogStore:
         # append handles are not record-atomic; without a process lock one JSON
         # line could be overwritten by a blank/partial sibling write.
         self._event_lock = threading.Lock()
+        self._feed_cond = threading.Condition()
+        self._feed: list[dict] = []
+        self._feed_seq = 0
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
@@ -267,3 +270,44 @@ class LogStore:
         with self._event_lock:
             with open(self.session_log_path(session_id), "a", encoding="utf-8") as f:
                 f.write(line)
+        self._publish_event(session_id, record)
+
+    # ---- live feed -------------------------------------------------------
+    # Every event already flows through log_event; keeping an in-memory ring
+    # of the most recent ones (with a monotonically increasing cursor) lets
+    # the dashboard STREAM the run instead of reconstructing it from state
+    # snapshots — the "black hole" fix from NEXT-LEVEL.md R1.
+
+    _FEED_CAPACITY = 500
+
+    def _publish_event(self, session_id: str, record: dict) -> None:
+        with self._feed_cond:
+            self._feed_seq += 1
+            entry = {
+                "seq": self._feed_seq,
+                "session_id": session_id,
+                **record,
+            }
+            self._feed.append(entry)
+            if len(self._feed) > self._FEED_CAPACITY:
+                del self._feed[: len(self._feed) - self._FEED_CAPACITY]
+            self._feed_cond.notify_all()
+
+    def feed_since(self, cursor: int, limit: int = 100) -> list[dict]:
+        """Events with seq > cursor (oldest first), without blocking."""
+        with self._feed_cond:
+            return [dict(e) for e in self._feed if e["seq"] > cursor][:limit]
+
+    def feed_wait(self, cursor: int, timeout_s: float = 25.0) -> list[dict]:
+        """Block up to timeout_s for events with seq > cursor; [] on timeout."""
+        with self._feed_cond:
+            fresh = [dict(e) for e in self._feed if e["seq"] > cursor]
+            if fresh:
+                return fresh
+            self._feed_cond.wait(timeout=timeout_s)
+            return [dict(e) for e in self._feed if e["seq"] > cursor]
+
+    @property
+    def feed_cursor(self) -> int:
+        with self._feed_cond:
+            return self._feed_seq

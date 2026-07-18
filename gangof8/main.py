@@ -166,7 +166,9 @@ def health() -> dict:
 
 @app.get("/diagnostics")
 def diagnostics() -> dict:
-    return service.diagnostics()
+    data = service.diagnostics()
+    data["seats"] = service.seat_health.snapshot()
+    return data
 
 
 @app.post("/tasks")
@@ -272,6 +274,63 @@ def session_timeline(session_id: str) -> dict:
     if service.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
     return service.timeline(session_id)
+
+
+@app.get("/goals/{goal_id}/timeline")
+def goal_timeline(goal_id: str) -> dict:
+    """The whole goal's ordered story plus a derived postmortem summary."""
+    try:
+        return service.goal_timeline(goal_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="goal not found")
+
+
+@app.get("/seats")
+def seats() -> dict:
+    """Live per-seat health: state, reason, since. Fed by every adapter
+    call's outcome; consulted by scheduling; rendered as dashboard badges."""
+    return {
+        "panel": service.panel,
+        "seats": service.seat_health.snapshot(),
+    }
+
+
+@app.get("/events/stream")
+async def events_stream(request: Request, since: int = 0):
+    """Server-Sent Events: every log event as it happens, rendered through
+    the human vocabulary (icon/label/detail). The dashboard's live feed."""
+    import asyncio
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+
+    async def generate():
+        cursor = since if since > 0 else service.store.feed_cursor
+        # On connect, replay a short recent window so the pane is never empty.
+        backlog = service.store.feed_since(max(0, cursor - 30), limit=30)
+        loop = asyncio.get_event_loop()
+        while True:
+            if await request.is_disconnected():
+                return
+            batch = backlog or await loop.run_in_executor(
+                None, service.store.feed_wait, cursor, 20.0)
+            backlog = []
+            if not batch:
+                yield ": keepalive\n\n"
+                continue
+            for entry in batch:
+                cursor = max(cursor, entry["seq"])
+                rendered = reporting.format_timeline([entry])[0]
+                rendered["seq"] = entry["seq"]
+                rendered["session_id"] = entry.get("session_id", "")
+                payload = entry.get("payload") or {}
+                if payload.get("goal_id"):
+                    rendered["goal_id"] = payload["goal_id"]
+                yield "data: " + _json.dumps(
+                    rendered, ensure_ascii=False, default=str) + "\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
 
 
 class EnhanceIn(BaseModel):

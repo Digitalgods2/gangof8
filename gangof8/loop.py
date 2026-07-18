@@ -297,7 +297,7 @@ def _agent_call(
             last_progress_save = [0.0]
             last_progress_chars = [0]
 
-            def _record_progress(chars: int, detail: str) -> None:
+            def _record_progress(chars: int, detail: str, tail: str = "") -> None:
                 """Persist a throttled, token-backed heartbeat for the dashboard."""
                 now = time.monotonic()
                 # The adapter reports cumulative output characters. Ignore
@@ -313,6 +313,9 @@ def _agent_call(
                     current["last_progress_at"] = utcnow()
                     current["progress_chars"] = last_progress_chars[0]
                     current["progress_detail"] = detail[:80]
+                    if tail:
+                        # what the model is literally writing right now
+                        current["tail"] = tail[-400:]
                     # One small WAL write every two seconds is enough for a live
                     # UI without turning a token stream into a write storm.
                     if now - last_progress_save[0] >= 2.0:

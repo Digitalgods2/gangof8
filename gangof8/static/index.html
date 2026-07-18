@@ -19,6 +19,7 @@
     <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
     <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
     <span class="bpill tagline">🔒 nothing executes without your approval</span>
+    <span id="seatHealth" class="seat-health" title="live seat health"></span>
     <div class="hgroup">
       <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
       <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
@@ -81,6 +82,10 @@
 
 <main>
   <div id="left">
+    <div id="feedWrap">
+      <h2>Live activity <span id="feedDot" class="feed-dot"></span></h2>
+      <div id="feed" aria-live="polite"></div>
+    </div>
     <div id="goalsWrap" style="display:none">
       <h2>Goals</h2>
       <div id="goals"></div>

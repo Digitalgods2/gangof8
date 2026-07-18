@@ -48,6 +48,10 @@ class Adapter(Protocol):
 class AgentRegistry:
     def __init__(self) -> None:
         self._adapters: dict[str, Adapter] = {}
+        # Optional SeatHealth sink (injected by the service): every call's
+        # outcome updates per-seat health so scheduling can route around
+        # seats that cannot answer instead of burning attempts against them.
+        self.health = None
 
     def register(self, adapter: Adapter) -> None:
         self._adapters[adapter.name] = adapter
@@ -73,7 +77,14 @@ class AgentRegistry:
             kwargs["images"] = images
         if cwd and getattr(adapter, "supports_cwd", False):
             kwargs["cwd"] = cwd
-        result = adapter.call(role, prompt, timeout_s, **kwargs)
+        try:
+            result = adapter.call(role, prompt, timeout_s, **kwargs)
+        except Exception as e:
+            if self.health is not None:
+                self.health.record_failure(agent, str(e))
+            raise
+        if self.health is not None:
+            self.health.record_success(agent)
         return self._normalize(result, t0)
 
     def resume(self, agent: str, resume_token: str, answer: str, timeout_s: int = 180) -> AdapterResult:
