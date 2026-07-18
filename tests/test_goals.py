@@ -2618,3 +2618,121 @@ def test_no_escalation_without_an_alternative_frontier_seat(tmp_path):
     assert second is not None
     assert second.owner == "claude"
     assert "OWNERSHIP TAKEOVER" not in second.acceptance_detail
+
+
+def test_goal_session_spend_is_counted_exactly_once(tmp_path):
+    from gangof8.models import Contribution
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(text="build", status="running")
+    session = Session(
+        session_id="s_spend", agent_call_attempts=5,
+        contributions=[
+            Contribution(round=0, role=Role.panelist, agent="claude", content="a"),
+            Contribution(round=0, role=Role.panelist, agent="claude", content="b"),
+            Contribution(round=0, role=Role.panelist, agent="codex", content="c"),
+        ],
+        task=Task(task_id="t", session_id="s_spend", text="build"),
+    )
+
+    service._count_goal_session(goal, session)
+    service._count_goal_session(goal, session)  # idempotent
+
+    # attempts (5) dominate completed contributions (3): failures cost too
+    assert goal.model_calls_used == 5
+    assert goal.model_calls_by_seat == {"claude": 2, "codex": 1}
+    assert goal.counted_session_ids == ["s_spend"]
+
+
+def test_goal_over_budget_pauses_with_cost_report_instead_of_starting_packages(tmp_path, monkeypatch):
+    """Phase 3: a goal at its call budget pauses with a per-seat cost report —
+    one real goal silently burned 283 calls on a single file."""
+    monkeypatch.setattr(config, "GOAL_MAX_MODEL_CALLS", 10)
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="build", status="running", collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        model_calls_used=10, model_calls_by_seat={"claude": 6, "glm": 4},
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="game",
+            task_text="author", status="pending", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            release_files=["game.html"],
+        )],
+    )
+    service.goals.save(goal)
+    started: list[str] = []
+    monkeypatch.setattr(
+        service, "_start_milestone",
+        lambda current, index, background: started.append(index))
+
+    service._start_ready_packages(goal, background=False)
+
+    assert started == []
+    paused = service.goals.get(goal.goal_id)
+    assert paused.status == "paused"
+    assert "goal call budget reached" in paused.last_error
+    assert "claude 6" in paused.last_error and "glm 4" in paused.last_error
+    assert "10" in paused.last_error
+
+
+def test_release_prep_respects_the_call_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "GOAL_MAX_MODEL_CALLS", 8)
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "game.html").write_text("<html></html>", encoding="utf-8")
+    goal = Goal(
+        text="build", status="running", collaboration_mode="build_team",
+        delivery_mode="final_batch", staging_root=str(stage),
+        model_calls_used=9,
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="game",
+            task_text="author", status="done", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            release_files=["game.html"],
+        )],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    assert goal.status == "paused"
+    assert "goal call budget reached" in goal.last_error
+    assert goal.release_session_id is None
+
+
+def test_resume_of_budget_paused_goal_grants_another_block(tmp_path, monkeypatch):
+    """Resume IS the cost review: it grants one more default block and the
+    goal continues; the next budget stop needs another explicit resume."""
+    monkeypatch.setattr(config, "GOAL_MAX_MODEL_CALLS", 10)
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    goal = Goal(
+        text="build", status="paused", collaboration_mode="build_team",
+        delivery_mode="final_batch", current_index=0,
+        model_calls_used=10, model_calls_by_seat={"claude": 10},
+        last_error=(
+            "goal call budget reached: 10 model calls (claude 10) against a "
+            "budget of 10; pausing for cost review — resume grants another 10 calls"
+        ),
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="game",
+            task_text="author", status="pending", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            release_files=["game.html"],
+        )],
+    )
+    service.goals.save(goal)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"))
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    extended = service.goals.get(goal.goal_id)
+    assert extended.model_calls_budget == 20
+    assert "budget reached" not in (extended.last_error or "")

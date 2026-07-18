@@ -1705,6 +1705,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         their declared interface is enough for parallel authoring.
         """
         current = self.goals.get(goal.goal_id) or goal
+        if current.status == "running" and self._pause_goal_over_budget(current):
+            self.goals.save(current)
+            return
         ready = [i for i in range(len(current.milestones)) if self._package_ready(current, i)]
         if ready:
             self.store.log_event(
@@ -1752,6 +1755,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             or persisted.worker_lease != token
                             or persisted.epoch != goal.epoch):
                         return persisted or goal
+                    goal.model_calls_used += 1
+                    goal.model_calls_by_seat[agent] = (
+                        goal.model_calls_by_seat.get(agent, 0) + 1)
                     try:
                         result = self.registry.call(
                             agent, role, prompt, timeout_s=config.GOAL_PLAN_TIMEOUT)
@@ -2612,6 +2618,76 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.store.save_session(session)
         return False
 
+    @staticmethod
+    def _goal_call_budget(goal: Goal) -> int:
+        """Effective model-call budget: per-goal override, else the config
+        default. <= 0 disables the cap."""
+        return goal.model_calls_budget or config.GOAL_MAX_MODEL_CALLS
+
+    @staticmethod
+    def _goal_cost_report(goal: Goal) -> str:
+        by_seat = ", ".join(
+            f"{seat} {count}" for seat, count in sorted(
+                goal.model_calls_by_seat.items(), key=lambda kv: (-kv[1], kv[0]))
+        ) or "no completed calls"
+        return f"{goal.model_calls_used} model calls ({by_seat})"
+
+    def _count_goal_session(self, goal: Goal, session: Session) -> None:
+        """Fold a session's spend into the goal ledger exactly once.
+
+        agent_call_attempts includes timeouts and transport failures — those
+        cost real time and often real money, so they count; contributions
+        attribute the completed calls per seat for the report.
+        """
+        if session.session_id in goal.counted_session_ids:
+            return
+        goal.counted_session_ids.append(session.session_id)
+        goal.model_calls_used += max(
+            session.agent_call_attempts, len(session.contributions))
+        for contribution in session.contributions:
+            seat = contribution.agent or "?"
+            goal.model_calls_by_seat[seat] = (
+                goal.model_calls_by_seat.get(seat, 0) + 1)
+
+    def _pause_goal_over_budget(self, goal: Goal) -> bool:
+        """Phase 3 cap: a goal at/over budget pauses with a cost report
+        instead of spending further; mutates the goal only — callers own
+        persistence. Resume grants another default block."""
+        budget = self._goal_call_budget(goal)
+        if budget <= 0 or goal.model_calls_used < budget:
+            return False
+        goal.status = "paused"
+        goal.last_error = (
+            f"goal call budget reached: {self._goal_cost_report(goal)} against "
+            f"a budget of {budget}; pausing for cost review — resume grants "
+            f"another {config.GOAL_MAX_MODEL_CALLS} calls"
+        )[:300]
+        self.store.log_event(
+            "-", "goal_budget_reached",
+            {"goal_id": goal.goal_id, "used": goal.model_calls_used,
+             "budget": budget, "by_seat": dict(goal.model_calls_by_seat)},
+        )
+        return True
+
+    def _grant_budget_extension(self, goal_id: str) -> None:
+        """An explicit human resume of a budget-paused goal IS the cost
+        review: grant one more default block and clear the pause reason."""
+        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        if goal is None:
+            return
+        token = goal.worker_lease
+        try:
+            goal.model_calls_budget = (
+                self._goal_call_budget(goal) + config.GOAL_MAX_MODEL_CALLS)
+            goal.last_error = ""
+            self.goals.save_owned(goal, token)
+            self.store.log_event(
+                "-", "goal_budget_extended",
+                {"goal_id": goal_id, "budget": goal.model_calls_budget},
+            )
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+
     def _mark_stale_assembly_packages(self, goal: Goal) -> bool:
         """Reopen any done assembly package whose accepted output was built
         from input bytes other packages have since rebuilt.
@@ -2675,6 +2751,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             # scheduling path rebuilds it from current inputs before any
             # release session is opened or paid for.
             return
+        if self._pause_goal_over_budget(goal):
+            # Release verification spends frontier calls; a goal at budget
+            # pauses for cost review before opening the session.
+            return
         files = self._goal_release_files(goal)
         goal.release_files = files
         if not files:
@@ -2711,7 +2791,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.manager.transition(session, SessionStatus.classified)
         self.manager.transition(session, SessionStatus.deliberating)
         goal.release_session_id = session.session_id
-        if not self._verify_goal_release(goal, session):
+        verified = self._verify_goal_release(goal, session)
+        self._count_goal_session(goal, session)
+        if not verified:
             goal.status = "paused"
             goal.release_status = "failed_verification"
             goal.last_error = session.stop_reason or "frontier final-batch verification failed"
@@ -3359,6 +3441,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if (milestone is None or milestone.session_id != session.session_id
                         or session.goal_epoch != goal.epoch):
                     return
+                # Fold this terminal session's spend into the goal ledger
+                # before any branch saves; idempotent per session.
+                self._count_goal_session(goal, session)
                 if session.status == SessionStatus.done:
                     accepted, files, detail = self._goal_acceptance(session, milestone)
                     milestone.acceptance_detail = detail
@@ -3605,6 +3690,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             data["contributing_agents"] = sorted(contributing_agents)
             data["contributor_count"] = len(contributing_agents)
             data["expected_contributor_count"] = len(expected_roster)
+            # Phase 3 economics: effective budget so the UI can render
+            # "used/budget" without knowing the server's config default.
+            data["call_budget"] = self._goal_call_budget(goal)
             data["participation_complete"] = (
                 set(expected_roster).issubset(contributing_agents)
                 if expected_roster else None
@@ -4026,6 +4114,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return self.get_goal(goal_id) or replanning.model_dump()
         if "pausing for human review" in (goal.last_error or ""):
             self._grant_streak_review_retry(goal_id)
+        if "goal call budget reached" in (goal.last_error or ""):
+            self._grant_budget_extension(goal_id)
+            goal = self.goals.get(goal_id) or goal
         self._reopen_paused_assembly_provider(goal_id)
         recovered = self._recover_verified_goal_packages(goal_id)
         goal = self.goals.get(goal_id) or goal

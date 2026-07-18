@@ -389,6 +389,16 @@ class Goal(BaseModel):
     # this rebuild-and-retry cycle indefinitely; see
     # ``Service._assembly_fault_streak_exceeded``.
     assembly_fault_streak: dict[str, int] = {}
+    # Economics (ARCHITECTURE-REVIEW.md Phase 3): the goal's model-call ledger.
+    # Every planning call and every counted session folds its spend in here so
+    # a runaway goal is visible and budget-capped — never another silent 283.
+    model_calls_used: int = 0
+    model_calls_by_seat: dict[str, int] = {}
+    # 0 = use config.GOAL_MAX_MODEL_CALLS. An explicit human resume of a
+    # budget-paused goal raises this by another default block.
+    model_calls_budget: int = 0
+    # Sessions already folded into the ledger — spend is counted exactly once.
+    counted_session_ids: list[str] = []
     created_at: str = Field(default_factory=utcnow)
     updated_at: str = Field(default_factory=utcnow)
 

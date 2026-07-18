@@ -359,6 +359,10 @@ package). Opt into the full council per install with environment variables:
 - `GANGOF8_GOAL_FULL_ROSTER=1` — let enabled budget seats join build-team
   goals and allow multi-owner assembly of a single release artifact
   (default: frontier seats only, one owner per artifact).
+- `GANGOF8_GOAL_MAX_MODEL_CALLS` — per-goal model-call budget (default
+  `40`, `0` disables). A goal that reaches it pauses with a per-seat cost
+  report; resuming grants another block. Spend shows on each goal card as
+  `used/budget calls`.
 
 An explicit seat roster chosen in Settings always wins over either mode.
 

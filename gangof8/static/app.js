@@ -693,11 +693,18 @@ function goalCard(g) {
       `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
       `${g.pending_inputs ? ` · ${g.pending_inputs} question blocked` : ""}` +
       ` · shared staging · ${esc(g.release_status || "not_started")}</div>` : "";
+  const spentSeats = Object.entries(g.model_calls_by_seat || {})
+    .sort((a, b) => b[1] - a[1]).map(([seat, n]) => `${seat} ${n}`).join(", ");
+  const cost = g.model_calls_used
+    ? `<span class="gprog" title="model calls spent${spentSeats ? `: ${esc(spentSeats)}` : ""}">` +
+      `${g.model_calls_used}${g.call_budget ? `/${g.call_budget}` : ""} calls</span>`
+    : "";
   return `
     <div class="goal ${esc(g.status)}">
       <div class="ghead">
         <span class="pill g-${esc(displayStatus)}">${esc(displayStatus.replaceAll("_", " "))}</span>
         <span class="gprog">${done}/${ms.length || "…"}</span>
+        ${cost}
         ${btns}
       </div>
       <div class="text" title="click to expand/collapse"

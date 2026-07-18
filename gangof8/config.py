@@ -144,6 +144,11 @@ ASSEMBLY_FAULT_STREAK_LIMIT = int(
 ASSEMBLY_FAULT_ESCALATE_AT = int(
     os.environ.get("GANGOF8_ASSEMBLY_FAULT_ESCALATE_AT", "2")
 )
+# Phase 3 economics: hard per-goal model-call budget. A goal that reaches it
+# pauses with a per-seat cost report instead of continuing to spend (one real
+# goal silently burned 283 calls on one file); an explicit human resume
+# grants another block this size. 0 disables the cap.
+GOAL_MAX_MODEL_CALLS = int(os.environ.get("GANGOF8_GOAL_MAX_MODEL_CALLS", "40"))
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom
