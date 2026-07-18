@@ -12,7 +12,15 @@ Straight from the session store:
 | Goal | Sessions | Model calls | Call distribution | Outcome |
 |---|---|---|---|---|
 | g_2d482c7e (Frogger #1) | **272** | **283** | claude 142, glm 136, all five other seats **1 each** | Failed. Human hand-assembled and delivered the file. |
-| g_8f31dff7 (Frogger #2) | **46** | **74+** (running) | claude 28, gemini 25, codex 9, qwen 7, deepseek 3, kimi 1, glm 1 | 2 days in; release still in verification. |
+| g_8f31dff7 (Frogger #2) | **46** | **74+** | claude 28, gemini 25, codex 9, qwen 7, deepseek 3, kimi 1, glm 1 | Cancelled by the operator after 2 days. |
+| **g_864401cc (Frogger #3, post-Phase-1 benchmark)** | **4** | **4** | claude 1 (authored the complete game), codex 3 (verification; 2 attempts lost to infra bugs fixed en route) | **Passed browser acceptance and independent verification; released for approval in under a day.** |
+
+*Benchmark verdict (2026-07-18): the identical brief under right-sized
+planning produced one package, one frontier author, a working game on the
+first authoring call, and a clean independent PASS — 4 calls total against
+283. The two lost verifier calls found and fixed two latent release-gate
+bugs (capacity outage recorded as rejection; verifier CLI judging an empty
+sandbox), which the old architecture's noise had always masked.*
 
 For reference: a single frontier model produces a complete, working
 single-file Frogger in **one call**, and one verify pass makes it three.
