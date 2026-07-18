@@ -3693,6 +3693,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             # Phase 3 economics: effective budget so the UI can render
             # "used/budget" without knowing the server's config default.
             data["call_budget"] = self._goal_call_budget(goal)
+            if not goal.model_calls_used and related:
+                # The durable ledger began with Phase 3; goals that predate it
+                # still show their true spend from their sessions
+                # (display-only — the stored goal is untouched).
+                data["model_calls_used"] = sum(
+                    item.get("agent_call_attempts") or 0 for item in related)
             data["participation_complete"] = (
                 set(expected_roster).issubset(contributing_agents)
                 if expected_roster else None
