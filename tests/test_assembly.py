@@ -513,3 +513,69 @@ def test_semantic_frontier_can_block_clean_deterministic_assembly(tmp_path, monk
     assert session.quality_gate["deterministic_preflight"]["verdict"] == "PASS"
     assert session.quality_gate["verdict"] == "FAIL"
     assert session.status == SessionStatus.failed
+
+
+def test_frontier_repair_accepts_whole_file_artifact_rewrite(tmp_path, monkeypatch):
+    """Phase 2 repair mandate: a verifier that sees a structural defect must be
+    able to ship a COMPLETE replacement file (ARTIFACT/END_ARTIFACT), not only
+    surgical OLD/NEW edits — a real verifier rejected a whole batch over
+    defects it could have rewritten in place, wasting the entire cycle."""
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    output = stage / "index.html"
+    output.write_text(
+        "<!doctype html><html><body><script>const broken = true;</script></body></html>",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    package = GoalMilestone(
+        index=0, package_id="wp_1", title="release", task_text="assemble",
+        owner="claude", required_files=["index.html"], release_files=["index.html"],
+        accepted_hashes={"index.html": digest}, assembly_mode=assembly.HTML_INLINE,
+        assembly_template=assembly.OWNER_TEMPLATE,
+    )
+    goal = Goal(
+        text="The release must define a working ready flag.",
+        staging_root=str(stage), milestones=[package],
+    )
+    session = Session(
+        session_id="s_release_rewrite", status=SessionStatus.deliberating,
+        workspace_root=str(stage), required_files=["index.html"],
+        task=Task(task_id="t", session_id="s_release_rewrite", text=goal.text),
+    )
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex"]
+    monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
+    replacement = (
+        "<!doctype html><html><body><script>const ready = true;"
+        "</script></body></html>"
+    )
+    calls = []
+
+    def semantic_review(current, _registry, _store, member, _prompt, timeout_s=None, **_kwargs):
+        del current, _registry, _store, member, _prompt, timeout_s
+        calls.append(1)
+        if len(calls) == 1:
+            content = (
+                "CHECK R1: FAIL - the flag is named broken, rewriting the file\n"
+                "ARTIFACT: index.html\n"
+                f"{replacement}\n"
+                "END_ARTIFACT\n"
+                "VERDICT: FAIL"
+            )
+        else:
+            content = "CHECK R1: PASS - ready flag present\nVERDICT: PASS"
+        return Contribution(
+            round=0, role=Role.panelist, agent="codex", content=content,
+        )
+
+    monkeypatch.setattr(service_module, "_agent_call", semantic_review)
+
+    assert service._verify_goal_release(goal, session)
+    assert len(calls) == 2
+    assert output.read_text(encoding="utf-8") == replacement
+    assert session.quality_gate["verdict"] == "PASS"
+    assert session.quality_gate["repairs_applied"] == 1
+    # provenance names the repairing agent, not the original owner
+    assert package.output_provenance["index.html"]["agent"] == "codex"
+    assert package.output_provenance["index.html"]["method"] == "frontier_release_repair"

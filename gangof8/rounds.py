@@ -992,8 +992,18 @@ def frontier_release_prompt(
         "This is the confirmation pass after your prior repair. Do not trust the "
         "claimed fix; re-inspect the resulting files from scratch."
         if repair_attempt else
-        "If any requirement fails, do implementation work now: emit the smallest "
-        "safe EDIT block(s) that fully repair it."
+        "REPAIR MANDATE — you are a release ENGINEER, not a critic. For EVERY "
+        "check you FAIL where the fix is knowable from the code in front of "
+        "you, you MUST ship that fix in this same reply:\n"
+        "- surgical fixes: exact, unique OLD/NEW EDIT block(s);\n"
+        "- broader fixes (structural rework, many touchpoints): a COMPLETE "
+        "replacement file as 'ARTIFACT: <exact path shown below>' followed by "
+        "the full file body and a line 'END_ARTIFACT'.\n"
+        "A FAIL without a repair is acceptable ONLY when the fix genuinely "
+        "requires its owner's rebuild (a missing subsystem, absent content you "
+        "cannot invent); say so in that DEFECT line as 'requires owner "
+        "rebuild: <why>'. Rejecting without repairing fixable defects wastes "
+        "an entire verification cycle and is treated as an incomplete review."
     )
     return (
         "You are the independent FRONTIER RELEASE ENGINEER. You did not select or "

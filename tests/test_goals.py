@@ -2536,3 +2536,85 @@ def test_release_verifier_runs_inside_a_review_copy_of_the_release_files(tmp_pat
     assert seen["workspace_note"] is True
     # the review copy is a COPY, not the staging directory itself
     assert Path(seen["cwd"]).resolve() != stage.resolve()
+
+
+def _escalation_fixture(tmp_path, owner):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex"]
+    stage = tmp_path / "stage"
+    (stage / "js").mkdir(parents=True)
+    (stage / "js" / "bad.js").write_text("window.Thing = {};\n", encoding="utf-8")
+    goal = Goal(
+        text="assemble", status="running", current_index=1,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_bad", owner=owner, title="bad",
+                task_text="author bad", status="done", session_id="s_bad",
+                contract_declared=True, requires_delivery=True,
+                required_files=["js/bad.js"],
+            ),
+            GoalMilestone(
+                index=1, package_id="wp_asm", owner="claude", title="assembly",
+                task_text="assemble", status="failed", session_id="s_asm",
+                depends_on=[0], contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], dependencies=["js/bad.js"],
+                assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+            ),
+        ],
+    )
+    session = Session(
+        session_id="s_asm", status=SessionStatus.failed,
+        goal_id=goal.goal_id, workspace_root=str(stage),
+        assembly_mode=assembly.HTML_INLINE, assembly_template="index.html",
+        quality_gate={
+            "verdict": "FAIL", "stage": "deterministic_assembly",
+            "detail": "assembly dependency is not utf-8 text: js/bad.js",
+            "fault_scope": "dependency", "fault_path": "js/bad.js",
+        },
+        task=Task(task_id="t_esc", session_id="s_asm", text="assembly"),
+    )
+    service.store.save_session(session)
+    return service, goal, session
+
+
+def test_second_fault_blame_escalates_package_to_strongest_frontier_seat(tmp_path):
+    """ARCHITECTURE-REVIEW.md Phase 2 ladder: blame 1 = owner retries with the
+    constraint; blame 2 = the package transfers to the strongest frontier seat
+    — the same fault never goes back to the same seat with the same brief
+    until a human is needed."""
+    service, goal, session = _escalation_fixture(tmp_path, owner="qwen")
+
+    first = service._invalidate_assembly_input_provider(goal, session, 1)
+    assert first is not None and first.owner == "qwen"
+
+    second = service._invalidate_assembly_input_provider(goal, session, 1)
+
+    assert second is not None
+    assert second.owner == "claude"
+    assert "OWNERSHIP TAKEOVER" in second.acceptance_detail
+    assert "qwen failed to resolve" in second.acceptance_detail
+    assert goal.assembly_fault_streak == {"0:dependency:js/bad.js": 2}
+
+
+def test_escalation_from_a_frontier_owner_moves_to_the_other_frontier_seat(tmp_path):
+    service, goal, session = _escalation_fixture(tmp_path, owner="claude")
+
+    service._invalidate_assembly_input_provider(goal, session, 1)
+    second = service._invalidate_assembly_input_provider(goal, session, 1)
+
+    assert second is not None
+    assert second.owner == "codex"
+
+
+def test_no_escalation_without_an_alternative_frontier_seat(tmp_path):
+    service, goal, session = _escalation_fixture(tmp_path, owner="claude")
+    service.panel = ["claude"]  # no other frontier seat available
+
+    service._invalidate_assembly_input_provider(goal, session, 1)
+    second = service._invalidate_assembly_input_provider(goal, session, 1)
+
+    assert second is not None
+    assert second.owner == "claude"
+    assert "OWNERSHIP TAKEOVER" not in second.acceptance_detail
