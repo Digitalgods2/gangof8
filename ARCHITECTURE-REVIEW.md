@@ -136,7 +136,7 @@ to silently continue.
 
 ## 5. The plan
 
-### Phase 1 — Triage & right-sizing *(biggest win, smallest change)*
+### Phase 1 — Triage & right-sizing *(implemented 2026-07-17)*
 
 1. **Complexity triage** at submission and at goal planning. Three modes:
    - **solo** — one frontier author + gates + one independent verify pass.
@@ -160,7 +160,7 @@ to silently continue.
 *Expected effect: the Frogger brief becomes 1 author call + gates + 1
 verify + 1 release ≈ **3–6 calls total**, versus 74 and 283.*
 
-### Phase 2 — Repair-first release loop
+### Phase 2 — Repair-first release loop *(implemented 2026-07-18)*
 
 5. **Verifier repair mandate.** On FAIL with a concrete fix, the verifier
    must ship the fix — including whole-file rewrites, not just `edit_file`
