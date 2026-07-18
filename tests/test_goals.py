@@ -1973,7 +1973,7 @@ def test_resume_of_breaker_paused_goal_grants_one_more_review_cycle(tmp_path, mo
             "fault 3 times in a row without resolving it (styles.css); pausing "
             "for human review instead of rebuilding it again"
         ),
-        assembly_fault_streak={f"0:dependency:styles.css": limit + 1},
+        assembly_fault_streak={"0:dependency:styles.css": limit + 1},
         milestones=[
             GoalMilestone(
                 index=0, package_id="wp_shell", owner="gemini", title="shell",
