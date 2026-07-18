@@ -72,11 +72,13 @@ def unregister_progress(session_id: str | None, call_id: str | None) -> None:
         _progressers.pop((session_id, call_id), None)
 
 
-def report_progress(chars: int = 0, detail: str = "output") -> None:
+def report_progress(chars: int = 0, detail: str = "output", tail: str = "") -> None:
     """Report meaningful adapter progress for the current call, if registered.
 
     Network keep-alives never call this function.  Only parsed model output (or
     an equivalent adapter-level milestone) refreshes the progress timestamp.
+    ``tail`` optionally carries the last few hundred characters the model has
+    produced so the dashboard can show what is being written, live.
     """
     sid, call_id = current_session(), current_call()
     if not sid or not call_id:
@@ -85,7 +87,7 @@ def report_progress(chars: int = 0, detail: str = "output") -> None:
         fn = _progressers.get((sid, call_id))
     if fn is not None:
         try:
-            fn(max(0, int(chars)), str(detail or "output"))
+            fn(max(0, int(chars)), str(detail or "output"), str(tail or ""))
         except Exception:  # noqa: BLE001 - progress reporting must never break a call
             pass
 

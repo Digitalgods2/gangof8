@@ -685,7 +685,8 @@ function goalCard(g) {
   const btns =
     (g.status === "paused" ? `<button class="gbtn" onclick="resumeGoal('${esc(g.goal_id)}', event)">Resume</button>` : "") +
     (live || g.status === "paused" ? `<button class="gbtn ghost" onclick="cancelGoal('${esc(g.goal_id)}', event)">Cancel</button>` : "") +
-    (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "");
+    (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "") +
+    `<button class="gbtn ghost" title="Full story: timeline + postmortem" onclick="toggleGoalStory('${esc(g.goal_id)}', event)">📜</button>`;
   const aggregate = g.delivery_mode === "final_batch"
     ? `<div class="sub">Build team · ${contributors}/${expectedContributors || "?"} contributing models` +
       ` · ${owners} planned owner${owners === 1 ? "" : "s"} · ${running} active` +
@@ -709,10 +710,46 @@ function goalCard(g) {
       </div>
       <div class="text" title="click to expand/collapse"
            onclick="this.classList.toggle('open')">${esc(g.text)}</div>
+      ${g.now ? `<div class="gnow">▸ ${esc(g.now)}</div>` : ""}
       ${g.last_error ? `<div class="gerr">${esc(g.last_error)}</div>` : ""}
       ${aggregate}
       ${rows}
+      <div class="gstory" id="gstory-${esc(g.goal_id)}" style="display:none"></div>
     </div>`;
+}
+
+async function toggleGoalStory(goalId, ev) {
+  if (ev) ev.stopPropagation();
+  const el = document.getElementById("gstory-" + goalId);
+  if (!el) return;
+  if (el.style.display !== "none") { el.style.display = "none"; return; }
+  el.style.display = "";
+  el.innerHTML = `<div class="hint">loading the story…</div>`;
+  const d = await api("/goals/" + encodeURIComponent(goalId) + "/timeline").catch(() => null);
+  if (!d) { el.innerHTML = `<div class="hint">could not load the timeline</div>`; return; }
+  const s = d.summary || {};
+  const seats = Object.entries(s.calls_by_seat || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+  const at = s.attempts || {};
+  const attemptBits = [
+    at.completed ? `${at.completed} completed` : "",
+    at.seat_outage ? `${at.seat_outage} lost to seat outages` : "",
+    at.interrupted ? `${at.interrupted} interrupted` : "",
+    at.other_failures ? `${at.other_failures} failed` : "",
+  ].filter(Boolean).join(" · ");
+  const pkgs = (s.packages || []).map(p =>
+    `P${p.package} ${esc(p.title)} — ${esc(p.owner)} (${esc(p.status)}${p.invalidated_attempts ? `, ${p.invalidated_attempts} invalidated attempt${p.invalidated_attempts === 1 ? "" : "s"}` : ""})`
+  ).join("<br>");
+  const rows = (d.events || []).slice(-120).map(e =>
+    `<div class="tlrow"><span class="tlts">${esc((e.ts || "").slice(11, 19))}</span> ${esc(e.icon || "•")} <b>${esc(e.label || e.event)}</b>${e.detail ? ` — ${esc(e.detail)}` : ""}</div>`
+  ).join("");
+  el.innerHTML = `
+    <div class="gsummary">
+      <b>${esc(s.status || "")}${s.release_status ? " · " + esc(s.release_status) : ""}</b>
+      · ${s.calls_used ?? 0}/${s.call_budget ?? "∞"} calls${seats ? ` (${esc(seats)})` : ""}
+      ${attemptBits ? `<br>attempts: ${esc(attemptBits)}` : ""}
+      ${pkgs ? `<br>${pkgs}` : ""}
+    </div>
+    <div class="gtimeline">${rows || '<div class="hint">no events recorded</div>'}</div>`;
 }
 
 async function refreshGoals(sessions = null) {
@@ -892,6 +929,57 @@ async function _refreshDetail() {
 // working. Idle (everything done/cancelled/failed) → slow checks; tab hidden →
 // no requests at all; resume instantly when the tab is shown again.
 const TERMINAL_STATES = new Set(["done", "cancelled", "failed"]);
+// ---- live activity feed (SSE) + seat health badges ----------------------
+const FEED_MAX_ROWS = 60;
+let _feedSource = null;
+function startFeed() {
+  if (_feedSource) return;
+  const el = document.getElementById("feed");
+  const dot = document.getElementById("feedDot");
+  if (!el) return;
+  try { _feedSource = new EventSource("/events/stream"); } catch (e) { return; }
+  _feedSource.onopen = () => { if (dot) dot.classList.add("on"); };
+  _feedSource.onerror = () => {
+    if (dot) dot.classList.remove("on");
+    // EventSource retries automatically; nothing else to do.
+  };
+  _feedSource.onmessage = (m) => {
+    let e = null;
+    try { e = JSON.parse(m.data); } catch (err) { return; }
+    const row = document.createElement("div");
+    row.className = "feedrow";
+    const ts = (e.ts || "").slice(11, 19);
+    const target = e.session_id && e.session_id !== "-" ? e.session_id : "";
+    row.innerHTML = `<span class="tlts">${esc(ts)}</span> ${esc(e.icon || "•")} ` +
+      `<b>${esc(e.label || e.event || "")}</b>` +
+      `${e.detail ? ` — ${esc(e.detail)}` : ""}`;
+    if (target) {
+      row.classList.add("clickable");
+      row.title = "open session " + target;
+      row.onclick = () => select(target);
+    }
+    el.prepend(row);
+    while (el.childElementCount > FEED_MAX_ROWS) el.removeChild(el.lastChild);
+  };
+}
+
+async function refreshSeatHealth() {
+  const el = document.getElementById("seatHealth");
+  if (!el) return;
+  const d = await api("/seats").catch(() => null);
+  if (!d) return;
+  const badge = (seat) => {
+    const info = (d.seats || {})[seat] || {};
+    const state = info.state || "healthy";
+    const cls = state === "healthy" ? "ok"
+      : (state === "degraded" || state === "capacity" || state === "timeout") ? "warn" : "bad";
+    const label = state === "healthy" ? "" : ` ${state.replaceAll("_", " ")}`;
+    const reason = info.reason ? ` — ${info.reason}` : "";
+    return `<span class="seatb ${cls}" title="${esc(seat)}: ${esc(state)}${esc(reason)}">${esc(seat)}${esc(label)}</span>`;
+  };
+  el.innerHTML = (d.panel || []).map(badge).join("");
+}
+
 const POLL_ACTIVE_DEFAULT = 3000, POLL_IDLE = 20000, POLL_HIDDEN = 30000;
 let _pollTimer = null, _pollGeneration = 0;
 function activePollInterval() {
@@ -906,6 +994,7 @@ async function pollLoop() {
     delay = POLL_HIDDEN;  // tab not visible: skip the fetch entirely
   } else {
     const sessions = await refresh().catch(() => []);
+    refreshSeatHealth().catch(() => {});
     // A submit/cancel/resolve may start a newer poll while this one awaits the
     // API. Only that newest poll is allowed to own the next timer.
     if (pollGeneration !== _pollGeneration) return;
@@ -1159,6 +1248,7 @@ function renderDetail(s) {
           <div>
             <div class="what">${packageMode ? "Building package" : esc(s.status)}<span class="ell"></span></div>
             <div class="meta">${liveGoal ? esc(liveGoal) : `round ${s.current_round ?? 0}`}${waitRole ? ` · ${esc(waitRole)} · ${esc(waitAgent)}` : ""}${_liveTalent ? ` · 🤝 ${esc(_liveTalent)}` : ""} · <span id="elapsed">0:00</span></div>
+            ${activeCall && activeCall.tail ? `<div class="tail" title="what the model is writing right now"><code>${esc(activeCall.tail)}</code></div>` : ""}
           </div>
         </div>
         ${_liveFeed.length ? `<div class="livefeed">${_liveFeed.map(e => `
@@ -2202,5 +2292,6 @@ if (location.hash.length > 1) select(decodeURIComponent(location.hash.slice(1)))
 else renderEmptyHero();
 loadUiPreferences().finally(() => pollLoop());
 setInterval(tickElapsed, 1000);
+startFeed();
 // when a task is submitted or an action resolved, jump back to fast polling
 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollLoop(); });

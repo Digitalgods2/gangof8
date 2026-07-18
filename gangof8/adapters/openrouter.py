@@ -114,11 +114,16 @@ class OpenRouterAdapter:
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
 
-        def _model_progress(chars: int) -> None:
+        tail_buf = [""]
+
+        def _model_progress(chars: int, tail_delta: str = "") -> None:
             with progress_lock:
                 last_progress[0] = time.monotonic()
                 output_chars[0] = max(output_chars[0], chars)
-            cancellation.report_progress(output_chars[0], "model output streaming")
+                if tail_delta:
+                    tail_buf[0] = (tail_buf[0] + tail_delta)[-400:]
+            cancellation.report_progress(
+                output_chars[0], "model output streaming", tail=tail_buf[0])
 
         def _watch_deadline() -> None:
             deadline_s = max(1.0, float(timeout_s)) if timeout_s > 0 else None
@@ -222,7 +227,8 @@ class OpenRouterAdapter:
                                 delta = delta_obj.get("content")
                                 if isinstance(delta, str) and delta:
                                     content_parts.append(delta)
-                                    _model_progress(output_chars[0] + len(delta))
+                                    _model_progress(
+                                        output_chars[0] + len(delta), delta)
             else:
                 fallback_payload = dict(payload)
                 fallback_payload.pop("stream", None)

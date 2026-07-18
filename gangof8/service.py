@@ -53,6 +53,7 @@ from .paths import extract_delivery_target, extract_established_root, prior_deli
 from .registry import AgentError
 from .registry import AgentRegistry
 from .runtime_diagnostics import collect_runtime_diagnostics
+from .seat_health import SeatHealth
 from .sessions import SessionManager
 from .settings import (
     Settings,
@@ -264,6 +265,11 @@ class GangOf8Service:
             self.role_agents = self._apply_seat_disables(self.role_agents)
 
         self.registry = AgentRegistry()
+        # Shared per-seat health: fed by every registry call outcome and
+        # consulted by scheduling so hard-unavailable seats (quota, auth,
+        # offline) are routed around instead of retried into the ground.
+        self.seat_health = SeatHealth()
+        self.registry.health = self.seat_health
         if self.backend == "cli":
             # A disabled OpenRouter seat is never registered merely because a
             # stale/custom role mapping references it.
@@ -1708,6 +1714,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if current.status == "running" and self._pause_goal_over_budget(current):
             self.goals.save(current)
             return
+        self._route_around_unavailable_owners(current)
         ready = [i for i in range(len(current.milestones)) if self._package_ready(current, i)]
         if ready:
             self.store.log_event(
@@ -1878,6 +1885,64 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if current and current.status == "running" and current.epoch == start_epoch:
             self._start_ready_packages(current, background=current.background)
         return self.goals.get(goal.goal_id) or goal
+
+    @staticmethod
+    def _session_seat_outage(session: Session) -> str:
+        """A human-readable seat-outage explanation for a failed session, or
+        "" when the failure was not a seat outage. Scans the session's
+        unresolved notes for dropped seats whose error classifies as
+        hard-unavailable (quota/auth/offline)."""
+        from .seat_health import UNAVAILABLE_STATES, classify_failure
+        for note in (session.unresolved or []):
+            match = re.search(
+                r"seat '([\w.\-]+)' dropped[^:]*:\s*(.+)", str(note))
+            if not match:
+                continue
+            seat, error_text = match.group(1), match.group(2)
+            state = classify_failure(error_text)
+            if state in UNAVAILABLE_STATES:
+                return (
+                    f"seat {seat} is unavailable ({state.replace('_', ' ')}): "
+                    f"{error_text.strip()[:160]}"
+                )
+        return ""
+
+    def _route_around_unavailable_owners(self, goal: Goal) -> None:
+        """Reassign pending packages away from seats that cannot answer.
+
+        A seat in a hard-unavailable state (quota exhausted, auth expired,
+        CLI offline) fails every attempt by definition; scheduling against
+        it burns budget and surfaces as a fake-fatal session error. When a
+        healthy frontier seat exists, transfer ownership BEFORE the session
+        opens and say so; when none exists, the package start will fail
+        honestly and the goal error names the seat, not the symptom.
+        """
+        changed = False
+        for package in goal.milestones:
+            if package.status != "pending" or not package.owner:
+                continue
+            if not self.seat_health.is_unavailable(package.owner):
+                continue
+            replacement = next(
+                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                 if seat in self.panel and seat != package.owner
+                 and not self.seat_health.is_unavailable(seat)),
+                None,
+            )
+            if replacement is None:
+                continue
+            reason = self.seat_health.state(package.owner)
+            self.store.log_event(
+                "-", "package_owner_rerouted_seat_unavailable",
+                {"goal_id": goal.goal_id, "package": package.index + 1,
+                 "from_owner": package.owner, "to_owner": replacement,
+                 "seat_state": reason,
+                 "detail": self.seat_health.reason(package.owner)[:200]},
+            )
+            package.owner = replacement
+            changed = True
+        if changed:
+            self.goals.save(goal)
 
     def _start_milestone(self, goal: Goal, index: int, background: bool) -> Optional[Session]:
         """Create a session, then atomically bind it to one live goal epoch."""
@@ -2318,6 +2383,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         verifier_pool = [
             seat for seat in enabled_frontier if seat not in release_owners
         ]
+        healthy_pool = [
+            seat for seat in verifier_pool
+            if not self.seat_health.is_unavailable(seat)
+        ]
+        # Prefer seats that can actually answer; if health has marked every
+        # candidate unavailable, keep the original pool so the transport
+        # retry/UNAVAILABLE path reports honestly rather than aborting here.
+        verifier_pool = healthy_pool or verifier_pool
         verifier_name = verifier_pool[0] if verifier_pool else None
         if verifier_name is None:
             detail = (
@@ -3365,7 +3438,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
             replacement = next(
                 (seat for seat in config.FRONTIER_AUTHOR_SEATS
-                 if seat in self.panel and seat != provider.owner),
+                 if seat in self.panel and seat != provider.owner
+                 and not self.seat_health.is_unavailable(seat)),
                 None,
             )
             if replacement:
@@ -3593,8 +3667,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             for item in goal.milestones
                         )
                         goal.status = "draining" if sibling_running else "paused"
+                        # Name the SEAT truth when that is the real story: a
+                        # quota-capped claude once surfaced as "no file was
+                        # delivered" and read as a fatal app error.
+                        outage = self._session_seat_outage(session)
                         goal.last_error = (
-                            session.stop_reason or f"milestone {idx + 1} failed"
+                            outage or session.stop_reason
+                            or f"milestone {idx + 1} failed"
                         )[:300]
                         self.goals.save_owned(goal, token)
                         self.store.log_event(
@@ -3624,6 +3703,42 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.log_event("-", "goal_advance_error",
                                  {"goal_id": session.goal_id, "detail": str(e)})
 
+    @staticmethod
+    def _goal_now_line(goal: Goal, related: list[dict]) -> str:
+        """Plain-language current activity for a goal card."""
+        if goal.status == "planning":
+            return "planning the build"
+        if goal.status == "completed":
+            return "released"
+        if goal.status == "cancelled":
+            return "cancelled"
+        if goal.status == "paused":
+            reason = (goal.last_error or "").split(";")[0].strip()
+            return f"paused — {reason}" if reason else "paused"
+        if goal.release_status == "awaiting_approval":
+            return "waiting for your release approval"
+        if goal.release_status == "awaiting_target":
+            return "waiting for a delivery folder"
+        running = [m for m in goal.milestones if m.status == "running"]
+        if running:
+            parts = []
+            for package in running[:2]:
+                meta = next(
+                    (item for item in related
+                     if item.get("session_id") == package.session_id), {})
+                calls = meta.get("active_agent_calls") or []
+                streaming = next(
+                    (c for c in calls if c.get("progress_chars")), None)
+                doing = f"{package.owner or 'seat'} authoring " + (
+                    ", ".join(package.required_files[:2]) or package.title)
+                if streaming:
+                    doing += f" ({streaming['progress_chars']:,} chars streamed)"
+                parts.append(doing)
+            return "; ".join(parts)
+        if goal.status == "running" and all(
+                m.status == "done" for m in goal.milestones) and goal.milestones:
+            return "verifying the final release"
+        return goal.status
     def _goal_views(self, items: list[Goal]) -> list[dict]:
         """Attach aggregate/actionable state without mutating durable goals."""
         sessions = self.store.list_sessions(limit=None)
@@ -3713,6 +3828,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             # Phase 3 economics: effective budget so the UI can render
             # "used/budget" without knowing the server's config default.
             data["call_budget"] = self._goal_call_budget(goal)
+            # NEXT-LEVEL R5: one plain sentence answering "what is this goal
+            # doing right now" — internal states are coordinator jargon.
+            data["now"] = self._goal_now_line(goal, related)
             if not goal.model_calls_used and related:
                 # The durable ledger began with Phase 3; goals that predate it
                 # still show their true spend from their sessions
@@ -4263,6 +4381,102 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 except _json.JSONDecodeError:
                     continue
         return {"session_id": session_id, "events": reporting.format_timeline(events)}
+
+    def goal_timeline(self, goal_id: str) -> dict:
+        """One ordered story for a whole goal, plus a derived postmortem.
+
+        Events are logged per-session (goal-scoped ones under "-" with a
+        goal_id payload), so a goal's narrative was previously scattered
+        across files and only recoverable by hand. This merges every related
+        log, and summarizes what a human wants after the fact: duration,
+        spend per seat, packages/owners/attempts, and how attempts were
+        actually lost (completed vs seat outage vs interrupted) so model
+        cost and infrastructure cost are separated honestly.
+        """
+        import json as _json
+
+        goal = self.goals.get(goal_id)
+        if goal is None:
+            raise KeyError(f"goal {goal_id} not found")
+
+        def read_log(session_id: str) -> list[dict]:
+            path = self.store.session_log_path(session_id)
+            out: list[dict] = []
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        out.append(_json.loads(line))
+                    except _json.JSONDecodeError:
+                        continue
+            return out
+
+        related = [
+            meta for meta in self.store.list_sessions(limit=None)
+            if meta.get("goal_id") == goal_id
+        ]
+        events: list[dict] = []
+        for meta in related:
+            for record in read_log(meta["session_id"]):
+                record["session_id"] = meta["session_id"]
+                events.append(record)
+        for record in read_log("-"):
+            if (record.get("payload") or {}).get("goal_id") == goal_id:
+                record["session_id"] = "-"
+                events.append(record)
+        events.sort(key=lambda record: record.get("ts") or "")
+        events = events[-400:]
+
+        attempts = 0
+        completed = 0
+        outage_attempts = 0
+        interrupted = 0
+        from .seat_health import UNAVAILABLE_STATES, classify_failure
+        for meta in related:
+            session = self.manager.load(meta["session_id"])
+            if session is None:
+                continue
+            attempts += session.agent_call_attempts
+            completed += len(session.contributions)
+            if session.status == SessionStatus.cancelled:
+                interrupted += max(
+                    0, session.agent_call_attempts - len(session.contributions))
+            for note in (session.unresolved or []):
+                if ("dropped" in str(note)
+                        and classify_failure(str(note)) in UNAVAILABLE_STATES):
+                    outage_attempts += 1
+        failed_other = max(
+            0, attempts - completed - interrupted - outage_attempts)
+        summary = {
+            "status": goal.status,
+            "release_status": goal.release_status,
+            "created_at": goal.created_at,
+            "updated_at": goal.updated_at,
+            "calls_used": goal.model_calls_used,
+            "call_budget": self._goal_call_budget(goal),
+            "calls_by_seat": dict(goal.model_calls_by_seat),
+            "attempts": {
+                "total": attempts,
+                "completed": completed,
+                "seat_outage": outage_attempts,
+                "interrupted": interrupted,
+                "other_failures": failed_other,
+            },
+            "packages": [
+                {
+                    "package": package.index + 1,
+                    "title": package.title,
+                    "owner": package.owner,
+                    "status": package.status,
+                    "invalidated_attempts": len(package.invalidated_session_ids),
+                }
+                for package in goal.milestones
+            ],
+        }
+        return {
+            "goal_id": goal_id,
+            "summary": summary,
+            "events": reporting.format_timeline(events),
+        }
 
     _TERMINAL = {SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}
     _PAUSED = {SessionStatus.awaiting_approval, SessionStatus.awaiting_input}
