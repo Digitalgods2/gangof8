@@ -134,16 +134,39 @@ function _throwCaptured(){
     throw err;
   }
 }
+// A COMPLETE AudioParam stub, shared by every node parameter. Faking only a
+// few methods falsely rejected valid games: a real Asteroids used the
+// standard gain.setTargetAtTime(...) and "crashed" only in this harness.
+function _param(){ return { value:0, defaultValue:0, minValue:-3.4e38, maxValue:3.4e38,
+  setValueAtTime:_noop, linearRampToValueAtTime:_noop, exponentialRampToValueAtTime:_noop,
+  setTargetAtTime:_noop, setValueCurveAtTime:_noop,
+  cancelScheduledValues:_noop, cancelAndHoldAtTime:_noop }; }
 const _audio = () => ({ state:"running", resume:()=>Promise.resolve(), suspend:_noop,
+  close:()=>Promise.resolve(),
   currentTime:0, sampleRate:44100, destination:{},
-  createOscillator:()=>({ frequency:{ setValueAtTime:_noop, linearRampToValueAtTime:_noop, exponentialRampToValueAtTime:_noop, value:0 },
-    type:"", detune:{ setValueAtTime:_noop }, connect:()=>_chain, start:_noop, stop:_noop, onended:null }),
-  createGain:()=>({ gain:{ setValueAtTime:_noop, linearRampToValueAtTime:_noop, exponentialRampToValueAtTime:_noop, value:0 }, connect:()=>_chain }),
-  createBiquadFilter:()=>({ frequency:{ setValueAtTime:_noop, exponentialRampToValueAtTime:_noop, value:0 }, type:"", connect:()=>_chain }),
+  createOscillator:()=>({ frequency:_param(), detune:_param(),
+    type:"", connect:()=>_chain, disconnect:_noop, start:_noop, stop:_noop, onended:null }),
+  createGain:()=>({ gain:_param(), connect:()=>_chain, disconnect:_noop }),
+  createBiquadFilter:()=>({ frequency:_param(), detune:_param(), Q:_param(), gain:_param(),
+    type:"", connect:()=>_chain, disconnect:_noop }),
   createBuffer:()=>({ getChannelData:()=>new Float32Array(256) }),
-  createBufferSource:()=>({ buffer:null, connect:()=>_chain, start:_noop, stop:_noop }),
-  createDynamicsCompressor:()=>({ connect:()=>_chain }),
-  createAnalyser:()=>({ connect:()=>_chain }),
+  createBufferSource:()=>({ buffer:null, playbackRate:_param(), detune:_param(), loop:false,
+    connect:()=>_chain, disconnect:_noop, start:_noop, stop:_noop, onended:null }),
+  createDynamicsCompressor:()=>({ threshold:_param(), knee:_param(), ratio:_param(),
+    attack:_param(), release:_param(), connect:()=>_chain, disconnect:_noop }),
+  createAnalyser:()=>({ fftSize:2048, frequencyBinCount:1024,
+    getByteFrequencyData:_noop, getByteTimeDomainData:_noop,
+    getFloatFrequencyData:_noop, getFloatTimeDomainData:_noop,
+    connect:()=>_chain, disconnect:_noop }),
+  createStereoPanner:()=>({ pan:_param(), connect:()=>_chain, disconnect:_noop }),
+  createPanner:()=>({ positionX:_param(), positionY:_param(), positionZ:_param(),
+    setPosition:_noop, connect:()=>_chain, disconnect:_noop }),
+  createDelay:()=>({ delayTime:_param(), connect:()=>_chain, disconnect:_noop }),
+  createWaveShaper:()=>({ curve:null, oversample:"none", connect:()=>_chain, disconnect:_noop }),
+  createConvolver:()=>({ buffer:null, connect:()=>_chain, disconnect:_noop }),
+  createChannelMerger:()=>({ connect:()=>_chain, disconnect:_noop }),
+  createChannelSplitter:()=>({ connect:()=>_chain, disconnect:_noop }),
+  createPeriodicWave:()=>({}),
   decodeAudioData:()=>Promise.resolve({}) });
 const _store = {};
 const _raf = (cb) => { _rafState.cb = cb; return 1; };

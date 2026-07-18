@@ -234,3 +234,35 @@ def test_console_error_only_in_untriggered_path_passes():
     src = "function reportProblem(){ console.error('never called'); }\nwindow.ok = 1;"
     ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
     assert ran is True and testable is True, detail
+
+
+def test_full_web_audio_param_surface_does_not_falsely_reject():
+    """AudioParam stubs must cover the real API: a valid Asteroids used the
+    standard gain.setTargetAtTime(...) and was rejected as a crasher because
+    the harness faked only three param methods. Exercise the commonly used
+    node/param surface end to end."""
+    src = (
+        "const ctx = new AudioContext();\n"
+        "const osc = ctx.createOscillator();\n"
+        "osc.frequency.setTargetAtTime(440, ctx.currentTime, 0.1);\n"
+        "osc.frequency.cancelScheduledValues(0);\n"
+        "osc.detune.setValueAtTime(3, 0);\n"
+        "const g = ctx.createGain();\n"
+        "g.gain.setTargetAtTime(0.5, ctx.currentTime, 0.02);\n"
+        "g.gain.setValueCurveAtTime(new Float32Array([0,1]), 0, 1);\n"
+        "const f = ctx.createBiquadFilter();\n"
+        "f.Q.setValueAtTime(2, 0); f.gain.setTargetAtTime(1, 0, 0.1);\n"
+        "const src2 = ctx.createBufferSource();\n"
+        "src2.playbackRate.setTargetAtTime(1.5, 0, 0.1);\n"
+        "const comp = ctx.createDynamicsCompressor();\n"
+        "comp.threshold.setValueAtTime(-24, 0);\n"
+        "const pan = ctx.createStereoPanner();\n"
+        "pan.pan.setTargetAtTime(-1, 0, 0.1);\n"
+        "const delay = ctx.createDelay();\n"
+        "delay.delayTime.setTargetAtTime(0.3, 0, 0.1);\n"
+        "osc.connect(g); g.connect(f); f.connect(comp); comp.connect(pan);\n"
+        "pan.connect(delay); delay.connect(ctx.destination);\n"
+        "osc.start(); window.audioReady = true;\n"
+    )
+    ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
+    assert ran is True and testable is True, detail
