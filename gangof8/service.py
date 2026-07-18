@@ -2309,10 +2309,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         release_owners = {
             package.owner for package in goal.milestones if package.release_files
         }
-        verifier_name = next(
-            (seat for seat in enabled_frontier if seat not in release_owners),
-            None,
-        )
+        verifier_pool = [
+            seat for seat in enabled_frontier if seat not in release_owners
+        ]
+        verifier_name = verifier_pool[0] if verifier_pool else None
         if verifier_name is None:
             detail = (
                 "no independent frontier release engineer is available after "
@@ -2332,7 +2332,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.save_session(session)
             return False
 
-        member = CouncilMember(role=Role.panelist, agent=verifier_name, active=True)
         def read_files() -> list[tuple[str, str]]:
             loaded: list[tuple[str, str]] = []
             for name in session.required_files:
@@ -2366,20 +2365,67 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             prompt = rounds.frontier_release_prompt(
                 session, files, defect_register=release_defect_register,
                 repair_attempt=attempt)
-            try:
-                answer = _agent_call(
-                    session, self.registry, self.store, member, prompt,
-                    timeout_s=config.FRONTIER_VERIFY_TIMEOUT,
-                )
-            except Exception as e:  # normalized below into a release failure
-                # Do not absorb explicit cancellation; the goal cancellation path
-                # owns that state transition.
-                if isinstance(e, SessionCancelled):
-                    raise
+            # A verifier CLI that exits, times out, or reports capacity did NOT
+            # judge the batch — a real release recorded "verifier rejected
+            # release" over a codex "model is at capacity" outage, for a game
+            # that had just PASSED real-browser acceptance. Rotate through the
+            # eligible independent seats with a short backoff, and when none
+            # can run, report the verifier as UNAVAILABLE (retryable via
+            # resume), never as a rejection.
+            answer = None
+            transport_error = ""
+            for transport_attempt in range(
+                    config.RELEASE_VERIFIER_TRANSPORT_RETRIES + 1):
+                seat = verifier_pool[transport_attempt % len(verifier_pool)]
+                member = CouncilMember(role=Role.panelist, agent=seat, active=True)
+                try:
+                    answer = _agent_call(
+                        session, self.registry, self.store, member, prompt,
+                        timeout_s=config.FRONTIER_VERIFY_TIMEOUT,
+                    )
+                    verifier_name = seat
+                    break
+                except Exception as e:
+                    # Do not absorb explicit cancellation; the goal
+                    # cancellation path owns that state transition.
+                    if isinstance(e, SessionCancelled):
+                        raise
+                    transport_error = str(e)
+                    self.store.log_event(
+                        session.session_id, "release_verifier_transport_failed",
+                        {"agent": seat, "attempt": transport_attempt + 1,
+                         "detail": transport_error[:300]},
+                    )
+                    if transport_attempt < config.RELEASE_VERIFIER_TRANSPORT_RETRIES:
+                        time.sleep(config.RELEASE_VERIFIER_TRANSPORT_BACKOFF)
+            if answer is None:
                 session.quality_gate = {
-                    "verifier": verifier_name, "verdict": "FAIL", "detail": str(e),
+                    "verifier": verifier_name, "verdict": "UNAVAILABLE",
+                    "detail": (
+                        "release verifier did not run (transport failure): "
+                        f"{transport_error}"
+                    )[:400],
+                    "browser_acceptance": browser_evidence,
                 }
-                break
+                session.unresolved.append(
+                    "release verification could not run — the verifier seat was "
+                    "unavailable; the batch was NOT judged. Resume the goal to "
+                    "retry verification."
+                )
+                session.stop_reason = "frontier release verifier unavailable"
+                session.outcome = "failed_verification"
+                self.manager.transition(session, SessionStatus.composing)
+                session.final = FinalAnswer(
+                    answer=(
+                        "The assembled batch passed deterministic and browser "
+                        "checks but its independent verification could not run."
+                    ),
+                    confidence="low", risks_unresolved=list(session.unresolved),
+                    next_action="Resume the goal to retry the release verifier.",
+                )
+                self.manager.transition(session, SessionStatus.failed)
+                self.store.save_session(session)
+                return False
             verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
             edits = [action for action in parse_proposals(
                 session.session_id, answer.content, Role.implementer)
