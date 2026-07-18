@@ -962,3 +962,24 @@ def test_legacy_establish_target_input_still_answerable(tmp_path):
     assert resumed.status == SessionStatus.failed
     assert resumed.outcome == "failed_verification"
     assert resumed.established_asked is True
+
+
+def test_release_prompt_mandates_repairs_including_whole_file_rewrites():
+    """Phase 2 repair mandate: the release engineer must ship fixes for every
+    fixable FAIL — surgical EDITs or complete ARTIFACT rewrites — and may only
+    leave a defect unrepaired by stating it requires the owner's rebuild."""
+    from gangof8.models import Session, Task
+    session = Session(
+        session_id="s_prompt", task=Task(
+            task_id="t", session_id="s_prompt", text="build a game"))
+    prompt = rounds.frontier_release_prompt(
+        session, [("game.html", "<html></html>")], defect_register=[])
+    assert "REPAIR MANDATE" in prompt
+    assert "ARTIFACT:" in prompt
+    assert "END_ARTIFACT" in prompt
+    assert "requires owner rebuild" in prompt
+    # the confirmation pass stays a clean-room re-inspection, not a repair pass
+    confirm = rounds.frontier_release_prompt(
+        session, [("game.html", "<html></html>")], repair_attempt=1)
+    assert "REPAIR MANDATE" not in confirm
+    assert "re-inspect the resulting files from scratch" in confirm

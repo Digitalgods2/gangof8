@@ -136,6 +136,14 @@ RELEASE_VERIFIER_TRANSPORT_BACKOFF = float(
 ASSEMBLY_FAULT_STREAK_LIMIT = int(
     os.environ.get("GANGOF8_ASSEMBLY_FAULT_STREAK_LIMIT", "3")
 )
+# Escalation ladder (ARCHITECTURE-REVIEW.md Phase 2): the same fault never
+# goes back to the same seat with the same brief indefinitely. Blame 1: the
+# owner retries with the constraint stated. Blame >= this value: the package
+# transfers to the strongest frontier seat that is not the current owner.
+# Blame > ASSEMBLY_FAULT_STREAK_LIMIT: pause for a human with the critique.
+ASSEMBLY_FAULT_ESCALATE_AT = int(
+    os.environ.get("GANGOF8_ASSEMBLY_FAULT_ESCALATE_AT", "2")
+)
 # The strong CODIFIER (summarizer seat) that examines/finishes the panel's output
 # — best-of-N selection/review/fix/recover, authoring described files, finishing
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom

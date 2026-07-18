@@ -2455,9 +2455,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self.store.save_session(session)
                 return False
             verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
+            # Repair mandate (ARCHITECTURE-REVIEW.md Phase 2): whole-file
+            # ARTIFACT rewrites are first-class repairs alongside surgical
+            # EDITs — a verifier that saw the fix but could only patch
+            # old/new pairs used to reject whole batches over structural
+            # defects it could have rewritten in place.
             edits = [action for action in parse_proposals(
                 session.session_id, answer.content, Role.implementer)
-                if action.kind == "edit_file"
+                if action.kind in ("edit_file", "write_file")
                 and action.filename in session.required_files
             ]
             # A verifier cannot truthfully PASS the current bytes while also
@@ -3249,6 +3254,32 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return None
         if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
             provider.invalidated_session_ids.append(provider.session_id)
+        # Escalation ladder (ARCHITECTURE-REVIEW.md Phase 2): after the owner
+        # has had its constrained retry, the package transfers to the
+        # strongest frontier seat rather than going back to the same seat
+        # with the same brief — one real fault cycled owner -> rebuild ->
+        # same fault three times before the breaker finally paused it.
+        escalated_from = ""
+        if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
+            replacement = next(
+                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                 if seat in self.panel and seat != provider.owner),
+                None,
+            )
+            if replacement:
+                escalated_from = provider.owner
+                provider.owner = replacement
+                self.store.log_event(
+                    session.session_id, "assembly_fault_escalated",
+                    {
+                        "goal_id": goal.goal_id,
+                        "provider_package": provider.index + 1,
+                        "from_owner": escalated_from,
+                        "to_owner": replacement,
+                        "streak": streak,
+                        "input": invalid_input,
+                    },
+                )
         provider.status = "failed"
         provider.files = []
         provider.accepted_files = []
@@ -3264,13 +3295,21 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "widely installed font stacks instead, e.g. font-family: "
                 "'Courier New', monospace."
             )
+        takeover = ""
+        if escalated_from:
+            takeover = (
+                f" OWNERSHIP TAKEOVER: {escalated_from} failed to resolve this "
+                f"same fault {streak - 1} time(s); you ({provider.owner}) are "
+                "taking the package over. Author your own complete replacement "
+                "from the contract — do not imitate the failed approach."
+            )
         # 600, not 300: this exact text becomes the owner's RETRY CORRECTION
         # prompt, and load-order faults need room to state the constraint the
         # rebuild must satisfy — truncating it re-creates the blind rebuild
         # that reproduced the same defect.
         provider.acceptance_detail = (
-            f"invalidated by deterministic assembly {scope}: {detail}{guidance}"
-        )[:600]
+            f"invalidated by deterministic assembly {scope}: {detail}{guidance}{takeover}"
+        )[:700]
         event = (
             "assembly_template_provider_invalidated"
             if scope == "template" else
