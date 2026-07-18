@@ -1335,9 +1335,10 @@ def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeyp
     # below still surfaces the ArcadePortal.input shape so a fix can land on
     # whichever side is correct.
     assert "js/input.js" in provider.acceptance_detail
-    # Case-preserved: this text is repeated to the rebuilding model, and
-    # identifiers like ArcadePortal must survive verbatim.
-    assert "ArcadePortal.input paths [actions, actions.fire]" in provider.acceptance_detail
+    # Case-preserved and namespace-generic: this text is repeated to the
+    # rebuilding model, and the full required property chain must survive
+    # verbatim for ANY shared namespace, not one hardcoded project's.
+    assert "ArcadePortal.input.actions.fire" in provider.acceptance_detail
     persisted = Session.model_validate(service.store.load_session("s_assembly_runtime"))
     assert persisted.quality_gate["fault_scope"] == "dependency"
     assert persisted.quality_gate["fault_path"] == "js/input.js"

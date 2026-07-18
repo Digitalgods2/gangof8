@@ -266,3 +266,42 @@ def test_full_web_audio_param_surface_does_not_falsely_reject():
     )
     ran, testable, detail, _dyn = smoke.smoke_source(src, ".js")
     assert ran is True and testable is True, detail
+
+
+def test_harness_failure_is_overridden_when_the_real_browser_passes(monkeypatch):
+    """The harness EMULATES a browser; its verdicts are advisory. When real
+    Chrome runs the same source clean, the failure was a stub gap — the code
+    must not be rejected. When Chrome cannot check (not testable), the
+    harness verdict stands, so this can only REDUCE false rejections."""
+    from gangof8 import browser_acceptance as ba
+
+    class _Result:
+        def __init__(self, passed, testable=True):
+            self.passed = passed
+            self.testable = testable
+            self.interactive = True
+            self.detail = ""
+            self.errors = ()
+            self.browser = "chrome"
+
+    captured = {}
+
+    def fake_browser(path, **kw):
+        captured["body"] = __import__("pathlib").Path(path).read_text(encoding="utf-8")
+        return _Result(passed=True)
+
+    monkeypatch.setattr(ba, "browser_acceptance", fake_browser)
+    confirmed = ba.confirms_runtime_failure(
+        "window.NS.go();", ".js", prelude="window.NS = {go(){}};")
+    assert confirmed is False  # real browser passed -> harness was wrong
+    # the shell carries the declared prelude before the source
+    assert captured["body"].index("window.NS = {go(){}};") < captured["body"].index("window.NS.go();")
+
+    monkeypatch.setattr(ba, "browser_acceptance", lambda p, **kw: _Result(passed=False))
+    assert ba.confirms_runtime_failure("var a; a.b();", ".js") is True
+
+    monkeypatch.setattr(ba, "browser_acceptance", lambda p, **kw: _Result(passed=True, testable=False))
+    assert ba.confirms_runtime_failure("var a; a.b();", ".js") is True
+
+    # non-web content cannot be browser-confirmed: harness verdict stands
+    assert ba.confirms_runtime_failure("text", ".txt") is True

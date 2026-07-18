@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import assembly, config, executor, rounds, skills, smoke, validation
+from . import assembly, browser_acceptance, config, executor, rounds, skills, smoke, validation
 from .artifacts import (
     ARTIFACT_MARKER as _ARTIFACT_MARKER,
     BLOCK_START as _BLOCK_START,
@@ -3930,9 +3930,19 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     frozen: list[dict] = []
     def probe_candidate(c: dict) -> tuple[dict, bool, bool, str, Optional[bool]]:
         candidate_name = _basename(c["base"])
+        suffix = Path(candidate_name).suffix or ".html"
+        prelude = _runtime_prelude(session, candidate_name)
         ran, testable, detail, dynamic = smoke.smoke_source(
-            c["content"], Path(candidate_name).suffix or ".html",
-            prelude=_runtime_prelude(session, candidate_name))
+            c["content"], suffix, prelude=prelude)
+        if (testable and not ran
+                and not browser_acceptance.confirms_runtime_failure(
+                    c["content"], suffix, prelude=prelude)):
+            # The emulating harness rejected code the REAL browser runs
+            # clean: a stub gap, not a defect. Harness verdicts are advisory.
+            store.log_event(sid, "smoke_false_rejection_overridden",
+                            {"agent": c["agent"], "file": candidate_name,
+                             "detail": detail[:300]})
+            ran, detail, dynamic = True, "runs in the real browser (harness emulation gap overridden)", None
         return c, ran, testable, detail, dynamic
 
     probes = _fan_out(session, group, probe_candidate, "smoke", config.MAX_PARALLEL_SMOKE) if len(group) > 1 else [
@@ -4996,11 +5006,26 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                          "detail": dep_detail[:300], "hard_failure": False},
                     )
                 else:
+                    dependency_prelude = "\n\n".join(
+                        text for _name, text in dependency_sources)
                     ran, testable, detail, dynamic = smoke.smoke_test(
-                        path, prelude="\n\n".join(
-                            text for _name, text in dependency_sources))
+                        path, prelude=dependency_prelude)
                     if not ran:
-                        failures.append(f"{action.filename}: does not run — {detail}")
+                        try:
+                            artifact_text = Path(path).read_text(
+                                encoding="utf-8", errors="replace")
+                        except OSError:
+                            artifact_text = ""
+                        if browser_acceptance.confirms_runtime_failure(
+                                artifact_text, Path(action.filename).suffix,
+                                prelude=dependency_prelude):
+                            failures.append(
+                                f"{action.filename}: does not run — {detail}")
+                        else:
+                            store.log_event(
+                                session.session_id,
+                                "smoke_false_rejection_overridden",
+                                {"file": action.filename, "detail": detail[:300]})
                     elif testable:
                         store.log_event(session.session_id, "runtime_ok",
                                         {"file": action.filename, "dynamic": dynamic})

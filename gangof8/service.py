@@ -2574,7 +2574,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             for name, content in files:
                 ran, testable, detail, _dynamic = smoke.smoke_source(
                     content, Path(name).suffix or ".txt")
-                if testable and not ran:
+                if (testable and not ran
+                        and browser_acceptance.confirms_runtime_failure(
+                            content, Path(name).suffix)):
                     runtime_failures.append(f"{name}: {detail}")
             if runtime_failures:
                 session.quality_gate["detail"] = "frontier repair failed runtime: " + "; ".join(runtime_failures)
@@ -2821,38 +2823,55 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     @staticmethod
     def _assembly_runtime_interface_hint(
         loaded_sources: list[tuple[str, str]],
+        all_sources: Optional[list[tuple[str, str]]] = None,
     ) -> str:
         """Describe browser-global paths earlier scripts require at runtime.
 
         Runtime errors such as ``cannot set ... fire`` reveal only the final
         property and caused expensive whole-package retries to add one field
-        while dropping another.  Recover the complete cross-file surface from
+        while dropping another. Recover the complete cross-file surface from
         the accepted consumers, including aliases such as
-        ``var portalInput = window.ArcadePortal.input``.
+        ``var portalInput = window.NS.input``. Works for ANY shared window
+        namespace the sources establish — an earlier version was hardcoded
+        to one past project's ``ArcadePortal.input`` and silently did
+        nothing for every other build.
         """
+        namespaces: set[str] = set()
+        # Roots may be DECLARED by a file that loads after the consumers being
+        # scanned (that is often the fault itself), so detect them across the
+        # whole declared order, not only the already-loaded prefix.
+        for _name, text in (all_sources or loaded_sources):
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_NS_ROOT_RE.finditer(text))
+            namespaces.update(
+                m.group(1) for m in _ASSEMBLY_WINDOW_ROOT_RE.finditer(text))
+        if not namespaces:
+            return ""
         requirements: list[tuple[str, list[str]]] = []
-        direct = re.compile(
-            r"(?:window\.)?ArcadePortal\.input"
-            r"((?:\.[A-Za-z_$][\w$]*)+)"
-        )
-        alias_decl = re.compile(
-            r"\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
-            r"(?:window\.)?ArcadePortal\.input\b"
-        )
-
         for source_name, text in loaded_sources:
             paths: set[str] = set()
-            matches = list(direct.finditer(text))
-            aliases = set(alias_decl.findall(text))
-            for alias in aliases:
-                matches.extend(re.finditer(
-                    rf"\b{re.escape(alias)}((?:\.[A-Za-z_$][\w$]*)+)",
-                    text,
-                ))
-            for match in matches:
-                pieces = [piece for piece in match.group(1).split(".") if piece]
-                for size in range(1, len(pieces) + 1):
-                    paths.add(".".join(pieces[:size]))
+            for ns in sorted(namespaces):
+                chains = [
+                    m.group(1) for m in re.finditer(
+                        rf"(?:window\.)?{re.escape(ns)}"
+                        r"((?:\.[A-Za-z_$][\w$]*)+)",
+                        text,
+                    )
+                ]
+                alias_decl = re.compile(
+                    rf"\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+                    rf"(?:window\.)?{re.escape(ns)}"
+                    r"((?:\.[A-Za-z_$][\w$]*)+)\b"
+                )
+                for alias, base in alias_decl.findall(text):
+                    for m in re.finditer(
+                            rf"\b{re.escape(alias)}((?:\.[A-Za-z_$][\w$]*)+)",
+                            text):
+                        chains.append(base + m.group(1))
+                for chain in chains:
+                    pieces = [piece for piece in chain.split(".") if piece]
+                    for size in range(1, len(pieces) + 1):
+                        paths.add(f"{ns}." + ".".join(pieces[:size]))
             if paths:
                 ordered = sorted(paths, key=lambda path: (path.count("."), path))
                 requirements.append((source_name, ordered[:14]))
@@ -2860,7 +2879,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if not requirements:
             return ""
         clauses = [
-            f"{name} requires ArcadePortal.input paths [{', '.join(paths)}]"
+            f"{name} requires window paths [{', '.join(paths)}]"
             for name, paths in requirements[:3]
         ]
         return "cross-file interface mismatch: " + "; ".join(clauses)
@@ -3191,7 +3210,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         break
                 hints: list[str] = []
                 if "undefined" in detail.lower():
-                    legacy = self._assembly_runtime_interface_hint(loaded_sources)
+                    legacy = self._assembly_runtime_interface_hint(
+                        loaded_sources, ordered)
                     if legacy:
                         hints.append(legacy)
                     # A THROWN "undefined" crash needs the same load-order

@@ -502,4 +502,61 @@ def browser_acceptance(
     )
 
 
-__all__ = ["BrowserAcceptanceResult", "browser_acceptance", "is_interactive_html"]
+def confirms_runtime_failure(text: str, suffix: str, prelude: str = "") -> bool:
+    """A smoke-harness failure is ADVISORY, never final.
+
+    The Node harness EMULATES a browser by hand, and every API its stubs do
+    not cover falsely rejects valid code — a real Asteroids "crashed" on the
+    standard ``gain.setTargetAtTime``, valid Space Invaders candidates died
+    on ``getComputedStyle``, and the stub surface can never be finished for
+    every domain this app builds for. So before a harness verdict may cost
+    anyone a rebuild, the REAL browser must reproduce the failure: run the
+    same source (JS gets a minimal HTML shell with its declared prelude) and
+    return True only when the real environment also fails — or when it
+    cannot be checked at all, in which case the harness verdict stands as
+    today. A real-browser PASS means the harness was wrong, never the code.
+
+    The asymmetry is deliberate: this can only REDUCE false rejections. A
+    bare-module shell missing its final DOM may fail here for shell reasons,
+    which simply confirms the existing harness verdict — never worse than
+    the behavior before this check existed.
+    """
+    import os
+    import tempfile
+
+    suffix = (suffix or "").lower()
+    if suffix not in {".html", ".htm", ".js", ".mjs"}:
+        return True
+    try:
+        if suffix in (".html", ".htm"):
+            body = text
+        else:
+            scripts = ""
+            if prelude:
+                scripts += f"<script>\n{prelude}\n</script>\n"
+            scripts += f"<script>\n{text}\n</script>\n"
+            body = (
+                "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+                f"<body>\n{scripts}</body></html>"
+            )
+        fd, tmp = tempfile.mkstemp(suffix=".html", prefix="gangof8_confirm_")
+        os.close(fd)
+        try:
+            Path(tmp).write_text(body, encoding="utf-8")
+            result = browser_acceptance(Path(tmp))
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except Exception:
+        return True
+    if not result.testable:
+        return True
+    return not result.passed
+
+
+__all__ = [
+    "BrowserAcceptanceResult", "browser_acceptance",
+    "confirms_runtime_failure", "is_interactive_html",
+]
