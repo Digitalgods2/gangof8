@@ -214,7 +214,7 @@ def _codifier(session: Session) -> Optional[CouncilMember]:
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
     member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
-    images: Optional[list[dict]] = None,
+    images: Optional[list[dict]] = None, cwd: Optional[str] = None,
 ) -> Contribution:
     # Cooperative cancellation: every agent call passes through here, so this is
     # the one checkpoint that aborts a run the human cancelled mid-flight.
@@ -328,8 +328,11 @@ def _agent_call(
             cancellation.set_call_kind("coding" if coding_call else "routine")
             cancellation.register_progress(session.session_id, call_id, _record_progress)
             try:
+                # cwd only when set: registry doubles in tests (and simple
+                # embedder registries) don't take the kwarg.
                 result = registry.call(
-                    member.agent, member.role, prompt, timeout_s, images=images)
+                    member.agent, member.role, prompt, timeout_s, images=images,
+                    **({"cwd": cwd} if cwd else {}))
             finally:
                 cancellation.unregister_progress(session.session_id, call_id)
                 cancellation.set_current_call(None)

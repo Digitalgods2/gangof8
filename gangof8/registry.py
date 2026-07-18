@@ -60,15 +60,20 @@ class AgentRegistry:
         return self._adapters.get(agent)
 
     def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 120,
-             images: list[dict] | None = None) -> AdapterResult:
+             images: list[dict] | None = None,
+             cwd: str | None = None) -> AdapterResult:
         if agent not in self._adapters:
             raise KeyError(f"no adapter registered for agent '{agent}'")
         t0 = time.perf_counter()
         adapter = self._adapters[agent]
-        # Only pass images when present, so adapters that don't take the kwarg
-        # (simple/text-only doubles) keep working unchanged.
-        result = adapter.call(role, prompt, timeout_s, images=images) if images \
-            else adapter.call(role, prompt, timeout_s)
+        # Only pass optional kwargs when present/supported, so adapters that
+        # don't take them (simple/text-only doubles) keep working unchanged.
+        kwargs: dict = {}
+        if images:
+            kwargs["images"] = images
+        if cwd and getattr(adapter, "supports_cwd", False):
+            kwargs["cwd"] = cwd
+        result = adapter.call(role, prompt, timeout_s, **kwargs)
         return self._normalize(result, t0)
 
     def resume(self, agent: str, resume_token: str, answer: str, timeout_s: int = 180) -> AdapterResult:

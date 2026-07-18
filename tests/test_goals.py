@@ -2459,3 +2459,80 @@ def test_release_verifier_transport_failure_is_unavailable_not_rejected(tmp_path
     # the outage is not a defect of the batch: register stays clean
     assert goal.release_defects == []
     assert any("NOT judged" in item for item in release.unresolved)
+
+
+def test_release_verifier_runs_inside_a_review_copy_of_the_release_files(tmp_path, monkeypatch):
+    """Agentic verifier CLIs inspect "their workspace" with tools and trust it
+    over inline prompt text: codex FAILed a browser-passing game with
+    "frogger.html is absent from the workspace" because it ran from the empty
+    neutral sandbox. The verifier must receive a working directory containing
+    the exact release bytes — a disposable copy, so shell experiments can
+    never mutate accepted staging."""
+    from gangof8 import service as service_module
+
+    monkeypatch.setattr(config, "RELEASE_VERIFIER_TRANSPORT_BACKOFF", 0.0)
+
+    class _AuthorSeat:
+        name = "claude"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="ok", duration_ms=1)
+
+    seen: dict = {}
+
+    class _InspectingVerifier:
+        name = "codex"
+        supports_cwd = True
+
+        def call(self, role, prompt, timeout_s, images=None, cwd=None):
+            seen["cwd"] = cwd
+            seen["has_file"] = bool(cwd) and (Path(cwd) / "frogger.html").is_file()
+            seen["workspace_note"] = "WORKSPACE NOTE" in prompt
+            raise RuntimeError("stop after capture")
+
+    class _BrowserPass:
+        passed = True
+        interactive = True
+        testable = True
+        detail = "passed"
+        browser = "chrome"
+        errors = ()
+
+    monkeypatch.setattr(
+        service_module.browser_acceptance, "browser_acceptance",
+        lambda path, **kw: _BrowserPass())
+    monkeypatch.setattr(config, "RELEASE_VERIFIER_TRANSPORT_RETRIES", 0)
+
+    service = GangOf8Service(
+        data_dir=tmp_path / "data", panel=["claude", "codex"])
+    service.registry.register(_AuthorSeat())
+    service.registry.register(_InspectingVerifier())
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    body = "<html><body><script>window.ok=1;</script></body></html>"
+    (stage / "frogger.html").write_text(body, encoding="utf-8")
+    goal = Goal(
+        text="build a single-file frogger", status="running", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="claude", title="game",
+                task_text="author the game", status="done",
+                contract_declared=True, requires_delivery=True,
+                required_files=["frogger.html"], release_files=["frogger.html"],
+                release_declared=True,
+                accepted_hashes={"frogger.html": hashlib.sha256(
+                    body.encode()).hexdigest()},
+            ),
+        ],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    assert seen.get("cwd"), "verifier was not given a working directory"
+    assert seen["has_file"] is True
+    assert seen["workspace_note"] is True
+    # the review copy is a COPY, not the staging directory itself
+    assert Path(seen["cwd"]).resolve() != stage.resolve()
