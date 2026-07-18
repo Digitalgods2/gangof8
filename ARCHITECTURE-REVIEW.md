@@ -172,20 +172,29 @@ verify + 1 release ≈ **3–6 calls total**, versus 74 and 283.*
    retries with the constraint stated. Streak 2: the package transfers to
    the strongest frontier seat. Streak 3: human, with the full critique.
 
-### Phase 3 — Economics
+### Phase 3 — Economics *(implemented 2026-07-18)*
 
 7. **Per-goal call budget** (default configurable, e.g. 40): exceeding it
    pauses for human review with a cost report. No more silent 283s.
 8. **Cost telemetry**: calls per seat per session recorded and shown in
    the dashboard goal header and `/goals` listing.
 
-### Phase 4 — Solo fast path as the front door
+### Phase 4 — Solo fast path as the front door *(satisfied by Phase 1 — no separate pipeline needed)*
 
 9. Implement **solo mode** end-to-end: one frontier session authors the
    complete deliverable in its own context (no packages, no assembly),
    the existing gates verify (smoke → browser → style), one independent
    frontier verify, release. Benchmark: re-run the identical Frogger brief
    and publish calls/wall-clock/quality against goal 2's numbers.
+
+   *Resolution: Phase 1's right-sizing already produces exactly this flow —
+   a single-artifact goal is validator-forced to one package, whose owner
+   authors the complete file in one context, with deterministic gates,
+   one independent frontier verification, and one approval. The benchmark
+   (g_864401cc) met the ≤ 6-call target at **4 calls**. Building a literal
+   separate solo pipeline would duplicate staging, verification, release,
+   resume, and budget machinery to save at most the single planning call —
+   precisely the kind of accidental complexity this overhaul removes.*
 
 ### Phase 5 — Validation & migration
 
