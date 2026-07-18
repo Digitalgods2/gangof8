@@ -421,6 +421,36 @@ Persisted goals created before the build-team overhaul keep their legacy
 tournament/milestone semantics; start a new `/goal` to use owned packages and
 final-batch delivery.
 
+## Live observability and seat health
+
+The dashboard streams the run instead of making you reconstruct it from
+status pills (see `NEXT-LEVEL.md` for the design rationale):
+
+- **Live activity feed** — a persistent pane fed by `GET /events/stream`
+  (SSE). Every coordinator event appears the moment it happens — authoring
+  progress, gates passing, fault attribution, package reopens, escalations,
+  budget stops — with clickable rows that jump to the session.
+- **Seat health badges** — the header shows each panel seat as
+  🟢 healthy · 🟡 degraded (capacity/timeout — still schedulable) ·
+  🔴 unavailable (quota exhausted, auth expired, or CLI offline), with the
+  provider's own message on hover. Health is fed by every adapter call and
+  *consulted by scheduling*: pending packages transfer away from a
+  hard-unavailable owner before a session opens, escalation targets and the
+  release-verifier pool skip dead seats, and a goal stopped by a seat outage
+  says so plainly ("seat claude is unavailable (quota exhausted): monthly
+  spend limit…") instead of surfacing a downstream symptom.
+- **Plain-language "now" line** — every goal card states its current
+  activity in one sentence: "claude authoring game.html (12,345 chars
+  streamed)", "waiting for your release approval", "paused — budget
+  reached".
+- **Goal story (📜)** — one click renders the goal's complete ordered
+  timeline merged from all of its sessions, topped by a postmortem: model
+  calls per seat against the budget, packages with owners and invalidated
+  attempts, and attempts split honestly into completed / lost to seat
+  outages / interrupted / failed.
+- **Output tail** — while a streaming seat is authoring, the session view
+  shows the last few hundred characters the model is literally writing.
+
 ## Timeouts, failures, and recovery
 
 The per-seat timeout shown in Settings is a routine/non-code guardrail and does
@@ -703,6 +733,9 @@ running.
 | `GET /sessions` | List sessions |
 | `GET /sessions/{id}` | Full persisted session, health, and run summary |
 | `GET /sessions/{id}/timeline` | Readable event timeline |
+| `GET /goals/{id}/timeline` | The whole goal's ordered story plus a derived postmortem (spend per seat, attempts split into completed / seat-outage / interrupted) |
+| `GET /seats` | Live per-seat health: state, reason, since — fed by every adapter call's outcome |
+| `GET /events/stream` | Server-Sent Events: every coordinator event as it happens, rendered through the human-readable vocabulary (the dashboard's live feed) |
 | `POST /sessions/{id}/followup` | Continue a completed conversation |
 | `POST /sessions/{id}/cancel` | Cancel a live session |
 | `POST /sessions/{id}/approvals/{approval_id}` | Approve or deny an action |
