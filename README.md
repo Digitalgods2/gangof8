@@ -50,19 +50,19 @@ rewriting the same file seven times.
 
 ```mermaid
 flowchart TD
-    Start(["User submits a task"]) --> Classify{{"Coordinator classifies<br/>the request"}}
+    Start(["User submits a task"]) --> Classify{{"Coordinator classifies the request"}}
 
-    Classify -->|"Question, review, design,<br/>or bounded deliverable"| Ordinary["Ordinary task<br/>council convenes as a panel"]
-    Classify -->|"/goal command, or a substantial<br/>build brief auto-routed from /tasks"| Goal["Build-team goal<br/>council convenes as owners"]
+    Classify -->|"Question, review, design, bounded deliverable"| Ordinary["Ordinary task: council as a panel"]
+    Classify -->|"/goal, or auto-routed build brief"| Goal["Build-team goal: council as owners"]
 
-    Ordinary --> OrdinaryWhat["Every enabled seat produces an<br/>independent whole-solution candidate"]
-    Goal --> GoalWhat["Architect splits the objective into<br/>owned, dependency-linked packages"]
+    Ordinary --> OrdinaryWhat["Every seat produces an independent candidate"]
+    Goal --> GoalWhat["Architect splits work into owned packages"]
 
-    OrdinaryWhat --> OrdinaryPick["Judge waves + chair pick<br/>one winning candidate"]
-    GoalWhat --> GoalPick["Each owner authors its exact<br/>paths; packages run concurrently"]
+    OrdinaryWhat --> OrdinaryPick["Judge waves + chair pick one winner"]
+    GoalWhat --> GoalPick["Owners author exact paths concurrently"]
 
-    OrdinaryPick --> OrdinaryDeliver["Governed 'promote' approval<br/>for that session"]
-    GoalPick --> GoalDeliver["Deterministic assembly, then one<br/>'promote_batch' approval for the release manifest"]
+    OrdinaryPick --> OrdinaryDeliver["Governed 'promote' approval"]
+    GoalPick --> GoalDeliver["One 'promote_batch' approval for the release"]
 ```
 
 Substantial production briefs no longer depend on the user remembering the
@@ -137,16 +137,16 @@ An ordinary task uses the council as a panel:
 
 ```mermaid
 flowchart TD
-    S1["1. Classify request; capture<br/>source, output, delivery context"] --> S2["2. Call every configured,<br/>available panel seat"]
-    S2 --> S3["3. Seats work independently<br/>through governed skills"]
+    S1["1. Classify request; capture context"] --> S2["2. Call every available panel seat"]
+    S2 --> S3["3. Seats work independently via governed skills"]
     S3 --> S4{"Build task?"}
-    S4 -->|Yes| S5["4. Each seat authors a complete<br/>namespaced candidate"]
+    S4 -->|Yes| S5["4. Each seat authors a full candidate"]
     S4 -->|No| S6
-    S5 --> S6["5. Smoke-test candidates; a required<br/>Claude/Codex failure returns for repair"]
-    S6 --> S7["6. Parallel judge waves score anonymous<br/>candidates; a unanimous first wave stops early"]
-    S7 --> S8["7. Codifier/chair ratifies or overrides,<br/>closes defects, applies surgical fixes"]
-    S8 --> S9["8. Independent frontier release engineer<br/>checks requirements, repairs, confirms"]
-    S9 --> S10["9. Output held for governed<br/>'promote' approval"]
+    S5 --> S6["5. Smoke-test candidates; repair required failures"]
+    S6 --> S7["6. Parallel judge waves score candidates"]
+    S7 --> S8["7. Codifier/chair ratifies, closes defects"]
+    S8 --> S9["8. Frontier engineer checks and repairs"]
+    S9 --> S10["9. Output held for 'promote' approval"]
 ```
 
 1. The coordinator classifies the request and captures its source, output, and
@@ -200,29 +200,29 @@ New goals use `collaboration_mode=build_team` and
 ```mermaid
 flowchart TD
     subgraph PH1["1. Architect creates the package graph"]
-        B1["Define owner, deps, exclusive outputs,<br/>RELEASE subset, acceptance checks"] --> B2{"Graph passes<br/>deterministic gate?"}
-        B2 -->|"No (up to 2 repair attempts)"| B1
+        B1["Define owners, deps, outputs, checks"] --> B2{"Graph valid?"}
+        B2 -->|"No, repair up to 2x"| B1
     end
 
     subgraph PH2["2. Source copied into private staging"]
-        C1["data/goal-workspaces/&lt;goal-id&gt;/stage/"]
+        C1["goal-workspaces/id/stage/"]
     end
 
     subgraph PH3["3. Owners build distinct pieces"]
-        D1["Packages with satisfied<br/>hard deps are scheduled"] --> D2["Each owner authors its exact<br/>output paths in one cohesive call"]
-        D2 --> D3["Completed files hashed and<br/>accepted into shared staging"]
+        D1["Ready packages are scheduled"] --> D2["Owner authors its exact output paths"]
+        D2 --> D3["Files hashed, accepted into staging"]
     end
 
     subgraph PH4["4. Packages verified before release"]
-        E1["Per-file syntax, acceptance checks,<br/>dependency compatibility, runtime smoke"] --> E2{"All pass?"}
-        E2 -->|No| E3["Bounded repair loop returns<br/>to the original owner"] --> E1
+        E1["Syntax, acceptance, deps, runtime checks"] --> E2{"All pass?"}
+        E2 -->|No| E3["Bounded repair returns to owner"] --> E1
     end
 
     subgraph PH5["5. Entire goal released once"]
-        F1["Deterministic assembly of the<br/>planner's RELEASE manifest"] --> F2["Real-browser + independent<br/>frontier semantic acceptance"]
+        F1["Deterministic assembly of RELEASE manifest"] --> F2["Browser + frontier acceptance"]
         F2 --> F3{"Approve final batch?"}
-        F3 -->|Deny| F4["Goal paused;<br/>staging retained"]
-        F3 -->|Approve| F5["Hash-bound rollback-protected<br/>copy to the delivery folder"]
+        F3 -->|Deny| F4["Goal paused, staging retained"]
+        F3 -->|Approve| F5["Rollback-protected copy to delivery folder"]
     end
 
     PH1 -.-> PH2 -.-> PH3 -.-> PH4 -.-> PH5
