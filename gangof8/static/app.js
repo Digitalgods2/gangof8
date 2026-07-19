@@ -644,6 +644,25 @@ function _followActiveGoal() {
   if (!GOAL_LIVE.has(fg.status)) _followGoal = null;  // settled — stop steering
 }
 
+// One human vocabulary for EVERY status surface (goal pills, session
+// pills, release states). The dashboard previously spoke four dialects at
+// once — goal status, release_status, session status, now-line — and an
+// operator watching an approval could not tell which one was THE status.
+// CSS classes stay keyed by the raw state; only the words are unified.
+const STATUS_WORDS = {
+  received: "queued", classified: "starting", deliberating: "working",
+  composing: "finishing", awaiting_approval: "needs your approval",
+  awaiting_input: "needs your answer", awaiting_release: "needs your approval",
+  awaiting_target: "needs a folder", done: "done", failed: "failed",
+  cancelled: "cancelled", running: "working", planning: "planning",
+  paused: "paused", draining: "winding down", completed: "done",
+  not_started: "not released yet", failed_verification: "verification failed",
+  released: "released", denied: "release denied",
+};
+function humanStatus(st) {
+  return STATUS_WORDS[st] || String(st || "").replaceAll("_", " ");
+}
+
 function goalCard(g) {
   const ms = g.milestones || [];
   const done = ms.filter(m => m.status === "done").length;
@@ -693,7 +712,7 @@ function goalCard(g) {
       `${g.active_agent_calls ? ` · ${g.active_agent_calls} model call${g.active_agent_calls === 1 ? "" : "s"}` : ""}` +
       `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
       `${g.pending_inputs ? ` · ${g.pending_inputs} question blocked` : ""}` +
-      ` · shared staging · ${esc(g.release_status || "not_started")}</div>` : "";
+      ` · shared staging · ${esc(humanStatus(g.release_status || "not_started"))}</div>` : "";
   const spentSeats = Object.entries(g.model_calls_by_seat || {})
     .sort((a, b) => b[1] - a[1]).map(([seat, n]) => `${seat} ${n}`).join(", ");
   const cost = g.model_calls_used
@@ -703,7 +722,7 @@ function goalCard(g) {
   return `
     <div class="goal ${esc(g.status)}">
       <div class="ghead">
-        <span class="pill g-${esc(displayStatus)}">${esc(displayStatus.replaceAll("_", " "))}</span>
+        <span class="pill g-${esc(displayStatus)}">${esc(humanStatus(displayStatus))}</span>
         <span class="gprog">${done}/${ms.length || "…"}</span>
         ${cost}
         ${btns}
@@ -853,7 +872,7 @@ async function refresh() {
       <button class="trash" title="Delete this session" onclick="deleteSession('${s.session_id}', event)">🗑</button>
       <div class="text">${esc(s.task_text) || "(no text)"}</div>
       <div class="meta">
-        <span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+        <span class="pill ${esc(s.status)}">${esc(humanStatus(s.status))}</span>
         ${s.pending_approvals ? `<span class="pill awaiting_approval">${s.pending_approvals} approval</span>` : ""}
         ${s.pending_inputs ? `<span class="pill awaiting_input">${s.pending_inputs} question</span>` : ""}
         <span>${esc(s.session_id)}</span>
@@ -1046,8 +1065,8 @@ function renderDetail(s) {
   const retryRunning = !!(attemptState?.isHistorical && currentPackage &&
     !TERMINAL_STATES.has(currentPackage.session_status || currentPackage.status));
   const taskStatusLabel = retryRunning
-    ? `historical ${verificationFailed ? "failed verification" : s.status}`
-    : (verificationFailed ? "failed verification" : s.status);
+    ? `historical ${verificationFailed ? "failed verification" : humanStatus(s.status)}`
+    : (verificationFailed ? "failed verification" : humanStatus(s.status));
   const attemptMeta = attemptState?.total
     ? `attempt ${attemptState.selectedNumber || "?"} of ${attemptState.total}` : "";
 

@@ -3715,6 +3715,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if goal.status == "paused":
             reason = (goal.last_error or "").split(";")[0].strip()
             return f"paused — {reason}" if reason else "paused"
+        if goal.release_status == "released" and goal.status != "completed":
+            return "delivering the approved release"
         if goal.release_status == "awaiting_approval":
             return "waiting for your release approval"
         if goal.release_status == "awaiting_target":
@@ -3738,7 +3740,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if goal.status == "running" and all(
                 m.status == "done" for m in goal.milestones) and goal.milestones:
             return "verifying the final release"
-        return goal.status
+        return goal.status.replace("_", " ")
     def _goal_views(self, items: list[Goal]) -> list[dict]:
         """Attach aggregate/actionable state without mutating durable goals."""
         sessions = self.store.list_sessions(limit=None)
