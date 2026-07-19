@@ -1151,3 +1151,7 @@ DEVELOPMENT.md                 Short contributor setup guide
 
 For deeper implementation context, see [ARCHITECTURE.md](ARCHITECTURE.md),
 [DESIGN.md](DESIGN.md), and [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Copyright
+
+Copyright © 2026 DigitalGods. All rights reserved.
