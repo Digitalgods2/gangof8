@@ -98,6 +98,13 @@ def _summary(session) -> dict:
         "delivery_mode": session.delivery_mode,
         "work_package_id": session.work_package_id,
         "work_package_owner": session.work_package_owner,
+        "resource_roster": session.resource_roster,
+        "participation_mode": session.participation_mode,
+        "collaboration_assignments": [
+            assignment.model_dump() for assignment in session.collaboration_assignments
+        ],
+        "collaboration_integrated_files": session.collaboration_integrated_files,
+        "collaboration_integration_status": session.collaboration_integration_status,
         "required_frontier_authors": session.required_frontier_authors,
         "frontier_author_recoveries": session.frontier_author_recoveries,
         "candidate_metrics": session.candidate_metrics,
@@ -432,6 +439,7 @@ def followup_session(session_id: str, body: FollowUpIn) -> dict:
 class GoalIn(BaseModel):
     text: str
     background: bool = False  # True: plan + run on a worker, poll GET /goals/{id}
+    participation_mode: str | None = None
 
 
 @app.post("/goals")
@@ -439,7 +447,11 @@ def create_goal(body: GoalIn) -> dict:
     """Open a build-team goal: owned packages share private staging and the
     complete verified manifest crosses into the project through one approval."""
     try:
-        goal = service.create_goal(body.text, background=body.background)
+        goal = service.create_goal(
+            body.text,
+            background=body.background,
+            participation_mode=body.participation_mode,
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return service.get_goal(goal.goal_id) or goal.model_dump()

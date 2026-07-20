@@ -166,6 +166,13 @@ button.deny:hover { background:rgba(255,93,108,.12); box-shadow:none; }
 .gms.awaiting_approval, .gms.awaiting_input { color:var(--text); }
 .gms.awaiting_approval .gicon, .gms.awaiting_input .gicon { color:var(--lead); }
 .gms .gtitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.resource-roster { display:flex; flex-wrap:wrap; gap:5px; margin-top:7px; }
+.resource-chip { border:1px solid var(--line); border-radius:999px; padding:2px 7px;
+  color:var(--dim); font:10.5px var(--mono); background:rgba(255,255,255,.025); }
+.resource-chip small { opacity:.72; }
+.resource-chip.contributed { color:var(--ok); border-color:var(--ok); }
+.resource-chip.running { color:var(--brand-2); border-color:var(--brand-2); }
+.resource-chip.failed, .resource-chip.unavailable { color:var(--critic); border-color:var(--critic); }
 .pill.g-running, .pill.g-planning { background:rgba(57,208,255,.12); color:var(--brand-2);
                                     border-color:rgba(57,208,255,.25); }
 .pill.g-draining { background:rgba(245,197,66,.12); color:var(--lead);

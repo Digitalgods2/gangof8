@@ -85,6 +85,11 @@ class Settings(BaseModel):
     # The codifier may offer a validated merge after best-of-N selection. The
     # voted winner remains the default until the human explicitly chooses it.
     integration_review_enabled: bool = True
+    # How build-team goals use enabled models. ``adaptive`` convenes every
+    # enabled resource for standard/complex code packages while retaining the
+    # focused owner+verifier path for small work. ``full_council`` always runs
+    # the artifact-aware challenge wave; ``focused`` preserves the lean path.
+    participation_mode: Literal["focused", "adaptive", "full_council"] = "adaptive"
 
 
 # Portable profiles use an explicit allowlist.  Do not replace this with a
@@ -105,6 +110,7 @@ PORTABLE_SETTINGS_FIELDS = (
     "composer",
     "rounds_per_consent",
     "integration_review_enabled",
+    "participation_mode",
     "ui",
 )
 

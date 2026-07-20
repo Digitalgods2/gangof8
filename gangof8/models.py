@@ -344,6 +344,27 @@ class GoalMilestone(BaseModel):
     summary: str = ""                 # snippet of its final answer, for context
 
 
+class CollaborationAssignment(BaseModel):
+    """One deterministic, artifact-aware contribution by an enabled resource.
+
+    Package ownership remains atomic; this record tracks a peer model that was
+    shown the owner's real baseline and asked for findings and concrete edits.
+    It is persisted so cancellation/restart never turns a successful call into
+    an invisible or duplicated contribution.
+    """
+
+    assignment_id: str = Field(default_factory=lambda: f"ca_{short_id()}")
+    seat: str
+    lens: str
+    status: str = "pending"  # pending | running | contributed | failed | unavailable
+    attempts: int = 0
+    findings: list[str] = []
+    patch_files: list[str] = []
+    disposition: str = ""
+    contribution_index: Optional[int] = None
+    error: str = ""
+
+
 class Goal(BaseModel):
     """A long-horizon objective with an explicitly versioned collaboration flow.
 
@@ -361,6 +382,12 @@ class Goal(BaseModel):
     # Enabled build participants frozen when the goal is created. Settings may
     # change while a long goal runs; its promised collaboration roster may not.
     build_roster: list[str] = []
+    # Package owners and collaboration resources are deliberately separate.
+    # A resource may challenge/review real artifact bytes without owning any
+    # file. This keeps enabled seats such as DeepSeek useful even when no named
+    # specialist role currently maps to them.
+    resource_roster: list[str] = []
+    participation_mode: str = "focused"  # focused | adaptive | full_council
     plan_rationale: str = ""
     last_error: str = ""      # why the goal paused/failed, for the UI
     # Workflow versioning is explicit so goals persisted before the build-team
@@ -437,6 +464,15 @@ class Session(BaseModel):
     # every correction/failover without relabeling sibling work.
     package_output_history: dict[str, list[dict]] = {}
     package_call_failures: dict[str, str] = {}
+    # Full-council collaboration is a post-baseline challenge wave. The owner
+    # remains accountable for final bytes; peers contribute findings/EDITs and
+    # the owner explicitly disposes of them during integration.
+    resource_roster: list[str] = []
+    participation_mode: str = "focused"
+    collaboration_assignments: list[CollaborationAssignment] = []
+    collaboration_baseline: dict[str, str] = {}
+    collaboration_integrated_files: list[str] = []
+    collaboration_integration_status: str = "not_started"
     package_started_at: Optional[str] = None
     package_deadline_at: Optional[str] = None
     # Frontier models are implementation quorum, not optional late judges.

@@ -1855,6 +1855,114 @@ def test_resume_reopens_culprit_package_after_failed_release_verification(tmp_pa
     assert repaired.assembly_fault_streak == {"0:dependency:js/painter.js": 1}
 
 
+def test_resume_reopens_direct_owner_after_failed_verification_single_package(tmp_path, monkeypatch):
+    """A single-file build has exactly one authoring package and no separate
+    deterministic HTML_INLINE assembly step, so ``_reopen_release_regression_
+    package`` never finds an assembly package to blame. Before this fix,
+    resuming such a goal after a failed release verification could only
+    re-run the frontier verifier's own blind self-repair loop — it did not
+    write the code, has no design context, and the goal came back paused
+    with the identical unresolved defects forever. Resume must instead send
+    the critique straight back to the package that actually authored the
+    criticized release file."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    game_source = "<html><body>Donkey Kong</body></html>\n"
+    (stage / "donkey-kong.html").write_text(game_source, encoding="utf-8")
+    goal = Goal(
+        text="build a donkey kong clone", status="paused", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_failed_release",
+        release_files=["donkey-kong.html"],
+        release_defects=[
+            "acceptance R4: Jumpman has no stored horizontal velocity; "
+            "releasing Right produces exactly 0 pixels of coasting.",
+            "verifier rejected the batch without a usable implementation repair",
+        ],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="claude", title="Donkey Kong",
+                task_text="author the game", status="done", session_id="s_game",
+                contract_declared=True, requires_delivery=True,
+                required_files=["donkey-kong.html"],
+                release_files=["donkey-kong.html"],
+                accepted_hashes={
+                    "donkey-kong.html": hashlib.sha256(game_source.encode()).hexdigest(),
+                },
+            ),
+        ],
+    )
+    service.goals.save(goal)
+    started: list[int] = []
+    monkeypatch.setattr(
+        service, "_start_ready_packages",
+        lambda current, background: started.extend(
+            package.index for package in current.milestones
+            if package.status == "pending"
+        ),
+    )
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "running"
+    assert started == [0]
+    repaired = service.goals.get(goal.goal_id)
+    provider = repaired.milestones[0]
+    assert provider.status == "pending"
+    assert provider.session_id is None
+    assert provider.owner == "claude"
+    assert provider.invalidated_session_ids == ["s_game"]
+    assert "horizontal velocity" in provider.acceptance_detail
+    assert repaired.release_status == "not_started"
+    assert repaired.release_session_id is None
+    assert repaired.release_defects == []
+    assert repaired.assembly_fault_streak == {"0:release_owner": 1}
+
+
+def test_direct_release_owner_streak_breaker_pauses_for_human(tmp_path):
+    """A defect that keeps coming back after repeated repair attempts must
+    stop consuming model calls and pause for a human instead of looping the
+    same owner against the same critique forever."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    game_source = "<html><body>Donkey Kong</body></html>\n"
+    (stage / "donkey-kong.html").write_text(game_source, encoding="utf-8")
+    goal = Goal(
+        text="build a donkey kong clone", status="paused", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_status="failed_verification",
+        release_session_id="s_failed_release",
+        release_files=["donkey-kong.html"],
+        release_defects=["acceptance R4: still no horizontal momentum"],
+        assembly_fault_streak={"0:release_owner": config.ASSEMBLY_FAULT_STREAK_LIMIT},
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="claude", title="Donkey Kong",
+                task_text="author the game", status="done", session_id="s_game",
+                contract_declared=True, requires_delivery=True,
+                required_files=["donkey-kong.html"],
+                release_files=["donkey-kong.html"],
+                accepted_hashes={
+                    "donkey-kong.html": hashlib.sha256(game_source.encode()).hexdigest(),
+                },
+            ),
+        ],
+    )
+    service.goals.save(goal)
+
+    out = service.resume_goal(goal.goal_id)
+
+    assert out["status"] == "paused"
+    assert "pausing for human review" in out["last_error"]
+    repaired = service.goals.get(goal.goal_id)
+    assert repaired.milestones[0].status == "done"  # left untouched, not silently rebuilt
+
+
 def test_resume_reopens_stylesheet_package_after_style_contract_release_failure(tmp_path, monkeypatch):
     """A style-contract release failure (rendered DOM classes mostly unmatched
     by any stylesheet rule) is reproducible statically from the staged
@@ -2370,8 +2478,8 @@ def test_plan_prompt_right_sizes_instead_of_feeding_the_roster():
 
 
 def test_default_build_roster_excludes_budget_seats(tmp_path, monkeypatch):
-    """Goals default to frontier seats (ARCHITECTURE-REVIEW.md P2); budget
-    OpenRouter seats join only by explicit opt-in."""
+    """Goals default to frontier owners with the configured coder first;
+    budget OpenRouter seats participate through the separate resource roster."""
     service = GangOf8Service(data_dir=tmp_path / "data")
     monkeypatch.setattr(
         service, "panel",
@@ -2460,6 +2568,100 @@ def test_release_verifier_transport_failure_is_unavailable_not_rejected(tmp_path
     # the outage is not a defect of the batch: register stays clean
     assert goal.release_defects == []
     assert any("NOT judged" in item for item in release.unresolved)
+
+
+def test_release_verifier_incomplete_turn_is_retried_not_treated_as_rejection(
+        tmp_path, monkeypatch):
+    """A verifier CLI call can succeed at the transport level but still never
+    perform a review: a real release verifier proposed exploratory "Tool:
+    bash" calls to list the working directory and stopped there, emitting no
+    CHECK, DEFECT, or VERDICT lines at all. The app treated that identically
+    to a genuine rejection — 'missing acceptance checks: R1...R20' — which
+    burned a fault-streak attempt on the package owner AND silently discarded
+    real defects an earlier round had already found (this synthetic entry
+    replaced them). An incomplete turn must retry instead, exactly like a
+    transport failure, and never touch the release defect register."""
+    from gangof8 import service as service_module
+
+    class _AuthorSeat:
+        name = "claude"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="ok", duration_ms=1)
+
+    class _IncompleteVerifierSeat:
+        name = "codex"
+        calls = 0
+
+        def call(self, role, prompt, timeout_s, images=None):
+            _IncompleteVerifierSeat.calls += 1
+            return AdapterResult(
+                content=(
+                    "I'll inspect the actual release file before judging.\n\n"
+                    "**Tool: bash**\n```json\n"
+                    '{"command": "ls -la .", "description": "List directory"}'
+                    "\n```"
+                ),
+                duration_ms=1,
+            )
+
+    class _BrowserPass:
+        passed = True
+        interactive = True
+        testable = True
+        detail = "passed real-browser input and sustained-runtime checks (chrome)"
+        browser = "chrome"
+        errors = ()
+
+    monkeypatch.setattr(
+        service_module.browser_acceptance, "browser_acceptance",
+        lambda path, **kw: _BrowserPass())
+
+    service = GangOf8Service(
+        data_dir=tmp_path / "data", panel=["claude", "codex"])
+    service.registry.register(_AuthorSeat())
+    service.registry.register(_IncompleteVerifierSeat())
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "frogger.html").write_text(
+        "<html><body><script>window.ok=1;</script></body></html>",
+        encoding="utf-8")
+    # Simulate an earlier round having already found real defects — the
+    # bug this guards against is those being silently replaced.
+    goal = Goal(
+        text="build a single-file frogger", status="running", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        release_defects=["a real, previously-found defect from an earlier round"],
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="claude", title="game",
+                task_text="author the game", status="done",
+                contract_declared=True, requires_delivery=True,
+                required_files=["frogger.html"], release_files=["frogger.html"],
+                release_declared=True,
+                accepted_hashes={"frogger.html": hashlib.sha256(
+                    (stage / "frogger.html").read_bytes()).hexdigest()},
+            ),
+        ],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    assert goal.status == "paused"
+    assert goal.release_status == "failed_verification"
+    assert goal.last_error == "frontier release verifier unavailable"
+    # retried up to FRONTIER_VERIFY_ATTEMPTS before giving up
+    assert _IncompleteVerifierSeat.calls == config.FRONTIER_VERIFY_ATTEMPTS
+    release = service.manager.load(goal.release_session_id)
+    assert release.quality_gate["verdict"] == "UNAVAILABLE"
+    assert "did not complete a review" in release.quality_gate["detail"]
+    # never attributed to the package owner and never lost real prior defects
+    assert goal.release_defects == [
+        "a real, previously-found defect from an earlier round"
+    ]
+    assert goal.milestones[0].status == "done"
 
 
 def test_release_verifier_runs_inside_a_review_copy_of_the_release_files(tmp_path, monkeypatch):

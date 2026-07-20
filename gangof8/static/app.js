@@ -668,8 +668,9 @@ function goalCard(g) {
   const done = ms.filter(m => m.status === "done").length;
   const running = g.active_packages ?? ms.filter(m => m.status === "running").length;
   const owners = new Set(ms.map(m => m.owner).filter(Boolean)).size;
-  const contributors = g.contributor_count ?? 0;
-  const expectedContributors = g.expected_contributor_count ?? 0;
+  const contributors = g.artifact_contributor_count ?? g.contributor_count ?? 0;
+  const expectedContributors = g.expected_artifact_contributor_count
+    ?? g.expected_contributor_count ?? 0;
   const displayStatus = g.display_status || g.status;
   const icons = {done: "✓", running: "▶", pending: "○", failed: "×",
     awaiting_approval: "!", awaiting_input: "?", cancelled: "×", draining: "◌"};
@@ -707,12 +708,24 @@ function goalCard(g) {
     (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "") +
     `<button class="gbtn ghost" title="Full story: timeline + postmortem" onclick="toggleGoalStory('${esc(g.goal_id)}', event)">📜</button>`;
   const aggregate = g.delivery_mode === "final_batch"
-    ? `<div class="sub">Build team · ${contributors}/${expectedContributors || "?"} contributing models` +
+    ? `<div class="sub">${g.participation_mode === "full_council" ? "Full Council" : g.participation_mode === "adaptive" ? "Adaptive council" : "Focused build"} · ${contributors}/${expectedContributors || "?"} artifact contributors` +
       ` · ${owners} planned owner${owners === 1 ? "" : "s"} · ${running} active` +
       `${g.active_agent_calls ? ` · ${g.active_agent_calls} model call${g.active_agent_calls === 1 ? "" : "s"}` : ""}` +
       `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
       `${g.pending_inputs ? ` · ${g.pending_inputs} question blocked` : ""}` +
       ` · shared staging · ${esc(humanStatus(g.release_status || "not_started"))}</div>` : "";
+  const artifactContributors = new Set(g.artifact_contributors || []);
+  const assignmentStatus = new Map();
+  ms.flatMap(m => m.collaboration_assignments || []).forEach(a => {
+    assignmentStatus.set(a.seat, a.status);
+  });
+  const resourceRoster = (g.resource_roster || []).map(seat => {
+    const status = artifactContributors.has(seat)
+      ? "contributed" : (assignmentStatus.get(seat) || "pending");
+    return `<span class="resource-chip ${esc(status)}" title="${esc(status.replaceAll("_", " "))}">${esc(seat)} <small>${esc(status === "contributed" ? "✓" : status)}</small></span>`;
+  }).join("");
+  const resources = resourceRoster
+    ? `<div class="resource-roster" aria-label="Collaboration resources">${resourceRoster}</div>` : "";
   const spentSeats = Object.entries(g.model_calls_by_seat || {})
     .sort((a, b) => b[1] - a[1]).map(([seat, n]) => `${seat} ${n}`).join(", ");
   const cost = g.model_calls_used
@@ -732,6 +745,7 @@ function goalCard(g) {
       ${g.now ? `<div class="gnow">▸ ${esc(g.now)}</div>` : ""}
       ${g.last_error ? `<div class="gerr">${esc(g.last_error)}</div>` : ""}
       ${aggregate}
+      ${resources}
       ${rows}
       <div class="gstory" id="gstory-${esc(g.goal_id)}" style="display:none"></div>
     </div>`;
@@ -1889,6 +1903,13 @@ function renderSettings(s, seats) {
       <div class="field">${lbl("Council integration review", "integration_review")}
         <input type="checkbox" id="set_integration_review" ${s.integration_review_enabled ? "checked" : ""}></div>
       <div class="sub">After a best-of-N build vote, the codifier may offer a separately validated merge when candidates have complementary strengths. The voted winner remains the default, and the human chooses whether to use the integration.</div>
+      <div class="field">${lbl("Build participation", "participation")}
+        <select id="set_participation_mode">
+          <option value="focused" ${s.participation_mode === "focused" ? "selected" : ""}>Focused — owner + verifier</option>
+          <option value="adaptive" ${s.participation_mode === "adaptive" ? "selected" : ""}>Adaptive — full council on substantial builds</option>
+          <option value="full_council" ${s.participation_mode === "full_council" ? "selected" : ""}>Full Council — every enabled resource</option>
+        </select></div>
+      <div class="sub">Full Council keeps one accountable file owner while every enabled resource reviews the actual baseline and can submit concrete code edits. Enabled resources such as DeepSeek participate even when no named specialist role maps to them.</div>
     </div>
 
     <div class="sset s-ui">
@@ -2069,6 +2090,7 @@ async function saveSettings() {
     cli_enabled,
     cli_timeouts,
     integration_review_enabled: document.getElementById("set_integration_review").checked,
+    participation_mode: document.getElementById("set_participation_mode").value,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),

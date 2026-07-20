@@ -27,9 +27,13 @@ ARTIFACT_END_MARKER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# 'EDIT: <filename>' with conflict-marker-like OLD/NEW blocks.
+# 'EDIT: <filename>' with conflict-marker-like OLD/NEW blocks. A frontier
+# reviewer proposing several edits in one reply commonly numbers and labels
+# them ("OLD/NEW EDIT 1:", "EDIT #2:") by echoing this file's own prompt
+# wording back — tolerate that prefix/suffix so a real, usable repair is never
+# silently discarded merely because the model counted its edits out loud.
 EDIT_MARKER = re.compile(
-    r"^[ \t]*(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
+    r"^[ \t]*(?:\*\*)?(?:OLD/NEW[ \t]+)?EDIT(?:\*\*)?[ \t]*(?:#?\d+)?[ \t]*:[ \t]*(?P<file>.+?)[ \t]*\n"
     r"[ \t]*<{7,}[^\n]*\n(?P<old>.*?)\n[ \t]*={7,}[^\n]*\n(?P<new>.*?)\n[ \t]*>{7,}[^\n]*",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
@@ -38,13 +42,16 @@ EDIT_MARKER = re.compile(
 # labeled fenced blocks instead of merge-conflict markers.  This is still a
 # deterministic surgical edit: the executor requires OLD to occur uniquely in
 # the target before replacing it.  Accept the common form so a usable repair is
-# not discarded merely because the model decorated its headings.
+# not discarded merely because the model decorated its headings — including a
+# blank line for readability between the header, the OLD/NEW labels, and their
+# fences, which a strict single-newline join used to reject outright even
+# though every section was still unambiguous.
 FENCED_EDIT_MARKER = re.compile(
-    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?EDIT(?:\*\*)?[ \t]*:[ \t]*"
-    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n"
-    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n"
-    r"[ \t]*```[^\r\n]*\r?\n(?P<old>.*?)\r?\n[ \t]*```[ \t]*\r?\n"
-    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:OLD/NEW[ \t]+)?EDIT(?:\*\*)?[ \t]*(?:#?\d+)?[ \t]*:[ \t]*"
+    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*```[^\r\n]*\r?\n(?P<old>.*?)\r?\n[ \t]*```[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n(?:[ \t]*\r?\n)*"
     r"[ \t]*```[^\r\n]*\r?\n(?P<new>.*?)\r?\n[ \t]*```[ \t]*",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
@@ -52,14 +59,14 @@ FENCED_EDIT_MARKER = re.compile(
 # Another common Markdown presentation wraps the whole labeled edit in one code
 # fence. Keep this form strict (one outer fence, explicit OLD/NEW labels) so the
 # replacement boundary is unambiguous and ordinary prose is never parsed as an
-# edit.
+# edit. Same numbered-header and blank-line tolerance as FENCED_EDIT_MARKER.
 OUTER_FENCED_EDIT_MARKER = re.compile(
     r"^[ \t]*```[^\r\n]*\r?\n"
-    r"[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:EDIT|FILE)(?:\*\*)?[ \t]*:[ \t]*"
-    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n"
-    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:OLD/NEW[ \t]+)?(?:EDIT|FILE)(?:\*\*)?[ \t]*(?:#?\d+)?[ \t]*:[ \t]*"
+    r"(?P<file>.+?)(?:[ \t]+={3,})?[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*(?:\*\*)?OLD(?:\*\*)?[ \t]*:[ \t]*\r?\n(?:[ \t]*\r?\n)*"
     r"(?P<old>.*?)\r?\n"
-    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n"
+    r"[ \t]*(?:\*\*)?NEW(?:\*\*)?[ \t]*:[ \t]*\r?\n(?:[ \t]*\r?\n)*"
     r"(?P<new>.*?)\r?\n[ \t]*```[ \t]*",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
@@ -81,8 +88,8 @@ PROMOTE_MARKER = re.compile(
 # are not swallowed into the file body. A colon is required so ordinary prose in
 # a file body is not mistaken for a block boundary.
 BLOCK_START = re.compile(
-    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?"
-    r"(?:ARTIFACT|EDIT|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
+    r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:OLD/NEW[ \t]+)?"
+    r"(?:ARTIFACT|EDIT(?:[ \t]*#?\d+)?|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
     re.IGNORECASE | re.MULTILINE,
 )
 

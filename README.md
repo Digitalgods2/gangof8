@@ -238,14 +238,13 @@ The planner defines each package with:
 - an interface contract; and
 - acceptance checks.
 
-For a broad build, the planner is instructed to use the enabled council across
-distinct areas of responsibility. A small job may reasonably need fewer
-packages. When a broad plan has enough work packages for the enabled roster,
-duplicate owner assignments are repaired so every enabled AI gets a real
-model-authored package before any owner gets a second; zero-call assembly does
-not count as participation. Claude and Codex are explicitly assigned
-source-producing packages when enabled, with a frontier seat preferred for
-final integration. Missing owners are normalized across enabled seats, inferred file
+For a broad build, the planner creates only the natural package boundaries the
+deliverable actually needs. A small job may reasonably need one package.
+Package ownership and collaboration resources are separate: enabled models do
+not receive artificial files merely to manufacture participation. The
+configured code generator owns the primary source/release package when it is
+available; other owners may take genuinely independent packages. Missing
+owners are normalized across eligible owner seats, inferred file
 dependencies are added, repeated output paths are sequenced, and cyclic hard
 dependency plans are rejected. A hard `AFTER`/`REQUIRES` edge means verified
 file bytes must exist before the owner can start. `CONTRACTS` remains
@@ -287,13 +286,19 @@ that only consumes another owner's declared interface can start immediately,
 even while that provider is still working. Dashboard goals run in the
 background, so a broad plan normally puts most or all enabled owners into its
 first execution wave. Each package session remains accountable to its named
-owner rather than convening another seven-way candidate tournament.
+owner. Under Adaptive or Full Council participation, that owner first produces
+a cohesive baseline and then every enabled collaboration resource receives the
+actual baseline bytes with a deterministic review lens. Peers return
+evidence-based findings and concrete `EDIT` patches. The owner must explicitly
+accept, reject, or supersede each contribution and emits the integrated package
+files in full.
 
 Every output path in a package goes to its accountable owner in one cohesive
 authoring call. Tightly coupled HTML, CSS, and JavaScript are never round-robin
-mixed and then mislabeled as integrated. Seven-model throughput comes from
-independent packages running concurrently. Existing-file revisions still use
-the owner and a surgical edit path.
+mixed and then mislabeled as integrated. Independent packages run concurrently,
+and each package's peer challenge wave fans out concurrently within the local
+CLI and API resource limits. Existing-file revisions still use the owner and a
+surgical edit path.
 
 Each owner receives the package/interface sections, its exact output map, and
 the actual hash-bound bytes of every hard dependency. A completed response that
@@ -412,7 +417,17 @@ the task. By default the panel runs in **duo** mode — a lead author plus one
 independent frontier reviewer — and goals are planned against a
 frontier-only build roster with the fewest packages the deliverable's real
 structure allows (a single-file deliverable is exactly one authoring
-package). Opt into the full council per install with environment variables:
+package). Build collaboration has a separate resource roster containing every
+enabled registered model, including DeepSeek when no named specialist role
+maps to it. Settings provides three participation modes:
+
+- **Focused** — package owner plus independent release verification.
+- **Adaptive** (default) — Full Council for standard/complex code builds and
+  Focused behavior for small work.
+- **Full Council** — every enabled resource is scheduled against the real
+  baseline; failures remain visible rather than silently shrinking the roster.
+
+Environment variables still control ordinary panels and owner eligibility:
 
 - `GANGOF8_PANEL_MODE=council` — convene every configured seat, plus enabled
   OpenRouter seats, on ordinary tasks (default: `duo`).
@@ -424,7 +439,8 @@ package). Opt into the full council per install with environment variables:
   report; resuming grants another block. Spend shows on each goal card as
   `used/budget calls`.
 
-An explicit seat roster chosen in Settings always wins over either mode.
+An explicit panel roster chosen in Settings controls ordinary panel sessions;
+it does not remove enabled models from a goal's collaboration resource roster.
 
 The real `cli` backend can register these local seats when their commands are
 installed and authenticated:
@@ -460,8 +476,9 @@ call. Settings supports:
 - pinning a different model for a specific role;
 - setting per-CLI-seat timeouts;
 - changing the lead and specialist role mapping;
-- changing complexity budgets and round-consent cadence; and
-- enabling or disabling Council integration review.
+- changing complexity budgets and round-consent cadence;
+- enabling or disabling Council integration review; and
+- selecting Focused, Adaptive, or Full Council build participation.
 
 The header lists the seven brands—OpenAI, Anthropic, Gemini, DeepSeek, GLM,
 Qwen, and Kimi—with a checkbox beside each. Each switch saves immediately

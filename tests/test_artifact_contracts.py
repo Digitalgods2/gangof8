@@ -95,6 +95,56 @@ NEW:
     assert "playerFlash <= 0" in action.args["new"]
 
 
+def test_parse_frontier_numbered_fenced_edit_with_blank_lines():
+    """A real frontier release-engineer reply echoed this file's own prompt
+    wording ("OLD/NEW EDIT block(s)") back as a literal numbered header —
+    'OLD/NEW EDIT 1:', 'OLD/NEW EDIT 2:' — and put a blank line between the
+    header/OLD/NEW labels and their fences for readability. The strict
+    original pattern required the bare word 'EDIT:' with no blank-line
+    padding anywhere, so a genuinely correct multi-edit repair (donkey-kong
+    momentum + oil-drum ignition fixes) parsed to zero actions and the whole
+    release verification was discarded as "no usable implementation repair"
+    even though the fix was right there."""
+    text = """\
+DEFECT: `game.html` - no stored horizontal velocity.
+
+OLD/NEW EDIT 1: `game.html`
+
+OLD:
+```js
+p.x += dir * MOVE * dt;
+```
+
+NEW:
+```js
+p.vx = approach(p.vx, dir * MOVE, ACCEL * dt);
+p.x += p.vx * dt;
+```
+
+OLD/NEW EDIT 2: `game.html`
+
+OLD:
+```js
+oilLit = Math.random() < 0.28;
+```
+
+NEW:
+```js
+oilLit = true;
+```
+
+VERDICT: FAIL
+"""
+    actions = artifacts.parse_proposals("s_1", text)
+    edits = [a for a in actions if a.kind == "edit_file"]
+    assert len(edits) == 2
+    assert all(a.filename == "game.html" for a in edits)
+    assert edits[0].args["old"] == "p.x += dir * MOVE * dt;"
+    assert "approach(p.vx" in edits[0].args["new"]
+    assert edits[1].args["old"] == "oilLit = Math.random() < 0.28;"
+    assert edits[1].args["new"] == "oilLit = true;"
+
+
 def test_clean_artifact_body_keeps_single_html_document():
     raw = """Here is the file:
 <!doctype html>

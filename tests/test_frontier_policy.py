@@ -77,6 +77,7 @@ def test_substantial_build_auto_routes_but_small_fix_does_not():
 def test_normalizer_moves_claude_and_codex_onto_code_packages(tmp_path):
     service = GangOf8Service(data_dir=tmp_path / "data")
     service.panel = ["gemini", "claude", "codex"]
+    service.role_agents[Role.code_generator] = "codex"
     packages = [
         # review.md is a released artifact too: two natural artifacts keep
         # this a legitimately multi-package plan under Phase 1 right-sizing.
@@ -96,7 +97,51 @@ def test_normalizer_moves_claude_and_codex_onto_code_packages(tmp_path):
         if any(name.endswith((".js", ".html")) for name in package.required_files)
     }
     assert {"claude", "codex"} <= code_owners
-    assert normalized[2].owner == "claude", "first frontier owns final integration"
+    assert normalized[2].owner == "codex", "configured coder owns final integration"
+
+
+def test_configured_code_generator_owns_single_file_build(tmp_path):
+    """Regression: a planner-authored Claude OWNER must not override Codex in
+    Settings for the sole source package in a single-file build."""
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.role_agents[Role.code_generator] = "codex"
+    package = GoalMilestone(
+        index=0, title="game", task_text="author the complete game",
+        owner="claude", required_files=["ms-pacman.html"],
+        release_files=["ms-pacman.html"], release_declared=True,
+        contract_declared=True,
+    )
+
+    normalized, errors = service._normalize_work_packages(
+        [package], "Build a complete single-file HTML arcade game",
+        roster=["claude", "codex"],
+    )
+
+    assert not errors
+    assert normalized[0].owner == "codex"
+
+
+def test_default_build_roster_puts_configured_code_generator_first(
+        tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["claude", "codex", "gemini"]
+    service.role_agents[Role.code_generator] = "codex"
+    monkeypatch.setattr(config, "GOAL_FULL_ROSTER", False)
+
+    assert service._default_build_roster() == ["codex", "claude", "gemini"]
+
+
+def test_service_role_remap_does_not_mutate_backend_defaults(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    configured_default = config.ROLE_AGENTS_BY_BACKEND[
+        service.backend
+    ][Role.code_generator]
+
+    service.role_agents[Role.code_generator] = "temporary-test-seat"
+
+    assert config.ROLE_AGENTS_BY_BACKEND[
+        service.backend
+    ][Role.code_generator] == configured_default
 
 
 def test_missing_frontier_candidate_is_a_hard_gate(tmp_path):
