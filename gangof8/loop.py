@@ -35,6 +35,7 @@ from .executor import ExecutionError
 from .governance import ApprovalRequired, BudgetExceeded, Governance
 from .logstore import LogStore
 from .models import (
+    CollaborationAssignment,
     Contribution,
     Council,
     CouncilMember,
@@ -1948,6 +1949,24 @@ def _run_in_place_revision(
     return False
 
 
+_CODE_ARTIFACT_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".css", ".cxx", ".go", ".h", ".hpp",
+    ".htm", ".html", ".java", ".js", ".jsx", ".kt", ".kts", ".mjs",
+    ".php", ".ps1", ".py", ".rb", ".rs", ".sh", ".sql", ".svelte",
+    ".swift", ".ts", ".tsx", ".vue",
+}
+
+
+def _package_has_code_artifacts(session: Session) -> bool:
+    """Whether this output contract contains source code rather than prose."""
+    return any(
+        Path(filename.replace("\\", "/")).suffix.lower()
+        in _CODE_ARTIFACT_SUFFIXES
+        for filename in session.required_files
+        if filename
+    )
+
+
 def _package_output_assignments(
     session: Session, council: Council,
 ) -> dict[str, CouncilMember]:
@@ -1972,7 +1991,15 @@ def _package_output_assignments(
         )
     if owner is None:
         return {}
-    author = CouncilMember(role=Role.panelist, agent=owner.agent, active=True)
+    # A source-code package owner performs the configured code-generator role,
+    # so both the selected seat and its role-specific model pin apply to real
+    # implementation. Preserve the planned role for prose and other artifacts;
+    # a Markdown report is not a coding task merely because it is a file.
+    author = (
+        CouncilMember(role=Role.code_generator, agent=owner.agent, active=True)
+        if _package_has_code_artifacts(session)
+        else owner
+    )
     return {filename: author for filename in required}
 
 
@@ -2081,6 +2108,372 @@ def _package_author_timeout(session: Session, member: CouncilMember, retry: bool
             if requested > 0 else config.PACKAGE_AUTHOR_WAVE_TIMEOUT
         )
     return _package_call_timeout(session, member, requested)
+
+
+_COLLABORATION_ROLE_LENSES = (
+    (Role.architect, "architecture"),
+    (Role.critic, "correctness"),
+    (Role.api_integrator, "integration"),
+    (Role.red_team, "adversarial"),
+    (Role.implementer, "implementation"),
+    (Role.fact_validator, "verification"),
+)
+_COLLABORATION_LENS_ROLES = {
+    lens: role for role, lens in _COLLABORATION_ROLE_LENSES
+}
+
+
+def _full_council_package(session: Session) -> bool:
+    """Whether this package earns the artifact-aware resource wave."""
+    if (session.participation_mode == "focused" or session.assembly_mode
+            or not session.required_files or len(session.resource_roster) < 2):
+        return False
+    if session.participation_mode == "full_council":
+        return True
+    classification = session.classification
+    return bool(
+        session.participation_mode == "adaptive"
+        and _package_has_code_artifacts(session)
+        and classification
+        and classification.task_type == TaskType.code
+        and getattr(classification.complexity, "value", classification.complexity)
+        in {"standard", "complex"}
+    )
+
+
+def _package_baseline(session: Session) -> dict[str, str]:
+    """Latest owner-accountable full contents for each contracted output."""
+    required = {
+        name.replace("\\", "/") for name in session.required_files if name
+    }
+    baseline: dict[str, str] = {}
+    for action in session.proposed_actions:
+        name = (action.filename or "").replace("\\", "/")
+        if (action.kind == "write_file" and action.role != Role.panelist
+                and name in required and (action.content or "").strip()):
+            baseline[name] = action.content
+    return baseline
+
+
+def _collaboration_lens(
+    seat: str, role_agents: Optional[dict[Role, str]], used: set[str],
+) -> str:
+    mapping = role_agents or config.ROLE_AGENTS
+    candidates = [
+        lens for role, lens in _COLLABORATION_ROLE_LENSES
+        if mapping.get(role) == seat
+    ]
+    for lens in candidates:
+        if lens not in used:
+            return lens
+    return candidates[0] if candidates else "independent"
+
+
+def _ensure_collaboration_assignments(
+    session: Session, role_agents: Optional[dict[Role, str]], store: LogStore,
+) -> list[CollaborationAssignment]:
+    """Create one stable, unique-lens assignment per non-owner resource."""
+    if session.collaboration_assignments:
+        for assignment in session.collaboration_assignments:
+            if assignment.status == "running":
+                assignment.status = "pending"
+        return session.collaboration_assignments
+    used: set[str] = set()
+    for seat in session.resource_roster:
+        if not seat or seat == session.work_package_owner:
+            continue
+        lens = _collaboration_lens(seat, role_agents, used)
+        used.add(lens)
+        session.collaboration_assignments.append(
+            CollaborationAssignment(seat=seat, lens=lens)
+        )
+    store.log_event(
+        session.session_id,
+        "package_collaboration_scheduled",
+        {
+            "package": session.work_package_id,
+            "owner": session.work_package_owner,
+            "assignments": [
+                {"seat": assignment.seat, "lens": assignment.lens}
+                for assignment in session.collaboration_assignments
+            ],
+        },
+    )
+    store.save_session(session)
+    return session.collaboration_assignments
+
+
+def _collaboration_patch_files(
+    session: Session, content: str, allowed: set[str],
+) -> list[str]:
+    return list(dict.fromkeys(
+        action.filename.replace("\\", "/")
+        for action in _parse_proposals(session.session_id, content)
+        if (action.kind == "edit_file"
+            and action.filename.replace("\\", "/") in allowed)
+    ))
+
+
+def _run_collaboration_assignment(
+    session: Session,
+    assignment: CollaborationAssignment,
+    baseline: dict[str, str],
+    call: AgentCall,
+    store: LogStore,
+    staged_context: str = "",
+) -> Optional[Contribution]:
+    member = CouncilMember(
+        role=_COLLABORATION_LENS_ROLES.get(assignment.lens, Role.panelist),
+        agent=assignment.seat,
+        active=True,
+    )
+    with _SESSION_LOCK:
+        assignment.status = "running"
+        assignment.attempts += 1
+        assignment.error = ""
+        store.log_event(
+            session.session_id, "package_collaboration_started",
+            {"seat": assignment.seat, "lens": assignment.lens,
+             "attempt": assignment.attempts},
+        )
+        store.save_session(session)
+    try:
+        contribution = call(
+            member,
+            rounds.package_collaboration_prompt(
+                session, member, assignment.lens, baseline, staged_context,
+            ),
+        )
+    except SessionCancelled:
+        with _SESSION_LOCK:
+            assignment.status = "pending"
+            store.save_session(session)
+        raise
+    except Exception as exc:  # one unavailable peer never discards the baseline
+        from .seat_health import UNAVAILABLE_STATES, classify_failure
+
+        state = classify_failure(str(exc))
+        with _SESSION_LOCK:
+            assignment.status = (
+                "unavailable" if state in UNAVAILABLE_STATES else "failed"
+            )
+            assignment.error = str(exc)[:500]
+            store.log_event(
+                session.session_id, "package_collaboration_failed",
+                {"seat": assignment.seat, "lens": assignment.lens,
+                 "status": assignment.status, "error": assignment.error},
+            )
+            store.save_session(session)
+        return None
+    with _SESSION_LOCK:
+        assignment.findings = rounds.parse_collaboration_findings(contribution.content)
+        assignment.patch_files = _collaboration_patch_files(
+            session, contribution.content, set(baseline)
+        )
+        verdict = re.search(
+            r"^\s*VERDICT\s*:\s*(PASS|CHANGES)\s*$",
+            contribution.content or "", re.IGNORECASE | re.MULTILINE,
+        )
+        if verdict is None or (
+                verdict.group(1).upper() == "CHANGES"
+                and not assignment.findings and not assignment.patch_files):
+            assignment.status = "failed"
+            assignment.error = (
+                "collaboration reply did not satisfy the VERDICT/FINDING/EDIT contract"
+            )
+            store.log_event(
+                session.session_id, "package_collaboration_protocol_miss",
+                {"seat": assignment.seat, "attempt": assignment.attempts},
+            )
+            store.save_session(session)
+            return None
+        assignment.status = "contributed"
+        try:
+            assignment.contribution_index = session.contributions.index(contribution)
+        except ValueError:
+            assignment.contribution_index = None
+        store.log_event(
+            session.session_id, "package_collaboration_contributed",
+            {"seat": assignment.seat, "lens": assignment.lens,
+             "findings": len(assignment.findings),
+             "patch_files": assignment.patch_files},
+        )
+        store.save_session(session)
+    return contribution
+
+
+def _integrated_package_problem(
+    session: Session, integrated: dict[str, str],
+) -> str:
+    for filename, content in integrated.items():
+        if not (content or "").strip():
+            return f"integrated file is empty: {filename}"
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".html", ".htm"}:
+            low = content.lower()
+            if not (("<!doctype html" in low or "<html" in low)
+                    and _html_doc_end(low) >= 0):
+                return f"integrated HTML is incomplete: {filename}"
+    # A single self-contained web artifact can be safely preflighted here. A
+    # multi-file package still goes through the normal dependency-aware gate.
+    if len(integrated) == 1:
+        filename, content = next(iter(integrated.items()))
+        if Path(filename).suffix.lower() in {".html", ".htm", ".js", ".mjs"}:
+            ran, testable, detail, _dynamic = smoke.smoke_source(
+                content, Path(filename).suffix.lower()
+            )
+            if testable and not ran:
+                return f"integrated artifact failed runtime preflight: {detail}"
+    return ""
+
+
+def _replace_package_baseline(
+    session: Session, integrated: dict[str, str], store: LogStore,
+) -> None:
+    replaced: list[str] = []
+    for filename, content in integrated.items():
+        action = next(
+            (candidate for candidate in reversed(session.proposed_actions)
+             if (candidate.kind == "write_file"
+                 and candidate.role != Role.panelist
+                 and candidate.filename.replace("\\", "/") == filename)),
+            None,
+        )
+        if action is None:
+            continue
+        action.content = content
+        action.args["content"] = content
+        replaced.append(filename)
+    session.collaboration_integrated_files = replaced
+    store.save_session(session)
+
+
+def _run_package_collaboration(
+    session: Session,
+    council: Council,
+    call: AgentCall,
+    owner_call: AgentCall,
+    store: LogStore,
+    role_agents: Optional[dict[Role, str]],
+    staged_context: str = "",
+) -> None:
+    """Run the full resource council against real owner-authored bytes."""
+    if not _full_council_package(session):
+        return
+    if session.collaboration_integration_status == "integrated":
+        return
+    baseline = _package_baseline(session)
+    if not baseline or set(baseline) != {
+            name.replace("\\", "/") for name in session.required_files}:
+        session.collaboration_integration_status = "baseline_unavailable"
+        store.save_session(session)
+        return
+    if not session.collaboration_baseline:
+        session.collaboration_baseline = dict(baseline)
+    assignments = _ensure_collaboration_assignments(session, role_agents, store)
+    # One bounded retry recovers a malformed review envelope or transient call
+    # failure. Hard-unavailable seats remain visible and are never burned again.
+    for wave in range(2):
+        pending = [
+            assignment for assignment in assignments
+            if assignment.status in {"pending", "failed"}
+            and assignment.attempts < 2
+        ]
+        if not pending:
+            break
+        _fan_out(
+            session,
+            pending,
+            lambda assignment: _run_collaboration_assignment(
+                session, assignment, baseline, call, store,
+                staged_context,
+            ),
+            f"package-collaboration-{wave + 1}",
+        )
+    contributions: list[tuple[str, str]] = []
+    for assignment in assignments:
+        index = assignment.contribution_index
+        if (assignment.status == "contributed" and index is not None
+                and 0 <= index < len(session.contributions)):
+            contributions.append(
+                (assignment.seat, session.contributions[index].content)
+            )
+    if not contributions:
+        session.collaboration_integration_status = "baseline_preserved_no_contributors"
+        store.save_session(session)
+        return
+    owner = CouncilMember(
+        role=Role.code_generator,
+        agent=session.work_package_owner,
+        active=True,
+    )
+    session.collaboration_integration_status = "integrating"
+    store.save_session(session)
+    try:
+        integrated_reply = owner_call(
+            owner,
+            rounds.package_collaboration_integration_prompt(
+                session, baseline, contributions, staged_context,
+            ),
+        )
+    except (AgentError, AgentInputRequired, BudgetExceeded):
+        session.collaboration_integration_status = "baseline_preserved_owner_unavailable"
+        store.save_session(session)
+        return
+    dispositions = rounds.parse_collaboration_dispositions(integrated_reply.content)
+    dispositions_by_seat = {
+        seat.lower(): disposition for seat, disposition in dispositions.items()
+    }
+    missing_dispositions = [
+        assignment.seat for assignment in assignments
+        if (assignment.status == "contributed"
+            and assignment.seat.lower() not in dispositions_by_seat)
+    ]
+    for assignment in assignments:
+        assignment.disposition = dispositions_by_seat.get(
+            assignment.seat.lower(), ""
+        )
+    if missing_dispositions:
+        session.collaboration_integration_status = (
+            "baseline_preserved_missing_dispositions"
+        )
+        store.log_event(
+            session.session_id, "package_collaboration_integration_rejected",
+            {"reason": "missing_dispositions", "seats": missing_dispositions},
+        )
+        store.save_session(session)
+        return
+    writes = {
+        action.filename.replace("\\", "/"): _clean_artifact_body(
+            action.content, action.filename
+        )
+        for action in _parse_proposals(
+            session.session_id, integrated_reply.content, role=Role.implementer,
+        )
+        if (action.kind == "write_file"
+            and action.filename.replace("\\", "/") in baseline)
+    }
+    if set(writes) != set(baseline):
+        session.collaboration_integration_status = "baseline_preserved_incomplete_owner_reply"
+        store.save_session(session)
+        return
+    problem = _integrated_package_problem(session, writes)
+    if problem:
+        session.collaboration_integration_status = "baseline_preserved_failed_preflight"
+        store.log_event(
+            session.session_id, "package_collaboration_integration_rejected",
+            {"reason": problem},
+        )
+        store.save_session(session)
+        return
+    _replace_package_baseline(session, writes, store)
+    session.collaboration_integration_status = "integrated"
+    store.log_event(
+        session.session_id, "package_collaboration_integrated",
+        {"owner": session.work_package_owner, "files": sorted(writes),
+         "contributors": [seat for seat, _ in contributions]},
+    )
+    store.save_session(session)
 
 
 def _adopt_owned_package_artifacts(
@@ -2610,6 +3003,17 @@ def _run_panel_rounds(
                     },
                 )
                 raise QualityGateFailed(failure)
+
+            # The owner has now produced a complete baseline. On substantial
+            # builds, let every enabled resource challenge those ACTUAL bytes
+            # in parallel, then require the same owner to reconcile the
+            # findings into one cohesive final output set. This is distinct
+            # from package ownership: peers propose code; they never silently
+            # replace the accountable author's files.
+            _run_package_collaboration(
+                session, council, call, lead_call, store, role_agents,
+                author_context,
+            )
             summary = (
                 f"Package {session.work_package_id or r + 1} was authored and staged by "
                 f"accountable owner {session.work_package_owner}. Exact output authors: "

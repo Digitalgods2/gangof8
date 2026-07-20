@@ -65,6 +65,7 @@
     },
     "rounds_per_consent": 3,
     "integration_review_enabled": true,
+    "participation_mode": "adaptive",
     "ui": {
       "poll_interval_ms": 5000,
       "collapse_finished": true

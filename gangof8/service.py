@@ -238,7 +238,10 @@ class GangOf8Service:
             })
             self.role_agents = base
         else:
-            self.role_agents = config.ROLE_AGENTS_BY_BACKEND[self.backend]
+            # Each service owns its effective mapping. Returning the config
+            # dictionary by reference let a test, embedder, or live remap on
+            # one service silently change every service created afterward.
+            self.role_agents = dict(config.ROLE_AGENTS_BY_BACKEND[self.backend])
 
         # Keep the user's declared/default mapping separate from the effective
         # mapping after disabled-seat inheritance. Per-role model pins belong
@@ -280,7 +283,15 @@ class GangOf8Service:
             # pinned to the model chosen in Settings (else the CLI's default).
             # gemini also gets the key getter so a Settings-stored key (not
             # just the env var) unlocks its SDK path.
-            for agent in sorted(set(self.role_agents.values())):
+            cli_resources = set(self.role_agents.values())
+            if not self._explicit_role_agents:
+                # Local seats are resources in their own right. Register an
+                # enabled CLI even when no named specialist role maps to it so
+                # full-council collaboration cannot silently lose that model.
+                cli_resources.update(
+                    config.PANEL_SEATS_BY_BACKEND.get("cli", [])
+                )
+            for agent in sorted(cli_resources):
                 if (agent not in config.OPENROUTER_SEATS
                         and (self._explicit_role_agents or self._seat_enabled(agent))):
                     self.registry.register(CliAdapter(
@@ -393,12 +404,49 @@ class GangOf8Service:
         GANGOF8_GOAL_FULL_ROSTER=1 or an explicit per-goal roster.
         """
         if config.GOAL_FULL_ROSTER:
-            return list(self.panel)
-        frontier = [
-            seat for seat in self.panel
-            if seat not in config.OPENROUTER_SEATS
+            roster = list(self.panel)
+        else:
+            frontier = [
+                seat for seat in self.panel
+                if seat not in config.OPENROUTER_SEATS
+            ]
+            roster = frontier or list(self.panel)
+
+        # The Settings role map is an ownership preference, not merely the
+        # model used if a planner happens to delegate to CODE GENERATOR. Put
+        # that enabled seat first so the architect sees the same priority the
+        # deterministic normalizer enforces below. Keep every other seat in
+        # its existing order for additional packages and failover.
+        preferred_coder = self.role_agents.get(Role.code_generator)
+        if preferred_coder in roster:
+            roster = [preferred_coder, *(
+                seat for seat in roster if seat != preferred_coder
+            )]
+        return roster
+
+    def _effective_resource_roster(self) -> list[str]:
+        """Every enabled, registered model available to collaborate on goals.
+
+        This is intentionally independent of both ``panel_seats`` and role
+        mappings. An enabled resource such as DeepSeek must not disappear just
+        because no specialist role currently points at it, and duo mode must
+        not silently turn a seven-model installation into a two-model build.
+        The roster is frozen onto each goal so settings changes cannot alter a
+        run halfway through it.
+        """
+        preferred_coder = self.role_agents.get(Role.code_generator)
+        candidates = [
+            preferred_coder,
+            *config.PANEL_SEATS_BY_BACKEND.get(self.backend, []),
+            *config.OPENROUTER_SEATS,
+            *self.panel,
+            *self.role_agents.values(),
         ]
-        return frontier or list(self.panel)
+        registered = set(self.registry.names())
+        return list(dict.fromkeys(
+            seat for seat in candidates
+            if seat and seat in registered and self._seat_enabled(seat)
+        ))
 
     def _openrouter_slug(self, seat: str) -> Optional[str]:
         """Effective model slug for a seat: a user override (settings) wins over
@@ -1300,7 +1348,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     # ---- Goals (/goal): long-horizon objectives, milestone by milestone -------
 
-    def create_goal(self, text: str, background: bool = False) -> Goal:
+    def create_goal(
+        self, text: str, background: bool = False,
+        participation_mode: Optional[str] = None,
+    ) -> Goal:
         """Open a goal: the architect decomposes it into milestone-sized
         deliverables, repairing a rejected contract when necessary, then the
         ready package wave runs as normal sessions. With
@@ -1316,12 +1367,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         active = self.workspaces.active()
         if not established and active:
             established = active.root
+        mode = participation_mode or self.settings.participation_mode
+        if mode not in {"focused", "adaptive", "full_council"}:
+            raise ValueError(
+                "participation_mode must be focused, adaptive, or full_council"
+            )
         goal = Goal(
             text=raw,
             collaboration_mode="build_team",
             delivery_mode="final_batch",
             background=background,
             build_roster=self._default_build_roster(),
+            resource_roster=self._effective_resource_roster(),
+            participation_mode=mode,
             established_root=established,
             delivery_root=delivery,
         )
@@ -1491,6 +1549,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             code_indices,
             key=lambda i: (not bool(milestones[i].release_files), i),
         )
+
+        # A configured CODE GENERATOR must actually own the primary source
+        # package. Previously the setting only controlled on-demand specialist
+        # calls; the architect's OWNER survived normalization, so a one-file
+        # build could be assigned to Claude even when Codex was the selected
+        # coder. Prefer the release/integration package, and swap the displaced
+        # owner onto the coder's former package when possible to preserve the
+        # planner's team coverage. If that seat is absent from the goal roster,
+        # retain the existing frontier fallback behavior.
+        preferred_coder = self.role_agents.get(Role.code_generator)
+        if targets and preferred_coder in seats:
+            primary_i = targets[0]
+            if milestones[primary_i].owner != preferred_coder:
+                displaced = milestones[primary_i].owner
+                old_i = next(
+                    (i for i, package in enumerate(milestones)
+                     if i != primary_i and package.owner == preferred_coder),
+                    None,
+                )
+                milestones[primary_i].owner = preferred_coder
+                if old_i is not None and displaced:
+                    milestones[old_i].owner = displaced
+
         for seat in frontier:
             if any(milestones[i].owner == seat for i in code_indices):
                 continue
@@ -1974,8 +2055,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.delivery_mode = bound.delivery_mode
         session.work_package_id = milestone.package_id
         session.work_package_owner = milestone.owner
+        session.resource_roster = list(bound.resource_roster or session.panel)
+        session.participation_mode = bound.participation_mode
         session.package_helpers = [
-            seat for seat in session.panel
+            seat for seat in session.resource_roster
             if seat and seat != milestone.owner
         ]
         session.assembly_mode, session.assembly_template = self._assembly_contract(milestone)
@@ -2534,6 +2617,52 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self.store.save_session(session)
                 return False
             verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
+            if not checks and not defects and "VERDICT:" not in (answer.content or "").upper():
+                # No CHECK lines, no DEFECT lines, no VERDICT at all — the
+                # turn produced real output (this is not a transport
+                # failure) but never performed an actual review. A real
+                # goal saw a verifier CLI propose exploratory tool calls
+                # ("Tool: bash" ... list the directory) and stop there
+                # instead of reading the results and continuing; treating
+                # that as a genuine rejection burned a fault-streak attempt
+                # on the package owner and overwrote real defects an
+                # earlier round had already found with a meaningless
+                # "missing acceptance checks: ALL" placeholder. Retry with
+                # a fresh call before ever attributing this to the code.
+                self.store.log_event(
+                    session.session_id, "release_verifier_incomplete_turn",
+                    {"agent": verifier_name, "attempt": attempt + 1,
+                     "response_chars": len(answer.content or "")},
+                )
+                if attempt + 1 < config.FRONTIER_VERIFY_ATTEMPTS:
+                    continue
+                session.quality_gate = {
+                    "verifier": verifier_name, "verdict": "UNAVAILABLE",
+                    "detail": (
+                        "release verifier did not complete a review (incomplete "
+                        "turn, no checks or defects emitted)"
+                    ),
+                    "browser_acceptance": browser_evidence,
+                }
+                session.unresolved.append(
+                    "release verification could not complete — the verifier's "
+                    "turn ended without reviewing the release; the batch was NOT "
+                    "judged. Resume the goal to retry verification."
+                )
+                session.stop_reason = "frontier release verifier unavailable"
+                session.outcome = "failed_verification"
+                self.manager.transition(session, SessionStatus.composing)
+                session.final = FinalAnswer(
+                    answer=(
+                        "The assembled batch passed deterministic and browser "
+                        "checks but its independent verification did not complete."
+                    ),
+                    confidence="low", risks_unresolved=list(session.unresolved),
+                    next_action="Resume the goal to retry the release verifier.",
+                )
+                self.manager.transition(session, SessionStatus.failed)
+                self.store.save_session(session)
+                return False
             # Repair mandate (ARCHITECTURE-REVIEW.md Phase 2): whole-file
             # ARTIFACT rewrites are first-class repairs alongside surgical
             # EDITs — a verifier that saw the fix but could only patch
@@ -3788,6 +3917,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     "output_attempts": current.get("package_output_attempts", {}),
                     "output_history": current.get("package_output_history", {}),
                     "author_failures": current.get("package_call_failures", {}),
+                    "resource_roster": current.get("resource_roster", []),
+                    "participation_mode": current.get(
+                        "participation_mode", goal.participation_mode
+                    ),
+                    "collaboration_assignments": current.get(
+                        "collaboration_assignments", []
+                    ),
+                    "collaboration_integrated_files": current.get(
+                        "collaboration_integrated_files", []
+                    ),
+                    "collaboration_integration_status": current.get(
+                        "collaboration_integration_status", "not_started"
+                    ),
                     "authoring_started_at": current.get("package_started_at"),
                     "authoring_deadline_at": current.get("package_deadline_at"),
                     "attempts": [
@@ -3807,6 +3949,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             "output_attempts": item.get("package_output_attempts") or {},
                             "output_history": item.get("package_output_history") or {},
                             "author_failures": item.get("package_call_failures") or {},
+                            "collaboration_assignments": item.get(
+                                "collaboration_assignments") or [],
+                            "collaboration_integrated_files": item.get(
+                                "collaboration_integrated_files") or [],
+                            "collaboration_integration_status": item.get(
+                                "collaboration_integration_status") or "not_started",
                             "authoring_started_at": item.get("package_started_at"),
                             "authoring_deadline_at": item.get("package_deadline_at"),
                             "is_current": item.get("session_id") == package.session_id,
@@ -3823,10 +3971,38 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 contributing_agents.update(
                     (item.get("successful_agent_calls") or {}).keys()
                 )
-            expected_roster = list(goal.build_roster or [])
+            artifact_contributors: set[str] = set()
+            for item in related:
+                artifact_contributors.update(
+                    (item.get("package_output_authors") or {}).values()
+                )
+                artifact_contributors.update(
+                    assignment.get("seat")
+                    for assignment in (item.get("collaboration_assignments") or [])
+                    if assignment.get("status") == "contributed"
+                    and assignment.get("seat")
+                )
+            expected_roster = list(
+                goal.resource_roster
+                if goal.participation_mode != "focused" and goal.resource_roster
+                else goal.build_roster or []
+            )
+            has_artifact_work = any(
+                package.required_files for package in goal.milestones
+            )
+            effective_artifact_contributors = (
+                artifact_contributors if has_artifact_work else contributing_agents
+            )
             data["contributing_agents"] = sorted(contributing_agents)
             data["contributor_count"] = len(contributing_agents)
             data["expected_contributor_count"] = len(expected_roster)
+            data["artifact_contributors"] = sorted(
+                effective_artifact_contributors
+            )
+            data["artifact_contributor_count"] = len(
+                effective_artifact_contributors
+            )
+            data["expected_artifact_contributor_count"] = len(expected_roster)
             # Phase 3 economics: effective budget so the UI can render
             # "used/budget" without knowing the server's config default.
             data["call_budget"] = self._goal_call_budget(goal)
@@ -3840,7 +4016,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 data["model_calls_used"] = sum(
                     item.get("agent_call_attempts") or 0 for item in related)
             data["participation_complete"] = (
-                set(expected_roster).issubset(contributing_agents)
+                set(expected_roster).issubset(
+                    effective_artifact_contributors
+                    if goal.participation_mode != "focused"
+                    else contributing_agents
+                )
                 if expected_roster else None
             )
             if goal.status in ("cancelled", "completed", "failed"):
@@ -4044,7 +4224,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 None,
             )
             if assembly_package is None:
-                return ""
+                # No deterministic HTML_INLINE assembly step exists — the
+                # default "one authoring package" shape for a single-file
+                # deliverable. There is no separate assembly package to
+                # blame; attribute the critique to the package that directly
+                # authored the criticized release file(s) instead.
+                return self._reopen_direct_release_owner(goal, token)
             session = self.manager.load(assembly_package.session_id)
             if session is None or session.assembly_mode != assembly.HTML_INLINE:
                 return ""
@@ -4124,6 +4309,103 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if scheduled:
                 self.store.log_event(
                     "-", "release_regression_rebuild_scheduled", scheduled)
+
+    def _reopen_direct_release_owner(self, goal: Goal, token: str) -> str:
+        """Attribute a failed release verification straight to the package
+        that authored the criticized file(s), for the common case where
+        there is no deterministic HTML_INLINE assembly step to blame — a
+        single-file build's one authoring package IS the release.
+
+        Without this, a goal with no assembly package could only retry via
+        the frontier verifier's own blind self-repair loop (it did not write
+        the code, has no design context, and gets a couple of attempts per
+        session), so a real defect just came back unchanged on every resume.
+        Routing it back to the actual owner mirrors the same streak/escalation
+        protection ``_invalidate_assembly_input_provider`` uses, so a genuinely
+        stuck repair still pauses for a human instead of looping forever.
+
+        Returns "reopened", "breaker", or "" (ambiguous ownership across
+        multiple contributing packages — fall back to the frontier loop).
+        """
+        if not goal.release_files or not goal.release_defects:
+            return ""
+        owners: dict[str, GoalMilestone] = {}
+        for package in goal.milestones:
+            for name in package.release_files:
+                owners[name.replace("\\", "/")] = package
+        candidates = {
+            owners[name].index for name in goal.release_files if name in owners
+        }
+        if len(candidates) != 1:
+            # Either an unowned release file (shouldn't happen) or several
+            # packages each contributed distinct release files — a generic
+            # critique cannot be pinned on one of them without guessing.
+            return ""
+        provider = goal.milestones[next(iter(candidates))]
+        defects = list(goal.release_defects)
+        streak_key = f"{provider.index}:release_owner"
+        streak = goal.assembly_fault_streak.get(streak_key, 0) + 1
+        goal.assembly_fault_streak[streak_key] = streak
+        if streak > config.ASSEMBLY_FAULT_STREAK_LIMIT:
+            goal.status = "paused"
+            goal.last_error = (
+                f"release verification has rejected package {provider.index + 1}'s "
+                f"output {streak - 1} times in a row without resolving it; pausing "
+                "for human review instead of rebuilding it again"
+            )[:300]
+            self.store.log_event(
+                "-", "release_owner_fault_loop_detected",
+                {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
+                 "streak": streak},
+            )
+            self.goals.save_owned(goal, token)
+            return "breaker"
+        if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
+            provider.invalidated_session_ids.append(provider.session_id)
+        escalated_from = ""
+        if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
+            replacement = next(
+                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                 if seat in self.panel and seat != provider.owner
+                 and not self.seat_health.is_unavailable(seat)),
+                None,
+            )
+            if replacement:
+                escalated_from = provider.owner
+                provider.owner = replacement
+                self.store.log_event(
+                    "-", "release_owner_fault_escalated",
+                    {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
+                     "from_owner": escalated_from, "to_owner": replacement,
+                     "streak": streak},
+                )
+        provider.status = "pending"
+        provider.session_id = None
+        provider.files = []
+        provider.accepted_files = []
+        provider.accepted_hashes = {}
+        provider.acceptance_detail = (
+            "The independent release verifier rejected this package's output on "
+            "final review. Fix every item below; do not change files you do not "
+            "own:\n- " + "\n- ".join(defects)
+        )[:4000]
+        goal.current_index = provider.index
+        goal.release_status = "not_started"
+        goal.release_session_id = None
+        goal.release_defects = []
+        takeover = f" (escalated from {escalated_from} to {provider.owner})" if escalated_from else ""
+        goal.last_error = (
+            f"release verification failed; sending package {provider.index + 1} "
+            f"back to its owner{takeover} for repair"
+        )[:300]
+        if not self.goals.save_owned(goal, token):
+            return ""
+        self.store.log_event(
+            "-", "release_regression_owner_reopened",
+            {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
+             "owner": provider.owner, "defects": len(defects)},
+        )
+        return "reopened"
 
     def _recover_verified_goal_packages(self, goal_id: str) -> list[str]:
         """Adopt completed package attempts that lost their goal commit.

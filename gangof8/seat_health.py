@@ -37,7 +37,8 @@ _CLASSIFIERS: tuple[tuple[str, re.Pattern], ...] = (
         r"insufficient[_ ]quota|billing", re.IGNORECASE)),
     ("auth_expired", re.compile(
         r"not logged in|login required|unauthorized|authentication|"
-        r"invalid api key|expired.*(?:token|credential)|\b401\b", re.IGNORECASE)),
+        r"invalid api key|no .*api key|api key.*required|"
+        r"expired.*(?:token|credential)|\b401\b", re.IGNORECASE)),
     ("offline", re.compile(
         r"not found on PATH|not runnable|No such file or directory.*CLI|"
         r"command not found", re.IGNORECASE)),

@@ -189,6 +189,11 @@ class LogStore:
             package_output_attempts: dict[str, int] = {}
             package_output_history: dict[str, list[dict]] = {}
             package_call_failures: dict[str, str] = {}
+            resource_roster: list[str] = []
+            participation_mode = "focused"
+            collaboration_assignments: list[dict] = []
+            collaboration_integrated_files: list[str] = []
+            collaboration_integration_status = "not_started"
             package_started_at = None
             package_deadline_at = None
             try:
@@ -211,6 +216,17 @@ class LogStore:
                 package_output_attempts = dict(data.get("package_output_attempts") or {})
                 package_output_history = dict(data.get("package_output_history") or {})
                 package_call_failures = dict(data.get("package_call_failures") or {})
+                resource_roster = list(data.get("resource_roster") or [])
+                participation_mode = data.get("participation_mode") or "focused"
+                collaboration_assignments = list(
+                    data.get("collaboration_assignments") or []
+                )
+                collaboration_integrated_files = list(
+                    data.get("collaboration_integrated_files") or []
+                )
+                collaboration_integration_status = (
+                    data.get("collaboration_integration_status") or "not_started"
+                )
                 package_started_at = data.get("package_started_at")
                 package_deadline_at = data.get("package_deadline_at")
                 pending_approvals = sum(
@@ -243,6 +259,11 @@ class LogStore:
                     "package_output_attempts": package_output_attempts,
                     "package_output_history": package_output_history,
                     "package_call_failures": package_call_failures,
+                    "resource_roster": resource_roster,
+                    "participation_mode": participation_mode,
+                    "collaboration_assignments": collaboration_assignments,
+                    "collaboration_integrated_files": collaboration_integrated_files,
+                    "collaboration_integration_status": collaboration_integration_status,
                     "package_started_at": package_started_at,
                     "package_deadline_at": package_deadline_at,
                 }

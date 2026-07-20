@@ -604,6 +604,142 @@ def package_output_prompt(
     )
 
 
+_COLLABORATION_LENS = {
+    "architecture": (
+        "Challenge the structure, state model, separation of responsibilities, "
+        "and whether the implementation can satisfy the package contract cleanly."
+    ),
+    "correctness": (
+        "Trace the important runtime paths and find concrete logic, completeness, "
+        "usability, or accessibility defects."
+    ),
+    "integration": (
+        "Check APIs, event flow, DOM hooks, timing units, persistence, load order, "
+        "and every boundary with accepted dependencies."
+    ),
+    "adversarial": (
+        "Attack edge cases, invalid states, rapid/repeated input, lifecycle races, "
+        "failure recovery, and assumptions likely to break under real use."
+    ),
+    "implementation": (
+        "Use your coding ability to propose a simpler, faster, or more robust "
+        "implementation of weak portions while preserving the requested behavior."
+    ),
+    "verification": (
+        "Independently verify stated requirements against the actual code and patch "
+        "any mismatch you can prove from the artifact."
+    ),
+    "independent": (
+        "Perform an independent code challenge without trusting the owner's design; "
+        "look for high-impact defects and provide exact corrective edits."
+    ),
+}
+
+
+def _collaboration_artifacts(artifacts: dict[str, str]) -> str:
+    return "\n\n".join(
+        f"===== ACTUAL BASELINE FILE: {filename} =====\n{content}\n"
+        f"===== END BASELINE FILE: {filename} ====="
+        for filename, content in artifacts.items()
+    )
+
+
+def package_collaboration_prompt(
+    session: Session, member: CouncilMember, lens: str,
+    artifacts: dict[str, str], staged_context: str = "",
+) -> str:
+    """Give one resource the owner's real baseline and demand usable patches."""
+    focus = _COLLABORATION_LENS.get(lens, _COLLABORATION_LENS["independent"])
+    allowed = ", ".join(artifacts)
+    dependencies = (
+        "ACTUAL ACCEPTED DEPENDENCY CONTEXT:\n" + staged_context.strip() + "\n\n"
+        if staged_context.strip() else ""
+    )
+    return (
+        f"{_GOVERNANCE_CONTEXT}"
+        f"You are resource model {member.agent} in a full-council build. The "
+        f"accountable file owner is {session.work_package_owner}; you are a code "
+        "challenger, not a replacement owner.\n\n"
+        f"PACKAGE CONTRACT:\n{_package_task_context(session)}\n\n"
+        f"{dependencies}"
+        f"YOUR REVIEW LENS ({lens.upper()}):\n{focus}\n\n"
+        "Review the ACTUAL baseline bytes below. Do not return a plan, ask for "
+        "tools, or merely suggest that someone inspect something later. If you "
+        "find a defect, provide a deterministic OLD/NEW edit against an allowed "
+        "file. Preserve unrelated behavior.\n\n"
+        f"Allowed files: {allowed}\n\n"
+        f"{_collaboration_artifacts(artifacts)}\n\n"
+        "Reply in this contract:\n"
+        "VERDICT: PASS or CHANGES\n"
+        "FINDING: <one concrete, evidence-based finding>\n"
+        "FINDING: <another finding, if needed>\n"
+        "EDIT: <exact allowed filename>\n"
+        "<<<<<<< OLD\n<text occurring exactly once>\n=======\n<replacement>\n>>>>>>> NEW\n"
+        "Repeat EDIT blocks as needed. A PASS needs no EDIT. Do not emit ARTIFACT, "
+        "PROMOTE, SKILL, CONSULT, or DELEGATE lines."
+    )
+
+
+def package_collaboration_integration_prompt(
+    session: Session, artifacts: dict[str, str], contributions: list[tuple[str, str]],
+    staged_context: str = "",
+) -> str:
+    """Require the accountable owner to reconcile every peer contribution."""
+    reviews = "\n\n".join(
+        f"===== RESOURCE CONTRIBUTION: {seat} =====\n{content}\n"
+        f"===== END RESOURCE CONTRIBUTION: {seat} ====="
+        for seat, content in contributions
+    )
+    seats = ", ".join(seat for seat, _ in contributions)
+    dependencies = (
+        "ACTUAL ACCEPTED DEPENDENCY CONTEXT:\n" + staged_context.strip() + "\n\n"
+        if staged_context.strip() else ""
+    )
+    return (
+        f"{_GOVERNANCE_CONTEXT}"
+        f"You are the accountable package owner ({session.work_package_owner}). "
+        "The enabled resource council has challenged your actual baseline. Reconcile "
+        "their findings now; you retain sole ownership of the final bytes.\n\n"
+        f"PACKAGE CONTRACT:\n{_package_task_context(session)}\n\n"
+        f"{dependencies}"
+        f"{_collaboration_artifacts(artifacts)}\n\n"
+        f"RESOURCE CONTRIBUTIONS:\n{reviews}\n\n"
+        "For EACH resource listed below, emit exactly one disposition line:\n"
+        "DISPOSITION: <seat> | ACCEPT, REJECT, or SUPERSEDE | <specific reason>\n"
+        f"Required seats: {seats}\n\n"
+        "Then emit every final package file in full, even when unchanged:\n"
+        "ARTIFACT: <exact package relative filename>\n"
+        "<complete integrated contents>\n"
+        "END_ARTIFACT\n"
+        "Use raw contents without fences. Do not emit PROMOTE, SKILL, CONSULT, or "
+        "DELEGATE lines. Do not invent additional files."
+    )
+
+
+_COLLABORATION_FINDING_RE = re.compile(
+    r"^\s*FINDING\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE,
+)
+_COLLABORATION_DISPOSITION_RE = re.compile(
+    r"^\s*DISPOSITION\s*:\s*([\w.\-]+)\s*\|\s*"
+    r"(ACCEPT|REJECT|SUPERSEDE)\s*\|\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def parse_collaboration_findings(text: str) -> list[str]:
+    return [" ".join(match.group(1).split())[:500]
+            for match in _COLLABORATION_FINDING_RE.finditer(text or "")]
+
+
+def parse_collaboration_dispositions(text: str) -> dict[str, str]:
+    return {
+        match.group(1): (
+            f"{match.group(2).upper()} | {' '.join(match.group(3).split())[:500]}"
+        )
+        for match in _COLLABORATION_DISPOSITION_RE.finditer(text or "")
+    }
+
+
 def panel_prompt(
     session: Session, member: CouncilMember, round_idx: int,
     established_overview: str = "", readable: list[str] = (),
@@ -995,7 +1131,12 @@ def frontier_release_prompt(
         "REPAIR MANDATE — you are a release ENGINEER, not a critic. For EVERY "
         "check you FAIL where the fix is knowable from the code in front of "
         "you, you MUST ship that fix in this same reply:\n"
-        "- surgical fixes: exact, unique OLD/NEW EDIT block(s);\n"
+        "- surgical fixes: one block per edit, each starting with the exact "
+        "literal header 'EDIT: <exact path>' — never 'OLD/NEW EDIT' or a "
+        "numbered variant like 'EDIT 1:', every edit restates the same plain "
+        "'EDIT: <path>' header — followed by 'OLD:' and a fenced code block "
+        "with the exact existing text, then 'NEW:' and a fenced code block "
+        "with its replacement;\n"
         "- broader fixes (structural rework, many touchpoints): a COMPLETE "
         "replacement file as 'ARTIFACT: <exact path shown below>' followed by "
         "the full file body and a line 'END_ARTIFACT'.\n"
