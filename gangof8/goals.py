@@ -281,6 +281,17 @@ class GoalStore:
             cur = conn.execute("DELETE FROM goals WHERE goal_id = ?", (goal_id,))
             return cur.rowcount > 0
 
+    def remove_all(self) -> int:
+        """Remove all goal history, including the legacy import source."""
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM goals")
+            deleted = max(int(cur.rowcount or 0), 0)
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return deleted
+
 
 def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
     """Ask the architect for an owned dependency graph in a strict format.

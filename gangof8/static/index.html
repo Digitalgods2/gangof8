@@ -80,8 +80,28 @@
   </div>
 </div>
 
+<div id="deleteHistoryOverlay" role="dialog" aria-modal="true"
+     aria-labelledby="deleteHistoryTitle"
+     onclick="if(event.target===this)closeDeleteHistoryConfirm()">
+  <div id="deleteHistoryDialog">
+    <h2 id="deleteHistoryTitle">Delete all history?</h2>
+    <p id="deleteHistorySummary">Are you sure?</p>
+    <p class="sub">This permanently removes transcripts and audit logs and cancels any active work.</p>
+    <div class="delete-history-actions">
+      <button class="ghost" type="button" onclick="closeDeleteHistoryConfirm()">No</button>
+      <button class="history-confirm" type="button" onclick="confirmDeleteAllHistory()">Yes, delete all</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <div id="left">
+    <div class="history-toolbar">
+      <span>History</span>
+      <button id="deleteAllHistory" class="history-delete-all" type="button"
+              title="Permanently delete all session and goal history"
+              onclick="deleteAllHistory()">Del All</button>
+    </div>
     <div id="feedWrap">
       <h2>Live activity <span id="feedDot" class="feed-dot"></span></h2>
       <div id="feed" aria-live="polite"></div>

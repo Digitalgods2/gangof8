@@ -605,6 +605,13 @@ labelled historical and points to the running retry. Package briefs omit live
 status words because their text is a start-time snapshot, while the goal card
 and build-team roster always render the current authoritative package state.
 
+The top of the dashboard's history rail includes **Del All** for clearing local
+history. It opens one confirmation dialog with **No** and **Yes, delete all**;
+no confirmation phrase must be typed. Confirming cancels any active sessions or
+goals and permanently removes all session records, goal records, transcripts,
+audit logs, and the visible activity feed. Generated project files and promoted
+deliverables are not deleted.
+
 ## Workspaces, staging, and delivery boundaries
 
 Gang of 8 uses several intentionally different file spaces:
@@ -813,6 +820,7 @@ running.
 | `GET /goals/{id}/timeline` | The whole goal's ordered story plus a derived postmortem (spend per seat, attempts split into completed / seat-outage / interrupted) |
 | `GET /seats` | Live per-seat health: state, reason, since — fed by every adapter call's outcome |
 | `GET /events/stream` | Server-Sent Events: every coordinator event as it happens, rendered through the human-readable vocabulary (the dashboard's live feed) |
+| `DELETE /history` | Cancel active work and permanently delete all session, goal, transcript, and audit-log history; requires the dashboard's guarded confirmation payload |
 | `POST /sessions/{id}/followup` | Continue a completed conversation |
 | `POST /sessions/{id}/cancel` | Cancel a live session |
 | `POST /sessions/{id}/approvals/{approval_id}` | Approve or deny an action |

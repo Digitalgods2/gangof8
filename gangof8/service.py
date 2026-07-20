@@ -1293,6 +1293,30 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.revoke_worker_lease(session_id)
         return self.store.delete_session(session_id)
 
+    def delete_all_history(self) -> dict[str, int]:
+        """Cancel active work, then remove all goal and session history."""
+        goal_records = self.goals.list()
+        for goal in goal_records:
+            self.goals.cancel(goal.goal_id)
+
+        session_records = self.store.list_sessions(limit=None)
+        terminal = {
+            SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled,
+        }
+        for record in session_records:
+            session_id = record["session_id"]
+            session = self.manager.load(session_id)
+            if session is not None and session.status not in terminal:
+                cancellation.request(session_id)
+                self.store.revoke_worker_lease(session_id)
+
+        goals_deleted = self.goals.remove_all()
+        sessions_deleted = self.store.delete_all_sessions()
+        return {
+            "sessions_deleted": sessions_deleted,
+            "goals_deleted": goals_deleted,
+        }
+
     def continue_session(self, session_id: str, text: str, background: bool = True,
                          attachments: Optional[list[str]] = None) -> Session:
         """Continue the conversation: the human responds to the council's
