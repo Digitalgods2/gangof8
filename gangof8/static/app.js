@@ -836,10 +836,68 @@ async function deleteGoal(id, ev) {
   _lastGoalsSig = ""; pollLoop();
 }
 
+function deleteAllHistory() {
+  const sessionCount = _sessionsCache.length;
+  const goalCount = _goalsCache.length;
+  if (!sessionCount && !goalCount) {
+    alert("There is no session history to delete.");
+    return;
+  }
+  const summary = document.getElementById("deleteHistorySummary");
+  if (summary) {
+    summary.textContent =
+      `Are you sure you want to delete ${sessionCount} session${sessionCount === 1 ? "" : "s"}` +
+      `${goalCount ? ` and ${goalCount} goal${goalCount === 1 ? "" : "s"}` : ""}?`;
+  }
+  document.getElementById("deleteHistoryOverlay")?.classList.add("open");
+}
+
+function closeDeleteHistoryConfirm() {
+  document.getElementById("deleteHistoryOverlay")?.classList.remove("open");
+}
+
+async function confirmDeleteAllHistory() {
+  closeDeleteHistoryConfirm();
+
+  const button = document.getElementById("deleteAllHistory");
+  if (button) { button.disabled = true; button.textContent = "Deletingâ€¦"; }
+  try {
+    const response = await fetch("/history", {
+      method: "DELETE",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({confirmation: "DELETE ALL"}),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.detail || `HTTP ${response.status}`);
+
+    detailRefreshGate.invalidate();
+    current = null; _followGoal = null; _planShownFor = "";
+    _sessionsCache = []; _goalsCache = [];
+    _lastListSig = ""; _lastDetailSig = ""; _lastGoalsSig = "";
+    history.replaceState(null, "", location.pathname + location.search);
+    const feed = document.getElementById("feed");
+    if (feed) feed.innerHTML = "";
+    renderEmptyHero();
+    await refresh();
+    alert(
+      `Deleted ${result.sessions_deleted || 0} session${result.sessions_deleted === 1 ? "" : "s"}` +
+      ` and ${result.goals_deleted || 0} goal${result.goals_deleted === 1 ? "" : "s"}.`
+    );
+  } catch (error) {
+    alert("Could not delete the history: " + (error.message || error));
+  } finally {
+    if (button) { button.textContent = "Del All"; }
+  }
+}
+
 async function refresh() {
   const sessions = await api("/sessions");
   _sessionsCache = sessions;
   await refreshGoals(sessions);
+  const deleteAllButton = document.getElementById("deleteAllHistory");
+  if (deleteAllButton) {
+    deleteAllButton.disabled = sessions.length === 0 && _goalsCache.length === 0;
+  }
   const el = document.getElementById("sessions");
   // Cancel button: a running open session cancels that run; with none open, a
   // LIVE goal (planning, or between milestones) offers cancelling the goal —

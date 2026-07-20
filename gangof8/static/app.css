@@ -101,6 +101,20 @@ main { display:grid; grid-template-columns: 430px 1fr; gap:0; height:calc(100vh 
 #left h2 { display:flex; align-items:center; gap:8px; font-size:11px; font-weight:600;
            text-transform:uppercase; letter-spacing:.14em; color:var(--dim-2); margin:2px 0 6px; }
 #left h2::before { content:""; width:18px; height:1px; background:var(--line-strong); }
+.history-toolbar { position:sticky; top:-16px; z-index:12; display:flex;
+                   align-items:center; justify-content:space-between; gap:12px;
+                   margin:-16px -16px 12px; padding:11px 16px 10px;
+                   background:rgba(10,10,15,.94); backdrop-filter:blur(12px);
+                   border-bottom:1px solid var(--line); }
+.history-toolbar > span { color:var(--dim-2); font-size:11px; font-weight:650;
+                          text-transform:uppercase; letter-spacing:.14em; }
+button.history-delete-all { padding:4px 10px; border-color:rgba(255,93,108,.4);
+                            background:rgba(255,93,108,.08); color:var(--critic);
+                            border-radius:8px; box-shadow:none; font-size:11px;
+                            text-transform:uppercase; letter-spacing:.08em; }
+button.history-delete-all:hover { background:rgba(255,93,108,.18);
+                                  border-color:var(--critic); box-shadow:none; }
+button.history-delete-all:disabled { opacity:.35; cursor:not-allowed; transform:none; }
 
 textarea { width:100%; min-height:64px; background:var(--panel); color:var(--text);
            border:1px solid var(--line-strong); border-radius:10px; padding:10px 12px;
@@ -382,6 +396,19 @@ header .hbtn:hover { color:var(--text); border-color:#fff3; transform:translateY
 #enhanceBtn.undo { color:var(--brand-2); border-color:var(--brand-2); }
 #settingsOverlay { position:fixed; inset:0; background:rgba(5,5,10,.6); backdrop-filter:blur(4px);
                    display:none; z-index:100; }  /* above the composer (60) */
+#deleteHistoryOverlay { position:fixed; inset:0; display:none; align-items:center;
+                        justify-content:center; z-index:140; padding:20px;
+                        background:rgba(5,5,10,.72); backdrop-filter:blur(5px); }
+#deleteHistoryOverlay.open { display:flex; }
+#deleteHistoryDialog { width:min(460px,94vw); padding:22px;
+                       background:linear-gradient(180deg,var(--panel),var(--bg-soft));
+                       border:1px solid rgba(255,93,108,.4); border-radius:var(--radius);
+                       box-shadow:var(--shadow); }
+#deleteHistoryDialog h2 { margin:0 0 8px; font-size:18px; }
+#deleteHistoryDialog p { margin:7px 0; }
+.delete-history-actions { display:flex; justify-content:flex-end; gap:9px; margin-top:18px; }
+button.history-confirm { background:var(--critic); color:#fff; box-shadow:none; }
+button.history-confirm:hover { background:#ff7180; box-shadow:none; }
 /* in-page folder browser (above settings) */
 #fsOverlay { position:fixed; inset:0; background:rgba(5,5,10,.66); backdrop-filter:blur(4px);
              display:none; z-index:120; }

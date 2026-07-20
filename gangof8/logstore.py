@@ -285,6 +285,26 @@ class LogStore:
             pass
         return deleted
 
+    def delete_all_sessions(self) -> int:
+        """Remove every persisted session and its audit log.
+
+        Callers must cancel live workers before invoking this method. Keep the
+        feed sequence monotonic so an already-connected EventSource continues
+        to receive future events after its visible history is cleared.
+        """
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM sessions")
+            deleted = max(int(cur.rowcount or 0), 0)
+        for log_path in self.sessions_dir.glob("*.jsonl"):
+            try:
+                log_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        with self._feed_cond:
+            self._feed.clear()
+            self._feed_cond.notify_all()
+        return deleted
+
     def log_event(self, session_id: str, event: str, payload: Optional[dict] = None) -> None:
         record = {"ts": utcnow(), "event": event, "payload": payload or {}}
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"

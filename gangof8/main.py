@@ -405,6 +405,20 @@ def delete_session(session_id: str) -> dict:
     return {"deleted": session_id}
 
 
+class DeleteHistoryIn(BaseModel):
+    confirmation: str = ""
+
+
+@app.delete("/history")
+def delete_all_history(body: DeleteHistoryIn) -> dict:
+    if body.confirmation != "DELETE ALL":
+        raise HTTPException(
+            status_code=400,
+            detail="confirmation must be exactly DELETE ALL",
+        )
+    return service.delete_all_history()
+
+
 @app.post("/sessions/{session_id}/cancel")
 def cancel_session(session_id: str) -> dict:
     try:
