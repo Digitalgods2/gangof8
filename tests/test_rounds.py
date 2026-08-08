@@ -422,17 +422,17 @@ LIVE_TOOL_DEBRIS = (
     "than relying on the excerpts — starting with the loop, delegation machinery, "
     "and the prompt layer.\n\n"
     "<summary>Read loop.py (deliberation loop core)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\loop.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\loop.py"\n}\n\n'
     "<summary>Read rounds.py (prompt layer)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\rounds.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\rounds.py"\n}\n\n'
     "<summary>Read config.py (budgets, seats)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\config.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\config.py"\n}\n\n'
     "<summary>Read models.py</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\models.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\models.py"\n}\n\n'
     "<summary>Read roles.py (council building)</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\roles.py"\n}\n\n'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\roles.py"\n}\n\n'
     "<summary>Read governance.py</summary>\n"
-    '{\n  "file_path": "C:\\\\Users\\\\gosmo\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\governance.py"\n}'
+    '{\n  "file_path": "C:\\\\Users\\\\user\\\\Desktop\\\\Gang of 8\\\\gangof8\\\\governance.py"\n}'
 )
 
 

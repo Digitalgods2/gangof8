@@ -1,4 +1,6 @@
 .venv/
+venv/
+env/
 __pycache__/
 *.pyc
 data/
@@ -8,3 +10,37 @@ pytest_tmp/
 gangof8-server.log
 .gangof8-server.pid
 *.egg-info/
+.ruff_cache/
+build/
+dist/
+
+# --- secrets / local machine state: never commit ---
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+credentials.json
+service-account*.json
+
+# local databases & runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# local run output & screenshots (may embed real paths / usernames)
+output/
+*.log
+
+# editor / OS / tool local config
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/settings.local.json
