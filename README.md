@@ -1180,3 +1180,11 @@ For deeper implementation context, see [ARCHITECTURE.md](ARCHITECTURE.md),
 ## Copyright
 
 Copyright © 2026 DigitalGods. All rights reserved.
+
+Gang of 8 is **source-available, not open source**. Viewing the code, running an
+unmodified copy for personal evaluation, and quoting short excerpts with
+attribution are permitted. Use, modification, redistribution, and derivative
+works are not, absent a separate written agreement.
+
+See [LICENSE](LICENSE) for the full terms — including the contribution
+assignment clause that applies to any pull request.
