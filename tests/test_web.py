@@ -61,7 +61,7 @@ def test_web_fetch_skill_blocks_localhost(session, tmp_path):
 
 
 def test_web_search_handler_returns_grounded_answer(session, tmp_path, monkeypatch):
-    monkeypatch.setattr(web, "web_search", lambda q: f"ANSWER about {q}\nSources:\n- ex: http://ex")
+    monkeypatch.setattr(web, "web_search", lambda q, data_dir=None: f"ANSWER about {q}\nSources:\n- ex: http://ex")
     action = ProposedAction(
         session_id=session.session_id, kind="web_search", role=Role.researcher,
         args={"query": "latest Go version"},
@@ -97,22 +97,22 @@ def test_web_overview_proactively_researches_factual_questions(tmp_path, monkeyp
     from gangof8.models import Classification, Complexity, Risk, TaskType
 
     monkeypatch.setattr(web, "web_search",
-                        lambda q: "Current: M51 is well placed tonight.\nSources:\n- ex: http://e")
+                        lambda q, data_dir=None: "Current: M51 is well placed tonight.\nSources:\n- ex: http://e")
     s = SessionManager(LogStore(tmp_path)).create("what galaxies are visible tonight?", source="test")
     s.classification = Classification(
         task_type=TaskType.question, complexity=Complexity.standard, risk=Risk.none, needs_facts=True)
-    ov = loop._web_overview(s)
+    ov = loop._web_overview(s, tmp_path)
     assert "WEB RESEARCH" in ov and "M51 is well placed" in ov
     # a local source to examine ⇒ no web overview (the file overview applies instead)
     s.established_root = str(tmp_path)
-    assert loop._web_overview(s) == ""
+    assert loop._web_overview(s, tmp_path) == ""
 
 
 def test_web_search_runs_mid_deliberation(session, tmp_path, monkeypatch):
     from gangof8 import loop
     from gangof8.models import Contribution, CouncilMember
 
-    monkeypatch.setattr(web, "web_search", lambda q: "web result for " + q)
+    monkeypatch.setattr(web, "web_search", lambda q, data_dir=None: "web result for " + q)
     store = LogStore(tmp_path)
     gov = Governance(store)
     member = CouncilMember(role=Role.researcher, agent="mock", active=True)

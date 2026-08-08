@@ -1423,7 +1423,7 @@ async function confirmDeleteAllHistory() {
   closeDeleteHistoryConfirm();
 
   const button = document.getElementById("deleteAllHistory");
-  if (button) { button.disabled = true; button.textContent = "Deletingâ€¦"; }
+  if (button) { button.disabled = true; button.textContent = "Deleting…"; }
   try {
     const response = await fetch("/history", {
       method: "DELETE",

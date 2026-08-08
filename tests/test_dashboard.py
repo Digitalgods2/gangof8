@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gangof8.service import GangOf8Service
+from gangof8.settings import SETTINGS_SCHEMA_VERSION
 
 TASK = (
     "Compare SQLite vs. plain JSON files for storing session logs in a local "
@@ -153,7 +154,7 @@ def test_dashboard_assets_served(client):
     assert "function enhancePrompt" in app_js.text
     assert "void enhancePrompt();" in app_js.text
     assert "const escAttr =" not in app_js.text, "shared helper must not be redeclared"
-    assert "this session has one accountable owner" in app_js.text
+    assert "this package has one accountable owner" in app_js.text
     assert "contract-linked to P" in app_js.text
     assert "Building package" in app_js.text
     assert "Export saved profile" in app_js.text
@@ -237,7 +238,7 @@ def test_diagnostics_reports_runtime_without_raw_secrets(client, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-secret-1234")
     d = client.get("/diagnostics").json()
     assert d["backend"] == "mock"
-    assert d["settings_version"] == 1
+    assert d["settings_version"] == SETTINGS_SCHEMA_VERSION
     assert "data_dir" in d and "sandbox_root" in d
     assert set(d["cli"]) == {"claude", "codex", "gemini"}
     assert d["api_keys"]["openrouter"]["present"] is True

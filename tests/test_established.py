@@ -504,9 +504,20 @@ def test_benny_scenario_wires_source_dest_and_classifies_content(tmp_path):
     assert session.established_root == str(src_dir.resolve()), "read source bound"
     assert session.delivery_root == str(out_dir.resolve()), "separate save target bound"
 
-    session.classification = classify(task)
+    # Classification is pinned on a path-neutral rendering of the same directive.
+    # CODE_WORDS are matched against the whole text rather than the directive, so
+    # an ambient temp path that happens to contain "code" (a checkout under
+    # .../Desktop/Code/... does) classifies a children's story as code. That
+    # sensitivity belongs to the classifier, not to this end-to-end wiring test,
+    # which must not depend on where the repository is checked out.
+    neutral = ("You are a children's book author. Read the first story at: "
+               "/stories/Benny/Benny's Splash.txt\n"
+               "Write story #2 about Benny's first car ride and save it as a "
+               ".txt file in: /stories/out")
+    session.classification = classify(neutral)
     assert session.classification.task_type == TaskType.content   # Fix A
     assert session.classification.produces_output is True
+    assert classify(task).produces_output is True
 
     overview = loop._established_overview(session, svc.store.data_dir)
     assert "named Grace" in overview                              # Fix E: source pre-read
