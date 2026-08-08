@@ -61,7 +61,15 @@ class WorkspaceStore:
         name = (name or "").strip()
         if not name:
             raise WorkspaceError("workspace name is required")
-        resolved = Path(_normalize_root(root or "")).expanduser().resolve()
+        raw_root = (root or "").strip()
+        if not raw_root:
+            raise WorkspaceError("workspace root is required")
+        resolved = Path(_normalize_root(raw_root)).expanduser().resolve()
+        anchor = Path(resolved.anchor).resolve()
+        if resolved == anchor or resolved == Path.home().resolve():
+            raise WorkspaceError(
+                "filesystem and home-directory roots cannot be registered as workspaces"
+            )
         if resolved.exists() and not resolved.is_dir():
             raise WorkspaceError(f"workspace root is not a directory: {resolved}")
         resolved.mkdir(parents=True, exist_ok=True)

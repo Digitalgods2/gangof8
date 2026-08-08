@@ -8,11 +8,18 @@ reverse), so the prompt layer stays cycle-free and independently testable.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Optional
 
 from .models import Contribution, Council, CouncilMember, Role, Session
 from . import assembly, config
-from .skills import get_skill
+from .skills import capability_manifest
+from .workbench import execution_text
+
+
+def _execution_task(session: Session) -> str:
+    """The original request plus its stable, user-editable outcome contract."""
+    return execution_text(session.task.text, session.outcome_contract)
 
 
 def _recent_context(session: Session, limit: int = 3) -> str:
@@ -150,28 +157,100 @@ def role_instruction(role: Role) -> str:
     return _ROLE_INSTRUCTIONS.get(role, f"Seat charter: {role.value}.")
 
 
+def _capability_index() -> dict[str, dict]:
+    """Reader-safe live catalogue keyed for prompt construction."""
+    manifest = capability_manifest()
+    capabilities = manifest.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        return {}
+    return {
+        item["name"]: item
+        for item in capabilities
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+
+
+def _hint_capability(
+    catalogue: dict[str, dict],
+    name: str,
+    role: Role,
+    available_spaces: set[str],
+) -> Optional[dict]:
+    """Return a safe, positional-SKILL-compatible discovery capability."""
+    capability = catalogue.get(name)
+    if not capability:
+        return None
+    if capability.get("requires_approval") or capability.get("mutates"):
+        return None
+    if capability.get("category") not in {"read", "web"}:
+        return None
+    if role.value not in capability.get("allowed_roles", []):
+        return None
+    inputs = capability.get("inputs")
+    primary = capability.get("primary_input")
+    if not isinstance(inputs, list) or (primary and primary not in inputs):
+        return None
+    spaces = capability.get("permitted_spaces")
+    if not isinstance(spaces, list):
+        return None
+    if spaces and not available_spaces.intersection(spaces):
+        return None
+    return capability
+
+
+def _has_bound_git_repository(session: Session) -> bool:
+    """A cheap prompt-time check; the handler performs the security validation."""
+    for raw in (session.workspace_root, session.established_root):
+        if not raw:
+            continue
+        try:
+            marker = Path(raw).resolve() / ".git"
+            if marker.is_dir() and not marker.is_symlink():
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def _skill_hints(session: Session, role: Role, readable: list[str] = ()) -> str:
-    """Advertise the no-approval discovery skills this role may pull (read/search/
-    list/web), but only when there's something to look at."""
+    """Advertise catalogue-declared, no-approval discovery capabilities."""
     has_dir = bool(session.established_root or session.workspace_root)
     where = "established folder" if session.established_root else "project"
+    available_spaces = {"sandbox"}
+    if session.workspace_root:
+        available_spaces.add("workspace")
+    if session.established_root:
+        available_spaces.add("established")
+    catalogue = _capability_index()
     hints: list[str] = []
-    ld = get_skill("list_dir")
-    if has_dir and ld and role in ld.allowed_roles:
+    ld = _hint_capability(catalogue, "list_dir", role, available_spaces)
+    if has_dir and ld:
         hints.append(
             f"list the {where}'s files with a line 'SKILL: list_dir .' (use a subfolder to drill in)"
         )
-    sp = get_skill("search_project")
-    if has_dir and sp and role in sp.allowed_roles:
+    sp = _hint_capability(catalogue, "search_project", role, available_spaces)
+    if has_dir and sp:
         hints.append(f"search the {where} with a line 'SKILL: search_project <query>'")
-    rf = get_skill("read_file")
-    if (readable or has_dir) and rf and role in rf.allowed_roles:
+    rf = _hint_capability(catalogue, "read_file", role, available_spaces)
+    if (readable or has_dir) and rf:
         avail = f" Available now: {', '.join(readable)}." if readable else ""
         hints.append(f"read a file with a line 'SKILL: read_file <path>'.{avail}")
-    ws = get_skill("web_search")
-    if config.WEB_ENABLED and ws and role in ws.allowed_roles:
+    gs = _hint_capability(catalogue, "git_snapshot", role, available_spaces)
+    if has_dir and gs and _has_bound_git_repository(session):
+        hints.append(
+            "inspect the bound Git repository with a line "
+            "'SKILL: git_snapshot .' (use a contained repository subfolder "
+            "instead of '.' when needed)"
+        )
+    ws = _hint_capability(catalogue, "web_search", role, available_spaces)
+    wf = _hint_capability(catalogue, "web_fetch", role, available_spaces)
+    if config.WEB_ENABLED and ws and wf:
         hints.append("search the live web with 'SKILL: web_search <query>' "
                      "(and read a page with 'SKILL: web_fetch <url>')")
+    elif config.WEB_ENABLED and ws:
+        hints.append("search the live web with 'SKILL: web_search <query>'")
+    elif config.WEB_ENABLED and wf:
+        hints.append("read a public page with 'SKILL: web_fetch <url>'")
     if not hints:
         return ""
     return "You may " + "; ".join(hints) + " (results are returned to you, no approval needed).\n"
@@ -239,7 +318,7 @@ def revision_patch_prompt(session: Session, targets: list[str], source_context: 
     """
     names = ", ".join(targets)
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         "You are the PRIMARY REVISION AUTHOR. This is an in-place change, not a "
         "greenfield rewrite. The exact current file has already been copied into "
@@ -265,7 +344,7 @@ def revision_review_prompt(session: Session, targets: list[str], patch_summary: 
     """Ask one reviewer to inspect a narrow revision, not author a rival file."""
     required = "\n".join(f"- {item}" for item in assertions) or "- preserve existing public APIs"
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         "You are the REVISION REVIEWER. Inspect the applied patch below against "
         "the task. Do not write code and do not propose a full rewrite. Identify "
         "only release-blocking defects: broken integration, lost existing APIs, "
@@ -281,7 +360,7 @@ def revision_review_prompt(session: Session, targets: list[str], patch_summary: 
 
 def revision_repair_prompt(session: Session, report: str, source_context: str) -> str:
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         "A reviewer found this release-blocking defect in your in-place patch:\n"
         f"{report}\n\n"
         "Return ONLY the additional surgical EDIT block(s) needed to correct it; "
@@ -315,7 +394,7 @@ def lead_prompt(
         "ready to use. Do not ask the human questions; state assumptions and answer.\n"
     )
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         "Your role: lead. You own the OUTCOME end to end: organize the work, "
         "assign it, integrate the results, and deliver the real, working result — "
@@ -509,7 +588,7 @@ def _package_task_context(session: Session) -> str:
     emits semantic section markers, so trim by those sections rather than by a
     made-up character or byte limit.  Legacy/unmarked tasks remain unchanged.
     """
-    text = session.task.text or ""
+    text = _execution_task(session)
     for marker in (
         "NON-BLOCKING INTERFACE INPUTS",
         "THE PACKAGE TO COMPLETE NOW",
@@ -761,7 +840,7 @@ def panel_prompt(
         "to positions. "
     )
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_PANEL_CONTEXT}"
         f"You are one seat on a multi-model council (round {round_idx + 1}; your "
         f"origin model: {member.agent}). Give YOUR best independent take on the "
@@ -900,7 +979,7 @@ def score_candidates_prompt(session: Session, labeled: list[tuple], source: str 
         "looks.\n"
     ) if has_runtime else ""
     return (
-        f"Task the candidates implement: {session.task.text}\n"
+        f"Task the candidates implement: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"You are an impartial JUDGE. Below are {n} independent candidate "
         "implementations of the SAME task, authorship hidden. Score each STRICTLY "
@@ -1007,7 +1086,7 @@ def chair_finish_prompt(session: Session, candidates: list[dict], filename: str,
             f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
             "<complete integrated file contents>\nEND_ARTIFACT\n")
     return (
-        f"Task the candidates implement: {session.task.text}\n"
+        f"Task the candidates implement: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"{CHAIR_CHARTER}"
         f"{_source_fidelity_block(session, source)}"
@@ -1120,7 +1199,7 @@ def frontier_release_prompt(
     bodies = "\n\n".join(
         f"===== FILE: {name} =====\n{content}" for name, content in files
     )
-    requirements = acceptance_requirements(session.task.text)
+    requirements = acceptance_requirements(_execution_task(session))
     checklist = "\n".join(
         f"R{i}: {requirement}" for i, requirement in enumerate(requirements, 1)
     )
@@ -1150,7 +1229,7 @@ def frontier_release_prompt(
         "You are the independent FRONTIER RELEASE ENGINEER. You did not select or "
         "summarize this result. Inspect the actual final code in full and protect "
         "the user from a superficially runnable but incomplete package.\n\n"
-        f"ORIGINAL TASK:\n{session.task.text}\n\n"
+        f"ORIGINAL TASK:\n{_execution_task(session)}\n\n"
         f"JUDGE DEFECT REGISTER:\n{register}\n\n"
         f"CHAIR CLOSURE CLAIMS:\n{closure}\n\n"
         f"REQUIRED ACCEPTANCE CHECKLIST:\n{checklist}\n\n"
@@ -1190,7 +1269,7 @@ def frontier_runtime_repair_prompt(
         "The coordinator executed your code and found the failure below. Repair "
         "your own implementation now with exact, unique OLD/NEW EDIT blocks. "
         "Preserve its design and fulfill the original task; return no plan.\n\n"
-        f"ORIGINAL TASK:\n{session.task.text}\n\n"
+        f"ORIGINAL TASK:\n{_execution_task(session)}\n\n"
         f"RUNTIME FAILURE:\n{failure}\n\n"
         f"===== FILE: {filename} =====\n{content}"
     )
@@ -1201,7 +1280,7 @@ def chair_recover_prompt(session: Session, filename: str, body: str, error: str)
     complete attempt — surgical EDITs to make it RUN — rather than discarding
     all the panel's work and starting over."""
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"{CHAIR_CHARTER}"
         "Every candidate the panel produced FAILED to run. Below is the most "
@@ -1254,7 +1333,7 @@ def synthesis_prompt(
             "and name real disagreements rather than papering over them):\n"
             f"{views}\n\n")
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"Your role: lead (round {round_idx + 1}). You own the OUTCOME end to "
         "end: organize the work, assign it to your talents, integrate their "
@@ -1278,7 +1357,7 @@ def test_fix_prompt(
     fix the code in-reply — not explain the failure back to the human."""
     file_list = ", ".join(files) if files else "(none yet)"
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"Your build's test run FAILED (repair attempt {attempt} of {max_attempts}). "
         "Fix the code NOW — do not explain the failure to the human; repair it.\n"

@@ -9,7 +9,15 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
+
+# Intake contracts are user-editable, so their execution budget needs a
+# generous but finite safety envelope. Runtime steering remains the explicit,
+# audited path for extending an active run.
+MAX_AGENT_CALLS = 500
+MAX_WALL_SECONDS = 86_400
+MAX_DELEGATION_DEPTH = 8
+MAX_DELEGATIONS = 64
 
 
 def utcnow() -> str:
@@ -83,6 +91,10 @@ class Task(BaseModel):
     session_id: str
     source: str = "cli"
     text: str
+    # The user's directive before attachment bodies or coordinator context are
+    # folded into ``text``.  Run cloning and playbooks use this field so they
+    # never duplicate extracted attachment text.
+    original_text: str = ""
     created_at: str = Field(default_factory=utcnow)
 
 
@@ -250,13 +262,15 @@ class Budgets(BaseModel):
     """The hard bounds on a run. Deliberation terminates on ROUND: DONE, a
     declined consent, the call budget, or wall time — there is no round cap."""
 
-    max_agent_calls: int = 12
-    max_wall_seconds: int = 600
+    max_agent_calls: int = Field(default=12, ge=1, le=MAX_AGENT_CALLS)
+    max_wall_seconds: int = Field(default=600, ge=1, le=MAX_WALL_SECONDS)
     # How deep the delegation tree may go (1 = lead → specialist only) and how
     # many CONSULT:/DELEGATE: grants one reply may fan out. Scaled by task
     # complexity in config.BUDGETS_BY_COMPLEXITY.
-    max_delegation_depth: int = 2
-    max_delegations: int = 4
+    max_delegation_depth: int = Field(
+        default=2, ge=1, le=MAX_DELEGATION_DEPTH
+    )
+    max_delegations: int = Field(default=4, ge=1, le=MAX_DELEGATIONS)
 
 
 class FinalAnswer(BaseModel):
@@ -356,7 +370,7 @@ class CollaborationAssignment(BaseModel):
     assignment_id: str = Field(default_factory=lambda: f"ca_{short_id()}")
     seat: str
     lens: str
-    status: str = "pending"  # pending | running | contributed | failed | unavailable
+    status: str = "pending"  # pending | running | contributed | failed | unavailable | stopped
     attempts: int = 0
     findings: list[str] = []
     patch_files: list[str] = []
@@ -375,10 +389,20 @@ class Goal(BaseModel):
 
     goal_id: str = Field(default_factory=lambda: f"g_{short_id()}")
     text: str
+    # Product-level intent that remains stable while package prompts evolve.
+    # Stored as a versioned JSON object so older Goal records remain valid.
+    outcome_contract: dict = Field(default_factory=dict)
+    execution_profile: str = "auto"
+    routing_decision: dict = Field(default_factory=dict)
+    playbook_id: Optional[str] = None
+    parent_goal_id: Optional[str] = None
     status: str = "planning"  # planning | running | draining | paused | completed | failed | cancelled
     milestones: list[GoalMilestone] = []
     current_index: int = 0
     planned_by: str = ""      # agent that authored the milestone plan
+    # Planning precedes the first milestone Session. Persist its live call here
+    # so the dashboard can supervise and stop it just like any session call.
+    active_agent_calls: list[dict] = []
     # Enabled build participants frozen when the goal is created. Settings may
     # change while a long goal runs; its promised collaboration roster may not.
     build_roster: list[str] = []
@@ -440,6 +464,15 @@ class Session(BaseModel):
     schema_version: int = SESSION_SCHEMA_VERSION
     session_id: str
     status: SessionStatus = SessionStatus.received
+    # An editable, versioned goal-to-result contract inferred at intake (or
+    # supplied by the caller after preview).  It is deliberately separate from
+    # Task.text: the dashboard can show the original request while every model
+    # receives the same explicit deliverables and success criteria.
+    outcome_contract: dict = Field(default_factory=dict)
+    execution_profile: str = "auto"
+    routing_decision: dict = Field(default_factory=dict)
+    playbook_id: Optional[str] = None
+    parent_session_id: Optional[str] = None
     backend: str = "mock"  # which adapter family this session runs on; resume must match
     workspace_root: Optional[str] = None  # the council's PERMANENT work area; None ⇒ sandbox only
     established_root: Optional[str] = None  # external real folder (per task): read-only; the
@@ -478,6 +511,9 @@ class Session(BaseModel):
     # Frontier models are implementation quorum, not optional late judges.
     required_frontier_authors: list[str] = []
     frontier_author_recoveries: dict[str, int] = {}
+    # Best-of-all protocol corrections are tracked separately from frontier
+    # runtime repairs: every enabled candidate author is treated equally.
+    candidate_author_recoveries: dict[str, int] = {}
     # Persist the real author/runtime funnel and semantic release gate.
     candidate_metrics: dict = {}
     quality_gate: dict = {}
@@ -498,7 +534,9 @@ class Session(BaseModel):
     active_agent_calls: list[dict] = []
     goal_background: bool = False
     goal_release: bool = False
-    cli_timeouts: dict[str, int] = {}  # per-seat call timeout (s), from Settings; {} ⇒ config defaults
+    # Legacy settings snapshot; normal model calls ignore it and are supervised
+    # by the operator instead of an elapsed-time cutoff.
+    cli_timeouts: dict[str, int] = {}
     integration_review_enabled: bool = False
     integration_proposal: Optional[IntegrationProposal] = None
     # Approval categories the human granted a session-wide standing approval for
@@ -529,6 +567,10 @@ class Session(BaseModel):
     # the author has intentionally changed it.
     revision_targets: list[str] = []
     revision_base_hashes: dict[str, str] = {}
+    # Where each revision target's authoritative pre-edit bytes came from.
+    # Post-release repairs must use the delivered established copy, while
+    # package-to-package revisions normally use goal staging.
+    revision_source_spaces: dict[str, str] = {}
     revision_api_contract: dict[str, list[str]] = {}
     revision_assertions: dict[str, list[str]] = {}
     acceptance_commands: list[str] = []

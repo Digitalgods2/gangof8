@@ -59,7 +59,7 @@ def test_settings_timeout_never_caps_any_coding_stage():
     assert loop._effective_agent_timeout(session, "claude", config.LEAD_TIMEOUT) == 0
     assert loop._effective_agent_timeout(session, "codex", config.JUDGE_TIMEOUT) == 0
     assert loop._effective_agent_timeout(session, "gemini", config.PANEL_AUTHOR_TIMEOUT) == 0
-    assert loop._effective_agent_timeout(session, "gemini", config.JUDGE_TIMEOUT) == 480
+    assert loop._effective_agent_timeout(session, "gemini", config.JUDGE_TIMEOUT) == 0
 
 
 def test_substantial_build_auto_routes_but_small_fix_does_not():

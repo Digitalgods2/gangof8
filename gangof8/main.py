@@ -13,20 +13,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import __version__, config, goals, reporting, security
+from . import __version__, config, reporting, security, skills
 from .models import Role
 from .service import GangOf8Service
 from .settings import SettingsProfile
-
-# The trinity of local CLI seats whose call timeout is user-tunable in Settings.
-_CLI_TIMEOUT_SEATS = ("gemini", "claude", "codex")
-
-
-def _cli_timeout_defaults() -> dict[str, int]:
-    """Built-in per-seat timeout (seconds) — what a seat uses when unset."""
-    return {s: config.agent_timeout(s) for s in _CLI_TIMEOUT_SEATS}
 
 app = FastAPI(title="Gang of 8 — Coordinator", version=__version__)
 # env read here (not from config.BACKEND) so `cli.py serve --backend X` can
@@ -48,11 +40,32 @@ async def localhost_only(request: Request, call_next):
     return await call_next(request)
 
 
+def _require_sensitive_local(request: Request, action: str) -> None:
+    client_host = request.client.host if request.client else None
+    if not security.sensitive_local_action_allowed(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{action} requires a local request",
+        )
+
+
 class TaskIn(BaseModel):
     text: str
     source: str = "api"
     background: bool = False  # True: return immediately, poll GET /sessions/{id}
-    attachments: list[str] = []  # upload ids whose text is folded into the task
+    attachments: list[str] = Field(default_factory=list)
+    outcome_contract: dict | None = None
+    execution_profile: str = "auto"
+    playbook_id: str | None = None
+    parent_session_id: str | None = None
+
+
+class TaskPreviewIn(BaseModel):
+    text: str
+    source: str = "api"
+    attachments: list[str] = Field(default_factory=list)
+    outcome_contract: dict | None = None
+    execution_profile: str = "auto"
 
 
 class UploadIn(BaseModel):
@@ -80,6 +93,12 @@ def _summary(session) -> dict:
     return {
         "session_id": session.session_id,
         "status": session.status.value,
+        "original_text": session.task.original_text or session.task.text,
+        "outcome_contract": session.outcome_contract,
+        "execution_profile": session.execution_profile,
+        "routing_decision": session.routing_decision,
+        "playbook_id": session.playbook_id,
+        "parent_session_id": session.parent_session_id,
         "outcome": session.outcome,
         "stop_reason": session.stop_reason,
         "final": session.final.model_dump() if session.final else None,
@@ -181,24 +200,46 @@ def diagnostics() -> dict:
 @app.post("/tasks")
 def submit_task(body: TaskIn) -> dict:
     try:
-        if goals.should_auto_route(body.text, has_attachments=bool(body.attachments)):
-            goal = service.create_goal(body.text, background=body.background)
-            payload = service.get_goal(goal.goal_id) or goal.model_dump()
-            payload.update({
-                "kind": "goal",
-                "auto_routed": True,
-                "route_reason": "substantial build: parallel owned packages + final batch",
-            })
-            return payload
-        if body.background:
-            session = service.submit_background(
-                body.text, source=body.source, attachments=body.attachments)
-        else:
-            session = service.run(
-                body.text, source=body.source, attachments=body.attachments)
+        kind, item = service.start_task(
+            body.text,
+            source=body.source,
+            background=body.background,
+            attachments=body.attachments,
+            outcome_contract=body.outcome_contract,
+            execution_profile=body.execution_profile,
+            playbook_id=body.playbook_id,
+            parent_session_id=body.parent_session_id,
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    return _summary(session)
+    if kind == "goal":
+        payload = service.get_goal(item.goal_id) or item.model_dump()
+    else:
+        payload = _summary(item)
+    payload["kind"] = kind
+    routing = getattr(item, "routing_decision", {}) or {}
+    payload["auto_routed"] = bool(
+        routing.get("requested_profile") == "auto"
+        and routing.get("selected_route") == "build_team"
+    )
+    payload["route_reason"] = routing.get("reason", "")
+    return payload
+
+
+@app.post("/tasks/preview")
+def preview_task(body: TaskPreviewIn) -> dict:
+    """Infer an editable outcome contract and show the routing decision before
+    any model call or side effect occurs."""
+    try:
+        return service.preview_task(
+            body.text,
+            source=body.source,
+            attachments=body.attachments,
+            outcome_contract=body.outcome_contract,
+            execution_profile=body.execution_profile,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @app.post("/uploads")
@@ -267,8 +308,13 @@ def get_session(session_id: str) -> dict:
     # values so API/UI consumers never have to guess whether a key disappeared.
     data.setdefault("required_frontier_authors", [])
     data.setdefault("frontier_author_recoveries", {})
+    data.setdefault("candidate_author_recoveries", {})
     data.setdefault("candidate_metrics", {})
     data.setdefault("quality_gate", {})
+    data.setdefault("outcome_contract", {})
+    data.setdefault("execution_profile", "auto")
+    data.setdefault("routing_decision", {})
+    data["evaluation"] = service.session_evaluation(session_id)
     service.annotate_council_models(data)  # label each member with the model it runs
     data["council_health"] = reporting.council_health(data.get("unresolved", []))
     data["run_summary"] = reporting.run_summary(data)
@@ -281,6 +327,112 @@ def session_timeline(session_id: str) -> dict:
     if service.get(session_id) is None:
         raise HTTPException(status_code=404, detail="session not found")
     return service.timeline(session_id)
+
+
+class CloneIn(BaseModel):
+    run: bool = False
+    background: bool = True
+
+
+class EvaluationIn(BaseModel):
+    verdict: str
+    rating: int | None = None
+    notes: str = ""
+
+
+class SteeringIn(BaseModel):
+    kind: str
+    payload: dict = Field(default_factory=dict)
+
+
+@app.post("/sessions/{session_id}/clone")
+def clone_session(session_id: str, body: CloneIn) -> dict:
+    """Return a clean editable template, or launch it as a fresh independent run."""
+    try:
+        return service.clone_session(
+            session_id, run=body.run, background=body.background
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/sessions/{session_id}/artifacts")
+def session_artifacts(session_id: str) -> dict:
+    try:
+        return service.artifact_manifest(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+@app.get("/sessions/{session_id}/artifacts/{artifact_id}/preview")
+def preview_artifact(session_id: str, artifact_id: str):
+    try:
+        preview = service.preview_artifact(session_id, artifact_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if preview.get("file_path"):
+        return FileResponse(
+            preview["file_path"],
+            media_type=preview.get("media_type") or "application/octet-stream",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+    return preview
+
+
+@app.get("/sessions/{session_id}/artifacts/{artifact_id}/download")
+def download_artifact(session_id: str, artifact_id: str) -> FileResponse:
+    try:
+        item = service.download_artifact(session_id, artifact_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(
+        item["file_path"],
+        media_type=item.get("media_type") or "application/octet-stream",
+        filename=item["name"],
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/sessions/{session_id}/commands")
+def session_commands(session_id: str) -> list[dict]:
+    try:
+        return service.list_steering_commands(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+@app.post("/sessions/{session_id}/commands")
+def steer_session(session_id: str, body: SteeringIn) -> dict:
+    try:
+        return service.add_steering_command(session_id, body.kind, body.payload)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.delete("/sessions/{session_id}/commands/{command_id}")
+def revoke_steering_command(session_id: str, command_id: str) -> dict:
+    try:
+        return service.revoke_steering_command(session_id, command_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="command not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.put("/sessions/{session_id}/evaluation")
+def evaluate_session(session_id: str, body: EvaluationIn) -> dict:
+    try:
+        return service.evaluate_session(
+            session_id, body.verdict, rating=body.rating, notes=body.notes
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @app.get("/goals/{goal_id}/timeline")
@@ -410,7 +562,8 @@ class DeleteHistoryIn(BaseModel):
 
 
 @app.delete("/history")
-def delete_all_history(body: DeleteHistoryIn) -> dict:
+def delete_all_history(body: DeleteHistoryIn, request: Request) -> dict:
+    _require_sensitive_local(request, "deleting all history")
     if body.confirmation != "DELETE ALL":
         raise HTTPException(
             status_code=400,
@@ -427,9 +580,21 @@ def cancel_session(session_id: str) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
 
 
+@app.post("/sessions/{session_id}/calls/{call_id}/stop")
+def stop_agent_call(session_id: str, call_id: str) -> dict:
+    """Stop one long-running model seat without cancelling sibling work."""
+    try:
+        return service.stop_agent_call(session_id, call_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="active call not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 class FollowUpIn(BaseModel):
     text: str = ""
     attachments: list[str] = []
+    artifact_id: str | None = None
 
 
 @app.post("/sessions/{session_id}/followup")
@@ -439,12 +604,27 @@ def followup_session(session_id: str, body: FollowUpIn) -> dict:
     original task box — attachments are upload ids from POST /uploads."""
     try:
         session = service.continue_session(session_id, body.text, background=True,
-                                           attachments=body.attachments)
+                                           attachments=body.attachments,
+                                           artifact_id=body.artifact_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="session not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"session_id": session.session_id, "status": session.status.value}
+    acknowledged = service.is_terminal_acknowledgement(
+        body.text,
+        attachments=body.attachments,
+        artifact_id=body.artifact_id,
+    )
+    return {
+        "session_id": session.session_id,
+        "status": session.status.value,
+        "acknowledged": acknowledged,
+        "message": (
+            "Acknowledged. The completed session remains closed; no models "
+            "were called."
+            if acknowledged else ""
+        ),
+    }
 
 
 # ---- Goals (/goal): long-horizon objectives, milestone by milestone -----------
@@ -454,6 +634,10 @@ class GoalIn(BaseModel):
     text: str
     background: bool = False  # True: plan + run on a worker, poll GET /goals/{id}
     participation_mode: str | None = None
+    outcome_contract: dict | None = None
+    execution_profile: str = "build_team"
+    playbook_id: str | None = None
+    parent_goal_id: str | None = None
 
 
 @app.post("/goals")
@@ -465,6 +649,10 @@ def create_goal(body: GoalIn) -> dict:
             body.text,
             background=body.background,
             participation_mode=body.participation_mode,
+            outcome_contract=body.outcome_contract,
+            execution_profile=body.execution_profile,
+            playbook_id=body.playbook_id,
+            parent_goal_id=body.parent_goal_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -484,12 +672,31 @@ def get_goal(goal_id: str) -> dict:
     return data
 
 
+@app.post("/goals/{goal_id}/clone")
+def clone_goal(goal_id: str, body: CloneIn) -> dict:
+    try:
+        return service.clone_goal(goal_id, run=body.run, background=body.background)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="goal not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 @app.post("/goals/{goal_id}/cancel")
 def cancel_goal(goal_id: str) -> dict:
     try:
         return service.cancel_goal(goal_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="goal not found")
+
+
+@app.post("/goals/{goal_id}/calls/{call_id}/stop")
+def stop_goal_agent_call(goal_id: str, call_id: str) -> dict:
+    """Stop the planning model without cancelling the goal."""
+    try:
+        return service.stop_goal_agent_call(goal_id, call_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="active planning call not found")
 
 
 @app.post("/goals/{goal_id}/resume")
@@ -507,6 +714,85 @@ def delete_goal(goal_id: str) -> dict:
     if not service.delete_goal(goal_id):
         raise HTTPException(status_code=404, detail="goal not found")
     return {"deleted": goal_id}
+
+
+# ---- Reusable playbooks / capability catalogue -------------------------------
+
+
+class PlaybookIn(BaseModel):
+    name: str
+    description: str = ""
+    task_template: str = ""
+    outcome_contract: dict | None = None
+    execution_profile: str = "auto"
+    session_id: str | None = None
+
+
+class PlaybookRunIn(BaseModel):
+    text: str | None = None
+    background: bool = True
+
+
+@app.get("/playbooks")
+def list_playbooks() -> list[dict]:
+    return service.list_playbooks()
+
+
+@app.post("/playbooks")
+def create_playbook(body: PlaybookIn) -> dict:
+    try:
+        return service.save_playbook(
+            name=body.name,
+            description=body.description,
+            task_template=body.task_template,
+            outcome_contract=body.outcome_contract,
+            execution_profile=body.execution_profile,
+            session_id=body.session_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.put("/playbooks/{playbook_id}")
+def update_playbook(playbook_id: str, body: PlaybookIn) -> dict:
+    try:
+        return service.save_playbook(
+            playbook_id=playbook_id,
+            name=body.name,
+            description=body.description,
+            task_template=body.task_template,
+            outcome_contract=body.outcome_contract,
+            execution_profile=body.execution_profile,
+            session_id=body.session_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="playbook not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.delete("/playbooks/{playbook_id}")
+def delete_playbook(playbook_id: str) -> dict:
+    if not service.delete_playbook(playbook_id):
+        raise HTTPException(status_code=404, detail="playbook not found")
+    return {"deleted": playbook_id}
+
+
+@app.post("/playbooks/{playbook_id}/run")
+def run_playbook(playbook_id: str, body: PlaybookRunIn) -> dict:
+    try:
+        return service.run_playbook(
+            playbook_id, text=body.text, background=body.background
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="playbook not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.get("/capabilities")
+def capability_catalogue() -> dict:
+    return skills.capability_manifest()
 
 
 # ---- Settings / preferences --------------------------------------------------
@@ -541,7 +827,6 @@ def get_settings() -> dict:
     data = service.settings.model_dump()
     data["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
     data["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
-    data["cli_timeout_defaults"] = _cli_timeout_defaults()
     data["effective_backend"] = service.backend
     return data
 
@@ -559,7 +844,6 @@ def put_settings(body: SettingsPatch) -> dict:
     out = service.settings.model_dump()
     out["resolved_role_agents"] = {r.value: a for r, a in service.role_agents.items()}
     out["role_catalog"] = [r.value for r in Role if r not in (Role.coordinator, Role.governance)]
-    out["cli_timeout_defaults"] = _cli_timeout_defaults()
     out["effective_backend"] = service.backend
     out["note"] = "saved — backend/role changes apply to new sessions"
     return out
@@ -619,9 +903,7 @@ def get_api_key(name: str) -> dict:
 def reveal_api_key(name: str, request: Request) -> dict:
     """The full key value, fetched on demand by the dashboard's eye-reveal
     (the app is localhost-only and the key is stored locally anyway)."""
-    client_host = request.client.host if request.client else None
-    if not security.sensitive_local_action_allowed(client_host):
-        raise HTTPException(status_code=403, detail="revealing API keys requires a local request")
+    _require_sensitive_local(request, "revealing API keys")
     try:
         return service.reveal_api_key(name)
     except KeyError as e:
@@ -629,7 +911,8 @@ def reveal_api_key(name: str, request: Request) -> dict:
 
 
 @app.put("/settings/api-keys/{name}")
-def put_api_key(name: str, body: ApiKeyIn) -> dict:
+def put_api_key(name: str, body: ApiKeyIn, request: Request) -> dict:
+    _require_sensitive_local(request, "changing API keys")
     try:
         return service.set_api_key(name, body.value)
     except KeyError as e:
@@ -637,7 +920,8 @@ def put_api_key(name: str, body: ApiKeyIn) -> dict:
 
 
 @app.delete("/settings/api-keys/{name}")
-def delete_api_key(name: str) -> dict:
+def delete_api_key(name: str, request: Request) -> dict:
+    _require_sensitive_local(request, "changing API keys")
     try:
         return service.clear_api_key(name)
     except KeyError as e:
@@ -664,7 +948,8 @@ def list_workspaces() -> dict:
 
 
 @app.post("/workspaces")
-def create_workspace(body: WorkspaceIn) -> dict:
+def create_workspace(body: WorkspaceIn, request: Request) -> dict:
+    _require_sensitive_local(request, "registering workspaces")
     try:
         ws = service.create_workspace(body.name, body.root)
     except Exception as e:  # noqa: BLE001 — surface a clean validation error
@@ -691,13 +976,15 @@ class MkdirIn(BaseModel):
 
 
 @app.post("/fs/mkdir")
-def fs_mkdir(body: MkdirIn) -> dict:
+def fs_mkdir(body: MkdirIn, request: Request) -> dict:
     """Create a sub-folder (in-page browser's New-folder button)."""
+    _require_sensitive_local(request, "creating local folders")
     return service.make_dir(body.path, body.name)
 
 
 @app.put("/workspaces/active")
-def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
+def set_active_workspace(body: ActiveWorkspaceIn, request: Request) -> dict:
+    _require_sensitive_local(request, "changing the active workspace")
     try:
         service.set_active_workspace(body.id)
     except Exception as e:  # noqa: BLE001
@@ -706,15 +993,17 @@ def set_active_workspace(body: ActiveWorkspaceIn) -> dict:
 
 
 @app.delete("/workspaces/{workspace_id}")
-def delete_workspace(workspace_id: str) -> dict:
+def delete_workspace(workspace_id: str, request: Request) -> dict:
+    _require_sensitive_local(request, "removing workspaces")
     service.remove_workspace(workspace_id)
     return service.list_workspaces()
 
 
 @app.post("/workspaces/empty")
-def empty_workspace() -> dict:
+def empty_workspace(request: Request) -> dict:
     """Delete the contents of the ACTIVE workspace (the council's own area).
     Does not touch any established folder."""
+    _require_sensitive_local(request, "emptying a workspace")
     try:
         return service.empty_workspace()
     except Exception as e:  # noqa: BLE001

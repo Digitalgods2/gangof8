@@ -73,11 +73,10 @@ MAX_PARALLEL_API_AGENTS = int(os.environ.get("GANGOF8_MAX_PARALLEL_API_AGENTS", 
 # where it stopped — appending, never re-drafting. Bound how many continuations.
 MAX_ARTIFACT_CONTINUATIONS = 3
 ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead sees to continue
-# The lead authors whole files in one shot, so give it markedly more headroom than
-# a quick specialist call before timing out.
-LEAD_TIMEOUT = 600
-# Code authors are user-cancellable and API authors have a no-output stall
-# watchdog, so productive generation is not stopped by a guessed wall clock.
+# Optional lead deadline; zero keeps the normal operator-supervised policy.
+LEAD_TIMEOUT = max(0, int(os.environ.get("GANGOF8_LEAD_TIMEOUT", "0")))
+# Code authors are user-cancellable, so productive generation is not stopped
+# by a guessed wall clock.
 # Set either environment value above zero only when an installation explicitly
 # wants a hard authoring deadline; zero means no coordinator deadline.
 PANEL_AUTHOR_TIMEOUT = max(
@@ -94,8 +93,8 @@ FRONTIER_AUTHOR_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "0"))
 )
 # An optional wall-clock deadline can cover a whole package. It is disabled by
-# default because a productive owner must be allowed to finish; cancellation and
-# the OpenRouter no-output stall watchdog remain active. Positive values opt in.
+# default because a productive owner must be allowed to finish; cancellation
+# remains active. Positive values opt in.
 PACKAGE_AUTHOR_DEADLINE = max(
     0, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "0"))
 )
@@ -108,17 +107,45 @@ PACKAGE_AUTHOR_WAVE_TIMEOUT = (
 FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
     os.environ.get("GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS", "1")
 )
+# A Best-of-all author that responds successfully but misses the required
+# artifact envelope gets one focused protocol correction. Provider errors are
+# not repeated automatically; they remain visible and the remaining candidates
+# can still compete when quorum is met.
+BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS = int(
+    os.environ.get("GANGOF8_BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS", "1")
+)
 # Semantic release review is implementation work performed by a frontier model,
 # so it follows the same default policy as frontier authoring: no coordinator
 # wall-clock deadline. A positive environment value remains an explicit operator
-# opt-in; zero keeps the call user-cancellable and lets provider-stall handling
-# remain authoritative.
+# opt-in; zero keeps the call user-cancellable and human-supervised.
 FRONTIER_VERIFY_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
 )
+# OpenRouter calls are human-supervised by default, including calls that have
+# not produced their first token yet. A positive value opts an installation
+# into an automatic no-output cutoff; zero leaves that decision to the
+# operator check-in.
 OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
-    1, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
+    0, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "0"))
 )
+# Streaming API seats are progress-supervised instead of killed by an arbitrary
+# elapsed-time guess. Zero is the normal policy: productive output may continue
+# until completion or an operator stops the individual call. Installations that
+# require a hard compliance deadline can opt in explicitly.
+OPENROUTER_HARD_TIMEOUT = max(
+    0, int(os.environ.get("GANGOF8_OPENROUTER_HARD_TIMEOUT", "0"))
+)
+# A long productive call is not an error, but it should not become invisible.
+# After this interval the dashboard asks whether to keep waiting, stop only
+# that model, or cancel the run. Waiting snoozes the prompt without restarting.
+MODEL_OPERATOR_CHECKIN_SECONDS = max(
+    30,
+    int(os.environ.get(
+        "GANGOF8_MODEL_OPERATOR_CHECKIN_SECONDS",
+        os.environ.get("GANGOF8_OPENROUTER_OPERATOR_CHECKIN_SECONDS", "300"),
+    )),
+)
+OPENROUTER_OPERATOR_CHECKIN_SECONDS = MODEL_OPERATOR_CHECKIN_SECONDS
 FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
 # A verifier CLI that exits or reports capacity did NOT judge the batch.
 # Retry the call (rotating through eligible independent seats) before
@@ -154,7 +181,7 @@ GOAL_MAX_MODEL_CALLS = int(os.environ.get("GANGOF8_GOAL_MAX_MODEL_CALLS", "40"))
 # cut-offs, fixing tests — is expected to think hard, so give it more headroom
 # than the lead's fast coordination path. (Raised with the removal of the
 # judging char caps: the chair now reads both finalists genuinely in full.)
-CODIFIER_TIMEOUT = int(os.environ.get("GANGOF8_CODIFIER_TIMEOUT", "600"))
+CODIFIER_TIMEOUT = max(0, int(os.environ.get("GANGOF8_CODIFIER_TIMEOUT", "0")))
 
 # Talent menu advertised to the lead: each specialist role and what it is good
 # for, so the lead knows what it can reach for (its origin model is filled in
@@ -348,24 +375,15 @@ RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 # reads; larger files retain the normal read/search fallback.
 REVISION_SOURCE_MAX_CHARS = int(os.environ.get("GANGOF8_REVISION_SOURCE_MAX_CHARS", "80000"))
 
-# Per-agent CLI timeouts (seconds). The gemini CLI in headless plan mode is
-# markedly slower than claude/codex and prone to stalling, so give it more room
-# before timing out. A seat that still times out is dropped gracefully (the
-# round continues without it) rather than aborting the whole deliberation.
-AGENT_TIMEOUT_DEFAULT = 120
-# gemini headless either answers reasonably fast or hangs; a long timeout just
-# makes a hang painful (you wait the whole time for nothing). Keep it short so a
-# stall surfaces quickly and the seat-drop / composer fallback can take over.
-# codex, by contrast, does genuine work per call (e.g. live web research in the
-# researcher seat, deep review as critic/fact_validator) that legitimately runs
-# past the 120s default — its invocation is non-interactive and doesn't hang, so
-# the extra time is real reasoning, not a stall. Give it real headroom.
+# Optional installation-level CLI hard deadlines. Defaults are all zero: long
+# calls are surfaced to the operator and remain individually cancellable.
+AGENT_TIMEOUT_DEFAULT = max(
+    0, int(os.environ.get("GANGOF8_AGENT_TIMEOUT_DEFAULT", "0"))
+)
 AGENT_TIMEOUTS: dict[str, int] = {
-    "gemini": 150,
-    "codex": 300,
-    # the claude CLI writes long, careful panel takes — observed >120s on real
-    # runs (two seats dropped at the old default); it works, it's just thorough
-    "claude": 240,
+    "gemini": max(0, int(os.environ.get("GANGOF8_GEMINI_TIMEOUT", "0"))),
+    "codex": max(0, int(os.environ.get("GANGOF8_CODEX_TIMEOUT", "0"))),
+    "claude": max(0, int(os.environ.get("GANGOF8_CLAUDE_TIMEOUT", "0"))),
 }
 
 
@@ -443,6 +461,9 @@ OVERVIEW_API_SURFACE_MAX_CHARS = 2500
 # shipped — a real model's code, not a lead re-author. Owner directive
 # 2026-07-05 ("I want true best-of-N selection").
 BEST_OF_N_MIN_CANDIDATES = 2      # fewer than this ⇒ fall back to author path
+BEST_OF_N_LINKED_CANDIDATE_MAX_BYTES = int(
+    os.environ.get("GANGOF8_BEST_OF_N_LINKED_CANDIDATE_MAX_BYTES", "2000000")
+)
 MAX_JUDGES = int(os.environ.get("GANGOF8_MAX_JUDGES", "3"))
 # Judges and the chair see every candidate IN FULL — no per-candidate char cap.
 # The old 24000-char window made the vote measure "which file fit under the
@@ -456,7 +477,7 @@ JUDGE_SCORE_MAX = 10              # score scale a judge gives each candidate
 # Scoring calls carry every candidate's full body, so give judges reading
 # headroom over the quick per-seat default (claude 240s would be the binding
 # timeout otherwise, with far more to read than before).
-JUDGE_TIMEOUT = int(os.environ.get("GANGOF8_JUDGE_TIMEOUT", "480"))
+JUDGE_TIMEOUT = max(0, int(os.environ.get("GANGOF8_JUDGE_TIMEOUT", "0")))
 # Judges run in PARALLEL waves: the first wave votes, and only a SPLIT vote
 # convenes the rest — a unanimous first wave with at least
 # JUDGE_EARLY_STOP_MIN_VOTES real votes decides the winner outright (live: a
@@ -480,7 +501,9 @@ MAX_ARTIFACT_FILES = 8
 # making the human manually retry an unchanged goal. Keep repair bounded so a
 # provider that repeatedly ignores the contract cannot loop forever.
 GOAL_MAX_MILESTONES = 8
-GOAL_PLAN_TIMEOUT = 600       # s per planning/repair call (architect thinks hard)
+GOAL_PLAN_TIMEOUT = max(
+    0, int(os.environ.get("GANGOF8_GOAL_PLAN_TIMEOUT", "0"))
+)  # planning/repair remains operator-supervised by default
 GOAL_PLAN_REPAIR_ATTEMPTS = max(
     0, int(os.environ.get("GANGOF8_GOAL_PLAN_REPAIR_ATTEMPTS", "2"))
 )

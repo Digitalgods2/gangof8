@@ -181,6 +181,8 @@ class LogStore:
             task_text, pending_approvals, pending_inputs = "", 0, 0
             goal_id, package_id, package_owner = None, "", ""
             goal_epoch, goal_milestone, goal_release = None, None, False
+            parent_session_id, outcome = None, "pending"
+            revision_targets: list[str] = []
             active_agent_calls: list[dict] = []
             agent_calls, agent_call_attempts = 0, 0
             successful_agent_calls: dict[str, int] = {}
@@ -205,6 +207,9 @@ class LogStore:
                 goal_epoch = data.get("goal_epoch")
                 goal_milestone = data.get("goal_milestone")
                 goal_release = bool(data.get("goal_release"))
+                parent_session_id = data.get("parent_session_id")
+                outcome = data.get("outcome") or "pending"
+                revision_targets = list(data.get("revision_targets") or [])
                 active_agent_calls = list(data.get("active_agent_calls") or [])
                 agent_calls = int(data.get("agent_calls") or 0)
                 agent_call_attempts = int(data.get("agent_call_attempts") or agent_calls)
@@ -250,6 +255,9 @@ class LogStore:
                     "goal_epoch": goal_epoch,
                     "goal_milestone": goal_milestone,
                     "goal_release": goal_release,
+                    "parent_session_id": parent_session_id,
+                    "outcome": outcome,
+                    "revision_targets": revision_targets,
                     "active_agent_calls": active_agent_calls,
                     "agent_calls": agent_calls,
                     "agent_call_attempts": agent_call_attempts,

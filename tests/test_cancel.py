@@ -33,6 +33,41 @@ def test_prerequested_cancel_aborts_run(service):
     assert not cancellation.is_requested(s.session_id)  # flag cleared after handling
 
 
+def test_individual_call_stop_does_not_cancel_sibling_or_session():
+    session_id = "s_call_stop"
+    stopped = []
+    killed = []
+
+    class Proc:
+        def __init__(self, name):
+            self.name = name
+
+        def kill(self):
+            killed.append(self.name)
+
+    cancellation.set_current_session(session_id)
+    cancellation.set_current_call("call_a")
+    cancellation.register_canceler(session_id, lambda: stopped.append("a"))
+    proc_a = Proc("a")
+    cancellation.register_proc(session_id, proc_a)
+    cancellation.set_current_call("call_b")
+    cancellation.register_canceler(session_id, lambda: stopped.append("b"))
+    proc_b = Proc("b")
+    cancellation.register_proc(session_id, proc_b)
+    try:
+        cancellation.request_call(session_id, "call_a")
+
+        assert stopped == ["a"]
+        assert killed == ["a"]
+        assert cancellation.is_call_requested(session_id, "call_a")
+        assert not cancellation.is_call_requested(session_id, "call_b")
+        assert not cancellation.is_requested(session_id)
+    finally:
+        cancellation.set_current_call(None)
+        cancellation.set_current_session(None)
+        cancellation.clear(session_id)
+
+
 def test_precancel_skips_preround_web_research(service, monkeypatch):
     """A cancel requested before deliberation must abort BEFORE the pre-round
     context build — which can include a slow, non-interruptible web search — not

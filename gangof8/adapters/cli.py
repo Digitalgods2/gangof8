@@ -27,7 +27,7 @@ from typing import Optional
 from .. import cancellation, config
 from ..cancellation import SessionCancelled
 from ..models import Role
-from ..registry import AdapterResult, AgentError
+from ..registry import AdapterResult, AgentCallStopped, AgentError
 
 
 def _err_tail(text: str, limit: int = 300) -> str:
@@ -170,6 +170,7 @@ class CliAdapter:
         if not exe:
             raise AgentError(f"{self.agent} CLI not found on PATH ({cmd[0]!r})")
         sid = cancellation.current_session()
+        call_id = cancellation.current_call()
         try:
             proc = subprocess.Popen(
                 [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -197,6 +198,8 @@ class CliAdapter:
         # If a cancel killed the process, report it as cancellation (not an error).
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
+        if sid and call_id and cancellation.is_call_requested(sid, call_id):
+            raise AgentCallStopped(f"{self.agent} CLI stopped by operator")
         return out or "", err or "", proc.returncode
 
     def _exec(self, cmd: list[str], prompt: str, timeout_s: int) -> str:
@@ -306,12 +309,35 @@ class CliAdapter:
             contents.append(types.Part.from_bytes(
                 data=data, mime_type=img.get("media_type", "image/png")))
         contents.append(prompt)
+        sid = cancellation.current_session()
+        call_id = cancellation.current_call()
+        client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+        def _abort() -> None:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        cancellation.register_canceler(sid, _abort)
         try:
-            client = genai.Client(api_key=api_key) if api_key else genai.Client()
             resp = client.models.generate_content(
                 model=self.model or "gemini-2.5-flash", contents=contents)
         except Exception as e:  # noqa: BLE001 — surface as a normal agent error
+            if sid and cancellation.is_requested(sid):
+                raise SessionCancelled() from e
+            if sid and call_id and cancellation.is_call_requested(sid, call_id):
+                raise AgentCallStopped("gemini SDK call stopped by operator") from e
             raise AgentError(f"gemini SDK error: {e}")
+        finally:
+            cancellation.unregister_canceler(sid, _abort)
+            _abort()
+        if sid and cancellation.is_requested(sid):
+            raise SessionCancelled()
+        if sid and call_id and cancellation.is_call_requested(sid, call_id):
+            raise AgentCallStopped("gemini SDK call stopped by operator")
         return resp.text or ""
 
     def _run_codex(self, prompt: str, timeout_s: int, images: list[dict] | None = None) -> str:
@@ -325,6 +351,7 @@ class CliAdapter:
             # EMPTY dir (see _neutral_cwd) — codex has no tools enabled here, so
             # the trust check protects nothing and only kills the seat.
             cmd = ["codex", "exec", "--color", "never", "--skip-git-repo-check",
+                   "--sandbox", "read-only",
                    "--output-last-message", outfile]
             if self.model:
                 cmd += ["-m", self.model]
