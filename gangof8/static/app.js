@@ -2,6 +2,12 @@ let current = null;
 let liveKey = null, liveSince = 0;  // drives the ticking elapsed timer
 let uiPreferences = {poll_interval_ms: 3000, collapse_finished: true};
 const detailRefreshGate = createLatestRequestGate();
+let pendingSubmission = null;
+let submissionBusy = false;
+let playbooksCache = [];
+let artifactCache = {};
+let commandCache = {};
+let evaluationCache = {};
 // Expand/collapse state for rollup sections, keyed by stable id (e.g.
 // "sec_contributions"). Tracked here rather than read off the DOM because
 // renderDetail() rebuilds #right.innerHTML every 3s, which would otherwise
@@ -356,6 +362,8 @@ function clearComposer() {
   const box = document.getElementById("task");
   box.value = ""; autoGrow(box);
   attachments = []; renderAttachments();
+  const profile = document.getElementById("executionProfile");
+  if (profile) profile.value = "auto";
   document.getElementById("submitNote").textContent = "";
   resetEnhance();
 }
@@ -406,22 +414,56 @@ function bindComposerControls() {
       void enhancePrompt();
     });
   }
+  const profile = document.getElementById("executionProfile");
+  const profileHint = document.getElementById("profileHint");
+  const hints = {
+    auto: "Gang of 8 will explain its routing choice before starting.",
+    focused: "Uses the smallest capable group for a fast, direct result.",
+    council: "Invites broad critique and synthesis across the council.",
+    best_of_n: "Every enabled AI independently attempts one complete artifact. Runnable candidates are validated, compared anonymously, and the strongest is selected.",
+    build_team: "Creates owned packages. Independent packages run in parallel; an atomic deliverable may use one owner plus council review.",
+  };
+  const updateHint = () => {
+    if (profileHint && profile) profileHint.textContent = hints[profile.value] || hints.auto;
+  };
+  profile?.addEventListener("change", updateHint);
+  updateHint();
 }
 
 // ---- floatable composer: drag it by the terminal bar out of the way of
 // on-screen text; position survives reloads; double-click the bar to re-dock ----
 const COMPOSER_POS_KEY = "g8ComposerPos";
 function _savedComposerPos() {
-  try { return JSON.parse(localStorage.getItem(COMPOSER_POS_KEY)); }
+  try {
+    const saved = JSON.parse(localStorage.getItem(COMPOSER_POS_KEY));
+    return Number.isFinite(saved?.x) && Number.isFinite(saved?.y) ? saved : null;
+  }
   catch { return null; }
+}
+function _composerViewport() {
+  const viewport = window.visualViewport;
+  return {
+    left: viewport?.offsetLeft || 0,
+    top: viewport?.offsetTop || 0,
+    width: viewport?.width || window.innerWidth,
+    height: viewport?.height || window.innerHeight,
+  };
 }
 function _placeComposer(box, bar, x, y) {
   // partial off-screen is allowed (that's how you shove it out of the way),
   // but at least 140px of the drag bar stays reachable, and the bar can never
   // leave the viewport vertically — a lost composer is unrecoverable
+  const viewport = _composerViewport();
   const w = box.offsetWidth, barH = bar.offsetHeight || 34;
-  x = Math.max(140 - w, Math.min(x, window.innerWidth - 140));
-  y = Math.max(0, Math.min(y, window.innerHeight - barH));
+  const reachable = Math.min(140, w);
+  x = Math.max(
+    viewport.left + reachable - w,
+    Math.min(x, viewport.left + viewport.width - reachable),
+  );
+  y = Math.max(
+    viewport.top,
+    Math.min(y, viewport.top + viewport.height - Math.min(barH, viewport.height)),
+  );
   box.style.left = x + "px"; box.style.top = y + "px";
   box.style.right = "auto"; box.style.bottom = "auto"; box.style.margin = "0";
 }
@@ -458,10 +500,19 @@ function bindComposerDrag() {
     box.style.left = box.style.top = box.style.right = "";
     box.style.bottom = box.style.margin = "";
   });
-  window.addEventListener("resize", () => {
+  const reclampSavedPosition = () => {
     const p = _savedComposerPos();
-    if (p) _placeComposer(box, bar, p.x, p.y);
-  });
+    if (!p) return;
+    _placeComposer(box, bar, p.x, p.y);
+    const r = box.getBoundingClientRect();
+    localStorage.setItem(
+      COMPOSER_POS_KEY,
+      JSON.stringify({x: r.left, y: r.top}),
+    );
+  };
+  window.addEventListener("resize", reclampSavedPosition);
+  window.visualViewport?.addEventListener("resize", reclampSavedPosition);
+  window.visualViewport?.addEventListener("scroll", reclampSavedPosition);
 }
 
 // ---- respond-to-council attachments — multi-modal like the main composer ----
@@ -506,8 +557,27 @@ async function sendFollowup(sid) {
   const r = await fetch(`/sessions/${encodeURIComponent(sid)}/followup`, {method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({text, attachments: fuAttachments.map(a => a.id)})});
-  if (r.ok) { if (ta) ta.value = ""; fuAttachments = []; _lastDetailSig = ""; pollLoop(); }
-  else { const d = await r.json().catch(() => ({})); alert("could not continue: " + (d.detail || r.status)); }
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    // Actionable follow-ups run in a clean child session. Follow the returned
+    // id so the operator sees the new response while the completed result
+    // remains immutable.
+    current = d.session_id || current;
+    if (ta) ta.value = "";
+    fuAttachments = [];
+    renderFuAttachments();
+    _lastDetailSig = "";
+    if (d.acknowledged) {
+      const note = document.getElementById("fuNote");
+      if (note) {
+        note.style.color = "var(--ok)";
+        note.textContent = d.message || "Acknowledged; the completed session remains closed.";
+      }
+      return;
+    }
+    pollLoop();
+  }
+  else { alert("could not continue: " + (d.detail || r.status)); }
 }
 function followupKey(e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendFollowup(current); }
@@ -516,13 +586,61 @@ function followupKey(e) {
 // What the composer's cancel button acts on this poll cycle: the open running
 // session, or (with none open) the live goal itself. Set in refresh().
 let _cancelTarget = null;
+const _slowCallSnoozes = new Map();
+
+function keepWaitingForCall(callId, checkinSeconds) {
+  const seconds = Math.max(30, Number(checkinSeconds) || 300);
+  _slowCallSnoozes.set(callId, Date.now() + seconds * 1000);
+  _lastDetailSig = "";
+  _refreshDetail();
+}
+
+async function stopAgentCall(sessionId, callId, agent) {
+  if (!confirm(`Stop only ${agent || "this model"}?\n\nOther seats and the run will continue.`)) return;
+  const response = await fetch(
+    `/sessions/${encodeURIComponent(sessionId)}/calls/${encodeURIComponent(callId)}/stop`,
+    {method: "POST"},
+  );
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert(body.detail || `Could not stop ${agent || "the model"} (${response.status})`);
+    return;
+  }
+  _slowCallSnoozes.delete(callId);
+  _lastDetailSig = "";
+  pollLoop();
+}
+
+function keepWaitingForGoalCall(callId, checkinSeconds) {
+  const seconds = Math.max(30, Number(checkinSeconds) || 300);
+  _slowCallSnoozes.set(callId, Date.now() + seconds * 1000);
+  _lastGoalsSig = "";
+  pollLoop();
+}
+
+async function stopGoalAgentCall(goalId, callId, agent, ev) {
+  if (ev) ev.stopPropagation();
+  if (!confirm(`Stop only ${agent || "the planning model"}?\n\nThe goal will pause so you can resume planning later.`)) return;
+  const response = await fetch(
+    `/goals/${encodeURIComponent(goalId)}/calls/${encodeURIComponent(callId)}/stop`,
+    {method: "POST"},
+  );
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert(body.detail || `Could not stop ${agent || "the planning model"} (${response.status})`);
+    return;
+  }
+  _slowCallSnoozes.delete(callId);
+  _lastGoalsSig = "";
+  pollLoop();
+}
 
 async function cancelCurrent() {
   if (_cancelTarget && _cancelTarget.kind === "goal") {
     return cancelGoal(_cancelTarget.id);
   }
   if (!current) return;
-  if (!confirm("Cancel this run? It stops at the next step — an in-flight agent call finishes first.")) return;
+  if (!confirm("Cancel this run? Active model calls will be stopped.")) return;
   detailRefreshGate.invalidate(); _lastDetailSig = "";
   const note = document.getElementById("submitNote");
   const r = await fetch(`/sessions/${current}/cancel`, {method: "POST"});
@@ -530,7 +648,7 @@ async function cancelCurrent() {
   else { note.style.color = "var(--bad)"; note.textContent = "cancel failed"; }
 }
 
-async function submitTask() {
+async function submitTaskLegacy() {
   const box = document.getElementById("task");
   const text = box.value.trim();
   const note = document.getElementById("submitNote");
@@ -562,7 +680,7 @@ async function submitTask() {
   if (r.goal_id) {
     note.style.color = "";
     note.textContent = "substantial build auto-routed to goal " + r.goal_id
-      + " — assigning parallel implementation owners…";
+      + " — planning owned packages; independent packages can run in parallel…";
     _followGoal = r.goal_id; _planShownFor = "";
     current = null;
     history.replaceState(null, "", location.pathname + location.search);
@@ -578,6 +696,218 @@ async function submitTask() {
 
 // True when the user currently has text selected inside `el` — we must NOT
 // clobber its innerHTML while they're selecting/copying.
+function _lines(value) {
+  if (Array.isArray(value)) return value.map(x => String(x).trim()).filter(Boolean);
+  return String(value || "").split(/\r?\n/)
+    .map(x => x.replace(/^\s*[-*]\s*/, "").trim()).filter(Boolean);
+}
+
+async function workbenchRequest(path, options = {}) {
+  const response = await fetch(path, {cache: "no-store", ...options});
+  let body = null;
+  const type = response.headers.get("content-type") || "";
+  if (type.includes("json")) body = await response.json().catch(() => ({}));
+  else body = await response.text().catch(() => "");
+  if (!response.ok) {
+    const detail = body && typeof body === "object" ? body.detail : body;
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
+  return body;
+}
+
+function closeContractReview() {
+  document.getElementById("contractOverlay")?.classList.remove("open");
+  document.getElementById("task")?.focus();
+}
+
+const EXECUTION_PROFILE_LABELS = {
+  auto: "Auto",
+  focused: "Focused",
+  council: "Council",
+  best_of_n: "Best-of-all",
+  build_team: "Planned build",
+};
+function executionProfileLabel(profile) {
+  const value = String(profile || "");
+  return EXECUTION_PROFILE_LABELS[value] || value.replaceAll("_", " ");
+}
+
+function _recommendedProfile(preview) {
+  const route = preview?.routing_decision || preview?.recommendation || {};
+  return route.execution_profile || route.recommended_profile || route.profile
+    || route.selected_profile || preview?.recommended_profile || "";
+}
+
+function useRecommendedProfile(profile) {
+  if (!pendingSubmission || !profile) return;
+  pendingSubmission.execution_profile = profile;
+  const select = document.getElementById("executionProfile");
+  if (select) select.value = profile;
+  const chosen = document.getElementById("contractChosenProfile");
+  if (chosen) chosen.textContent = executionProfileLabel(profile);
+  document.querySelectorAll("#contractRoute .route-use").forEach(button => button.remove());
+}
+
+function _routeReview(preview, selectedProfile) {
+  const route = preview?.routing_decision || preview?.recommendation || {};
+  const recommended = _recommendedProfile(preview);
+  const chosen = selectedProfile === "auto"
+    ? (recommended || route.selected_route || route.route || "auto")
+    : selectedProfile;
+  const reason = route.reason || route.rationale || route.explanation
+    || preview?.rationale || "Matched to the task's scope, risk, and expected deliverables.";
+  const alternatives = Array.isArray(route.alternatives) ? route.alternatives : [];
+  return `
+    <div class="route-review">
+      <div class="route-kicker">Recommended execution</div>
+      <div class="route-choice"><span id="contractChosenProfile">${esc(executionProfileLabel(chosen))}</span>
+        ${recommended && recommended !== selectedProfile && selectedProfile !== "auto"
+          ? `<button class="ghost route-use" type="button" onclick="useRecommendedProfile('${escAttr(recommended)}')">Use recommendation</button>` : ""}
+      </div>
+      <div class="route-reason">${esc(reason)}</div>
+      ${alternatives.length ? `<details><summary>Why not the other routes?</summary>
+        <div class="route-alternatives">${alternatives.map(item => {
+          if (typeof item === "string") return `<div>${esc(item)}</div>`;
+          const name = item.execution_profile || item.profile || item.route || item.name || "alternative";
+          return `<div><b>${esc(executionProfileLabel(name))}</b>${item.reason ? ` · ${esc(item.reason)}` : ""}</div>`;
+        }).join("")}</div></details>` : ""}
+    </div>`;
+}
+
+function openContractReview(preview) {
+  const contract = preview?.outcome_contract || preview?.contract || {};
+  if (!pendingSubmission) return;
+  pendingSubmission.preview = preview;
+  pendingSubmission.contractBase = contract;
+  document.getElementById("contractOutcome").value =
+    contract.outcome || contract.objective || pendingSubmission.text;
+  document.getElementById("contractDeliverables").value =
+    _lines(contract.deliverables).join("\n");
+  document.getElementById("contractAcceptance").value =
+    _lines(contract.acceptance_criteria || contract.acceptance).join("\n");
+  document.getElementById("contractConstraints").value =
+    _lines(contract.constraints).join("\n");
+  document.getElementById("contractExclusions").value =
+    _lines(contract.exclusions).join("\n");
+  document.getElementById("contractRoute").innerHTML =
+    _routeReview(preview, pendingSubmission.execution_profile);
+  const note = document.getElementById("contractNote");
+  note.style.color = "";
+  note.textContent = "This becomes the shared definition of done for every agent.";
+  document.getElementById("contractRunBtn").disabled = false;
+  document.getElementById("contractOverlay").classList.add("open");
+  document.getElementById("contractOutcome").focus();
+}
+
+async function dispatchTask(payload) {
+  const note = document.getElementById("submitNote");
+  try {
+    const result = await workbenchRequest("/tasks", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({...payload, background: true}),
+    });
+    closeContractReview();
+    pendingSubmission = null;
+    if (result.goal_id) {
+      note.style.color = "";
+      note.textContent = "planned build " + result.goal_id
+        + " opened — assigning owned packages; independent packages can run in parallel…";
+      _followGoal = result.goal_id; _planShownFor = "";
+      current = null;
+      history.replaceState(null, "", location.pathname + location.search);
+      clearComposer();
+      pollLoop();
+      return;
+    }
+    note.style.color = "";
+    note.textContent = payload.execution_profile === "best_of_n"
+      ? "best-of-all " + result.session_id
+        + " opened — every enabled AI is authoring a complete candidate…"
+      : "submitted " + result.session_id;
+    current = result.session_id;
+    history.replaceState(null, "", "#" + current);
+    clearComposer();
+    pollLoop();
+  } catch (error) {
+    note.style.color = "var(--bad)";
+    note.textContent = "submission failed: " + (error.message || error);
+    const contractNote = document.getElementById("contractNote");
+    if (contractNote && document.getElementById("contractOverlay")?.classList.contains("open")) {
+      contractNote.style.color = "var(--bad)";
+      contractNote.textContent = note.textContent;
+    }
+  } finally {
+    submissionBusy = false;
+    const button = document.getElementById("contractRunBtn");
+    if (button) button.disabled = false;
+  }
+}
+
+async function confirmOutcomeContract() {
+  if (!pendingSubmission || submissionBusy) return;
+  const outcome = document.getElementById("contractOutcome").value.trim();
+  if (!outcome) {
+    const note = document.getElementById("contractNote");
+    note.style.color = "var(--bad)";
+    note.textContent = "Give the run a concrete outcome before starting.";
+    return;
+  }
+  submissionBusy = true;
+  document.getElementById("contractRunBtn").disabled = true;
+  const outcomeContract = {
+    ...(pendingSubmission.contractBase || {}),
+    outcome,
+    deliverables: _lines(document.getElementById("contractDeliverables").value),
+    acceptance_criteria: _lines(document.getElementById("contractAcceptance").value),
+    constraints: _lines(document.getElementById("contractConstraints").value),
+    exclusions: _lines(document.getElementById("contractExclusions").value),
+  };
+  document.getElementById("contractNote").textContent = "Starting with the reviewed contract…";
+  await dispatchTask({...pendingSubmission, preview: undefined, contractBase: undefined,
+    outcome_contract: outcomeContract});
+}
+
+async function submitTask() {
+  if (submissionBusy) return;
+  const box = document.getElementById("task");
+  let text = box.value.trim();
+  const note = document.getElementById("submitNote");
+  if (!text && !attachments.length) { note.textContent = "type a task or attach a file"; return; }
+  if (!text) { note.textContent = "add a short instruction for the attachment(s)"; return; }
+  let executionProfile = document.getElementById("executionProfile")?.value || "auto";
+  if (/^\/goal\b/i.test(text)) {
+    text = text.replace(/^\/goal\b/i, "").trim();
+    if (!text) {
+      note.textContent = "usage: /goal <a big objective — the planner creates owned packages and parallelizes independent work>";
+      return;
+    }
+    executionProfile = "build_team";
+  }
+  const payload = {
+    text, source: "dashboard",
+    attachments: attachments.map(item => item.id),
+    execution_profile: executionProfile,
+  };
+  pendingSubmission = payload;
+  submissionBusy = true;
+  note.style.color = "";
+  note.textContent = "building an outcome contract and checking the best route…";
+  try {
+    const preview = await workbenchRequest("/tasks/preview", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    submissionBusy = false;
+    note.textContent = "preflight ready — review the contract before the council starts";
+    openContractReview(preview || {});
+  } catch (error) {
+    // Compatibility fast path: preflight being unavailable must not make the
+    // existing task runner unusable.
+    note.textContent = "preflight unavailable; starting with your prompt…";
+    await dispatchTask(payload);
+  }
+}
+
 function _hasSelectionIn(el) {
   const sel = window.getSelection && window.getSelection();
   if (!el || !sel || sel.isCollapsed || sel.rangeCount === 0) return false;
@@ -585,8 +915,180 @@ function _hasSelectionIn(el) {
 }
 let _lastListSig = "", _lastDetailSig = "";
 
+// ---- reusable playbooks + safe cloning --------------------------------------
+function _playbookId(playbook) {
+  return playbook.playbook_id || playbook.id || "";
+}
+
+function _playbookText(playbook) {
+  return playbook.description || playbook.task_template || playbook.text || playbook.template?.text
+    || playbook.outcome_contract?.outcome || "";
+}
+
+function renderPlaybooks() {
+  const wrap = document.getElementById("playbooksWrap");
+  const target = document.getElementById("playbooks");
+  if (!wrap || !target) return;
+  wrap.style.display = playbooksCache.length ? "" : "none";
+  target.innerHTML = playbooksCache.map(playbook => {
+    const id = _playbookId(playbook);
+    const profile = playbook.execution_profile || playbook.template?.execution_profile || "auto";
+    return `<div class="playbook">
+      <div class="playbook-head">
+        <b>${esc(playbook.name || "Untitled playbook")}</b>
+        <span class="badge">${esc(executionProfileLabel(profile))}</span>
+      </div>
+      ${_playbookText(playbook) ? `<div class="playbook-text">${esc(_playbookText(playbook))}</div>` : ""}
+      <div class="playbook-actions">
+        <button type="button" onclick="runPlaybook('${escAttr(id)}')">Run</button>
+        <button class="ghost" type="button" onclick="editFromPlaybook('${escAttr(id)}')">Edit first</button>
+        <button class="deny" type="button" title="Delete playbook" onclick="deletePlaybook('${escAttr(id)}')">Delete</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function loadPlaybooks(announce = false) {
+  try {
+    const result = await workbenchRequest("/playbooks");
+    playbooksCache = Array.isArray(result) ? result : (result?.playbooks || []);
+    renderPlaybooks();
+    if (announce) {
+      const note = document.getElementById("submitNote");
+      note.style.color = "";
+      note.textContent = `loaded ${playbooksCache.length} playbook${playbooksCache.length === 1 ? "" : "s"}`;
+    }
+  } catch (error) {
+    // Older servers simply omit this optional area; task submission remains usable.
+    playbooksCache = [];
+    renderPlaybooks();
+    if (announce) alert("Could not load playbooks: " + (error.message || error));
+  }
+}
+
+function _putTemplateInComposer(template, message = "Template loaded — edit it, then Send.") {
+  const source = template?.template || template || {};
+  const text = source.task_template || source.text || source.task?.original_text || source.task?.text
+    || source.outcome_contract?.outcome || "";
+  const box = document.getElementById("task");
+  box.value = text;
+  autoGrow(box);
+  const profile = source.execution_profile || source.profile || "auto";
+  const select = document.getElementById("executionProfile");
+  if (select && [...select.options].some(option => option.value === profile)) select.value = profile;
+  const clonedAttachments = source.attachments || source.attachment_records || [];
+  attachments = clonedAttachments.filter(item => item && typeof item === "object" && item.id)
+    .map(item => ({id: item.id, name: item.name || "attachment", kind: item.kind || "text"}));
+  renderAttachments();
+  const note = document.getElementById("submitNote");
+  note.style.color = "";
+  note.textContent = message;
+  box.focus();
+}
+
+function editFromPlaybook(id) {
+  const playbook = playbooksCache.find(item => _playbookId(item) === id);
+  if (playbook) _putTemplateInComposer(playbook);
+}
+
+async function runPlaybook(id) {
+  const note = document.getElementById("submitNote");
+  note.style.color = "";
+  note.textContent = "starting playbook…";
+  try {
+    const result = await workbenchRequest(`/playbooks/${encodeURIComponent(id)}/run`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({background: true}),
+    });
+    if (result.goal_id) {
+      _followGoal = result.goal_id; _planShownFor = ""; current = null;
+      history.replaceState(null, "", location.pathname + location.search);
+      note.textContent = "playbook started as planned build " + result.goal_id;
+    } else if (result.session_id) {
+      current = result.session_id;
+      history.replaceState(null, "", "#" + current);
+      note.textContent = "playbook started " + result.session_id;
+    } else {
+      _putTemplateInComposer(result, "Playbook loaded — review and Send.");
+    }
+    pollLoop();
+  } catch (error) {
+    note.style.color = "var(--bad)";
+    note.textContent = "playbook failed: " + (error.message || error);
+  }
+}
+
+async function deletePlaybook(id) {
+  if (!confirm("Delete this playbook? Past runs are not affected.")) return;
+  try {
+    await workbenchRequest(`/playbooks/${encodeURIComponent(id)}`, {method: "DELETE"});
+    await loadPlaybooks();
+  } catch (error) {
+    alert("Could not delete playbook: " + (error.message || error));
+  }
+}
+
+async function cloneSession(id) {
+  const note = document.getElementById("submitNote");
+  try {
+    const result = await workbenchRequest(`/sessions/${encodeURIComponent(id)}/clone`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({run: false}),
+    });
+    _putTemplateInComposer(result, "Session copied into the composer — edit it, then Send.");
+  } catch (error) {
+    note.style.color = "var(--bad)";
+    note.textContent = "could not copy session: " + (error.message || error);
+  }
+}
+
+async function cloneGoal(id, event) {
+  event?.stopPropagation();
+  const note = document.getElementById("submitNote");
+  try {
+    const result = await workbenchRequest(`/goals/${encodeURIComponent(id)}/clone`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({run: false}),
+    });
+    _putTemplateInComposer(result, "Goal copied into the composer as a build-team draft.");
+    const profile = document.getElementById("executionProfile");
+    if (profile) profile.value = "build_team";
+  } catch (error) {
+    note.style.color = "var(--bad)";
+    note.textContent = "could not copy goal: " + (error.message || error);
+  }
+}
+
+async function saveSessionAsPlaybook(id) {
+  const session = _sessionsCache.find(item => item.session_id === id);
+  const defaultName = (session?.task?.original_text || session?.task?.text
+    || session?.task_text || "Reusable run")
+    .replace(/\s+/g, " ").slice(0, 52);
+  const name = prompt("Name this playbook:", defaultName);
+  if (!name?.trim()) return;
+  try {
+    await workbenchRequest("/playbooks", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({name: name.trim(), session_id: id}),
+    });
+    await loadPlaybooks();
+    const note = document.getElementById("submitNote");
+    note.style.color = "";
+    note.textContent = `saved “${name.trim()}” as a playbook`;
+  } catch (error) {
+    alert("Could not save playbook: " + (error.message || error));
+  }
+}
+
 // ---- goals rail: long-horizon objectives above the session list -------------
 const GOAL_LIVE = new Set(["planning", "running", "draining", "awaiting_release"]);
+const GOAL_FOLLOWUP_LIVE = new Set(["revising", "following_up"]);
+function goalIsLive(g) {
+  return !!g && (
+    GOAL_LIVE.has(g.status)
+    || GOAL_FOLLOWUP_LIVE.has(g.display_status)
+  );
+}
 let _goalsCache = [], _lastGoalsSig = "";
 let _sessionsCache = [];
 
@@ -610,7 +1112,7 @@ function renderPlanningHero(g) {
         <span class="bpill"><span class="dot dot-brand"></span>goal ${esc(g.goal_id)}</span>
         <span class="bpill">🧭 assigning build packages…</span>
       </div>
-      <h1>Forming the build team and<br><span class="grad-text">assigning owned packages.</span></h1>
+      <h1>Planning the build and<br><span class="grad-text">assigning owned packages.</span></h1>
       <p>The architect is mapping dependencies and interfaces. Ready packages
          start in parallel and their work accumulates in private staging.</p>
     </div>`;
@@ -620,7 +1122,7 @@ function _followActiveGoal() {
   if (!_followGoal) {
     // adopt a live goal when nothing is open, or when the open session is
     // already one of its milestones (e.g. after a page reload mid-goal)
-    const live = _goalsCache.find(g => GOAL_LIVE.has(g.status) &&
+    const live = _goalsCache.find(g => goalIsLive(g) &&
       (!current || _goalSessions(g).includes(current)));
     if (live) _followGoal = live.goal_id;
   }
@@ -641,7 +1143,7 @@ function _followActiveGoal() {
   } else if (!latest && fg.status === "planning" && !current) {
     renderPlanningHero(fg);
   }
-  if (!GOAL_LIVE.has(fg.status)) _followGoal = null;  // settled — stop steering
+  if (!goalIsLive(fg)) _followGoal = null;  // settled — stop steering
 }
 
 // One human vocabulary for EVERY status surface (goal pills, session
@@ -656,6 +1158,7 @@ const STATUS_WORDS = {
   awaiting_target: "needs a folder", done: "done", failed: "failed",
   cancelled: "cancelled", running: "working", planning: "planning",
   paused: "paused", draining: "winding down", completed: "done",
+  revising: "revising", following_up: "reviewing follow-up",
   not_started: "not released yet", failed_verification: "verification failed",
   released: "released", denied: "release denied",
 };
@@ -702,11 +1205,16 @@ function goalCard(g) {
       </div>`;
   }).join("");
   const live = GOAL_LIVE.has(g.status);
-  const btns =
+  const followupLive = GOAL_FOLLOWUP_LIVE.has(displayStatus);
+  let btns =
     (g.status === "paused" ? `<button class="gbtn" onclick="resumeGoal('${esc(g.goal_id)}', event)">Resume</button>` : "") +
     (live || g.status === "paused" ? `<button class="gbtn ghost" onclick="cancelGoal('${esc(g.goal_id)}', event)">Cancel</button>` : "") +
-    (!live && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "") +
+    (followupLive && g.actionable_session_id
+      ? `<button class="gbtn ghost" onclick="cancelSession('${esc(g.actionable_session_id)}', event)">Cancel repair</button>`
+      : "") +
+    (!live && !followupLive && g.status !== "paused" ? `<button class="trash" title="Remove this goal (its sessions stay)" onclick="deleteGoal('${esc(g.goal_id)}', event)">🗑</button>` : "") +
     `<button class="gbtn ghost" title="Full story: timeline + postmortem" onclick="toggleGoalStory('${esc(g.goal_id)}', event)">📜</button>`;
+  btns += `<button class="gbtn ghost" title="Copy this goal into the composer" onclick="cloneGoal('${esc(g.goal_id)}', event)">Copy</button>`;
   const aggregate = g.delivery_mode === "final_batch"
     ? `<div class="sub">${g.participation_mode === "full_council" ? "Full Council" : g.participation_mode === "adaptive" ? "Adaptive council" : "Focused build"} · ${contributors}/${expectedContributors || "?"} artifact contributors` +
       ` · ${owners} planned owner${owners === 1 ? "" : "s"} · ${running} active` +
@@ -726,6 +1234,40 @@ function goalCard(g) {
   }).join("");
   const resources = resourceRoster
     ? `<div class="resource-roster" aria-label="Collaboration resources">${resourceRoster}</div>` : "";
+  const nowMs = Date.now();
+  const slowPlanningCalls = (g.planning_agent_calls || []).filter(call => {
+    const started = Date.parse(call.started_at || "");
+    const checkin = Number(call.operator_checkin_s || 0);
+    const snoozedUntil = _slowCallSnoozes.get(call.call_id) || 0;
+    return call.operator_stoppable && checkin > 0 && Number.isFinite(started) &&
+      nowMs - started >= checkin * 1000 && nowMs >= snoozedUntil;
+  });
+  const planningCheckin = slowPlanningCalls.length ? `
+    <div class="slow-call-checkin" role="status" aria-live="polite">
+      <div class="slow-call-title">Long-running planning check-in</div>
+      ${slowPlanningCalls.map(call => {
+        const elapsedMinutes = Math.max(
+          1, Math.floor((nowMs - Date.parse(call.started_at)) / 60000)
+        );
+        const chars = Number(call.progress_chars || 0);
+        const checkin = Number(call.operator_checkin_s || 300);
+        return `<div class="slow-call-row">
+          <div>
+            <b>${esc(call.agent || "model")}</b> has been planning for ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"}.
+            ${chars ? `It is still producing output (${chars.toLocaleString()} characters so far).` : "It has not produced output yet."}
+            There is no automatic wall-clock cutoff.
+          </div>
+          <div class="slow-call-actions">
+            <button class="ghost mini" type="button"
+                    onclick="keepWaitingForGoalCall('${escAttr(call.call_id)}', ${checkin})">Keep waiting</button>
+            <button class="deny mini" type="button"
+                    onclick="stopGoalAgentCall('${escAttr(g.goal_id)}', '${escAttr(call.call_id)}', '${escAttr(call.agent || "model")}', event)">Stop planner</button>
+            <button class="deny mini" type="button"
+                    onclick="cancelGoal('${escAttr(g.goal_id)}', event)">Cancel goal</button>
+          </div>
+        </div>`;
+      }).join("")}
+    </div>` : "";
   const spentSeats = Object.entries(g.model_calls_by_seat || {})
     .sort((a, b) => b[1] - a[1]).map(([seat, n]) => `${seat} ${n}`).join(", ");
   const cost = g.model_calls_used
@@ -746,6 +1288,7 @@ function goalCard(g) {
       ${g.last_error ? `<div class="gerr">${esc(g.last_error)}</div>` : ""}
       ${aggregate}
       ${resources}
+      ${planningCheckin}
       ${rows}
       <div class="gstory" id="gstory-${esc(g.goal_id)}" style="display:none"></div>
     </div>`;
@@ -793,7 +1336,17 @@ async function refreshGoals(sessions = null) {
   if (!wrap || !el) return;
   wrap.style.display = _goalsCache.length ? "" : "none";
   _followActiveGoal();  // steer the main pane before the detail render runs
-  const sig = JSON.stringify(_goalsCache);
+  const nowMs = Date.now();
+  const checkinState = _goalsCache.map(goal =>
+    (goal.planning_agent_calls || []).some(call => {
+      const started = Date.parse(call.started_at || "");
+      const checkin = Number(call.operator_checkin_s || 0);
+      const snoozedUntil = _slowCallSnoozes.get(call.call_id) || 0;
+      return call.operator_stoppable && checkin > 0 && Number.isFinite(started) &&
+        nowMs - started >= checkin * 1000 && nowMs >= snoozedUntil;
+    }) ? `${goal.goal_id}:due` : `${goal.goal_id}:waiting`
+  ).join("|");
+  const sig = JSON.stringify(_goalsCache) + "|checkins:" + checkinState;
   if (sig === _lastGoalsSig || _hasSelectionIn(el)) return;
   _lastGoalsSig = sig;
   el.innerHTML = _goalsCache.map(goalCard).join("");
@@ -827,6 +1380,16 @@ async function cancelGoal(id, ev) {
   detailRefreshGate.invalidate(); _lastDetailSig = "";
   await fetch(`/goals/${encodeURIComponent(id)}/cancel`, {method: "POST"});
   _lastGoalsSig = ""; pollLoop();
+}
+
+async function cancelSession(id, ev) {
+  if (ev) ev.stopPropagation();
+  if (!confirm("Cancel this repair run? Active model calls will be stopped.")) return;
+  detailRefreshGate.invalidate();
+  _lastDetailSig = "";
+  await fetch(`/sessions/${encodeURIComponent(id)}/cancel`, {method: "POST"});
+  _lastGoalsSig = "";
+  pollLoop();
 }
 
 async function deleteGoal(id, ev) {
@@ -970,6 +1533,7 @@ async function refresh() {
 // this request, so obsolete work cannot mutate the visible live card.
 let _liveTalent = "";
 let _liveFeed = [];  // recent {ts, icon, label, detail} rows for the live card
+let _liveEvents = []; // complete live timeline, used for the plain-language status brief
 
 async function _liveActivity(sid) {
   const d = await api(`/sessions/${encodeURIComponent(sid)}/timeline`);
@@ -983,6 +1547,7 @@ async function _liveActivity(sid) {
   return {
     talent: open.slice(0, 90),
     feed: events.filter(e => e.event !== "status_change").slice(-8),
+    events,
   };
 }
 
@@ -995,20 +1560,30 @@ async function _refreshDetail() {
   if (!detailRefreshGate.isCurrent(requestToken) || current !== sid) return;
   const workingNow = detail &&
     ["received", "classified", "deliberating", "composing"].includes(detail.status);
-  let activity = {talent: "", feed: []};
-  if (workingNow) {
+  let activity = {talent: "", feed: [], events: []};
+  if (detail) {
     activity = await _liveActivity(detail.session_id).catch(() => activity);
     if (!detailRefreshGate.isCurrent(requestToken) || current !== sid) return;
   }
   _liveTalent = activity.talent;
   _liveFeed = activity.feed;
+  _liveEvents = activity.events;
   const right = document.getElementById("right");
   const feedKey = _liveFeed.length
     ? _liveFeed[_liveFeed.length - 1].ts + ":" + _liveFeed.length : "";
   const parentGoal = detail?.goal_id
     ? _goalsCache.find(goal => goal.goal_id === detail.goal_id) : null;
+  const nowMs = Date.now();
+  const callCheckinDue = (detail.active_agent_calls || []).some(call => {
+    const started = Date.parse(call.started_at || "");
+    const checkin = Number(call.operator_checkin_s || 0);
+    const snoozedUntil = _slowCallSnoozes.get(call.call_id) || 0;
+    return call.operator_stoppable && checkin > 0 && Number.isFinite(started) &&
+      nowMs - started >= checkin * 1000 && nowMs >= snoozedUntil;
+  });
   const sig = JSON.stringify(detail) + "|goal:" + goalRenderSignature(parentGoal)
-    + "|talent:" + _liveTalent + "|feed:" + feedKey;
+    + "|talent:" + _liveTalent + "|feed:" + feedKey
+    + "|checkin:" + callCheckinDue;
   if (sig === _lastDetailSig) return;
   const terminal = detail && TERMINAL_STATES.has(detail.status);
   if (!terminal && _hasSelectionIn(right)) return;
@@ -1090,7 +1665,7 @@ async function pollLoop() {
     // API. Only that newest poll is allowed to own the next timer.
     if (pollGeneration !== _pollGeneration) return;
     const working = (sessions || []).some(s => !TERMINAL_STATES.has(s.status))
-      || _goalsCache.some(g => GOAL_LIVE.has(g.status));
+      || _goalsCache.some(goalIsLive);
     delay = working ? activePollInterval() : POLL_IDLE;
   }
   _pollTimer = setTimeout(pollLoop, delay);
@@ -1120,6 +1695,517 @@ function select(id) {
   refresh();
 }
 
+function _detailList(label, values) {
+  const lines = _lines(values);
+  return lines.length ? `<div class="contract-detail">
+    <b>${esc(label)}</b><ul>${lines.map(item => `<li>${esc(item)}</li>`).join("")}</ul>
+  </div>` : "";
+}
+
+function outcomeContractCard(s) {
+  const contract = s.outcome_contract || {};
+  const route = s.routing_decision || {};
+  const profile = s.execution_profile || route.execution_profile || route.selected_profile || "";
+  const outcome = contract.outcome || contract.objective || "";
+  if (!outcome && !profile && !Object.keys(route).length) return "";
+  const routeName = route.selected_route || route.route || route.recommended_profile
+    || route.execution_profile || profile;
+  const reason = route.reason || route.rationale || route.explanation || "";
+  return `<div class="card outcome-card">
+    <div class="card-heading-row">
+      <h3>Outcome contract</h3>
+      ${profile ? `<span class="pill profile-pill">${esc(executionProfileLabel(profile))}</span>` : ""}
+    </div>
+    ${outcome ? `<div class="contract-outcome">${esc(outcome)}</div>` : ""}
+    <div class="contract-detail-grid">
+      ${_detailList("Deliverables", contract.deliverables)}
+      ${_detailList("Acceptance criteria", contract.acceptance_criteria || contract.acceptance)}
+      ${_detailList("Constraints", contract.constraints)}
+      ${_detailList("Exclusions", contract.exclusions)}
+    </div>
+    ${routeName || reason ? `<div class="routing-line">
+      <span>Route</span> <b>${esc(executionProfileLabel(routeName || "auto"))}</b>
+      ${reason ? `<span>· ${esc(reason)}</span>` : ""}
+    </div>` : ""}
+  </div>`;
+}
+
+function _artifactData(sessionId) {
+  const entry = artifactCache[sessionId];
+  return entry?.data || null;
+}
+
+function artifactWorkbenchCard(s) {
+  const data = _artifactData(s.session_id);
+  const artifacts = data?.artifacts || [];
+  const counts = data?.counts || {};
+  const count = artifacts.length || counts.total || 0;
+  return `<div class="card artifact-workbench">
+    <div class="card-heading-row">
+      <h3>Artifact workbench${count ? ` · ${count}` : ""}</h3>
+      <button class="ghost mini" type="button" onclick="loadArtifacts('${escAttr(s.session_id)}', true)">Refresh</button>
+    </div>
+    <div class="sub workbench-intro">Inspect outputs here before opening or promoting them. HTML stays isolated in a sandbox.</div>
+    <div id="artifactList">${data ? renderArtifactItems(s.session_id, artifacts) : '<div class="workbench-loading">Loading artifacts…</div>'}</div>
+    <div id="artifactPreview" class="artifact-preview" aria-live="polite"></div>
+  </div>`;
+}
+
+function renderArtifactItems(sessionId, artifacts) {
+  if (!artifacts.length) return '<div class="workbench-empty">No artifacts yet. This area updates while the run works.</div>';
+  return `<div class="artifact-grid">${artifacts.map(item => {
+    const aid = item.artifact_id || item.id || "";
+    const kind = item.kind || "file";
+    const state = item.state || "scratch";
+    const size = Number(item.size || 0);
+    const sizeLabel = size >= 1048576 ? `${(size / 1048576).toFixed(1)} MB`
+      : size >= 1024 ? `${Math.round(size / 1024)} KB` : (size ? `${size} B` : "");
+    const digest = item.hash || item.sha256 || "";
+    const downloadUrl = _safeSameOriginUrl(item.download_url);
+    return `<article class="artifact-item">
+      <div class="artifact-icon">${kind === "image" ? "IMG" : kind === "html" ? "WEB" : kind === "text" ? "TXT" : "FILE"}</div>
+      <div class="artifact-copy">
+        <b title="${escAttr(item.relative_path || item.name || "")}">${esc(item.name || item.relative_path || "artifact")}</b>
+        <div class="artifact-meta"><span class="artifact-state ${escAttr(state)}">${esc(state)}</span>
+          <span>${esc(kind)}</span>${sizeLabel ? `<span>${esc(sizeLabel)}</span>` : ""}
+          ${digest ? `<span title="${escAttr(digest)}">${esc(digest.slice(0, 10))}…</span>` : ""}</div>
+      </div>
+      <div class="artifact-actions">
+        <button class="ghost mini" type="button"
+          data-session="${escAttr(sessionId)}" data-artifact="${escAttr(aid)}"
+          onclick="previewArtifact(this)">Preview</button>
+        ${downloadUrl ? `<a class="button-link mini" href="${escAttr(downloadUrl)}" download>Download</a>` : ""}
+      </div>
+    </article>`;
+  }).join("")}</div>`;
+}
+
+async function loadArtifacts(sessionId, force = false) {
+  const cached = artifactCache[sessionId];
+  if (cached?.loading) return;
+  if (!force && cached?.loadedAt && Date.now() - cached.loadedAt < 3500) return;
+  artifactCache[sessionId] = {...cached, loading: true};
+  try {
+    const result = await workbenchRequest(`/sessions/${encodeURIComponent(sessionId)}/artifacts`);
+    artifactCache[sessionId] = {data: result || {artifacts: []}, loadedAt: Date.now(), loading: false};
+    if (current !== sessionId) return;
+    const target = document.getElementById("artifactList");
+    if (target) target.innerHTML = renderArtifactItems(sessionId, result?.artifacts || []);
+  } catch (error) {
+    artifactCache[sessionId] = {...cached, loadedAt: Date.now(), loading: false, error: String(error)};
+    if (current === sessionId) {
+      const target = document.getElementById("artifactList");
+      if (target) target.innerHTML = `<div class="workbench-empty">Artifacts are not available for this run yet.</div>`;
+    }
+  }
+}
+
+function _safeSameOriginUrl(value) {
+  if (!value) return "";
+  try {
+    const url = new URL(value, location.origin);
+    return url.origin === location.origin ? url.href : "";
+  } catch (_) { return ""; }
+}
+
+async function previewArtifact(button) {
+  const sessionId = button.dataset.session;
+  const artifactId = button.dataset.artifact;
+  const data = _artifactData(sessionId);
+  const item = (data?.artifacts || []).find(candidate =>
+    String(candidate.artifact_id || candidate.id) === artifactId);
+  const viewer = document.getElementById("artifactPreview");
+  if (!viewer || !item) return;
+  viewer.replaceChildren();
+  viewer.classList.add("open");
+  const heading = document.createElement("div");
+  heading.className = "artifact-preview-head";
+  heading.textContent = `Preview · ${item.name || item.relative_path || "artifact"}`;
+  viewer.appendChild(heading);
+  const safeUrl = _safeSameOriginUrl(item.preview_url);
+  if (!safeUrl) {
+    const note = document.createElement("div");
+    note.className = "workbench-empty";
+    note.textContent = "This artifact does not have a safe preview URL.";
+    viewer.appendChild(note);
+    return;
+  }
+  const rasterTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"]);
+  if (rasterTypes.has(String(item.media_type || "").toLowerCase())) {
+    const image = document.createElement("img");
+    image.className = "artifact-image";
+    image.alt = item.name || "Generated artifact";
+    image.src = safeUrl;
+    viewer.appendChild(image);
+    return;
+  }
+  try {
+    const response = await fetch(safeUrl, {cache: "no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const type = response.headers.get("content-type") || "";
+    const payload = type.includes("json")
+      ? await response.json() : {kind: item.kind, content: await response.text(), media_type: type};
+    const content = String(payload.content ?? payload.text ?? "");
+    const kind = payload.kind || item.kind;
+    const mediaType = payload.media_type || item.media_type || "";
+    if (kind === "html" || mediaType.includes("html")) {
+      const frame = document.createElement("iframe");
+      frame.className = "artifact-frame";
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">`;
+      frame.srcdoc = csp + content;
+      frame.title = `Sandboxed preview of ${item.name || "artifact"}`;
+      viewer.appendChild(frame);
+    } else if (content) {
+      const pre = document.createElement("pre");
+      pre.className = "artifact-text";
+      pre.textContent = content;
+      viewer.appendChild(pre);
+    } else {
+      const note = document.createElement("div");
+      note.className = "workbench-empty";
+      note.textContent = payload.message || "This artifact is available for download but has no inline preview.";
+      viewer.appendChild(note);
+    }
+    if (payload.truncated) {
+      const warning = document.createElement("div");
+      warning.className = "sub";
+      warning.textContent = "Preview truncated — download the artifact to inspect the full file.";
+      viewer.appendChild(warning);
+    }
+  } catch (error) {
+    const note = document.createElement("div");
+    note.className = "workbench-empty";
+    note.textContent = "Preview failed: " + (error.message || error);
+    viewer.appendChild(note);
+  }
+}
+
+function steeringCard(s, working) {
+  const commands = commandCache[s.session_id]?.data || s.steering_commands || [];
+  return `<div class="card steering-card">
+    <div class="card-heading-row"><h3>Steer this run</h3>
+      <span class="pill ${working ? "deliberating" : "done"}">${working ? "live controls" : "command history"}</span>
+    </div>
+    ${working ? `<div class="steering-grid">
+      <div class="steering-box">
+        <label for="steerConstraint">Add a constraint</label>
+        <textarea id="steerConstraint" data-draft rows="2" placeholder="A boundary every remaining agent must respect…"></textarea>
+        <button class="ghost mini" type="button" onclick="sendSteering('constraint')">Apply constraint</button>
+      </div>
+      <div class="steering-box">
+        <label for="steerFocus">Shift the focus</label>
+        <textarea id="steerFocus" data-draft rows="2" placeholder="What should the remaining work prioritize?"></textarea>
+        <button class="ghost mini" type="button" onclick="sendSteering('focus')">Refocus</button>
+      </div>
+    </div>
+    <div class="budget-controls">
+      <span>Increase budget</span>
+      <label>calls <input id="budgetCalls" data-draft type="number" min="0" value="2"></label>
+      <label>rounds <input id="budgetRounds" data-draft type="number" min="0" value="1"></label>
+      <label>seconds <input id="budgetSeconds" data-draft type="number" min="0" step="30" value="120"></label>
+      <button class="ghost mini" type="button" onclick="sendSteering('increase_budget')">Add</button>
+      <button class="deny mini" type="button" onclick="sendSteering('finish_now')">Finish after current step</button>
+    </div>` : `<div class="sub">This run is settled; its steering history remains part of the audit trail.</div>`}
+    <div id="commandList" class="command-list">${renderCommands(commands, working)}</div>
+    <div id="steeringNote" class="sub" aria-live="polite"></div>
+  </div>`;
+}
+
+function renderCommands(commands, canRevoke) {
+  if (!commands.length) return '<div class="workbench-empty">No steering commands.</div>';
+  return commands.map(command => {
+    const payload = command.payload || {};
+    const detail = payload.text || Object.entries(payload)
+      .map(([key, value]) => `${key.replaceAll("_", " ")} +${value}`).join(" · ");
+    const id = command.command_id || command.id || "";
+    return `<div class="command-row">
+      <span class="command-kind">${esc(String(command.kind || "command").replaceAll("_", " "))}</span>
+      <span>${esc(detail)}</span>
+      <span class="artifact-state ${escAttr(command.status || "pending")}">${esc(command.status || "pending")}</span>
+      ${canRevoke && !["applied", "revoked", "completed"].includes(command.status)
+        ? `<button class="ghost mini" type="button" data-command="${escAttr(id)}" onclick="revokeSteering(this)">Revoke</button>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function loadCommands(sessionId, force = false) {
+  const cached = commandCache[sessionId];
+  if (cached?.loading) return;
+  if (!force && cached?.loadedAt && Date.now() - cached.loadedAt < 3500) return;
+  commandCache[sessionId] = {...cached, loading: true};
+  try {
+    const result = await workbenchRequest(`/sessions/${encodeURIComponent(sessionId)}/commands`);
+    const commands = Array.isArray(result) ? result : (result?.commands || []);
+    commandCache[sessionId] = {data: commands, loadedAt: Date.now(), loading: false};
+    if (current === sessionId) {
+      const target = document.getElementById("commandList");
+      const session = _sessionsCache.find(item => item.session_id === sessionId);
+      const working = session ? !TERMINAL_STATES.has(session.status) : true;
+      if (target) target.innerHTML = renderCommands(commands, working);
+    }
+  } catch (_) {
+    commandCache[sessionId] = {...cached, loadedAt: Date.now(), loading: false};
+  }
+}
+
+async function sendSteering(kind) {
+  if (!current) return;
+  let payload = {};
+  if (kind === "constraint" || kind === "focus") {
+    const input = document.getElementById(kind === "constraint" ? "steerConstraint" : "steerFocus");
+    const text = input?.value.trim() || "";
+    if (!text) { input?.focus(); return; }
+    payload = {text};
+  } else if (kind === "increase_budget") {
+    payload = {
+      agent_calls: Math.max(0, Number(document.getElementById("budgetCalls")?.value || 0)),
+      rounds: Math.max(0, Number(document.getElementById("budgetRounds")?.value || 0)),
+      duration_seconds: Math.max(0, Number(document.getElementById("budgetSeconds")?.value || 0)),
+    };
+    if (!payload.agent_calls && !payload.rounds && !payload.duration_seconds) return;
+  } else if (kind === "finish_now" &&
+             !confirm("Finish after the current model step? The council will compose from work already completed.")) {
+    return;
+  }
+  const note = document.getElementById("steeringNote");
+  if (note) note.textContent = "Sending command…";
+  try {
+    await workbenchRequest(`/sessions/${encodeURIComponent(current)}/commands`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({kind, payload}),
+    });
+    const field = kind === "constraint" ? "steerConstraint" : kind === "focus" ? "steerFocus" : "";
+    if (field) document.getElementById(field).value = "";
+    if (note) note.textContent = "Command recorded. It takes effect at the next safe checkpoint.";
+    await loadCommands(current, true);
+    pollLoop();
+  } catch (error) {
+    if (note) {
+      note.style.color = "var(--bad)";
+      note.textContent = "Command failed: " + (error.message || error);
+    }
+  }
+}
+
+async function revokeSteering(button) {
+  if (!current || !button.dataset.command) return;
+  try {
+    await workbenchRequest(`/sessions/${encodeURIComponent(current)}/commands/${encodeURIComponent(button.dataset.command)}`,
+      {method: "DELETE"});
+    await loadCommands(current, true);
+  } catch (error) {
+    const note = document.getElementById("steeringNote");
+    if (note) note.textContent = "Could not revoke: " + (error.message || error);
+  }
+}
+
+function evaluationCard(s) {
+  if (!TERMINAL_STATES.has(s.status)) return "";
+  const saved = evaluationCache[s.session_id] || s.evaluation || {};
+  const verdict = saved.verdict || "";
+  const rating = Number(saved.rating || 0);
+  const option = (value, label) => `<option value="${value}" ${verdict === value ? "selected" : ""}>${label}</option>`;
+  return `<div class="card evaluation-card">
+    <div class="card-heading-row"><h3>Evaluate this outcome</h3>
+      ${saved.updated_at || saved.created_at ? '<span class="pill done">saved</span>' : ""}
+    </div>
+    <div class="evaluation-grid">
+      <label>Verdict<select id="evalVerdict" data-draft>
+        ${option("", "Choose…")}${option("success", "Successful")}${option("partial", "Partially successful")}${option("failure", "Missed the outcome")}
+      </select></label>
+      <label>Rating<input id="evalRating" data-draft type="number" min="1" max="5" value="${rating || ""}" placeholder="1–5"></label>
+    </div>
+    <label class="evaluation-notes">Notes
+      <textarea id="evalNotes" data-draft rows="3" placeholder="What worked, what missed, and what should the next run do differently?">${esc(saved.notes || "")}</textarea>
+    </label>
+    <div class="row"><button type="button" onclick="saveEvaluation('${escAttr(s.session_id)}')">Save evaluation</button>
+      <span id="evaluationNote" class="sub">Your feedback improves future route recommendations.</span></div>
+  </div>`;
+}
+
+async function saveEvaluation(sessionId) {
+  const verdict = document.getElementById("evalVerdict")?.value || "";
+  const rating = Number(document.getElementById("evalRating")?.value || 0);
+  const notes = document.getElementById("evalNotes")?.value.trim() || "";
+  const status = document.getElementById("evaluationNote");
+  if (!verdict || rating < 1 || rating > 5) {
+    if (status) {
+      status.style.color = "var(--bad)";
+      status.textContent = "Choose a verdict and a rating from 1 to 5.";
+    }
+    return;
+  }
+  try {
+    const result = await workbenchRequest(`/sessions/${encodeURIComponent(sessionId)}/evaluation`, {
+      method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({verdict, rating, notes}),
+    });
+    evaluationCache[sessionId] = result?.evaluation || result || {verdict, rating, notes};
+    if (status) {
+      status.style.color = "var(--ok)";
+      status.textContent = "Evaluation saved — future auto-routing can learn from it.";
+    }
+  } catch (error) {
+    if (status) {
+      status.style.color = "var(--bad)";
+      status.textContent = "Could not save: " + (error.message || error);
+    }
+  }
+}
+
+function statusAgentName(name) {
+  const value = String(name || "model");
+  const known = {codex: "Codex", claude: "Claude", gemini: "Gemini"};
+  return known[value.toLowerCase()] || value.replace(/(^|[-_ ])([a-z])/g,
+    (_m, left, letter) => left + letter.toUpperCase());
+}
+
+function runStatusBrief(s, goal, events) {
+  const activeCalls = s.active_agent_calls || [];
+  const activeCall = activeCalls[0] || null;
+  const gate = s.quality_gate || s.run_summary?.quality_gate || {};
+  const timeline = events || [];
+  const hasEvent = name => timeline.some(item => item.event === name);
+  const verification = !!(
+    s.goal_release || gate.verifier ||
+    hasEvent("browser_release_verified") ||
+    hasEvent("frontier_final_batch_verdict")
+  );
+  const working = ["received", "classified", "deliberating", "composing"]
+    .includes(s.status);
+  let headline = "This run is waiting for an update.";
+  if (working && verification) {
+    headline = "The current run is still actively verifying\u2014not stuck or finished.";
+  } else if (working) {
+    headline = "The current run is still actively working\u2014not stuck or finished.";
+  } else if (s.status === "awaiting_approval") {
+    headline = "The run is paused for your approval; no model work is currently blocked invisibly.";
+  } else if (s.status === "awaiting_input") {
+    headline = "The run is paused for an answer from you.";
+  } else if (s.status === "done") {
+    headline = s.outcome === "succeeded"
+      ? "This run finished successfully."
+      : "This run finished, but its recorded outcome was not successful.";
+  } else if (s.status === "failed") {
+    headline = "This run stopped after failing verification; it was not delivered as a success.";
+  } else if (s.status === "cancelled") {
+    headline = "This run was cancelled and is no longer doing work.";
+  }
+
+  const bullets = [];
+  const completedPackages = (goal?.milestones || []).filter(item =>
+    item.status === "done" && item.owner
+  );
+  for (const item of completedPackages.slice(-2)) {
+    const outputs = Object.keys(item.output_authors || {});
+    const result = outputs.length
+      ? outputs.join(", ")
+      : (item.title || `package ${item.package_id || ""}`).trim();
+    bullets.push(`${statusAgentName(item.owner)} completed ${result} successfully.`);
+  }
+
+  if (goal?.release_status === "failed_verification" &&
+      goal.release_session_id && goal.release_session_id !== s.session_id) {
+    bullets.push("An earlier final-release attempt failed verification; this is the active retry.");
+  }
+
+  const missingChecks = gate.missing_checks || [];
+  const gateVerdict = String(gate.verdict || "").toUpperCase();
+  const repairApplied = hasEvent("frontier_final_batch_repair_applied");
+  if (gateVerdict === "FAIL") {
+    const verifier = statusAgentName(gate.verifier || "verifier");
+    const attempt = Number(gate.attempt || 1);
+    if (missingChecks.length) {
+      bullets.push(
+        `${verifier}'s verification attempt ${attempt} omitted results for ` +
+        `${missingChecks.length} acceptance check${missingChecks.length === 1 ? "" : "s"} ` +
+        `(${missingChecks.join(", ")}).`
+      );
+    } else {
+      bullets.push(`${verifier}'s verification attempt ${attempt} did not pass.`);
+    }
+  } else if (gateVerdict === "PASS" && repairApplied) {
+    bullets.push("The first verification attempt did not pass and triggered a repair cycle.");
+  }
+
+  if (repairApplied) {
+    bullets.push("The app automatically applied the verifier's proposed repairs before retrying.");
+  }
+
+  if (gateVerdict === "PASS") {
+    const verifier = statusAgentName(gate.verifier || "verifier");
+    const attempt = Number(gate.attempt || 1);
+    bullets.push(
+      `${verifier} completed verification attempt ${attempt} successfully.`
+    );
+  }
+
+  if (activeCall) {
+    const attempt = Number(activeCall.attempt || 1);
+    const action = verification ? "verification" : (activeCall.role || "work");
+    bullets.push(
+      `${statusAgentName(activeCall.agent)} is now performing ${action} attempt ${attempt}.`
+    );
+  } else if (working) {
+    bullets.push("No model call is active at this instant; the coordinator is processing the latest result.");
+  }
+
+  const browserChecks = gate.browser_acceptance || [];
+  const passedBrowser = browserChecks.find(check => check.passed);
+  if (passedBrowser) {
+    const browser = String(passedBrowser.browser || "the configured browser")
+      .replace(/^msedge$/i, "Microsoft Edge");
+    bullets.push(`Browser testing already passed in ${browser}.`);
+  } else if (hasEvent("browser_release_verified")) {
+    bullets.push("The real-browser release check already passed.");
+  }
+
+  const approvals = (s.approvals || []).filter(item => item.status === "pending");
+  bullets.push(approvals.length
+    ? `${approvals.length} approval${approvals.length === 1 ? " is" : "s are"} pending.`
+    : "No approval is pending.");
+
+  const promoted = (s.proposed_actions || []).some(action =>
+    ["promote", "promote_batch"].includes(action.kind) && action.status === "executed"
+  );
+  const established = String(s.established_root || "").toLowerCase();
+  const delivered = promoted || (s.files_changed || []).some(path =>
+    established && String(path).toLowerCase().startsWith(established)
+  );
+  bullets.push(delivered
+    ? "Verified output has been delivered to the established folder."
+    : "Nothing has been delivered yet.");
+
+  if (activeCall) {
+    if (Number(activeCall.timeout_s) === 0) {
+      bullets.push("This call has no hard timeout; it is operator-supervised.");
+    } else if (activeCall.timeout_s) {
+      bullets.push(`This call has a ${activeCall.timeout_s}-second hard timeout.`);
+    }
+  }
+  return {headline, bullets, live: working || s.status === "awaiting_approval"};
+}
+
+function toggleRunStatus() {
+  const card = document.getElementById("runStatusCard");
+  if (!card) return;
+  const key = card.dataset.statusKey;
+  const expanded = !card.classList.contains("expanded");
+  card.classList.toggle("expanded", expanded);
+  if (key) openSections[key] = expanded;
+  const button = card.querySelector("[data-status-toggle]");
+  if (button) button.textContent = expanded ? "Hide details" : "Show details";
+}
+
+function openRunStatus() {
+  const card = document.getElementById("runStatusCard");
+  if (!card) return;
+  if (!card.classList.contains("expanded")) toggleRunStatus();
+  card.scrollIntoView({behavior: "smooth", block: "start"});
+}
+
 function renderDetail(s) {
   if (!s) return;
   const right = document.getElementById("right");
@@ -1128,7 +2214,11 @@ function renderDetail(s) {
   const inputs = (s.input_requests||[]).filter(i => i.status === "pending");
   const verificationFailed = s.outcome === "failed_verification";
   const packageMode = s.collaboration_mode === "build_team" && !!s.work_package_owner;
-  const parentGoal = packageMode ? _goalsCache.find(g => g.goal_id === s.goal_id) : null;
+  const candidateMode = s.execution_profile === "best_of_n"
+    || s.routing_decision?.selected_route === "best_of_n";
+  const sessionGoal = s.goal_id
+    ? _goalsCache.find(g => g.goal_id === s.goal_id) : null;
+  const parentGoal = packageMode ? sessionGoal : null;
   const currentPackage = parentGoal
     ? (parentGoal.milestones || []).find(m => m.package_id === s.work_package_id)
     : null;
@@ -1146,17 +2236,40 @@ function renderDetail(s) {
   // in-progress answer text + focus/caret + scroll so reading/typing isn't
   // clobbered mid-word.
   const draft = {};
-  right.querySelectorAll('textarea[id^="ans_"], #followupText').forEach(t => {
-    draft[t.id] = {v: t.value, start: t.selectionStart, end: t.selectionEnd,
-                   focused: document.activeElement === t};
+  right.querySelectorAll('textarea[id^="ans_"], #followupText, [data-draft]').forEach(t => {
+    let start = null, end = null;
+    try { start = t.selectionStart; end = t.selectionEnd; } catch (_) {}
+    draft[t.id] = {v: t.value, start, end, focused: document.activeElement === t};
   });
   const scrollTop = right.scrollTop;
 
   const working = ["received","classified","deliberating","composing"].includes(s.status);
+  const statusBrief = runStatusBrief(s, sessionGoal, _liveEvents);
+  const runStatusKey = `run_status_${s.session_id}`;
+  if (!Object.prototype.hasOwnProperty.call(openSections, runStatusKey)) {
+    openSections[runStatusKey] = working || s.status === "awaiting_approval";
+  }
+  const runStatusExpanded = !!openSections[runStatusKey];
   const spokenRoles = new Set((s.contributions||[]).map(c => c.role));
+  const respondedAgents = new Set([
+    ...Object.keys(s.successful_agent_calls || {}),
+    ...(s.contributions || []).map(c => c.agent).filter(Boolean),
+  ]);
+  const acceptedCandidateAgents = new Set(
+    (s.proposed_actions || [])
+      .filter(a => a.kind === "write_file" && a.role === "panelist" &&
+        a.status === "executed" && String(a.content || "").trim())
+      .map(a => a.args?.package_author ||
+        (String(a.filename || "").includes("__")
+          ? String(a.filename).split("__", 1)[0] : ""))
+      .filter(Boolean)
+  );
+  const workingCandidateAgents = new Set(
+    (s.active_agent_calls || []).map(call => call.agent).filter(Boolean)
+  );
   const members = ((s.council||{}).members||[]);
   const roster = members.filter(m => m.active && m.agent && m.agent !== "system" &&
-    (!packageMode || m.role === "panelist"));
+    (candidateMode ? m.role === "panelist" : (!packageMode || m.role === "panelist")));
   const agentOf = Object.fromEntries(members.map(m => [m.role, m.agent]));
   // exact model per seat, learned from the contributions that carried it
   // exact model per ROLE+AGENT, learned from the contributions that carried it —
@@ -1189,6 +2302,40 @@ function renderDetail(s) {
   }
   const activeCalls = s.active_agent_calls || [];
   const activeCall = activeCalls[0] || null;
+  const nowMs = Date.now();
+  const slowCalls = activeCalls.filter(call => {
+    const started = Date.parse(call.started_at || "");
+    const checkin = Number(call.operator_checkin_s || 0);
+    const snoozedUntil = _slowCallSnoozes.get(call.call_id) || 0;
+    return call.operator_stoppable && checkin > 0 && Number.isFinite(started) &&
+      nowMs - started >= checkin * 1000 && nowMs >= snoozedUntil;
+  });
+  const slowCallPrompt = slowCalls.length ? `
+    <div class="slow-call-checkin" role="status" aria-live="polite">
+      <div class="slow-call-title">Long-running model check-in</div>
+      ${slowCalls.map(call => {
+        const elapsedMinutes = Math.max(
+          1, Math.floor((nowMs - Date.parse(call.started_at)) / 60000)
+        );
+        const chars = Number(call.progress_chars || 0);
+        const checkin = Number(call.operator_checkin_s || 300);
+        return `<div class="slow-call-row">
+          <div>
+            <b>${esc(call.agent || "model")}</b> has been working for ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"}.
+            ${chars ? `It is still producing output (${chars.toLocaleString()} characters so far).` : "It has not produced output yet."}
+            There is no automatic wall-clock cutoff.
+          </div>
+          <div class="slow-call-actions">
+            <button class="ghost mini" type="button"
+                    onclick="keepWaitingForCall('${escAttr(call.call_id)}', ${checkin})">Keep waiting</button>
+            <button class="deny mini" type="button"
+                    onclick="stopAgentCall('${escAttr(s.session_id)}', '${escAttr(call.call_id)}', '${escAttr(call.agent || "model")}')">Stop this seat</button>
+            <button class="deny mini" type="button"
+                    onclick="cancelCurrent()">Cancel run</button>
+          </div>
+        </div>`;
+      }).join("")}
+    </div>` : "";
   if (activeCall) {
     waitRole = activeCall.role || waitRole;
     waitAgent = activeCall.agent || waitAgent;
@@ -1244,17 +2391,40 @@ function renderDetail(s) {
   if (attemptMs) {
     statBits.push(`<span title="Sum of elapsed time across every model attempt, including failed and overlapping calls"><b>${shortDuration(attemptMs)}</b> aggregate attempt time</span>`);
   }
-  if (agentCount) statBits.push(`<b>${agentCount}</b> successful agent${agentCount === 1 ? "" : "s"}`);
+  if (candidateMode) {
+    const responseCount = Object.keys(
+      runSummary.successful_agent_calls || s.successful_agent_calls || {}
+    ).length;
+    if (responseCount) {
+      statBits.push(`<b>${responseCount}</b> model${responseCount === 1 ? "" : "s"} responded`);
+    }
+  } else if (agentCount) {
+    statBits.push(`<b>${agentCount}</b> successful agent${agentCount === 1 ? "" : "s"}`);
+  }
   if (delegations) statBits.push(`<b>${delegations}</b> delegation${delegations === 1 ? "" : "s"}`);
   if (runSummary.test_fix_attempts) statBits.push(`<b>${runSummary.test_fix_attempts}</b> test repair${runSummary.test_fix_attempts === 1 ? "" : "s"}`);
   const candidateMetrics = runSummary.candidate_metrics || s.candidate_metrics || {};
   if (candidateMetrics.authored !== undefined) {
-    statBits.push(`<b>${candidateMetrics.authored}</b> authored / <b>${candidateMetrics.runnable || 0}</b> runnable`);
+    const expected = candidateMetrics.expected
+      ? ` of <b>${candidateMetrics.expected}</b> expected` : "";
+    const missing = (candidateMetrics.missing_authors || []).length
+      ? ` · missing ${esc(candidateMetrics.missing_authors.join(", "))}` : "";
+    const runtime = candidateMetrics.runtime_evaluated === false
+      ? "runtime not evaluated"
+      : `<b>${candidateMetrics.runnable ?? 0}</b> runnable`;
+    statBits.push(
+      `<b>${candidateMetrics.authored}</b> authored${expected} / `
+      + `${runtime}${missing}`
+    );
   }
   const qualityGate = runSummary.quality_gate || s.quality_gate || {};
   if (qualityGate.verdict) {
-    const gateLabel = String(qualityGate.stage || "").startsWith("deterministic_assembly")
-      ? "deterministic assembly gate" : "release gate";
+    const gateStage = String(qualityGate.stage || "");
+    const gateLabel = gateStage.startsWith("deterministic_assembly")
+      ? "deterministic assembly gate"
+      : gateStage === "candidate_comparison"
+        ? "candidate comparison gate"
+        : "release gate";
     statBits.push(`${gateLabel} <b>${esc(String(qualityGate.verdict).toLowerCase())}</b>${qualityGate.verifier ? ` by ${esc(qualityGate.verifier)}` : ""}`);
   }
   // legacy sessions may carry court-era disagreements; show them if present
@@ -1299,6 +2469,28 @@ function renderDetail(s) {
       }</div>` : ""}
     </div>
 
+    <div class="detail-quick-actions">
+      <button class="ghost mini" type="button" onclick="openRunStatus()">Run status</button>
+      <button class="ghost mini" type="button" onclick="cloneSession('${escAttr(s.session_id)}')">Copy & edit</button>
+      <button class="ghost mini" type="button" onclick="saveSessionAsPlaybook('${escAttr(s.session_id)}')">Save as playbook</button>
+    </div>
+    <div id="runStatusCard"
+         class="card run-status ${runStatusExpanded ? "expanded" : ""} ${statusBrief.live ? "is-live" : ""}"
+         data-status-key="${escAttr(runStatusKey)}">
+      <div class="run-status-head">
+        <h3>${statusBrief.live ? '<span class="run-status-pulse" aria-hidden="true"></span>' : ""}Run status</h3>
+        <button class="ghost mini" type="button" data-status-toggle onclick="toggleRunStatus()">${runStatusExpanded ? "Hide details" : "Show details"}</button>
+      </div>
+      <div class="run-status-headline" role="status" aria-live="polite">${esc(statusBrief.headline)}</div>
+      <div class="run-status-details">
+        <ul>${statusBrief.bullets.map(item => `<li>${esc(item)}</li>`).join("")}</ul>
+        <div class="sub">${statusBrief.live
+          ? "Updated automatically while this session is active."
+          : "Final recorded status for this session."}</div>
+      </div>
+    </div>
+    ${outcomeContractCard(s)}
+
     ${showSummary ? `
       <div class="card summary">
         <h3>${retryRunning ? "Historical attempt failed — retry still running" : (verificationFailed ? "Verification failed — not delivered" : ((s.turns && s.turns.length > 2) ? "Latest conclusion" : "Summary"))}</h3>
@@ -1342,6 +2534,7 @@ function renderDetail(s) {
             ${activeCall && activeCall.tail ? `<div class="tail" title="what the model is writing right now"><code>${esc(activeCall.tail)}</code></div>` : ""}
           </div>
         </div>
+        ${slowCallPrompt}
         ${_liveFeed.length ? `<div class="livefeed">${_liveFeed.map(e => `
           <div class="lfrow">
             <span class="lfts">${esc((e.ts || "").slice(11, 19))}</span>
@@ -1351,9 +2544,17 @@ function renderDetail(s) {
           </div>`).join("")}</div>` : ""}
       </div>` : ""}
 
+    ${steeringCard(s, working)}
+
     ${(roster.length || (parentGoal && (parentGoal.milestones || []).length)) ? `
       <div class="card">
-        <h3>${packageMode ? "Build team" : "Council"}${packageMode ? ` <span class="sub">· this session has one accountable owner</span>` : ""}</h3>
+        <h3>${candidateMode ? "Best-of-all candidates" : packageMode ? "Planned build" : "Council"}${
+          candidateMode
+            ? ` <span class="sub">· every enabled AI attempts the complete artifact; runnable candidates are judged anonymously</span>`
+            : packageMode
+              ? ` <span class="sub">· this package has one accountable owner; peers review and can propose edits</span>`
+              : ""
+        }</h3>
         <div class="roster">
           ${packageMode && parentGoal ? (parentGoal.milestones || []).map((m, i) => {
             const active = m.package_id === s.work_package_id;
@@ -1370,6 +2571,27 @@ function renderDetail(s) {
             // the model this member's role+agent actually ran; else the one it
             // WILL run (resolved server-side: role pin › seat pin › CLI default).
             const full = contribModel[modelKey(m.role, m.agent)] || m.model || "";
+            if (candidateMode) {
+              const accepted = acceptedCandidateAgents.has(m.agent);
+              const responding = workingCandidateAgents.has(m.agent);
+              const responded = respondedAgents.has(m.agent);
+              const missing = !working && !accepted;
+              const state = accepted
+                ? "candidate accepted"
+                : responding
+                  ? "building candidate"
+                  : missing
+                    ? (responded ? "response received; no candidate accepted" : "no response")
+                    : responded
+                      ? "response received; checking candidate"
+                      : "awaiting candidate";
+              const stateClass = accepted ? "spoke"
+                : responding ? "working"
+                  : missing ? "missing"
+                    : responded ? "responded" : "on";
+              return `<span class="seat role-panelist ${stateClass}"
+                title="${esc(state)}${full ? ` · ${esc(full)}` : ""}">${esc(m.agent)}${full ? ` · ${esc(shortModel(full))}` : ""} · ${esc(state)}</span>`;
+            }
             const title = (talent ? "pulled in by the lead mid-round (CONSULT/DELEGATE) — " : "") + (full ? esc(full) : "model: CLI default");
             return `<span class="seat role-${esc(m.role)}${talent ? " talent" : ""} ${spokenRoles.has(m.role)?"spoke":"on"}"
               title="${title}">${talent ? "🤝 " : ""}${esc(m.role)} · ${esc(m.agent)}${full ? ` · ${esc(shortModel(full))}` : ""}</span>`;
@@ -1481,6 +2703,9 @@ function renderDetail(s) {
         ${final.next_action ? `<h3>Next action</h3><div>${esc(final.next_action)}</div>` : ""}
       </div>` : ""}
 
+    ${artifactWorkbenchCard(s)}
+    ${evaluationCard(s)}
+
     ${(s.files_changed||[]).length ? (() => {
         const est = s.established_root || "";
         const inEst = f => est && f.toLowerCase().startsWith(est.toLowerCase());
@@ -1532,6 +2757,8 @@ function renderDetail(s) {
     if (d.focused) { t.focus(); try { t.setSelectionRange(d.start, d.end); } catch {} }
   }
   right.scrollTop = scrollTop;
+  loadArtifacts(s.session_id);
+  loadCommands(s.session_id);
   tickElapsed();
 }
 
@@ -1841,8 +3068,6 @@ function renderSettings(s, seats) {
       ${(seats || []).filter(x => x.kind === "cli").map(x => {
         const catalog = x.models || [];
         const isCustom = x.model && !catalog.includes(x.model);
-        const _to = (s.cli_timeouts || {})[x.name] || (s.cli_timeout_defaults || {})[x.name] || "";
-        const _tod = (s.cli_timeout_defaults || {})[x.name] || "—";
         return `
         <div class="field" style="align-items:center;flex-wrap:wrap">
           <label style="margin:0;flex:0 0 92px;display:flex;align-items:center;gap:6px"
@@ -1858,16 +3083,12 @@ function renderSettings(s, seats) {
             <option value="__custom__">custom…</option>
           </select><input type="text" class="cli_model_custom mono" data-seat="${esc(x.name)}"
                  spellcheck="false" placeholder="exact model id" style="flex:1;min-width:220px;display:none">
-          <label class="sub" style="flex:0 0 auto;display:flex;align-items:center;gap:5px;margin:0"
-                 title="Routine/non-code call timeout for this seat (built-in default ${_tod}s). Code authoring is unlimited by default; frontier seats are unlimited at every coding stage and remain user-cancellable.">⏱
-            <input type="number" class="cli_timeout" data-seat="${esc(x.name)}" min="30" max="3600" step="10"
-                   value="${escAttr(String(_to))}" placeholder="${escAttr(String(_tod))}" style="width:74px">s</label>
         </div>`;}).join("")}
       <div class="field" style="justify-content:flex-end">
         <button class="ghost" onclick="refreshModelCatalog(this)">↻ refresh model list</button>
       </div>
       <div class="sub">Fetched live from the public model catalog — <b>no API key needed</b> (newest first; a model released yesterday shows up here). A Gemini key below upgrades the gemini list to Google's own authoritative catalog. "custom…" takes any id; default = whatever that CLI is configured to use. Every contribution shows the model that actually produced it.</div>
-      <div class="sub"><b>⏱ timeout</b> is a routine/non-code guardrail (built-in defaults: claude 240 · codex 300 · gemini 150). Code authoring is unlimited by default; frontier seats are unlimited at every coding stage. Cancel still terminates their CLI process immediately.</div>
+      <div class="sub"><b>Human-supervised calls:</b> no model is stopped merely because an estimated duration elapsed. After five minutes the app asks whether to keep waiting, stop that model, or cancel the run. Keep waiting does not restart the call.</div>
       <div class="sub">Unchecking a seat removes its adapter and redistributes its roles across all remaining enabled local and OpenRouter models. Enable at least one model; OpenRouter seats also require the API key below to run.</div>
     </div>
 
@@ -2133,11 +3354,6 @@ async function saveSettings() {
   });
   const cli_enabled = {};
   document.querySelectorAll(".cli_enable").forEach(c => { cli_enabled[c.dataset.seat] = c.checked; });
-  const cli_timeouts = {};
-  document.querySelectorAll(".cli_timeout").forEach(i => {
-    const v = parseInt(i.value, 10);
-    if (Number.isFinite(v) && v > 0) cli_timeouts[i.dataset.seat] = v;
-  });
   const patch = {
     backend: document.getElementById("set_backend").value,
     role_agents,
@@ -2146,7 +3362,7 @@ async function saveSettings() {
     openrouter_models,
     cli_models,
     cli_enabled,
-    cli_timeouts,
+    cli_timeouts: {},
     integration_review_enabled: document.getElementById("set_integration_review").checked,
     participation_mode: document.getElementById("set_participation_mode").value,
     risk_boundary: document.getElementById("set_risk").value,
@@ -2383,6 +3599,7 @@ async function emptyWorkspace() {
 
 loadHealth();
 loadWorkspace();
+loadPlaybooks();
 bindHeaderSeatToggles();
 bindComposerControls();
 bindComposerDrag();

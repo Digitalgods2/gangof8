@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import config
 
-SETTINGS_SCHEMA_VERSION = 1
+SETTINGS_SCHEMA_VERSION = 2
 SETTINGS_PROFILE_VERSION = 1
 
 
@@ -64,10 +64,9 @@ class Settings(BaseModel):
     # gemini → "gemini-2.5-pro"). Empty/absent ⇒ each CLI's own default —
     # note the gemini SDK path defaults to gemini-2.5-flash.
     cli_models: dict[str, str] = {}
-    # Per-CLI-seat call timeout in SECONDS (claude/codex/gemini → seconds).
-    # Empty/absent for a seat ⇒ config.AGENT_TIMEOUTS default. A thorough seat
-    # (claude/opus) can be given more room here so it isn't dropped mid-work; the
-    # built-in authoring floors (lead/panel/codifier) still apply as a minimum.
+    # Legacy per-CLI-seat hard-cutoff map retained for profile compatibility.
+    # Version-2 migration clears the old 320-second values; normal operation is
+    # operator-supervised and has no elapsed-time cutoff.
     cli_timeouts: dict[str, int] = {}
     # Per-ROLE model pins (role name → exact model id, or OpenRouter slug for
     # an OpenRouter-mapped role), layered over the seat pin: role pin › seat
@@ -192,10 +191,16 @@ def _settings_path(data_dir: Optional[Path] = None) -> Path:
 def migrate_settings_data(data: dict) -> dict:
     """Normalize persisted settings before validation.
 
-    Version 1 only stamps the version field. Future migrations should be added
-    here as ordered transforms from older shapes to the current Settings model.
+    Version 2 clears legacy per-seat hard deadlines. They could silently stop
+    useful work; explicit installation deadlines now live in environment policy.
     """
     out = dict(data)
+    try:
+        version = int(out.get("settings_version") or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version < 2:
+        out["cli_timeouts"] = {}
     out["settings_version"] = SETTINGS_SCHEMA_VERSION
     return out
 

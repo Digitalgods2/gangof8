@@ -14,10 +14,19 @@ unable to land its work in the sandbox is a design failure).
 
 import pytest
 
-from gangof8 import executor, loop
+from gangof8 import config, executor, loop
 from gangof8.governance import Governance
 from gangof8.logstore import LogStore
-from gangof8.models import Contribution, Council, CouncilMember, Role
+from gangof8.models import (
+    Classification,
+    Complexity,
+    Contribution,
+    Council,
+    CouncilMember,
+    Risk,
+    Role,
+    TaskType,
+)
 from gangof8.registry import AgentError
 from gangof8.sessions import SessionManager
 from gangof8.skills import get_skill
@@ -40,9 +49,9 @@ def session(store):
     return SessionManager(store).create("panel access test task", source="test")
 
 
-def test_agent_call_honors_per_seat_timeout_as_an_upper_bound(session, store):
-    # The Settings value is an honest cap. A purpose-specific call may choose a
-    # shorter retry window, but a heavy authoring request cannot exceed the cap.
+def test_agent_call_ignores_legacy_seat_timeout_and_uses_explicit_policy(session, store):
+    # The retired Settings value cannot silently cap work. Only a purpose-
+    # specific positive value is an explicit hard-deadline policy.
     from types import SimpleNamespace
     session.cli_timeouts = {"claude": 500}
     session.budgets.max_agent_calls = 50
@@ -55,12 +64,12 @@ def test_agent_call_honors_per_seat_timeout_as_an_upper_bound(session, store):
 
     reg = Reg()
     claude = CouncilMember(role=Role.panelist, agent="claude")
-    loop._agent_call(session, reg, store, claude, "p")                  # None → seat setting 500
+    loop._agent_call(session, reg, store, claude, "p")                  # no explicit deadline
     loop._agent_call(session, reg, store, claude, "p", timeout_s=300)   # focused call stays 300
-    loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # heavy call is capped at 500
+    loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # explicit policy stays 800
     codex = CouncilMember(role=Role.panelist, agent="codex")
-    loop._agent_call(session, reg, store, codex, "p")                   # no override → config default 300
-    assert seen == [500, 300, 500, 300]
+    loop._agent_call(session, reg, store, codex, "p")                   # default is operator-supervised
+    assert seen == [0, 300, 800, 0]
 
 
 def test_panel_one_uses_the_authoring_timeout(session, governance, store):
@@ -156,6 +165,74 @@ def test_panel_complete_file_saved_namespaced(tmp_path, store, governance, sessi
     assert not loop._has_proposals(session)
 
 
+def _best_of_all_session(session, agent="codex"):
+    session.execution_profile = "best_of_n"
+    session.routing_decision = {"selected_route": "best_of_n"}
+    session.panel = [agent]
+    session.classification = Classification(
+        task_type=TaskType.code,
+        complexity=Complexity.standard,
+        risk=Risk.none,
+        produces_output=True,
+    )
+    return session
+
+
+def test_best_of_all_retries_a_response_without_a_candidate(
+    tmp_path, store, governance, session,
+):
+    _best_of_all_session(session)
+    member = CouncilMember(role=Role.panelist, agent="codex", active=True)
+    replies = iter([
+        "Created and validated the app.",
+        f"ARTIFACT: index.html\n{GAME}\nEND_ARTIFACT",
+    ])
+    calls = []
+
+    def call(m, prompt, timeout_s=None):
+        calls.append(prompt)
+        return _contribution(m.role, m.agent, next(replies))
+
+    out = loop._panel_one(
+        session, member, "author it", call, governance, store, timeout_s=0
+    )
+
+    assert out is not None
+    assert len(calls) == 2
+    assert session.candidate_author_recoveries == {"codex": 1}
+    assert session.candidate_metrics["accepted_agents"] == ["codex"]
+    assert session.candidate_metrics["runtime_evaluated"] is False
+
+
+def test_best_of_all_captures_one_fresh_linked_sandbox_candidate(
+    tmp_path, monkeypatch, store, governance, session,
+):
+    sandbox = tmp_path / "sandbox"
+    monkeypatch.setattr(config, "SANDBOX_ROOT", sandbox)
+    _best_of_all_session(session)
+    member = CouncilMember(role=Role.panelist, agent="codex", active=True)
+
+    def call(m, prompt, timeout_s=None):
+        linked = sandbox / "cli-neutral" / "linked-app.html"
+        linked.parent.mkdir(parents=True, exist_ok=True)
+        linked.write_text(GAME, encoding="utf-8")
+        return _contribution(
+            m.role,
+            m.agent,
+            f"Created and validated it.\n\n[Download the app]({linked.as_posix()})",
+        )
+
+    out = loop._panel_one(
+        session, member, "author it", call, governance, store, timeout_s=0
+    )
+
+    assert out is not None
+    assert session.candidate_author_recoveries == {}
+    assert session.candidate_metrics["accepted_agents"] == ["codex"]
+    saved = executor.artifacts_dir(tmp_path, session.session_id) / "codex__linked-app.html"
+    assert saved.read_text(encoding="utf-8") == GAME
+
+
 def test_two_seats_same_filename_do_not_clobber(tmp_path, store, governance, session):
     for agent, body in (("codex", GAME), ("gemini", GAME.replace("go()", "run()"))):
         member = CouncilMember(role=Role.panelist, agent=agent, active=True)
@@ -230,10 +307,9 @@ def test_consults_run_after_delegates_and_see_their_files(store, session):
     assert out.content.startswith("integrated")
 
 
-def test_delegation_reseats_on_requester_model_after_double_failure(store, session):
-    """A seat that fails twice gets the role RESEATED on the requester's own
-    model before the assignment collapses back onto the lead (live: codex as
-    code_generator failed the same way across two runs)."""
+def test_delegation_reseats_on_distinct_model_after_first_failure(store, session):
+    """A failed seat moves immediately to a distinct configured model instead
+    of spending another full attempt on the same broken provider/model."""
     lead = CouncilMember(role=Role.lead, agent="claude", active=True)
     critic = CouncilMember(role=Role.critic, agent="codex")
     council = Council(members=[lead, critic])
@@ -249,7 +325,7 @@ def test_delegation_reseats_on_requester_model_after_double_failure(store, sessi
         return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
 
     out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
-    assert seen[:3] == ["codex", "codex", "claude"], "retry, then reseat"
+    assert seen[:2] == ["codex", "claude"], "fail once, then use a distinct seat"
     assert out.content.startswith("integrated")
     assert not any("failed" in u for u in session.unresolved), \
         "a reseated delegation leaves no failure note"

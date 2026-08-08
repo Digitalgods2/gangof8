@@ -30,7 +30,13 @@ class SessionManager:
     def create(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None) -> Session:
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
         session_id = f"s_{day}_{short_id()}"
-        task = Task(task_id=f"t_{short_id()}", session_id=session_id, source=source, text=text)
+        task = Task(
+            task_id=f"t_{short_id()}",
+            session_id=session_id,
+            source=source,
+            text=text,
+            original_text=text,
+        )
         session = Session(session_id=session_id, task=task)
         if budgets is not None:
             session.budgets = budgets
@@ -57,5 +63,11 @@ class SessionManager:
 def migrate_session_data(data: dict) -> dict:
     """Normalize a persisted session dict before Pydantic validation."""
     out = dict(data)
+    task = dict(out.get("task") or {})
+    if not task.get("original_text"):
+        task["original_text"] = str(task.get("text") or "").split(
+            "\n\nAttachments provided by the user:", 1
+        )[0].strip()
+    out["task"] = task
     out["schema_version"] = SESSION_SCHEMA_VERSION
     return out

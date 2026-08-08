@@ -27,7 +27,7 @@ from gangof8.models import (
     Task,
     TaskType,
 )
-from gangof8.registry import AgentError, AgentRegistry
+from gangof8.registry import AdapterResult, AgentError, AgentRegistry
 from gangof8.sessions import SessionManager
 from gangof8.service import GangOf8Service
 
@@ -468,3 +468,31 @@ def test_failed_calls_remain_visible_as_attempts(tmp_path):
     persisted = Session.model_validate(store.load_session(session.session_id))
     assert persisted.agent_call_attempts == 1
     assert persisted.agent_attempt_duration_ms >= 1
+
+
+class _ProgressSupervisedAdapter:
+    name = "streaming-api"
+    local_process = False
+    streams_progress = True
+
+    def __init__(self):
+        self.timeout_s = None
+
+    def call(self, role, prompt, timeout_s, images=None):
+        del role, prompt, images
+        self.timeout_s = timeout_s
+        return AdapterResult(content="completed")
+
+
+def test_streaming_api_calls_have_no_arbitrary_hard_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop.config, "OPENROUTER_HARD_TIMEOUT", 0)
+    store = LogStore(tmp_path)
+    session = SessionManager(store).create("review the artifact", source="test")
+    registry = AgentRegistry()
+    adapter = _ProgressSupervisedAdapter()
+    registry.register(adapter)
+    member = CouncilMember(role=Role.critic, agent=adapter.name, active=True)
+
+    loop._agent_call(session, registry, store, member, "work", timeout_s=120)
+
+    assert adapter.timeout_s == 0

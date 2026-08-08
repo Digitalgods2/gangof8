@@ -94,6 +94,48 @@
   </div>
 </div>
 
+<div id="contractOverlay" role="dialog" aria-modal="true"
+     aria-labelledby="contractTitle"
+     onclick="if(event.target===this)closeContractReview()">
+  <div id="contractPanel">
+    <div class="shead">
+      <div>
+        <div class="eyebrow">Preflight</div>
+        <h2 id="contractTitle">Review the outcome contract</h2>
+      </div>
+      <button class="ghost x" type="button" onclick="closeContractReview()">Back</button>
+    </div>
+    <div id="contractRoute"></div>
+    <div class="contract-grid">
+      <label class="contract-field contract-wide">
+        <span>Outcome</span>
+        <textarea id="contractOutcome" rows="3"></textarea>
+      </label>
+      <label class="contract-field">
+        <span>Deliverables <small>one per line</small></span>
+        <textarea id="contractDeliverables" rows="5"></textarea>
+      </label>
+      <label class="contract-field">
+        <span>Acceptance criteria <small>one per line</small></span>
+        <textarea id="contractAcceptance" rows="5"></textarea>
+      </label>
+      <label class="contract-field">
+        <span>Constraints <small>one per line</small></span>
+        <textarea id="contractConstraints" rows="4"></textarea>
+      </label>
+      <label class="contract-field">
+        <span>Explicit exclusions <small>one per line</small></span>
+        <textarea id="contractExclusions" rows="4"></textarea>
+      </label>
+    </div>
+    <div class="contract-actions">
+      <span class="sub" id="contractNote">This becomes the shared definition of done for every agent.</span>
+      <button class="ghost" type="button" onclick="closeContractReview()">Keep editing</button>
+      <button id="contractRunBtn" type="button" onclick="confirmOutcomeContract()">Run with this contract</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <div id="left">
     <div class="history-toolbar">
@@ -105,6 +147,13 @@
     <div id="feedWrap">
       <h2>Live activity <span id="feedDot" class="feed-dot"></span></h2>
       <div id="feed" aria-live="polite"></div>
+    </div>
+    <div id="playbooksWrap" style="display:none">
+      <div class="rail-heading">
+        <h2>Playbooks</h2>
+        <button class="rail-refresh" type="button" title="Refresh playbooks" onclick="loadPlaybooks(true)">Refresh</button>
+      </div>
+      <div id="playbooks"></div>
     </div>
     <div id="goalsWrap" style="display:none">
       <h2>Goals</h2>
@@ -121,6 +170,17 @@
     <span class="path">council composer — one question, every AI you have</span></div>
   <div class="cbody">
   <div id="attachments"></div>
+  <div class="composer-options">
+    <label for="executionProfile">Execution</label>
+    <select id="executionProfile" title="Choose how much of the council to engage">
+      <option value="auto">Auto · recommended route</option>
+      <option value="focused">Focused · smallest capable team</option>
+      <option value="council">Council · broad deliberation</option>
+      <option value="best_of_n">Best-of-all · every AI builds, blind winner</option>
+      <option value="build_team">Planned build · parallel when decomposable</option>
+    </select>
+    <span id="profileHint">Gang of 8 will explain its routing choice before starting.</span>
+  </div>
   <div class="crow">
     <div class="plusw">
       <button id="plusBtn" title="Attach a file" onclick="togglePlus(event)">+</button>

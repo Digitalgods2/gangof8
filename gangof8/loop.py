@@ -14,6 +14,7 @@ import math
 import shutil
 import threading
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ from .governance import ApprovalRequired, BudgetExceeded, Governance
 from .logstore import LogStore
 from .models import (
     CollaborationAssignment,
+    Complexity,
     Contribution,
     Council,
     CouncilMember,
@@ -50,7 +52,13 @@ from .models import (
     TaskType,
     utcnow,
 )
-from .registry import AdapterResult, AgentError, AgentInputRequired, AgentRegistry
+from .registry import (
+    AdapterResult,
+    AgentCallStopped,
+    AgentError,
+    AgentInputRequired,
+    AgentRegistry,
+)
 from .roles import build_council
 from .rounds import (
     _GOVERNANCE_CONTEXT,
@@ -66,6 +74,7 @@ from .skills import get_skill
 from . import cancellation
 from .cancellation import SessionCancelled  # re-exported for callers (service)
 from .uploads import image_inputs
+from .workbench import execution_text
 
 
 # Actionable draft proposals (writes/exec/stage/promote) — distinct from the
@@ -74,6 +83,11 @@ from .uploads import image_inputs
 # guards must count only these, not read requests. (Most now execute freely;
 # only `promote` pauses for approval — but all are "the council produced work".)
 _PROPOSAL_KINDS = {"write_file", "edit_file", "run_tests", "stage", "promote"}
+
+
+def _execution_task(session: Session) -> str:
+    """The raw request plus the stable Outcome Contract used by every seat."""
+    return execution_text(session.task.text, session.outcome_contract)
 
 
 def _has_proposals(session: Session) -> bool:
@@ -116,29 +130,14 @@ def _agent_semaphore(registry: AgentRegistry, agent: str) -> threading.Semaphore
 def _effective_agent_timeout(
     session: Session, agent: str, requested: Optional[int] = None,
 ) -> int:
-    """Resolve one timeout; Settings caps never govern coding sessions.
+    """Resolve only explicit runtime policy; legacy Settings caps are ignored.
 
-    Frontier seats performing code work have no coordinator wall-clock limit at
-    any stage (author, lead, judge, codifier, repair, or release verification).
-    Other calls retain their supplied stage policy, and per-seat Settings values
-    remain solely routine/non-code guardrails.
+    Zero is the normal policy and means the operator supervises elapsed time.
+    A positive stage/installation value is an explicit hard-deadline opt-in.
     """
-    if requested is not None and int(requested) <= 0:
-        return 0
-    classification = getattr(session, "classification", None)
-    coding = bool(classification and classification.task_type == TaskType.code)
-    if coding and agent in config.FRONTIER_AUTHOR_SEATS:
-        return 0
-    configured = (getattr(session, "cli_timeouts", None) or {}).get(agent)
-    if coding:
-        if requested is None:
-            return max(1, int(config.agent_timeout(agent)))
-        return max(1, int(requested))
     if requested is None:
-        return int(configured or config.agent_timeout(agent))
-    if configured:
-        return max(1, min(int(requested), int(configured)))
-    return max(1, int(requested))
+        return max(0, int(config.agent_timeout(agent)))
+    return max(0, int(requested))
 
 
 def _parse_utc(value: str) -> datetime:
@@ -212,6 +211,106 @@ def _codifier(session: Session) -> Optional[CouncilMember]:
     return session.council.get(Role.lead)
 
 
+def _steering_checkpoint(
+    session: Session, store: LogStore, prompt: str
+) -> str:
+    """Apply durable operator guidance between model calls.
+
+    API threads only append commands to SQLite. The worker that owns the live
+    Session claims one-shot commands here, which prevents stale snapshots and
+    concurrent panel calls from applying the same budget change twice.
+    """
+    workbench = getattr(store, "workbench", None)
+    if workbench is None:
+        return prompt
+    try:
+        directives = workbench.list_active_directives(session.session_id)
+        claimed = workbench.claim_steering(
+            session.session_id,
+            claimed_by=f"worker:{threading.get_ident()}",
+        )
+    except Exception as exc:  # steering must not make an otherwise valid run fail
+        store.log_event(
+            session.session_id,
+            "steering_checkpoint_failed",
+            {"detail": str(exc)[:300]},
+        )
+        return prompt
+
+    finish_requested = False
+    for command in claimed:
+        try:
+            if command.kind == "increase_budget":
+                try:
+                    increments = json.loads(command.directive or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    increments = {"agent_calls": command.amount}
+                with _SESSION_LOCK:
+                    session.budgets.max_agent_calls += max(
+                        0, int(increments.get("agent_calls") or command.amount or 0)
+                    )
+                    session.budgets.max_wall_seconds += max(
+                        0, int(increments.get("duration_seconds") or 0)
+                    )
+                    session.consent_extra_rounds += max(
+                        0, int(increments.get("rounds") or 0)
+                    )
+                    session.budgets_locked = True
+                    store.save_session(session)
+            elif command.kind == "finish_now":
+                with _SESSION_LOCK:
+                    session.compose_now = True
+                    finish_requested = True
+                    store.save_session(session)
+            workbench.mark_steering_applied(
+                command.command_id, claim_token=command.claim_token
+            )
+            store.log_event(
+                session.session_id,
+                "steering_applied",
+                {
+                    "command_id": command.command_id,
+                    "kind": command.kind,
+                },
+            )
+        except Exception as exc:
+            try:
+                workbench.release_steering_claim(
+                    command.command_id, command.claim_token
+                )
+            except Exception:
+                pass
+            store.log_event(
+                session.session_id,
+                "steering_apply_failed",
+                {
+                    "command_id": command.command_id,
+                    "kind": command.kind,
+                    "detail": str(exc)[:300],
+                },
+            )
+
+    steering_lines: list[str] = []
+    for command in directives:
+        directive = (command.directive or "").strip()
+        if directive:
+            steering_lines.append(
+                f"- {command.kind.replace('_', ' ').upper()}: {directive}"
+            )
+    if finish_requested:
+        steering_lines.append(
+            "- FINISH: make this current step conclusive; the coordinator will "
+            "compose immediately afterward"
+        )
+    if not steering_lines:
+        return prompt
+    context = "\n".join(steering_lines)[:5000]
+    return (
+        f"{prompt}\n\nOPERATOR STEERING (authoritative for all remaining work):\n"
+        f"{context}\n"
+    )
+
+
 def _agent_call(
     session: Session, registry: AgentRegistry, store: LogStore,
     member: CouncilMember, prompt: str, timeout_s: Optional[int] = None, reserve: int = 0,
@@ -223,6 +322,7 @@ def _agent_call(
             or (session.worker_lease
                 and not store.lease_is_current(session.session_id, session.worker_lease))):
         raise SessionCancelled()
+    prompt = _steering_checkpoint(session, store, prompt)
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
     cap = session.budgets.max_agent_calls - max(0, min(reserve, session.budgets.max_agent_calls - 1))
@@ -241,10 +341,17 @@ def _agent_call(
         session.agent_call_attempts += 1
         attempt = session.agent_call_attempts
     attempt_started = time.monotonic()
-    # Per-seat Settings values cap ordinary calls. Coding stages supply their
-    # own policy; code authoring may deliberately pass zero (no hard deadline).
-    # Cancellation remains active in either case.
-    timeout_s = _effective_agent_timeout(session, member.agent, timeout_s)
+    getter = getattr(registry, "get", None)
+    adapter = getter(member.agent) if callable(getter) else None
+    stream_supervised = bool(getattr(adapter, "streams_progress", False))
+    # A productive response has no guessed wall-clock deadline. Streaming APIs
+    # may retain an independent provider-stall detector; elapsed time itself is
+    # supervised through the dashboard for both API and CLI seats.
+    timeout_s = (
+        config.OPENROUTER_HARD_TIMEOUT
+        if stream_supervised
+        else _effective_agent_timeout(session, member.agent, timeout_s)
+    )
     call_id = f"call_{threading.get_ident()}_{time.monotonic_ns()}"
     store.log_event(
         session.session_id, "agent_call_queued",
@@ -273,11 +380,9 @@ def _agent_call(
                 session.classification
                 and session.classification.task_type == TaskType.code
             )
-            getter = getattr(registry, "get", None)
-            adapter = getter(member.agent) if callable(getter) else None
             stall_timeout_s = (
                 config.OPENROUTER_OUTPUT_STALL_TIMEOUT
-                if getattr(adapter, "streams_progress", False) else None
+                if stream_supervised else None
             )
             activity = {
                 "call_id": call_id, "agent": member.agent, "role": member.role.value,
@@ -285,9 +390,14 @@ def _agent_call(
                 "last_progress_at": started_at, "progress_chars": 0,
                 "progress_detail": "request dispatched", "timeout_s": timeout_s,
                 "timeout_policy": (
-                    "hard_deadline" if timeout_s > 0 else "user_cancel_or_provider_stall"
+                    "hard_deadline" if timeout_s > 0 else "operator_supervised"
                 ),
                 "stall_timeout_s": stall_timeout_s,
+                "operator_checkin_s": (
+                    config.MODEL_OPERATOR_CHECKIN_SECONDS
+                    if timeout_s == 0 else None
+                ),
+                "operator_stoppable": True,
                 "attempt": attempt,
                 "package_deadline_at": session.package_deadline_at,
             }
@@ -339,6 +449,7 @@ def _agent_call(
                     **({"cwd": cwd} if cwd else {}))
             finally:
                 cancellation.unregister_progress(session.session_id, call_id)
+                cancellation.clear_call(session.session_id, call_id)
                 cancellation.set_current_call(None)
                 cancellation.set_call_kind(None)
                 with _SESSION_LOCK:
@@ -355,6 +466,21 @@ def _agent_call(
             session.agent_attempt_duration_ms += int(
                 (time.monotonic() - attempt_started) * 1000
             )
+        raise
+    except AgentCallStopped as exc:
+        elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+        with _SESSION_LOCK:
+            store.log_event(
+                session.session_id, "agent_call_stopped",
+                {"call_id": call_id, "agent": member.agent,
+                 "role": member.role.value, "attempt": attempt,
+                 "detail": str(exc)[:300], "duration_ms": elapsed_ms,
+                 "progress_chars": activity.get("progress_chars", 0),
+                 "partial_output_tail": activity.get("tail", "")},
+            )
+            session.agent_calls -= 1
+            session.agent_attempt_duration_ms += elapsed_ms
+            store.save_session(session)
         raise
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
@@ -642,7 +768,7 @@ def _revision_public_contract(source: str) -> list[str]:
 def _revision_assertions(session: Session, source: str) -> list[str]:
     """Derive small behavior-facing checks from the task and current portal."""
     assertions: list[str] = []
-    task = session.task.text or ""
+    task = _execution_task(session)
     for sub, base in _REVISION_EXTENDS_RE.findall(task):
         if sub not in {"Game", "class"}:
             assertions.append(f"extends:{sub}:{base}")
@@ -658,6 +784,21 @@ def _revision_assertions(session: Session, source: str) -> list[str]:
 
 def _revision_source_for(session: Session, data_dir, name: str) -> Optional[Path]:
     """Find the pre-edit source without accidentally selecting this session's copy."""
+    preferred = (session.revision_source_spaces or {}).get(name)
+    if preferred:
+        try:
+            if preferred == "delivery" and session.delivery_root:
+                candidate = executor.resolve_in_workspace(
+                    Path(session.delivery_root), name
+                )
+            else:
+                candidate = executor.resolve_space(
+                    session, Path(data_dir), preferred, name
+                )
+            if candidate.is_file():
+                return candidate
+        except (ExecutionError, OSError):
+            pass
     for root in (session.workspace_root, session.delivery_root, session.established_root):
         if not root:
             continue
@@ -1123,7 +1264,7 @@ def _conversation_overview(session: Session) -> str:
     return "\n\n".join(parts)
 
 
-def _web_overview(session: Session) -> str:
+def _web_overview(session: Session, data_dir: Path) -> str:
     """Proactively look up current info ONCE up front for fact-needing tasks with
     no local source — so the council has REAL web data even if the researcher
     seat fails or no agent thinks to call web_search. (Having internet access
@@ -1139,7 +1280,7 @@ def _web_overview(session: Session) -> str:
         return ""
     try:
         from . import web
-        result = web.web_search(session.task.text)
+        result = web.web_search(session.task.text, data_dir=data_dir)
     except Exception:  # noqa: BLE001 — web is best-effort context
         return ""
     if not result or not result.strip():
@@ -1185,12 +1326,57 @@ def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
     return True, "granted"
 
 
+_DELEGATION_FALLBACK_ROLES: dict[Role, tuple[Role, ...]] = {
+    Role.code_generator: (Role.implementer, Role.architect, Role.lead),
+    Role.implementer: (Role.code_generator, Role.lead, Role.architect),
+    Role.fact_validator: (Role.critic, Role.red_team, Role.researcher),
+    Role.critic: (Role.fact_validator, Role.red_team, Role.architect),
+    Role.researcher: (
+        Role.knowledge_retriever,
+        Role.fact_validator,
+        Role.lead,
+    ),
+    Role.architect: (Role.code_generator, Role.critic, Role.lead),
+}
+
+
+def _distinct_delegation_fallback(
+    council: Council,
+    role: Role,
+    failed_agent: str,
+) -> Optional[CouncilMember]:
+    """Pick a configured, distinct seat before repeating a failed call."""
+    ranked: list[CouncilMember] = []
+    for wanted in _DELEGATION_FALLBACK_ROLES.get(role, ()):
+        member = council.get(wanted)
+        if member is not None:
+            ranked.append(member)
+    ranked.extend(council.members)
+    seen: set[str] = set()
+    for member in ranked:
+        agent = (member.agent or "").strip()
+        if (
+            not agent
+            or agent in {"system", failed_agent}
+            or agent in seen
+        ):
+            continue
+        seen.add(agent)
+        member.active = True
+        return CouncilMember(
+            role=role,
+            agent=agent,
+            active=True,
+        )
+    return None
+
+
 def delegate_prompt(session: Session, role: Role, kind: str, reason: str,
                     *, by: str = "lead", may_subconsult: bool = False,
                     extra: str = "") -> str:
     produces = bool(session.classification and session.classification.produces_output)
     lines = [
-        f"Task: {session.task.text}",
+        f"Task: {_execution_task(session)}",
         # The no-native-tools context is NOT optional here: an agentic CLI seat
         # (codex) told to "author a file" without it tries to CREATE the file
         # with its own tools inside its read-only sandbox and dies (live:
@@ -1264,11 +1450,9 @@ def _resolve_one_delegation(
                          "reason": reason, "depth": depth})
         store.save_session(session)  # the talent's roster chip appears the moment it's recruited
     try:
-        # Escalation ladder for a failing seat: retry once, then RESEAT the
-        # role on the requester's own model, and only then let the assignment
-        # collapse back onto the lead — the lead doing the talent's work itself
-        # defeats the point of the roster, so it is the LAST resort (live:
-        # codex-as-code_generator failed the same way twice across runs).
+        # Move immediately to one distinct configured model after a failure.
+        # Repeating the exact same timed-out call before trying another capable
+        # seat was both slow and less likely to recover.
         def _ask(member: CouncilMember) -> Contribution:
             return call(member, delegate_prompt(
                 session, role, kind, reason,
@@ -1278,21 +1462,23 @@ def _resolve_one_delegation(
         try:
             answer = _ask(helper)
         except AgentError as first:
-            with _SESSION_LOCK:
-                store.log_event(sid, "delegation_retry",
-                                {"to": role.value, "agent": helper.agent,
-                                 "error": str(first)[:200]})
-            try:
-                answer = _ask(helper)
-            except AgentError as second:
-                if helper.agent == requester.agent:
-                    raise
+            fallback = _distinct_delegation_fallback(
+                council, role, helper.agent
+            )
+            if fallback is not None:
                 with _SESSION_LOCK:
                     store.log_event(sid, "delegation_reseated",
                                     {"role": role.value, "from": helper.agent,
-                                     "to": requester.agent,
-                                     "error": str(second)[:200]})
-                helper = CouncilMember(role=role, agent=requester.agent, active=True)
+                                     "to": fallback.agent,
+                                     "error": str(first)[:200]})
+                helper = fallback
+                answer = _ask(helper)
+            else:
+                with _SESSION_LOCK:
+                    store.log_event(sid, "delegation_retry",
+                                    {"to": role.value, "agent": helper.agent,
+                                     "error": str(first)[:200],
+                                     "reason": "no distinct fallback"})
                 answer = _ask(helper)
         # ORCHESTRATOR model: a DELEGATED talent produces its piece of the
         # deliverable itself. Its ARTIFACT/EDIT/RUNTESTS blocks become real
@@ -1623,7 +1809,7 @@ def _candidate_artifact_problem(session: Session, filename: str) -> str:
         return "artifact did not name a file"
     if session.delivery_root and base.casefold() == Path(session.delivery_root).name.casefold():
         return "artifact named the delivery folder instead of a file"
-    task = session.task.text or ""
+    task = _execution_task(session)
     named_suffixes = {Path(m.group(1)).suffix.lower() for m in _FILENAME_RE.finditer(task)}
     direct_suffixes = {f".{ext.lower()}" for ext in re.findall(
         r"(?<![\w.])\.([a-z0-9]{1,10})\b", task, re.IGNORECASE)}
@@ -1632,6 +1818,105 @@ def _candidate_artifact_problem(session: Session, filename: str) -> str:
     if expected_suffixes and suffix not in expected_suffixes:
         return f"artifact filename does not match requested extension(s): {', '.join(sorted(expected_suffixes))}"
     return ""
+
+
+def _is_strict_best_of_n(session: Session) -> bool:
+    return bool(
+        session.execution_profile == "best_of_n"
+        or (session.routing_decision or {}).get("selected_route") == "best_of_n"
+    )
+
+
+_LOCAL_CANDIDATE_LINK = re.compile(
+    r"\]\(\s*<?((?:[A-Za-z]:[\\/]|/)[^>\r\n)]*)>?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _linked_candidate_envelope(
+    session: Session,
+    member: CouncilMember,
+    content: str,
+    call_started_at: float,
+    store: LogStore,
+) -> str:
+    """Recover one freshly tool-written candidate referenced by a model reply.
+
+    Some Codex CLI versions use their filesystem tool despite the explicit
+    ARTIFACT contract, then return a Markdown download link. Only a single,
+    current-call file inside GangOf8's own sandbox is eligible. This never reads
+    arbitrary workspace/user paths and never guesses among multiple outputs.
+    """
+    roots = [
+        (config.SANDBOX_ROOT / "cli-neutral").resolve(),
+        (config.SANDBOX_ROOT / session.session_id).resolve(),
+    ]
+    eligible: list[Path] = []
+    for raw in dict.fromkeys(_LOCAL_CANDIDATE_LINK.findall(content or "")):
+        try:
+            path = Path(raw.strip().strip("\"'")).resolve(strict=True)
+            stat = path.stat()
+        except (OSError, ValueError):
+            continue
+        if not path.is_file():
+            continue
+        if not any(path == root or root in path.parents for root in roots):
+            continue
+        # Files that predate this call can be leftovers from a different run.
+        if stat.st_mtime < call_started_at - 2:
+            continue
+        if stat.st_size <= 0 or stat.st_size > config.BEST_OF_N_LINKED_CANDIDATE_MAX_BYTES:
+            continue
+        if _candidate_artifact_problem(session, path.name):
+            continue
+        eligible.append(path)
+    if len(eligible) != 1:
+        return ""
+    path = eligible[0]
+    try:
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+    store.log_event(
+        session.session_id,
+        "candidate_file_recovered",
+        {"agent": member.agent, "file": path.name, "chars": len(body)},
+    )
+    return f"ARTIFACT: {path.name}\n{body}\nEND_ARTIFACT"
+
+
+def _refresh_candidate_author_metrics(session: Session) -> None:
+    """Expose artifact acceptance separately from mere model-call success."""
+    if not _is_strict_best_of_n(session):
+        return
+    actions = [
+        action for action in session.proposed_actions
+        if action.kind == "write_file"
+        and action.role == Role.panelist
+        and action.status == "executed"
+        and (action.content or "").strip()
+    ]
+    accepted_agents = list(dict.fromkeys(
+        (action.args or {}).get("package_author")
+        or (action.filename.split("__", 1)[0] if "__" in action.filename else "")
+        for action in actions
+    ))
+    accepted_agents = [agent for agent in accepted_agents if agent]
+    expected_agents = list(dict.fromkeys(seat for seat in session.panel if seat))
+    evaluated = bool((session.candidate_metrics or {}).get("runtime_evaluated"))
+    session.candidate_metrics = {
+        **(session.candidate_metrics or {}),
+        "expected": len(expected_agents),
+        "authored": len(actions),
+        "accepted_agents": accepted_agents,
+        "missing_authors": [
+            agent for agent in expected_agents if agent not in accepted_agents
+        ],
+        "runtime_evaluated": evaluated,
+        "runnable": (
+            (session.candidate_metrics or {}).get("runnable") if evaluated else None
+        ),
+    }
 
 
 def _capture_panel_artifacts(
@@ -1644,6 +1929,7 @@ def _capture_panel_artifacts(
     advisory drafts the lead can read/compare (they appear in its readable
     list) — they never count as the delivery itself (_has_proposals excludes
     the panelist role), so materialization/salvage still guard the pipeline."""
+    captured = False
     for a in _parse_proposals(session.session_id, content, role=Role.panelist):
         if a.kind != "write_file":
             continue  # edits/tests/promotes in a panel take are advice, not actions
@@ -1681,11 +1967,15 @@ def _capture_panel_artifacts(
         with _SESSION_LOCK:
             session.proposed_actions.append(a)
             if a.status == "executed":
+                captured = True
                 if path and path not in session.files_changed:
                     session.files_changed.append(path)
                 store.log_event(session.session_id, "panel_artifact_saved",
                                 {"agent": member.agent, "file": fn,
                                  "chars": len(a.content or "")})
+            _refresh_candidate_author_metrics(session)
+            store.save_session(session)
+    return captured
 
 
 def _panel_one(
@@ -1703,6 +1993,13 @@ def _panel_one(
     per seat."""
     dropped_contribution = None
     budget_failure = False
+    operator_stopped = False
+    call_started_at = time.time()
+    requires_candidate = bool(
+        _is_strict_best_of_n(session)
+        and session.classification
+        and session.classification.produces_output
+    )
     try:
         # authoring a whole candidate needs headroom; pass the timeout only when set
         # so plain 2-arg callers keep working
@@ -1726,6 +2023,14 @@ def _panel_one(
         else:
             c = _resolve_skill_requests(
                 session, member, prompt, c, call, governance, store, recall=recall)
+        if requires_candidate and not _reply_has_artifact(session.session_id, c.content):
+            recovered = _linked_candidate_envelope(
+                session, member, c.content, call_started_at, store
+            )
+            if recovered:
+                # Contribution is the same object already held by the session;
+                # append the governed envelope so provenance remains intact.
+                c.content = f"{c.content.rstrip()}\n\n{recovered}"
         # A stub take (tool-call debris / announced-but-not-done work) would
         # only pollute the synthesis and later context windows — drop the seat
         # for this round AND remove its debris from the transcript (the
@@ -1735,33 +2040,71 @@ def _panel_one(
             reason = "stub reply (announced or attempted the work instead of doing it)"
             dropped_contribution = c
         elif dropped_contribution is None:
-            _capture_panel_artifacts(session, member, c.content, governance, store)
-            with _SESSION_LOCK:
-                session.package_call_failures.pop(member.agent, None)
-            return c
+            captured = _capture_panel_artifacts(
+                session, member, c.content, governance, store
+            )
+            if requires_candidate and not captured:
+                reason = (
+                    "completed response did not yield one usable ARTIFACT candidate"
+                )
+                dropped_contribution = c
+                with _SESSION_LOCK:
+                    _refresh_candidate_author_metrics(session)
+                    store.log_event(
+                        session.session_id,
+                        "candidate_response_rejected",
+                        {
+                            "agent": member.agent,
+                            "round": session.current_round,
+                            "reason": reason,
+                        },
+                    )
+                    store.save_session(session)
+            else:
+                with _SESSION_LOCK:
+                    session.package_call_failures.pop(member.agent, None)
+                return c
     except AgentInputRequired:
         reason = "asked for user input"
     except BudgetExceeded as e:
         budget_failure = True
         reason = str(e)
+    except AgentCallStopped as e:
+        operator_stopped = True
+        reason = str(e) or "stopped by operator"
     except AgentError as e:
         reason = str(e)
+    candidate_author = bool(requires_candidate and dropped_contribution is not None)
     frontier_author = bool(
-        session.collaboration_mode != "build_team"
+        not requires_candidate
+        and session.collaboration_mode != "build_team"
         and
         session.assembly_mode != assembly.HTML_INLINE
         and
         timeout_s is not None and member.agent in config.FRONTIER_AUTHOR_SEATS
     )
-    recoveries = session.frontier_author_recoveries.get(member.agent, 0)
-    if (frontier_author and not budget_failure
-            and recoveries < config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS):
+    recovery_ledger = (
+        session.candidate_author_recoveries
+        if candidate_author else session.frontier_author_recoveries
+    )
+    recovery_limit = (
+        config.BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS
+        if candidate_author else config.FRONTIER_AUTHOR_RECOVERY_ATTEMPTS
+    )
+    recovery_event = (
+        "candidate_author_recovery_started"
+        if candidate_author else "frontier_author_recovery_started"
+    )
+    recoveries = recovery_ledger.get(member.agent, 0)
+    if ((candidate_author or frontier_author) and not budget_failure
+            and not operator_stopped
+            and recoveries < recovery_limit):
         with _SESSION_LOCK:
             if dropped_contribution is not None and dropped_contribution in session.contributions:
                 session.contributions.remove(dropped_contribution)
-            session.frontier_author_recoveries[member.agent] = recoveries + 1
+            recovery_ledger[member.agent] = recoveries + 1
             store.log_event(
-                session.session_id, "frontier_author_recovery_started",
+                session.session_id, recovery_event,
                 {"agent": member.agent, "round": session.current_round,
                  "attempt": recoveries + 2, "reason": reason[:300]},
             )
@@ -1777,10 +2120,15 @@ def _panel_one(
     with _SESSION_LOCK:
         if dropped_contribution is not None and dropped_contribution in session.contributions:
             session.contributions.remove(dropped_contribution)
-        session.unresolved.append(f"panel seat '{member.agent}' dropped this round: {reason}")
+        disposition = "stopped by operator" if operator_stopped else "dropped"
+        session.unresolved.append(
+            f"panel seat '{member.agent}' {disposition} this round: {reason}"
+        )
         if session.collaboration_mode == "build_team":
             session.package_call_failures[member.agent] = reason[:300]
-        store.log_event(session.session_id, "panel_seat_dropped",
+        store.log_event(
+                        session.session_id,
+                        "panel_seat_stopped" if operator_stopped else "panel_seat_dropped",
                         {"agent": member.agent, "round": session.current_round,
                          "error": reason[:300]})
     return None
@@ -1811,7 +2159,12 @@ def _fan_out(session: Session, items: list, fn, thread_name: str,
         ex.shutdown(wait=False, cancel_futures=True)
 
 
-def _pause_for_consent(session: Session, manager: SessionManager, store: LogStore) -> None:
+def _pause_for_consent(
+    session: Session,
+    manager: SessionManager,
+    store: LogStore,
+    reason: str = "",
+) -> None:
     """The automatic rotation's one checkpoint: after a block of rounds without
     DONE, ask the human whether the council should keep going."""
     n = len(session.rounds)
@@ -1820,6 +2173,7 @@ def _pause_for_consent(session: Session, manager: SessionManager, store: LogStor
         session_id=session.session_id, agent="system", role=Role.coordinator,
         round=session.current_round, purpose="continue_rounds", resume_token="",
         question=(
+            f"{reason + chr(10) if reason else ''}"
             f"The council has deliberated {n} rounds without declaring the task done.\n"
             f"Round summaries:\n{rounds.round_summaries(session)}\n"
             f"Continue for another {block} rounds? Reply 'yes', a number of extra "
@@ -1916,9 +2270,23 @@ def _run_in_place_revision(
 
     assertions = list(dict.fromkeys(
         item for target in targets for item in session.revision_assertions.get(target, [])))
-    reviewer = council.get(Role.fact_validator) or council.get(Role.critic)
+    reviewer = next(
+        (
+            candidate
+            for candidate in (
+                council.get(Role.fact_validator),
+                council.get(Role.critic),
+                council.get(Role.red_team),
+            )
+            if candidate is not None
+            and candidate.active
+            and candidate.agent
+            and candidate.agent != author.agent
+        ),
+        None,
+    )
     review_failures: list[str] = []
-    if reviewer and reviewer.active and reviewer.agent and reviewer.agent != author.agent:
+    if reviewer:
         review_prompt = rounds.revision_review_prompt(
             session, targets, _revision_patch_summary(actions), assertions)
         try:
@@ -2253,8 +2621,10 @@ def _run_collaboration_assignment(
         from .seat_health import UNAVAILABLE_STATES, classify_failure
 
         state = classify_failure(str(exc))
+        operator_stopped = "stopped by operator" in str(exc).lower()
         with _SESSION_LOCK:
             assignment.status = (
+                "stopped" if operator_stopped else
                 "unavailable" if state in UNAVAILABLE_STATES else "failed"
             )
             assignment.error = str(exc)[:500]
@@ -2659,8 +3029,16 @@ def _run_panel_rounds(
             session.unresolved.append("rounds stopped: agent-call budget headroom exhausted")
             break
         if r > 0 and time.monotonic() - start > session.budgets.max_wall_seconds:
-            session.unresolved.append("rounds stopped: wall-time budget reached")
-            break
+            elapsed = max(1, int((time.monotonic() - start) // 60))
+            _pause_for_consent(
+                session, manager, store,
+                reason=(
+                    f"This run has been active for about {elapsed} minute"
+                    f"{'' if elapsed == 1 else 's'}. Elapsed time alone does not "
+                    "stop it; choose whether the council should continue."
+                ),
+            )
+            return True
         session.current_round = r
         build_package = bool(
             session.collaboration_mode == "build_team" and session.work_package_owner
@@ -3153,7 +3531,44 @@ def run_session(
     # sandbox/workspace, and the ONE hard gate is the promote approval at
     # delivery time (where a missing target is also asked for — see
     # _execute_actions). No pre-run pauses.
-    cls = classify(session.task.text, role_agents)
+    # Conversation follow-ups are new directives, not merely context. Classify
+    # the latest human turn while the prompt layer still carries the complete
+    # original request, conversation, and amended Outcome Contract.
+    latest_turn = next(
+        (
+            str(turn.get("text") or "")
+            for turn in reversed(session.turns)
+            if turn.get("role") == "user" and turn.get("text")
+        ),
+        "",
+    )
+    classification_text = (
+        latest_turn.split("\n\nAttachments provided by the user:", 1)[0].strip()
+        if latest_turn
+        else session.task.text
+    )
+    cls = classify(classification_text, role_agents)
+    if session.revision_targets:
+        cls = cls.model_copy(update={
+            "task_type": TaskType.code,
+            "complexity": (
+                Complexity.standard
+                if cls.complexity == Complexity.trivial
+                else cls.complexity
+            ),
+            "tools_allowed": True,
+            "needs_facts": False,
+            "needs_design": False,
+            "produces_output": True,
+            "quality_matters": True,
+            "greenfield": False,
+            "match_source": True,
+            "skills_needed": ["implementation", "critique"],
+            "rationale": (
+                f"{cls.rationale}; exact recorded artifact revision preserves "
+                "the parent code/output context"
+            ),
+        })
     session.classification = cls
     if not session.budgets_locked:
         session.budgets = config.budgets_for(cls.complexity)
@@ -3269,7 +3684,7 @@ def _deliberate(
             _ov_fut = _ov_ex.submit(lambda: "\n\n".join(p for p in (
                 _conversation_overview(session),
                 _established_overview(overview_session, store.data_dir),
-                _web_overview(session),
+                _web_overview(session, store.data_dir),
             ) if p))
             while True:
                 if cancellation.is_requested(sid):
@@ -3324,7 +3739,12 @@ def _deliberate(
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
         if not _has_proposals(session) and lead and lead.active and not session.compose_now:
-            if _is_in_place_revision(session):
+            if (
+                _is_in_place_revision(session)
+                and session.execution_profile != "best_of_n"
+                and (session.routing_decision or {}).get("selected_route")
+                != "best_of_n"
+            ):
                 # An existing-file change needs one author grounded in the exact
                 # source plus one patch review, not a panel of whole-file
                 # reconstructions that compete mostly on token budget.
@@ -3353,9 +3773,14 @@ def _deliberate(
         package_failure = bool(
             session.collaboration_mode == "build_team" and session.work_package_owner
         )
+        candidate_failure = bool(
+            session.execution_profile == "best_of_n"
+            or (session.routing_decision or {}).get("selected_route") == "best_of_n"
+        )
         stage = (
             "deterministic_assembly" if assembly_failure else
             "package_implementation" if package_failure else
+            "candidate_comparison" if candidate_failure else
             "frontier_implementation"
         )
         session.outcome = "failed_verification"
@@ -3368,6 +3793,7 @@ def _deliberate(
         event = (
             "assembly_failed" if assembly_failure else
             "package_implementation_gate_failed" if package_failure else
+            "candidate_comparison_failed" if candidate_failure else
             "frontier_implementation_gate_failed"
         )
         store.log_event(sid, event, {"detail": str(e)})
@@ -3383,6 +3809,11 @@ def _deliberate(
                 "was not relabeled or substituted for the missing output, and no file "
                 "was delivered."
                 if package_failure else
+                "The best-of-all run could not produce at least two comparable "
+                "complete candidates and finish a blind selection. It did not "
+                "silently fall back to a single lead-authored result, and no file "
+                "was delivered."
+                if candidate_failure else
                 "The run was stopped because a required frontier implementation "
                 "did not complete or did not run. It was not silently replaced by "
                 "a weaker candidate or counted later as a judge. No file was delivered."
@@ -3397,6 +3828,10 @@ def _deliberate(
                 "to enabled authors under one accountable owner, without a default "
                 "wall-clock cutoff."
                 if package_failure else
+                "Retry Best-of-all after checking the missing candidate authors, or "
+                "choose Focused/Planned build if one product cannot be represented "
+                "as a single comparable artifact."
+                if candidate_failure else
                 "Resume or rerun so the named frontier owner can finish the code."
             ),
         )
@@ -3681,7 +4116,7 @@ _FILENAME_RE = re.compile(
 
 def materialize_prompt(session: Session, filename: str) -> str:
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"Output the COMPLETE contents of the file '{filename}' and NOTHING else: no "
         "explanation, no commentary, no markdown code fences — just the raw file body, "
@@ -3704,7 +4139,7 @@ def _intended_filenames(session: Session) -> list[str]:
         (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
         None,
     )
-    text = f"{draft.content if draft else ''}\n{session.task.text}"
+    text = f"{draft.content if draft else ''}\n{_execution_task(session)}"
     seen: set[str] = set()
     out: list[str] = []
     for m in list(_ARTIFACT_MARKER.finditer(text)) + list(_FILENAME_RE.finditer(text)):
@@ -3760,7 +4195,7 @@ def _target_is_html(session: Session) -> bool:
                 return True
         except OSError:
             pass
-    return ".html" in (session.task.text or "").lower()
+    return ".html" in _execution_task(session).lower()
 
 
 def _is_complete_file(raw: str, want_html: bool) -> bool:
@@ -4233,7 +4668,9 @@ def _independent_frontier_release_gate(
             ) from e
         verdict, checks, remaining = rounds.parse_frontier_verdict(answer.content)
         expected = {
-            f"R{i}" for i in range(1, len(rounds.acceptance_requirements(session.task.text)) + 1)
+            f"R{i}" for i in range(
+                1, len(rounds.acceptance_requirements(_execution_task(session))) + 1
+            )
         }
         checked = {item.get("id") for item in checks}
         missing_checks = sorted(expected - checked)
@@ -4297,6 +4734,56 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     candidates or the vote collapsed). The lead only orchestrated getting here;
     the codify + examine stage is the strong model's job."""
     candidates = _collect_candidates(session)
+    strict_best_of_n = _is_strict_best_of_n(session)
+    expected_agents = list(dict.fromkeys(
+        member.agent for member in panel
+        if member.active and member.agent and member.agent != "system"
+    ))
+    authored_by_agent = Counter(candidate["agent"] for candidate in candidates)
+    missing_expected = [
+        agent for agent in expected_agents if not authored_by_agent.get(agent)
+    ]
+    if strict_best_of_n and missing_expected:
+        session.unresolved.append(
+            f"{len(missing_expected)} enabled model(s) did not produce a complete "
+            "candidate: " + ", ".join(missing_expected)
+        )
+        store.log_event(
+            session.session_id,
+            "candidate_authors_missing",
+            {
+                "expected": expected_agents,
+                "missing": missing_expected,
+                "authored": sorted(authored_by_agent),
+            },
+        )
+    if strict_best_of_n and any(
+        authored_by_agent[agent] != 1 for agent in authored_by_agent
+    ):
+        session.candidate_metrics = {
+            "expected": len(expected_agents),
+            "authored": len(candidates),
+            "accepted_agents": sorted(authored_by_agent),
+            "runnable": None,
+            "runtime_evaluated": False,
+            "missing_authors": missing_expected,
+        }
+        raise QualityGateFailed(
+            "best-of-all requires exactly one complete comparable artifact per "
+            "model; use Planned build for a multi-file product"
+        )
+    if strict_best_of_n and len(candidates) < config.BEST_OF_N_MIN_CANDIDATES:
+        session.candidate_metrics = {
+            "expected": len(expected_agents),
+            "authored": len(candidates),
+            "accepted_agents": sorted(authored_by_agent),
+            "runnable": None,
+            "runtime_evaluated": False,
+            "missing_authors": missing_expected,
+        }
+        raise QualityGateFailed(
+            "best-of-all needs at least two complete candidates for comparison"
+        )
     required_frontier = (
         list(dict.fromkeys(session.required_frontier_authors))
         if session.classification and session.classification.produces_output else []
@@ -4305,9 +4792,13 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     missing_authored = [agent for agent in required_frontier if agent not in authored_agents]
     if missing_authored:
         session.candidate_metrics = {
-            "authored": len(candidates), "runnable": 0,
+            "expected": len(expected_agents),
+            "authored": len(candidates), "runnable": None,
+            "runtime_evaluated": False,
+            "accepted_agents": sorted(authored_by_agent),
             "required_frontier": required_frontier,
             "missing_frontier_authors": missing_authored,
+            "missing_authors": missing_expected,
         }
         raise QualityGateFailed(
             "required frontier author(s) produced no candidate: "
@@ -4458,13 +4949,17 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         runnable, frozen = frozen, []
 
     session.candidate_metrics = {
+        "expected": len(expected_agents),
         "authored": len(group),
         "runnable": len(runnable),
+        "runtime_evaluated": True,
         "runtime_rejected": len(crashers),
         "static_rejected": len(frozen),
         "filename_rejected": len(dropped),
         "required_frontier": required_frontier,
+        "accepted_agents": [c["agent"] for c in group],
         "runnable_agents": [c["agent"] for c in runnable],
+        "missing_authors": missing_expected,
     }
     missing_runnable = [
         agent for agent in required_frontier
@@ -4478,6 +4973,10 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         )
 
     if not runnable:
+        if strict_best_of_n:
+            raise QualityGateFailed(
+                "best-of-all produced no runnable candidate to compare"
+            )
         # CHAIR RECOVERY: the codifier repairs the most complete failed attempt
         # instead of throwing all the panel's work away.
         rec = _chair_recover(session, crashers, codifier_call, store)
@@ -4488,6 +4987,11 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         return {"agent": rec["agent"], "file": rec["base"], "score": None, "votes": 0,
                 "judges": 0, "candidates": len(group), "authored": len(group),
                 "runnable": 1, "fixes": 1, "chair": "chair recovered a failed candidate"}
+
+    if strict_best_of_n and len(runnable) < config.BEST_OF_N_MIN_CANDIDATES:
+        raise QualityGateFailed(
+            "best-of-all needs at least two runnable candidates for a blind comparison"
+        )
 
     store.log_event(sid, "candidates_collected",
                     {"n": len(runnable), "rejected": len(crashers),
@@ -4511,6 +5015,11 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
     judges = panel[: config.MAX_JUDGES]
     ordered, agg, votes, defects, judged = _score_candidates(session, judges, runnable, call, store, source)
     if judged == 0:
+        if strict_best_of_n:
+            raise QualityGateFailed(
+                "best-of-all candidates completed, but no blind comparison "
+                "could be completed"
+            )
         return None  # scoring collapsed → author path (with its own nets) instead
     wi = max(range(len(ordered)),
              key=lambda i: (agg[i + 1], votes[i + 1], len(ordered[i]["content"])))
@@ -4627,7 +5136,7 @@ def _looks_truncated(path: Path) -> bool:
 
 def continuation_prompt(session: Session, filename: str, tail: str) -> str:
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {_execution_task(session)}\n"
         f"You were writing the file '{filename}' but your output was CUT OFF before "
         "the file was complete. Here are the LAST characters you produced:\n"
         f"-----\n{tail}\n-----\n"
@@ -4984,7 +5493,7 @@ def _repair_artifact_failure(
         store.log_event(session.session_id, "artifact_repair_started",
                         {"attempt": attempt, "file": filename, "failure": failure[:500]})
         prompt = (
-            f"Repair the failed deliverable for this task:\n{session.task.text}\n\n"
+            f"Repair the failed deliverable for this task:\n{_execution_task(session)}\n\n"
             f"Coordinator validation failure:\n{failure}\n\n"
             f"Target file: {filename}\n"
             "Return EXACTLY one complete replacement, with no analysis or fences:\n"
@@ -5269,7 +5778,12 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
 
     if session.required_files:
         written = {a.filename.replace("\\", "/") for a in executed}
+        mutable_targets = set(_revision_targets(session))
         for required in session.required_files:
+            if required in mutable_targets:
+                # The target set bounds what may change; a multi-file release
+                # does not require rewriting every sibling to fix one defect.
+                continue
             if required not in written:
                 failures.append(f"required artifact missing: {required}")
 

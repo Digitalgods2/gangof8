@@ -14,6 +14,7 @@ from . import config
 from .governance import BudgetExceeded
 from .models import Contribution, Council, CouncilMember, FinalAnswer, Role, Session
 from .registry import AgentError
+from .workbench import execution_text
 
 AgentCall = Callable[[CouncilMember, str], Contribution]
 
@@ -92,7 +93,7 @@ def compose_prompt(session: Session) -> str:
         if session.established_root else ""
     )
     return (
-        f"Task: {session.task.text}\n"
+        f"Task: {execution_text(session.task.text, session.outcome_contract)}\n"
         "Your role: summarizer. Synthesize the final response from the "
         "deliberation below — the council has already done the work. Do NOT ask "
         "the user any questions and do NOT request more information; if anything "

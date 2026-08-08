@@ -47,7 +47,7 @@ class _UnauthenticatedPanelAdapter:
 
 def test_defaults_when_no_file(tmp_path):
     s = load_settings(tmp_path)
-    assert s.settings_version == 1
+    assert s.settings_version == 2
     assert s.backend == config.BACKEND
     assert s.role_agents == {}
     assert s.risk_boundary == config.RISK_BOUNDARY.value
@@ -122,7 +122,7 @@ def test_corrupt_file_falls_back(tmp_path):
 
 def test_settings_migration_stamps_current_version(tmp_path):
     (tmp_path / "settings.json").write_text('{"backend":"mock"}', encoding="utf-8")
-    assert load_settings(tmp_path).settings_version == 1
+    assert load_settings(tmp_path).settings_version == 2
 
 
 def test_packaged_default_profile_is_valid_and_complete():

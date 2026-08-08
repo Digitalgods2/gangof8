@@ -15,6 +15,10 @@ class AgentError(Exception):
     The loop degrades to a partial answer instead of crashing the session."""
 
 
+class AgentCallStopped(AgentError):
+    """The operator stopped one call; the seat itself is still healthy."""
+
+
 class AgentInputRequired(Exception):
     """An agent paused mid-call to ask the human a question. The loop turns
     this into an InputRequest and pauses the session; answering resumes the
@@ -63,7 +67,7 @@ class AgentRegistry:
         """Return a registered adapter for optional capability checks."""
         return self._adapters.get(agent)
 
-    def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 120,
+    def call(self, agent: str, role: Role, prompt: str, timeout_s: int = 0,
              images: list[dict] | None = None,
              cwd: str | None = None) -> AdapterResult:
         if agent not in self._adapters:
@@ -79,6 +83,8 @@ class AgentRegistry:
             kwargs["cwd"] = cwd
         try:
             result = adapter.call(role, prompt, timeout_s, **kwargs)
+        except AgentCallStopped:
+            raise
         except Exception as e:
             if self.health is not None:
                 self.health.record_failure(agent, str(e))
@@ -87,7 +93,7 @@ class AgentRegistry:
             self.health.record_success(agent)
         return self._normalize(result, t0)
 
-    def resume(self, agent: str, resume_token: str, answer: str, timeout_s: int = 180) -> AdapterResult:
+    def resume(self, agent: str, resume_token: str, answer: str, timeout_s: int = 0) -> AdapterResult:
         """Continue a paused call with the human's answer."""
         if agent not in self._adapters:
             raise KeyError(f"no adapter registered for agent '{agent}'")

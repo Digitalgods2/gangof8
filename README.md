@@ -72,6 +72,44 @@ incidental method names inside the attachment. Requests to fix, improve, or
 return an attached implementation therefore enter the code workflow and its
 authoring policy; genuine destructive directives remain governed actions.
 
+### Outcome contracts and execution profiles
+
+The dashboard now performs a deterministic preflight before spending a model
+call. It turns the prompt into an editable **Outcome Contract**: the intended
+outcome, concrete deliverables, acceptance criteria, constraints, exclusions,
+paths, task class, risk, and bounded budget. Confirm or edit that contract
+before starting. The same versioned contract then follows every prompt,
+build-team package, verifier, repair pass, and final release.
+
+Preflight also explains its route recommendation. The selector always remains
+under human control:
+
+| Profile | Behavior |
+|---|---|
+| `Auto` | Scores the eligible routes from task type, complexity, risk, build shape, and sufficiently sampled past evaluations |
+| `Focused` | One lead owns the result and calls specialist roles only as needed |
+| `Council` | Convenes the complete configured panel for independent takes and synthesis |
+| `Best-of-all` | Every enabled model attempts one complete single-artifact candidate; runnable candidates are validated, judged blindly, and the strongest is selected |
+| `Planned build` | Plans owned packages, runs independent packages in parallel when decomposition permits, then verifies one final-batch release |
+
+An explicit profile is never overridden by adaptive routing. Auto-routing
+stores its candidate scores, filters, reason, policy version, and historical
+evidence on the session or goal so the decision remains inspectable.
+
+Every session detail view also contains an **Artifact Workbench**. Candidate,
+verified, and delivered files are listed with hashes, preview and download
+controls, and their latest approval diff. Text is bounded, raster images are
+served directly, and generated HTML runs only inside a sandboxed iframe with a
+restrictive content-security policy.
+
+While a run is active, safe steering controls can add a durable constraint,
+change the focus, increase bounded calls/rounds/time, or request composition
+after the current step. One-shot commands are claimed atomically by the worker;
+the API never edits a live in-memory session from another thread. Completed
+runs can be rated, copied into the composer, or saved as portable playbooks.
+Playbooks preserve intent and contract but remove machine-specific source and
+delivery roots, approvals, leases, artifacts, and attachment bodies.
+
 For file-producing code, content, design, and explicit revision tasks, prose is
 never accepted as proof of completion. Success requires an executed file write,
 edit, or delivery action followed by artifact verification. If the owner fails
@@ -129,7 +167,8 @@ quality verdict.
 
 ## How an ordinary task works
 
-An ordinary task uses the council as a panel:
+An ordinary task uses either a focused lead or, with the Council profile, the
+configured council as a panel:
 
 ```mermaid
 flowchart TD
@@ -147,8 +186,9 @@ flowchart TD
 
 1. The coordinator classifies the request and captures its source, output, and
    delivery context.
-2. Every configured and available panel seat is called. There is no automatic
-   four-seat cap and no latency-based benching.
+2. A focused run calls the lead and pulls specialist roles on demand. A Council
+   run calls every configured and available panel seat; there is no automatic
+   four-seat cap or latency-based benching.
 3. Seats work independently so the first answer does not anchor the others.
    Discovery requests such as file reads, project searches, directory listings,
    and web lookups are resolved through the governed skill layer.
@@ -167,10 +207,11 @@ flowchart TD
 9. The chosen output remains in a council-controlled space until its governed
    delivery action is approved.
 
-The panel roster is product intent, not a speed setting. Performance work is
-therefore concentrated in concurrency, early stopping, reduced serial model
-passes, and deterministic summaries. If a smaller panel is desired, disable
-the unwanted seats in Settings before starting the run.
+When Council is selected, the panel roster is product intent, not a speed
+setting. Performance work is therefore concentrated in concurrency, early
+stopping, reduced serial model passes, and deterministic summaries. Choose
+Focused for lead-driven work, or disable unwanted seats in Settings to change
+the complete Council roster.
 
 Ordinary deliberation proceeds automatically in bounded round blocks. If the
 lead wants more rounds after the configured consent interval, the app asks
@@ -527,25 +568,29 @@ status pills (see `NEXT-LEVEL.md` for the design rationale):
   outages / interrupted / failed.
 - **Output tail** — while a streaming seat is authoring, the session view
   shows the last few hundred characters the model is literally writing.
+- **Long-call check-in** — after five minutes, the dashboard asks whether to
+  keep waiting, stop only that model, or cancel the run. This covers local CLI
+  seats, OpenRouter seats, and goal planning whether they are streaming or
+  still waiting for first output. Keeping waiting does not restart the call.
 
 ## Timeouts, failures, and recovery
 
-The per-seat timeout shown in Settings is a routine/non-code guardrail and does
-not cap any session classified as code. Code-authoring and package-recovery
-calls have no coordinator wall-clock deadline by default: a productive model is
-allowed to finish. Operators can opt into author/package deadlines with the
-environment variables below. Frontier seats in coding sessions stay unlimited
-at lead, judge, codifier, repair, and release-review stages too; stage limits
-still apply to non-frontier seats. OpenRouter closes a request after 180 seconds
-with no answer or reasoning tokens; transport comments and keep-alives do not
-count as progress. Registered HTTP connections and CLI processes also stop
-immediately when the user cancels the session or goal.
+Model calls have no coordinator wall-clock deadline by default: elapsed time is
+not evidence of failure. This covers planning, local CLI seats, OpenRouter,
+authors, reviewers, judges, summarizers, repair passes, and release verification.
+At the configurable check-in interval, the dashboard offers **Keep waiting**,
+**Stop this model**, or **Cancel run/goal**. Keeping waiting snoozes the next
+check-in without restarting the call; stopping one model leaves healthy sibling
+calls alone. Installations that require compliance deadlines can opt in with
+the environment variables below. Registered HTTP connections and CLI processes
+still stop immediately when the operator asks.
 
 Gang of 8 handles failures as follows:
 
 - an unavailable local Claude or Codex login is detected before a CLI-backed
   ordinary run and recorded as degraded council health;
-- an ordinary non-frontier seat that hits a hard timeout is recorded as dropped;
+- an explicitly configured hard deadline is reported as installation policy,
+  never inferred merely from elapsed time;
 - outside build-team packages, a frontier tournament author returning a stub or
   transient error is re-called as the same implementation owner; a missing or
   non-runnable required frontier candidate stops delivery instead of degrading
@@ -560,8 +605,8 @@ Gang of 8 handles failures as follows:
 - a completed protocol/path miss can receive one focused exact-path correction;
   no assignment or timeout decision uses guessed file byte or token counts;
 - deterministic assembly spends only its one compact-template call;
-- streaming OpenRouter calls persist output-backed progress timestamps and
-  distinguish productive generation from a silent/stalled request;
+- streaming calls persist output-backed progress timestamps and distinguish
+  productive generation from a call still waiting for output;
 - bounded artifact and test repair loops re-run verification after changes,
   stay on the exact path, and return package code to its owner;
 - exhausted recovery does not report success;
@@ -594,8 +639,8 @@ failures, optional deadline, package wall time, and aggregate elapsed time acros
 successful and failed model attempts. Streaming calls
 report output characters and whether they are
 waiting for first output; calls show either their hard deadline or "no hard
-deadline", and streaming
-providers also show the independent no-output limit. The goal card exposes the
+deadline", and streaming providers show an independent no-output limit only
+when the installation explicitly configures one. The goal card exposes the
 `draining` state, aggregates approval/input blockers, and selects the actionable
 session, so a cancelled goal cannot continue to look like an active
 deliberation and a release approval is not hidden behind an arbitrary package.
@@ -651,6 +696,7 @@ request named actions, which Gang of 8 validates and executes.
 | `read_file` | Read from an allowed space | No approval |
 | `search_project` | Search names and file contents | No approval |
 | `list_dir` | List an allowed directory | No approval |
+| `git_snapshot` | Inspect branch, HEAD, upstream drift, and bounded working-tree status without fetching or mutating Git | No approval |
 | `web_search`, `web_fetch` | Retrieve current public information | No approval |
 | `write_file` | Write a file in a council space | No approval |
 | `edit_file` | Replace a unique snippet in a council-space file | No approval |
@@ -663,6 +709,9 @@ An ordinary session can grant a standing approval for a category with
 `approve_all`, avoiding repeated approvals of the same category in that
 session. Build-team goals do not rely on standing per-file promotion approval;
 they suppress intermediate promotions and create one `promote_batch` action.
+The live, reader-safe v1 catalogue is available at `GET /capabilities`.
+Dispatch revalidates roles, declared inputs, permitted spaces, and the trusted
+handler, including when resuming older persisted sessions.
 
 ## Installation
 
@@ -747,7 +796,7 @@ explicitly select `cli`.
    missing local CLI you intend to use.
 3. Add an OpenRouter key and enable the four optional API seats if you want the
    full seven-model council.
-4. Review model pins, role assignments, and per-seat timeouts.
+4. Review model pins and role assignments.
 5. Register an active workspace if you want new tasks/goals to use a default
    project folder.
 6. Start with an ordinary question to verify the council, then use `/goal` for
@@ -812,17 +861,26 @@ running.
 |---|---|
 | `GET /health` | Process health, version, and active backend |
 | `GET /diagnostics` | Redacted runtime and seat diagnostics |
-| `POST /tasks` | Submit a task; substantial unattached build briefs may return an auto-routed goal (`kind: goal`, `auto_routed: true`) |
+| `POST /tasks/preview` | Infer an editable Outcome Contract and explain the route before any model call |
+| `POST /tasks` | Submit a reviewed contract with `auto`, `focused`, `council`, or `build_team`; response `kind` is `session` or `goal` |
 | `POST /uploads` | Store a base64 attachment and return its upload ID |
 | `GET /sessions` | List sessions |
 | `GET /sessions/{id}` | Full persisted session, health, and run summary |
 | `GET /sessions/{id}/timeline` | Readable event timeline |
+| `POST /sessions/{id}/clone` | Return a clean editable template or start a fresh independent run |
+| `GET /sessions/{id}/artifacts` | Candidate/verified/delivered artifact manifest |
+| `GET /sessions/{id}/artifacts/{artifact_id}/preview` | Bounded safe preview |
+| `GET /sessions/{id}/artifacts/{artifact_id}/download` | Download the exact recorded artifact |
+| `GET`, `POST /sessions/{id}/commands` | Inspect or add durable steering and one-shot budget/finish commands |
+| `DELETE /sessions/{id}/commands/{command_id}` | Revoke a command that has not already applied |
+| `PUT /sessions/{id}/evaluation` | Idempotently rate a terminal outcome for future routing evidence |
 | `GET /goals/{id}/timeline` | The whole goal's ordered story plus a derived postmortem (spend per seat, attempts split into completed / seat-outage / interrupted) |
 | `GET /seats` | Live per-seat health: state, reason, since — fed by every adapter call's outcome |
 | `GET /events/stream` | Server-Sent Events: every coordinator event as it happens, rendered through the human-readable vocabulary (the dashboard's live feed) |
 | `DELETE /history` | Cancel active work and permanently delete all session, goal, transcript, and audit-log history; requires the dashboard's guarded confirmation payload |
 | `POST /sessions/{id}/followup` | Continue a completed conversation |
 | `POST /sessions/{id}/cancel` | Cancel a live session |
+| `POST /sessions/{id}/calls/{call_id}/stop` | Stop one supervised API call while sibling seats and the run continue |
 | `POST /sessions/{id}/approvals/{approval_id}` | Approve or deny an action |
 | `POST /sessions/{id}/inputs/{input_id}` | Answer or decline a question |
 | `GET /approvals` | List pending approvals |
@@ -831,6 +889,11 @@ running.
 | `GET /goals`, `GET /goals/{id}` | List or inspect goals, including aggregate blockers, active calls, attempts, and the actionable session |
 | `POST /goals/{id}/resume` | Resume a paused goal |
 | `POST /goals/{id}/cancel` | Cancel a goal |
+| `POST /goals/{id}/clone` | Copy a goal into a clean draft or freshly planned run |
+| `GET`, `POST /playbooks` | List or create portable reusable run templates |
+| `PUT`, `DELETE /playbooks/{id}` | Update or delete a playbook without affecting past runs |
+| `POST /playbooks/{id}/run` | Start a fresh run from a playbook |
+| `GET /capabilities` | Reader-safe versioned capability manifest |
 | `GET /settings`, `PUT /settings` | Read or patch persisted settings |
 | `GET /settings/seats` | Inspect seat and model availability |
 | `GET /settings/profile` | Export the current versioned, non-secret portable profile |
@@ -847,13 +910,26 @@ $body = @{
   text = "Assess the current application architecture"
   source = "automation"
   background = $true
+  execution_profile = "auto"
 } | ConvertTo-Json
+
+$preview = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8790/tasks/preview" `
+  -ContentType "application/json" -Body $body
+
+$reviewed = @{
+  text = "Assess the current application architecture"
+  source = "automation"
+  background = $true
+  execution_profile = "auto"
+  outcome_contract = $preview.outcome_contract
+} | ConvertTo-Json -Depth 8
 
 $request = @{
   Method = "Post"
   Uri = "http://127.0.0.1:8790/tasks"
   ContentType = "application/json"
-  Body = $body
+  Body = $reviewed
 }
 $run = Invoke-RestMethod @request
 
@@ -971,6 +1047,9 @@ Common environment variables:
 | `GANGOF8_SANDBOX_KEEP` | Recent inactive sandboxes retained | `25` |
 | `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
 | `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
+| `GANGOF8_MODEL_OPERATOR_CHECKIN_SECONDS` | Ask whether to keep waiting, stop one model, or cancel | `300` |
+| `GANGOF8_LEAD_TIMEOUT` | Optional lead-call hard deadline; `0` disables | `0` |
+| `GANGOF8_GOAL_PLAN_TIMEOUT` | Optional goal-planning hard deadline; `0` disables | `0` |
 | `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Optional package/panel authoring hard deadline; `0` disables | `0` |
 | `GANGOF8_PANEL_RETRY_TIMEOUT` | Optional focused recovery hard deadline; `0` disables | `0` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
@@ -979,9 +1058,11 @@ Common environment variables:
 | `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls for non-build-team frontier tournament authors | `1` |
 | `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Optional independent frontier release deadline; `0` disables | `0` |
 | `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
-| `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Independent no-model-output stall deadline, seconds | `180` |
-| `GANGOF8_CODIFIER_TIMEOUT` | Strong finishing pass timeout, seconds | `600` |
-| `GANGOF8_JUDGE_TIMEOUT` | Candidate judge timeout, seconds | `480` |
+| `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Optional no-model-output deadline; `0` leaves the decision to the operator | `0` |
+| `GANGOF8_OPENROUTER_HARD_TIMEOUT` | Optional hard deadline for streaming OpenRouter calls; `0` disables | `0` |
+| `GANGOF8_OPENROUTER_OPERATOR_CHECKIN_SECONDS` | Legacy alias for the model check-in interval | `300` |
+| `GANGOF8_CODIFIER_TIMEOUT` | Optional finishing-pass hard deadline; `0` disables | `0` |
+| `GANGOF8_JUDGE_TIMEOUT` | Optional candidate-judge hard deadline; `0` disables | `0` |
 | `GANGOF8_MAX_JUDGES` | Maximum blind judges | `3` |
 | `GANGOF8_JUDGE_FIRST_WAVE` | Judges called before early-stop evaluation | `2` |
 | `GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS` | Aggregate final-batch diff display cap | `60000` |
@@ -990,7 +1071,7 @@ Common environment variables:
 | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Gemini key; override stored key | unset |
 
 Additional tuning defaults live in `gangof8/config.py`. Prefer the Settings UI
-for routine seat, model, role, timeout, budget, and interface configuration.
+for routine seat, model, role, budget, and interface configuration.
 
 ## Data and audit trail
 
@@ -1075,12 +1156,13 @@ Build team card shows every package, owner, state, hard blocker, and non-blockin
 contract link. Several package sessions should show `running` together when the
 graph permits it.
 
-### Claude timed out after reading a file
+### A model is taking a long time after reading a file
 
-Start a new session after updating/restarting the app. New Claude/Codex author
-and release-verifier calls have no coordinator hard deadline by default. A
-positive environment override can opt into a limit. User cancellation still
-terminates an in-flight CLI process immediately.
+Start a new session after updating/restarting the app. Model calls have no
+coordinator hard deadline by default. The dashboard checks in after five
+minutes; keep waiting, stop only that model, or cancel the run. A positive
+environment override can opt into a compliance limit. Operator cancellation
+still terminates an in-flight CLI process immediately.
 
 ### I am being asked to approve every output file
 
@@ -1140,6 +1222,7 @@ change.
 cli.py                         Command-line entry point
 gangof8/main.py                FastAPI service and dashboard routes
 gangof8/service.py             Service wiring, background work, goals, recovery
+gangof8/workbench.py           Outcome contracts, playbooks, evaluations, steering, artifact manifests
 gangof8/loop.py                Deliberation, delegation, selection, repair
 gangof8/goals.py               Goal planning, persistence, package contracts
 gangof8/skills.py              Governed file/web/test/delivery operations

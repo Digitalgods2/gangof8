@@ -23,7 +23,7 @@ import httpx
 from .. import cancellation, config
 from ..cancellation import SessionCancelled
 from ..models import Role
-from ..registry import AdapterResult, AgentError
+from ..registry import AdapterResult, AgentCallStopped, AgentError
 
 _APP_TITLE = "Gang of 8"
 _REFERER = "https://github.com/Digitalgods2/gangof8"
@@ -85,15 +85,18 @@ class OpenRouterAdapter:
         # We register a closer that `cancellation.request` invokes to tear down
         # the connection; the torn read then surfaces as SessionCancelled.
         sid = cancellation.current_session()
+        call_id = cancellation.current_call()
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
+        if cancellation.is_call_requested(sid, call_id):
+            raise AgentCallStopped(f"{self.name} (OpenRouter) stopped by operator")
         t0 = time.monotonic()
         # httpx's scalar timeout is per socket operation. A provider can keep a
         # request alive forever with transport-level trickles, which is exactly
         # how the live Qwen call ran for 16 minutes under a nominal 360-second
         # limit. Reads are therefore unbounded here and the watchdog below owns
-        # an opted-in hard deadline. Streaming supplies truthful progress and
-        # the no-output watchdog still detects a genuinely stalled provider.
+        # an opted-in hard deadline. Streaming supplies truthful progress; an
+        # installation may also opt into an automatic no-output deadline.
         transport_timeout = httpx.Timeout(
             None,
             connect=30.0,
@@ -127,12 +130,16 @@ class OpenRouterAdapter:
 
         def _watch_deadline() -> None:
             deadline_s = max(1.0, float(timeout_s)) if timeout_s > 0 else None
-            stall_s = float(config.OPENROUTER_OUTPUT_STALL_TIMEOUT)
+            stall_s = (
+                float(config.OPENROUTER_OUTPUT_STALL_TIMEOUT)
+                if config.OPENROUTER_OUTPUT_STALL_TIMEOUT > 0
+                else None
+            )
             while not finished.wait(0.5):
                 with progress_lock:
                     quiet_for = time.monotonic() - last_progress[0]
                 elapsed = time.monotonic() - t0
-                if quiet_for >= stall_s:
+                if stall_s is not None and quiet_for >= stall_s:
                     deadline_reason[0] = "stalled"
                     stalled.set()
                     _abort()
@@ -267,6 +274,10 @@ class OpenRouterAdapter:
             # report it as cancellation, not a generic failure.
             if sid and cancellation.is_requested(sid):
                 raise SessionCancelled() from e
+            if cancellation.is_call_requested(sid, call_id):
+                raise AgentCallStopped(
+                    f"{self.name} (OpenRouter) stopped by operator"
+                ) from e
             if stalled.is_set():
                 raise AgentError(_deadline_error()) from e
             raise AgentError(f"{self.name} (OpenRouter) request failed: {e}") from e
@@ -275,6 +286,10 @@ class OpenRouterAdapter:
         except Exception as e:  # a cross-thread client.close may surface as RuntimeError
             if sid and cancellation.is_requested(sid):
                 raise SessionCancelled() from e
+            if cancellation.is_call_requested(sid, call_id):
+                raise AgentCallStopped(
+                    f"{self.name} (OpenRouter) stopped by operator"
+                ) from e
             if stalled.is_set():
                 raise AgentError(_deadline_error()) from e
             raise AgentError(f"{self.name} (OpenRouter) request failed: {e}") from e
@@ -285,6 +300,8 @@ class OpenRouterAdapter:
             watchdog.join(timeout=0.2)
         if sid and cancellation.is_requested(sid):
             raise SessionCancelled()
+        if cancellation.is_call_requested(sid, call_id):
+            raise AgentCallStopped(f"{self.name} (OpenRouter) stopped by operator")
         if stalled.is_set():
             raise AgentError(_deadline_error())
         if status_code != 200:

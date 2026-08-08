@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from gangof8 import config, executor, loop
+from gangof8 import config, executor, loop, skills
 from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (
@@ -20,11 +20,12 @@ from gangof8.sessions import SessionManager
 from gangof8 import validation
 
 
-def test_explicit_routine_timeout_is_a_cap_but_authoring_defaults_unlimited():
+def test_legacy_settings_timeout_is_ignored_but_explicit_policy_is_honored():
     session = Session(
         session_id="s_timeout", cli_timeouts={"claude": 320},
         task=Task(task_id="t", session_id="s_timeout", text="build"))
-    assert loop._effective_agent_timeout(session, "claude", 900) == 320
+    assert loop._effective_agent_timeout(session, "claude", None) == 0
+    assert loop._effective_agent_timeout(session, "claude", 900) == 900
     assert loop._effective_agent_timeout(session, "gemini", 360) == 360
     assert loop._effective_agent_timeout(session, "claude", config.PANEL_RETRY_TIMEOUT) == 0
     assert loop._effective_agent_timeout(
@@ -367,6 +368,28 @@ def test_in_place_revision_preserves_api_and_allows_the_intended_hash_change(tmp
 
     assert loop._verify_artifact_outputs(session, store, require_file=True)
     assert target.read_text(encoding="utf-8") == source  # no direct overwrite before approval
+
+
+def test_revision_promotion_prefers_repaired_sandbox_over_stale_staging(tmp_path):
+    store, session, target, source = _revision_fixture(tmp_path)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stale = staging / "arcade.txt"
+    stale.write_text(source, encoding="utf-8")
+    session.workspace_root = str(staging)
+    sandbox_file = executor.artifacts_dir(
+        store.data_dir, session.session_id
+    ) / "arcade.txt"
+    sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+    sandbox_file.write_text(source + "\n// corrected\n", encoding="utf-8")
+
+    selected = skills._promote_source(
+        session, store.data_dir, "arcade.txt"
+    )
+
+    assert selected == sandbox_file
+    assert selected.read_text(encoding="utf-8").endswith("// corrected\n")
+    assert target.read_text(encoding="utf-8") == source
 
 
 def test_in_place_revision_rejects_an_external_change_before_delivery(tmp_path):

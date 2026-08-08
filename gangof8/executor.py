@@ -88,10 +88,88 @@ def resolve_space(session: Session, data_dir: Path, space: str, relpath: str) ->
     return resolve_in_workspace(space_root(session, data_dir, space), relpath)
 
 
+_PERSISTED_ACTION_INPUTS: dict[str, set[str]] = {
+    # These fields predate the v1 capability manifest.  They are coordinator
+    # metadata or handler inputs already present in saved sessions, so retaining
+    # them is required for resume compatibility; no other undeclared keys pass.
+    "write_file": {"contract_filename", "package_author"},
+    "promote_batch": {"source_hashes"},
+}
+
+
+def _validated_handler(action: ProposedAction):
+    """Resolve an action through the live v1 capability contract.
+
+    Governance normally checks role/risk/approval when an action is proposed.
+    Dispatch repeats the structural checks because restored sessions and direct
+    callers must not be able to reach a stale handler with invented inputs or a
+    space the capability does not declare.
+    """
+    from .skills import HANDLERS, get_skill  # local: skills imports this module
+
+    kind = action.kind
+    if not isinstance(kind, str) or not kind:
+        raise ExecutionError(f"unsupported action kind: {kind!r}")
+    skill = get_skill(kind)
+    if skill is None or skill.name != kind:
+        raise ExecutionError(f"unsupported action kind: {kind!r}")
+    if action.role not in skill.allowed_roles:
+        role = getattr(action.role, "value", str(action.role))
+        raise ExecutionError(
+            f"role {role!r} is not allowed to execute capability {kind!r}"
+        )
+    if not isinstance(action.args, dict):
+        raise ExecutionError(f"capability {kind!r} requires an args object")
+
+    declared = set(skill.inputs)
+    compatible = set(_PERSISTED_ACTION_INPUTS.get(kind, set()))
+    # ``space`` was the original spelling accepted by _space_arg; ``target`` is
+    # the catalogue spelling.  Accept the alias only for capabilities which
+    # actually declare a target.
+    if "target" in declared:
+        compatible.add("space")
+    unknown = sorted(
+        str(key) for key in action.args
+        if not isinstance(key, str) or key not in declared | compatible
+    )
+    if unknown:
+        raise ExecutionError(
+            f"capability {kind!r} received undeclared input(s): {', '.join(unknown)}"
+        )
+
+    target = action.args.get("target")
+    legacy_space = action.args.get("space")
+    if target and legacy_space:
+        target_name = str(target).strip().lower()
+        legacy_name = str(legacy_space).strip().lower()
+        if target_name != legacy_name:
+            raise ExecutionError(
+                f"capability {kind!r} received conflicting target and space inputs"
+            )
+    selected = target or legacy_space
+    if selected:
+        if not isinstance(selected, str):
+            raise ExecutionError(
+                f"capability {kind!r} target must be a space name"
+            )
+        selected_name = selected.strip().lower()
+        if selected_name not in set(skill.permitted_spaces):
+            allowed = ", ".join(skill.permitted_spaces) or "none"
+            raise ExecutionError(
+                f"capability {kind!r} cannot target {selected_name!r} "
+                f"(permitted spaces: {allowed})"
+            )
+
+    handler = HANDLERS.get(kind)
+    if handler is None or not callable(handler):
+        raise ExecutionError(f"capability {kind!r} has no executable handler")
+    return handler
+
+
 def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Dispatch the action to its registered skill handler and return the
     handler's result string (e.g. the written path, or file contents)."""
-    from .skills import HANDLERS  # local import avoids a circular dependency
+    handler = _validated_handler(action)
 
     # Defense in depth for restored sessions and non-parser action producers.
     if action.kind in {"write_file", "edit_file", "promote", "read_file", "stage"}:
@@ -101,7 +179,4 @@ def execute(session: Session, action: ProposedAction, data_dir: Path) -> str:
             raise ExecutionError(f"unusable filename: {raw!r}")
         action.filename = clean
         action.args["filename"] = clean
-    handler = HANDLERS.get(action.kind)
-    if handler is None:
-        raise ExecutionError(f"unsupported action kind: {action.kind!r}")
     return handler(session, action, Path(data_dir))

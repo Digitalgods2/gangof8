@@ -34,11 +34,7 @@
       "codex": "gpt-5.5",
       "gemini": "gemini-3.5-flash"
     },
-    "cli_timeouts": {
-      "claude": 320,
-      "codex": 320,
-      "gemini": 320
-    },
+    "cli_timeouts": {},
     "cli_enabled": {
       "claude": true,
       "codex": true,

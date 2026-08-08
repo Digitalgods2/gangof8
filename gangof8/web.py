@@ -16,7 +16,9 @@ import ipaddress
 import re
 import socket
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlparse
+from typing import Optional
 
 from . import config
 
@@ -80,13 +82,15 @@ def web_fetch(url: str) -> str:
         "\n\n[truncated]" if len(body) > config.WEB_FETCH_MAX_CHARS else "")
 
 
-def web_search(query: str) -> str:
+def web_search(query: str, data_dir: Optional[Path] = None) -> str:
     """Answer a query with live web grounding (Gemini + Google Search), returning
     a synthesized answer plus its source URLs. The key resolves from the env OR
     the Settings-stored secrets — an env var must not be the only way in."""
     from .secrets import SecretStore
 
-    api_key = SecretStore(config.DATA_DIR).get("gemini")  # env override wins inside
+    # Tests, embedders, and alternate installations may inject a data directory.
+    # Never fall through to another installation's secret store.
+    api_key = SecretStore(data_dir or config.DATA_DIR).get("gemini")
     if not api_key:
         raise WebError("web_search needs a Gemini API key — set GEMINI_API_KEY or "
                        "add it in Settings → API keys (Google Search grounding)")

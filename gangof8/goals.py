@@ -158,6 +158,7 @@ class GoalStore:
                 goal.status = "cancelled"
                 goal.epoch += 1
                 goal.worker_lease = ""
+                goal.active_agent_calls = []
                 for package in goal.milestones:
                     if package.status == "running":
                         package.status = "cancelled"
@@ -234,6 +235,7 @@ class GoalStore:
             goal.last_error = reason
             goal.epoch += 1
             goal.worker_lease = ""
+            goal.active_agent_calls = []
             # A final-batch goal can have many package workers.  A process restart
             # kills every one of them, not only current_index, so every running
             # binding becomes retryable in the new epoch.

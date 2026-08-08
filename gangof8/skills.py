@@ -16,10 +16,12 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import config
 from .executor import (
@@ -49,6 +51,8 @@ class Skill(BaseModel):
     gates on this (allowed_roles + requires_approval + category/risk) instead
     of branching on the action kind."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     name: str
     description: str
     category: str
@@ -57,6 +61,27 @@ class Skill(BaseModel):
     allowed_roles: list[Role]
     inputs: list[str]
     blocked_by_default: bool = True
+    # Manifest metadata is deliberately additive: callers which construct a
+    # Skill using the original fields continue to work.  The conservative
+    # defaults never advertise an unclassified capability as read-only or
+    # idempotent.
+    manifest_schema: str = Field(
+        default="gangof8.capability",
+        validation_alias="schema",
+        serialization_alias="schema",
+    )
+    version: int = 1
+    provider: str = "gangof8.core"
+    invocation: str = "coordinator_action"
+    primary_input: Optional[str] = None
+    permitted_spaces: list[str] = Field(default_factory=list)
+    mutates: bool = True
+    idempotency: str = "unknown"
+
+    @property
+    def schema(self) -> str:
+        """Public spelling without shadowing BaseModel.schema at import time."""
+        return self.manifest_schema
 
 
 # A handler performs one skill's effect and returns a result string (the
@@ -336,6 +361,16 @@ def _promote_source(session: Session, data_dir: Path, raw_name: str) -> Optional
     """The council file `promote` would deliver: prefer the permanent workspace,
     fall back to the sandbox (so an ARTIFACT written to scratch can promote
     without an explicit stage)."""
+    normalized = (raw_name or "").strip().replace("\\", "/")
+    if normalized in {
+        name.replace("\\", "/") for name in session.revision_targets
+    }:
+        # A surgical revision is seeded and edited in the session sandbox. The
+        # bound workspace may be immutable goal staging from the prior release;
+        # preferring it would silently re-deliver the old bytes.
+        revised = resolve_space(session, data_dir, SANDBOX, raw_name)
+        if revised.is_file():
+            return revised
     if session.workspace_root:
         try:
             ws_root = Path(session.workspace_root).resolve()
@@ -574,6 +609,460 @@ def _promote_batch(session: Session, action: ProposedAction, data_dir: Path) -> 
     return str(dest)
 
 
+_GIT_READ_SPACES = {WORKSPACE, ESTABLISHED}
+_GIT_TIMEOUT_SECONDS = 4
+_GIT_COMMAND_OUTPUT_MAX_BYTES = 256 * 1024
+_GIT_RESULT_MAX_CHARS = 64_000
+_GIT_DISPLAY_PATHS = 30
+_GIT_DISPLAY_RECORDS = 40
+_GIT_PATH_MAX_CHARS = 240
+
+# Every switch is coordinator-owned.  In particular, neither action.args nor
+# repository config can add a command, ref, pager, external diff, or fsmonitor.
+_GIT_SAFE_OPTIONS = (
+    "--no-pager",
+    "-c", "core.pager=cat",
+    "-c", "pager.status=false",
+    "-c", "pager.diff=false",
+    "-c", "diff.external=",
+    "-c", "interactive.diffFilter=",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+)
+
+
+def _inside_root(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _git_environment() -> dict[str, str]:
+    """A non-interactive, read-only-oriented Git environment.
+
+    All inherited GIT_* variables are discarded so a caller cannot redirect
+    the index, object database, work tree, config, pager, or executable through
+    the coordinator process environment.  The fixed commands below do not
+    invoke diff, so textconv is never eligible to run; the config overrides
+    additionally disable external diff and interactive diff filters.
+    """
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    env.update({
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_PAGER": "cat",
+        "GIT_EXTERNAL_DIFF": "",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_PROTOCOL_FROM_USER": "0",
+        "PAGER": "cat",
+    })
+    return env
+
+
+def _run_fixed_git(
+    git: str,
+    cwd: Path,
+    safe_directory: Path,
+    fixed_args: tuple[str, ...],
+) -> tuple[str, bool]:
+    """Run one coordinator-authored Git query with an actual output ceiling."""
+    argv = [
+        git,
+        *_GIT_SAFE_OPTIONS,
+        "-c", f"safe.directory={safe_directory}",
+        "-C", str(cwd),
+        *fixed_args,
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            shell=False,
+            cwd=str(cwd),
+            env=_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as e:
+        raise ExecutionError(f"could not start git: {e}") from e
+
+    buffers = [bytearray(), bytearray()]
+    overflow = [False, False]
+
+    def drain(stream, index: int) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                remaining = _GIT_COMMAND_OUTPUT_MAX_BYTES - len(buffers[index])
+                if remaining > 0:
+                    buffers[index].extend(chunk[:remaining])
+                if len(chunk) > max(remaining, 0):
+                    overflow[index] = True
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(target=drain, args=(proc.stdout, 0), daemon=True),
+        threading.Thread(target=drain, args=(proc.stderr, 1), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = proc.wait(timeout=_GIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        proc.kill()
+        proc.wait()
+        for reader in readers:
+            reader.join()
+        raise ExecutionError(
+            f"git snapshot timed out after {_GIT_TIMEOUT_SECONDS}s"
+        ) from e
+    for reader in readers:
+        reader.join()
+
+    stdout = bytes(buffers[0]).decode("utf-8", errors="replace")
+    stderr = bytes(buffers[1]).decode("utf-8", errors="replace")
+    if returncode != 0:
+        detail = (stderr or stdout).strip()
+        if len(detail) > 800:
+            detail = detail[:797] + "..."
+        suffix = f": {detail}" if detail else ""
+        raise ExecutionError(f"git snapshot query failed (exit {returncode}){suffix}")
+    return stdout, overflow[0]
+
+
+def _git_target(
+    session: Session,
+    action: ProposedAction,
+    data_dir: Path,
+) -> tuple[str, Path, Path, str]:
+    """Resolve the requested directory and bind it to workspace|established."""
+    workspace_has_repo = False
+    if session.workspace_root:
+        try:
+            marker = Path(session.workspace_root).resolve(strict=True) / ".git"
+            workspace_has_repo = marker.is_dir() and not marker.is_symlink()
+        except (OSError, RuntimeError, ValueError):
+            workspace_has_repo = False
+    if workspace_has_repo:
+        default = WORKSPACE
+    elif session.established_root:
+        default = ESTABLISHED
+    elif session.workspace_root:
+        default = WORKSPACE
+    else:
+        default = WORKSPACE
+    space = _space_arg(action, default, _GIT_READ_SPACES)
+    try:
+        root = space_root(session, data_dir, space).resolve(strict=True)
+    except FileNotFoundError as e:
+        raise ExecutionError(f"{space} root does not exist") from e
+    except (OSError, RuntimeError) as e:
+        raise ExecutionError(f"could not resolve {space} root: {e}") from e
+    if not root.is_dir():
+        raise ExecutionError(f"{space} root is not a directory")
+
+    raw = (_arg(action, "path") or "").strip().replace("\\", "/")
+    if raw in {"", ".", "./"}:
+        target = root
+        relative = "."
+    else:
+        try:
+            target = resolve_in_workspace(root, raw)
+        except (OSError, RuntimeError) as e:
+            raise ExecutionError(f"could not resolve git snapshot path: {e}") from e
+        relative = target.relative_to(root).as_posix()
+    if not target.is_dir():
+        raise ExecutionError(f"git snapshot path is not a directory: {raw or '.'!r}")
+    # resolve_in_workspace already performs this check for a non-root path.  Do
+    # it again explicitly so a symlink swapped between checks fails closed.
+    try:
+        target = target.resolve(strict=True)
+    except (OSError, RuntimeError) as e:
+        raise ExecutionError(f"could not resolve git snapshot path: {e}") from e
+    if not _inside_root(target, root):
+        raise ExecutionError("git snapshot path escapes its bound space")
+    return space, root, target, relative
+
+
+def _short_git_path(path: str) -> str:
+    if len(path) <= _GIT_PATH_MAX_CHARS:
+        return path
+    return path[: _GIT_PATH_MAX_CHARS - 3] + "..."
+
+
+def _standard_git_top(target: Path, root: Path) -> Path:
+    """Find a normal in-space .git directory without following indirection."""
+    candidate = target
+    while True:
+        marker = candidate / ".git"
+        if marker.exists() or marker.is_symlink():
+            if marker.is_symlink() or marker.is_file() or not marker.is_dir():
+                raise ExecutionError(
+                    "refusing git snapshot: linked or redirected .git metadata"
+                )
+            return candidate
+        if candidate == root:
+            break
+        parent = candidate.parent
+        if not _inside_root(parent, root):
+            break
+        candidate = parent
+    raise ExecutionError(
+        "refusing git snapshot: no repository metadata exists inside the bound space"
+    )
+
+
+def _append_unique(items: list[str], path: str) -> None:
+    if path not in items:
+        items.append(path)
+
+
+def _parse_porcelain_v2(raw: str, command_truncated: bool) -> dict:
+    """Turn NUL-delimited porcelain-v2 into JSON-safe summary data."""
+    records = raw.split("\0")
+    # A capped command may end halfway through a pathname or record.  Never
+    # present that fragment as a real status entry.
+    if command_truncated and raw and not raw.endswith("\0"):
+        records = records[:-1]
+
+    branch: dict[str, str] = {}
+    staged: list[str] = []
+    unstaged: list[str] = []
+    untracked: list[str] = []
+    porcelain: list[dict[str, str]] = []
+    status_records = 0
+    malformed = False
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if not record:
+            continue
+        if record.startswith("# "):
+            key_value = record[2:].split(" ", 1)
+            branch[key_value[0]] = key_value[1] if len(key_value) == 2 else ""
+            continue
+
+        kind = record[:1]
+        xy = ""
+        path = ""
+        original = ""
+        if kind == "1":
+            fields = record.split(" ", 8)
+            if len(fields) != 9:
+                malformed = True
+                continue
+            xy, path = fields[1], fields[8]
+        elif kind == "2":
+            fields = record.split(" ", 9)
+            if len(fields) != 10 or i >= len(records):
+                malformed = True
+                continue
+            xy, path = fields[1], fields[9]
+            original = records[i]
+            i += 1
+        elif kind == "u":
+            fields = record.split(" ", 10)
+            if len(fields) != 11:
+                malformed = True
+                continue
+            xy, path = fields[1], fields[10]
+        elif kind == "?":
+            path = record[2:] if record.startswith("? ") else ""
+            if not path:
+                malformed = True
+                continue
+            _append_unique(untracked, path)
+        elif kind == "!":
+            continue
+        else:
+            malformed = True
+            continue
+
+        if kind in {"1", "2", "u"}:
+            if kind == "u" or (xy and xy[0] != "."):
+                _append_unique(staged, path)
+            if kind == "u" or (len(xy) > 1 and xy[1] != "."):
+                _append_unique(unstaged, path)
+
+        status_records += 1
+        if len(porcelain) < _GIT_DISPLAY_RECORDS:
+            item = {"kind": kind, "path": _short_git_path(path)}
+            if xy:
+                item["xy"] = xy
+            if original:
+                item["original_path"] = _short_git_path(original)
+            porcelain.append(item)
+
+    ahead: Optional[int] = None
+    behind: Optional[int] = None
+    for item in branch.get("branch.ab", "").split():
+        try:
+            if item.startswith("+"):
+                ahead = int(item[1:])
+            elif item.startswith("-"):
+                behind = int(item[1:])
+        except ValueError:
+            malformed = True
+
+    def group(paths: list[str]) -> dict:
+        return {
+            "count": len(paths),
+            "paths": [_short_git_path(path) for path in paths[:_GIT_DISPLAY_PATHS]],
+            "paths_truncated": len(paths) > _GIT_DISPLAY_PATHS or command_truncated,
+        }
+
+    oid = branch.get("branch.oid")
+    if oid == "(initial)":
+        oid = None
+    head = branch.get("branch.head")
+    if head == "(detached)":
+        head = "detached"
+    return {
+        "branch": head,
+        "head": oid,
+        "upstream": branch.get("branch.upstream"),
+        "ahead": ahead,
+        "behind": behind,
+        "status": {
+            "format": "porcelain-v2",
+            "counts_exact": not command_truncated and not malformed,
+            "command_output_truncated": command_truncated,
+            "staged": group(staged),
+            "unstaged": group(unstaged),
+            "untracked": group(untracked),
+            "records": porcelain,
+            "records_truncated": (
+                status_records > len(porcelain)
+                or command_truncated
+            ),
+        },
+    }
+
+
+def _git_snapshot(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Return a bounded, read-only snapshot of a repository in a bound space.
+
+    The only accepted action inputs select workspace|established and an
+    optional contained directory.  Git subcommands, flags, and refs are fixed
+    here; there is no network operation and no model-supplied argv.
+    """
+    git = shutil.which("git")
+    if not git:
+        raise ExecutionError("git is not available on PATH")
+    space, root, target, relative = _git_target(session, action, data_dir)
+    expected_top = _standard_git_top(target, root)
+
+    metadata, metadata_truncated = _run_fixed_git(
+        git,
+        target,
+        expected_top,
+        (
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ),
+    )
+    if metadata_truncated:
+        raise ExecutionError("git repository metadata exceeded the safe output limit")
+    lines = [line.strip() for line in metadata.splitlines() if line.strip()]
+    if len(lines) != 3:
+        raise ExecutionError("git returned an unexpected repository metadata shape")
+    try:
+        top = Path(lines[0]).resolve(strict=True)
+        git_dir_raw = Path(lines[1])
+        git_dir = git_dir_raw.resolve(strict=True)
+        common_dir = Path(lines[2]).resolve(strict=True)
+    except (OSError, RuntimeError) as e:
+        raise ExecutionError(f"could not validate git repository metadata: {e}") from e
+
+    if not _inside_root(top, root):
+        raise ExecutionError(
+            "refusing git snapshot: repository top-level is outside the bound space"
+        )
+    if top != expected_top:
+        raise ExecutionError(
+            "refusing git snapshot: discovered repository does not match contained metadata"
+        )
+    if not _inside_root(git_dir, root) or not _inside_root(common_dir, root):
+        raise ExecutionError(
+            "refusing git snapshot: git metadata is outside the bound space"
+        )
+    expected_git_dir = top / ".git"
+    # A .git file denotes a linked worktree/submodule; a symlink can redirect
+    # after containment validation.  This first version intentionally refuses
+    # both instead of following indirection into a shared repository.
+    if (expected_git_dir.is_symlink() or expected_git_dir.is_file()
+            or not expected_git_dir.is_dir()):
+        raise ExecutionError(
+            "refusing git snapshot: linked, redirected, or missing .git metadata"
+        )
+    expected_resolved = expected_git_dir.resolve(strict=True)
+    if git_dir != expected_resolved or common_dir != git_dir:
+        raise ExecutionError(
+            "refusing git snapshot: linked or shared git metadata is not supported"
+        )
+    alternates = git_dir / "objects" / "info" / "alternates"
+    if alternates.exists():
+        raise ExecutionError(
+            "refusing git snapshot: an alternate object database is configured"
+        )
+    for metadata_name in (
+        "HEAD", "config", "index", "objects", "refs", "logs", "packed-refs",
+    ):
+        if (git_dir / metadata_name).is_symlink():
+            raise ExecutionError(
+                "refusing git snapshot: git metadata contains redirected paths"
+            )
+
+    status_raw, status_truncated = _run_fixed_git(
+        git,
+        top,
+        top,
+        (
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ),
+    )
+    parsed = _parse_porcelain_v2(status_raw, status_truncated)
+    repository = "." if top == root else top.relative_to(root).as_posix()
+    payload = {
+        "schema": "gangof8.git-snapshot",
+        "version": 1,
+        "read_only": True,
+        "space": space,
+        "path": relative,
+        "repository": repository,
+        **parsed,
+    }
+    result = json.dumps(payload, ensure_ascii=False, indent=2)
+    if len(result) > _GIT_RESULT_MAX_CHARS:
+        # Keep valid JSON if exceptionally long path names fill the display
+        # budget. Counts remain available even when examples are omitted.
+        for key in ("staged", "unstaged", "untracked"):
+            payload["status"][key]["paths"] = []
+            payload["status"][key]["paths_truncated"] = True
+        payload["status"]["records"] = []
+        payload["status"]["records_truncated"] = True
+        result = json.dumps(payload, ensure_ascii=False, indent=2)
+    return result
+
+
 def _web_search(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Answer a query with live web grounding (the coordinator does the search)."""
     from . import web
@@ -584,7 +1073,7 @@ def _web_search(session: Session, action: ProposedAction, data_dir: Path) -> str
     if not query:
         raise ExecutionError("web_search requires a non-empty query")
     try:
-        return web.web_search(query)
+        return web.web_search(query, data_dir=data_dir)
     except web.WebError as e:
         raise ExecutionError(str(e)) from e
 
@@ -737,6 +1226,10 @@ SKILLS: dict[str, Skill] = {
         # lead/implementer + a human approval.
         allowed_roles=list(Role),
         inputs=["filename", "content", "target"],
+        primary_input="filename",
+        permitted_spaces=[SANDBOX, WORKSPACE],
+        mutates=True,
+        idempotency="idempotent_for_same_input",
     ),
     "read_file": Skill(
         name="read_file",
@@ -746,6 +1239,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["filename", "target"],
+        primary_input="filename",
+        permitted_spaces=[SANDBOX, WORKSPACE, ESTABLISHED],
+        mutates=False,
+        idempotency="read_only",
     ),
     "search_project": Skill(
         name="search_project",
@@ -755,6 +1252,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["query", "target"],
+        primary_input="query",
+        permitted_spaces=[SANDBOX, WORKSPACE, ESTABLISHED],
+        mutates=False,
+        idempotency="read_only",
     ),
     "list_dir": Skill(
         name="list_dir",
@@ -765,6 +1266,24 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # discovery is free for every seat (incl. panelists)
         inputs=["path", "target"],
+        primary_input="path",
+        permitted_spaces=[SANDBOX, WORKSPACE, ESTABLISHED],
+        mutates=False,
+        idempotency="read_only",
+    ),
+    "git_snapshot": Skill(
+        name="git_snapshot",
+        description="Inspect branch, HEAD, upstream divergence, and working-tree "
+                    "status for a contained Git repository without mutating it.",
+        category="read",
+        risk=Risk.low,
+        requires_approval=False,
+        allowed_roles=list(Role),
+        inputs=["path", "target"],
+        primary_input="path",
+        permitted_spaces=[WORKSPACE, ESTABLISHED],
+        mutates=False,
+        idempotency="read_only",
     ),
     "web_search": Skill(
         name="web_search",
@@ -775,6 +1294,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # governed web lookups: free for every seat
         inputs=["query"],
+        primary_input="query",
+        permitted_spaces=[],
+        mutates=False,
+        idempotency="external_snapshot",
     ),
     "web_fetch": Skill(
         name="web_fetch",
@@ -784,6 +1307,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # governed web lookups: free for every seat
         inputs=["url"],
+        primary_input="url",
+        permitted_spaces=[],
+        mutates=False,
+        idempotency="external_snapshot",
     ),
     "edit_file": Skill(
         name="edit_file",
@@ -793,6 +1320,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=list(Role),  # council-space edits: free for every seat
         inputs=["filename", "old", "new", "target"],
+        primary_input="filename",
+        permitted_spaces=[SANDBOX, WORKSPACE],
+        mutates=True,
+        idempotency="non_idempotent",
     ),
     "run_tests": Skill(
         name="run_tests",
@@ -802,6 +1333,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=True,
         allowed_roles=[Role.lead, Role.implementer, Role.critic, Role.code_generator],
         inputs=["command", "target"],
+        primary_input="command",
+        permitted_spaces=[SANDBOX, WORKSPACE],
+        mutates=True,
+        idempotency="unknown",
     ),
     "stage": Skill(
         name="stage",
@@ -811,6 +1346,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=False,
         allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename"],
+        primary_input="filename",
+        permitted_spaces=[SANDBOX, WORKSPACE],
+        mutates=True,
+        idempotency="idempotent_for_same_input",
     ),
     "promote": Skill(
         name="promote",
@@ -820,6 +1359,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=True,
         allowed_roles=[Role.lead, Role.implementer],
         inputs=["filename"],
+        primary_input="filename",
+        permitted_spaces=[SANDBOX, WORKSPACE, ESTABLISHED],
+        mutates=True,
+        idempotency="idempotent_for_same_input",
     ),
     "promote_batch": Skill(
         name="promote_batch",
@@ -829,6 +1372,10 @@ SKILLS: dict[str, Skill] = {
         requires_approval=True,
         allowed_roles=[Role.lead, Role.implementer],
         inputs=["files", "baselines"],
+        primary_input="files",
+        permitted_spaces=[WORKSPACE, ESTABLISHED],
+        mutates=True,
+        idempotency="conditional",
     ),
 }
 
@@ -837,6 +1384,7 @@ HANDLERS: dict[str, Handler] = {
     "read_file": _read_file,
     "search_project": _search_project,
     "list_dir": _list_dir,
+    "git_snapshot": _git_snapshot,
     "web_search": _web_search,
     "web_fetch": _web_fetch,
     "edit_file": _edit_file,
@@ -850,3 +1398,38 @@ HANDLERS: dict[str, Handler] = {
 def get_skill(name: str) -> Optional[Skill]:
     """Return the registered Skill, or None for an unknown name."""
     return SKILLS.get(name)
+
+
+def capability_manifest() -> dict:
+    """Return the public v1 capability catalogue as JSON-native data.
+
+    The result is detached from the live registry and contains no handler
+    references, enum instances, filesystem paths, secrets, or mutable model
+    objects.  Sorting makes API responses and saved snapshots deterministic.
+    """
+    capabilities: list[dict] = []
+    for name in sorted(SKILLS):
+        skill = SKILLS[name]
+        capabilities.append({
+            "schema": skill.schema,
+            "version": skill.version,
+            "name": skill.name,
+            "description": skill.description,
+            "provider": skill.provider,
+            "invocation": skill.invocation,
+            "category": skill.category,
+            "risk": skill.risk.value,
+            "requires_approval": skill.requires_approval,
+            "blocked_by_default": skill.blocked_by_default,
+            "allowed_roles": [role.value for role in skill.allowed_roles],
+            "inputs": list(skill.inputs),
+            "primary_input": skill.primary_input,
+            "permitted_spaces": list(skill.permitted_spaces),
+            "mutates": skill.mutates,
+            "idempotency": skill.idempotency,
+        })
+    return {
+        "schema": "gangof8.capability-catalogue",
+        "version": 1,
+        "capabilities": capabilities,
+    }

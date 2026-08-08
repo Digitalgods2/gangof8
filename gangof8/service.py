@@ -23,6 +23,7 @@ from . import (
     assembly,
     browser_acceptance,
     cancellation,
+    classifier,
     config,
     executor,
     goals,
@@ -47,10 +48,25 @@ from .loop import (
     resume_with_input,
     run_session,
 )
-from .models import (Budgets, CouncilMember, FinalAnswer, Goal, GoalMilestone, InputRequest,
-                     ProposedAction, Risk, Role, Session, SessionStatus, utcnow)
+from .models import (
+    Budgets,
+    Complexity,
+    Council,
+    CouncilMember,
+    FinalAnswer,
+    Goal,
+    GoalMilestone,
+    InputRequest,
+    ProposedAction,
+    Risk,
+    Role,
+    Session,
+    SessionStatus,
+    TaskType,
+    utcnow,
+)
 from .paths import extract_delivery_target, extract_established_root, prior_deliverable_files
-from .registry import AgentError
+from .registry import AgentCallStopped, AgentError
 from .registry import AgentRegistry
 from .runtime_diagnostics import collect_runtime_diagnostics
 from .seat_health import SeatHealth
@@ -66,6 +82,17 @@ from .settings import (
     save_settings,
 )
 from .uploads import UploadStore, attachment_context
+from .workbench import (
+    OutcomeContract,
+    Playbook,
+    RunEvaluation,
+    SteeringCommand,
+    WorkbenchStore,
+    artifact_manifest as build_artifact_manifest,
+    execution_text,
+    infer_outcome_contract,
+    resolve_artifact,
+)
 from .workspaces import WorkspaceError, WorkspaceStore
 
 
@@ -177,6 +204,12 @@ class GangOf8Service:
         self.uploads = UploadStore(self._data_dir)
         self.secrets = SecretStore(self._data_dir)
         self.goals = goals.GoalStore(self._data_dir)
+        self.workbench = WorkbenchStore(self._data_dir)
+        # The execution loop receives the LogStore rather than this service.
+        # Attach the durable workbench so every agent-call checkpoint can see
+        # operator steering without mutating a worker's in-memory Session from
+        # the API thread.
+        self.store.workbench = self.workbench
         # background workers for service mode — sessions on real backends take
         # minutes, so the dashboard submits and polls instead of blocking
         # Goal packages are intentionally independent work units.  Keep enough
@@ -520,7 +553,7 @@ class GangOf8Service:
     # make stale entries linger and break "reset to backend default". Nested
     # composer/ui are partial-friendly and still merge.
     _REPLACE_KEYS = {"role_agents", "budgets", "openrouter_enabled", "openrouter_models",
-                     "cli_models", "cli_enabled", "role_models"}
+                     "cli_models", "cli_timeouts", "cli_enabled", "role_models"}
 
     # API keys the app knows how to use. "openrouter" unlocks the OpenRouter
     # seats; "gemini" is OPTIONAL and upgrades the gemini seat (SDK path),
@@ -646,32 +679,469 @@ class GangOf8Service:
         """Apply the profile shipped with this installation."""
         return self.import_settings_profile(load_default_settings_profile())
 
+    _EXECUTION_PROFILES = {
+        "auto", "focused", "council", "best_of_n", "build_team",
+    }
+    _ROUTING_POLICY_VERSION = "outcome-router.v2"
+    _TERMINAL_ACKNOWLEDGEMENTS = {
+        "accept",
+        "accepted",
+        "acknowledged",
+        "all good",
+        "approve",
+        "approved",
+        "done",
+        "good",
+        "great",
+        "i accept",
+        "i approve",
+        "looks good",
+        "looks great",
+        "ok",
+        "okay",
+        "perfect",
+        "sounds good",
+        "thank you",
+        "thanks",
+        "that works",
+        "works for me",
+        "yes",
+        "yes thank you",
+        "yes thanks",
+    }
+
+    @classmethod
+    def _execution_profile(cls, value: Optional[str]) -> str:
+        profile = (value or "auto").strip().lower().replace("-", "_")
+        aliases = {
+            "full_council": "council",
+            "parallel_candidates": "best_of_n",
+            "best_of_all": "best_of_n",
+            "tournament": "best_of_n",
+            "team": "build_team",
+            "build": "build_team",
+        }
+        profile = aliases.get(profile, profile)
+        if profile not in cls._EXECUTION_PROFILES:
+            raise ValueError(
+                "execution_profile must be auto, focused, council, best_of_n, "
+                "or build_team"
+            )
+        return profile
+
+    @classmethod
+    def is_terminal_acknowledgement(
+        cls,
+        text: str,
+        *,
+        attachments: Optional[list[str]] = None,
+        artifact_id: Optional[str] = None,
+    ) -> bool:
+        """True when a response only accepts an already completed result.
+
+        This is intentionally exact and conservative. A phrase such as
+        ``accept, but fix the date`` must remain an actionable follow-up, while
+        punctuation and harmless whitespace around ``accept`` should not
+        convene another council.
+        """
+        if attachments or artifact_id:
+            return False
+        normalized = re.sub(
+            r"[\s.!?,;:]+",
+            " ",
+            (text or "").strip().casefold(),
+        ).strip()
+        return normalized in cls._TERMINAL_ACKNOWLEDGEMENTS
+
+    def _outcome_contract(
+        self,
+        text: str,
+        supplied: Optional[dict] = None,
+        *,
+        has_attachments: bool = False,
+    ) -> OutcomeContract:
+        """Merge an edited contract over deterministic intake inference.
+
+        The preview is editable, so callers may send either the complete object
+        they received or a small patch. Unknown keys are rejected by the
+        Pydantic contract model instead of silently becoming prompt content.
+        """
+        inferred = infer_outcome_contract(
+            text,
+            role_agents=self.role_agents,
+            has_attachments=has_attachments,
+        ).model_dump()
+        if supplied:
+            unknown = sorted(set(supplied) - set(OutcomeContract.model_fields))
+            if unknown:
+                raise ValueError(
+                    "unknown outcome contract field(s): " + ", ".join(unknown)
+                )
+            inferred.update(supplied)
+        contract = OutcomeContract.model_validate(inferred)
+        if not contract.outcome.strip():
+            raise ValueError("outcome contract requires a concrete outcome")
+        return contract
+
+    def _evaluation_routing_evidence(self, task_type: str) -> dict[str, dict]:
+        """Summarize only statistically useful, explicit user evaluations."""
+        grouped: dict[str, list[RunEvaluation]] = {}
+        try:
+            evaluations = self.workbench.list_evaluations(limit=200)
+        except Exception:  # best-effort recommendation; intake must still work
+            return {}
+        for evaluation in evaluations:
+            metadata = evaluation.metadata or {}
+            if metadata.get("task_type") != task_type:
+                continue
+            strategy = str(metadata.get("strategy") or "").strip()
+            if strategy not in {
+                "focused", "council", "best_of_n", "build_team",
+            }:
+                continue
+            grouped.setdefault(strategy, []).append(evaluation)
+        evidence: dict[str, dict] = {}
+        for strategy, rows in grouped.items():
+            if len(rows) < 3:
+                continue
+            positive = 0
+            ratings: list[int] = []
+            for row in rows:
+                verdict = (row.verdict or "").strip().lower()
+                row_positive = verdict in {
+                    "success", "satisfied", "accepted", "useful"
+                }
+                if row.rating is not None:
+                    ratings.append(int(row.rating))
+                    if int(row.rating) >= 4 and verdict not in {
+                        "failed", "rejected", "unsatisfied"
+                    }:
+                        row_positive = True
+                if row_positive:
+                    positive += 1
+            success_rate = positive / len(rows)
+            average_rating = (
+                round(sum(ratings) / len(ratings), 2) if ratings else None
+            )
+            evidence[strategy] = {
+                "sample_size": len(rows),
+                "success_rate": round(success_rate, 3),
+                "average_rating": average_rating,
+                "score_adjustment": round((success_rate - 0.5) * 20, 2),
+            }
+        return evidence
+
+    def _routing_decision(
+        self,
+        text: str,
+        contract: OutcomeContract,
+        execution_profile: str,
+        *,
+        has_attachments: bool,
+    ) -> dict:
+        profile = self._execution_profile(execution_profile)
+        classification = classifier.classify(text, self.role_agents)
+        substantial_build = goals.should_auto_route(
+            text, has_attachments=has_attachments
+        )
+        candidates = {
+            "focused": {
+                "route": "focused",
+                "eligible": True,
+                "score": 55.0,
+                "rationale": [
+                    "one lead with specialists pulled in only when needed"
+                ],
+            },
+            "council": {
+                "route": "council",
+                "eligible": True,
+                "score": 48.0,
+                "rationale": [
+                    "independent model perspectives and explicit synthesis"
+                ],
+            },
+            "best_of_n": {
+                "route": "best_of_n",
+                "eligible": bool(classification.produces_output),
+                "score": 32.0,
+                "rationale": [
+                    "every enabled model attempts one complete candidate; "
+                    "runnable candidates are compared blindly"
+                ],
+            },
+            "build_team": {
+                "route": "build_team",
+                "eligible": bool(
+                    classification.produces_output and not has_attachments
+                ),
+                "score": 20.0,
+                "rationale": [
+                    "owned parallel packages with one verified final release"
+                ],
+            },
+        }
+        if classification.complexity.value == "trivial":
+            candidates["focused"]["score"] += 30
+            candidates["focused"]["rationale"].append(
+                "the request is compact enough for a lean path"
+            )
+        elif classification.complexity.value == "complex":
+            candidates["council"]["score"] += 24
+            candidates["council"]["rationale"].append(
+                "complexity benefits from independent challenge"
+            )
+        else:
+            candidates["focused"]["score"] += 8
+            candidates["council"]["score"] += 8
+        if classification.risk.value in {"medium", "high"}:
+            candidates["council"]["score"] += 12
+            candidates["council"]["rationale"].append(
+                "risk benefits from adversarial review"
+            )
+        if substantial_build:
+            candidates["build_team"]["score"] += 78
+            candidates["build_team"]["rationale"].append(
+                "the brief spans a substantial multi-surface build"
+            )
+        if has_attachments:
+            candidates["build_team"]["rationale"].append(
+                "attached source stays in a single contract-aware session"
+            )
+
+        evidence = self._evaluation_routing_evidence(
+            classification.task_type.value
+        )
+        for route, historical in evidence.items():
+            candidates[route]["score"] += historical["score_adjustment"]
+            candidates[route]["rationale"].append(
+                f"{historical['sample_size']} comparable rated runs informed "
+                "the recommendation"
+            )
+
+        if profile != "auto":
+            if not candidates[profile]["eligible"]:
+                raise ValueError(
+                    f"execution profile '{profile}' is not available for this task"
+                )
+            selected = profile
+            reason = "selected explicitly by the user"
+        else:
+            selected = max(
+                (
+                    item for item in candidates.values()
+                    if item["eligible"]
+                ),
+                key=lambda item: (item["score"], item["route"]),
+            )["route"]
+            reason = "; ".join(candidates[selected]["rationale"])
+        ordered_candidates = sorted(
+            candidates.values(), key=lambda item: item["score"], reverse=True
+        )
+        return {
+            "policy_version": self._ROUTING_POLICY_VERSION,
+            "requested_profile": profile,
+            "selected_route": selected,
+            "recommended_profile": selected,
+            "reason": reason,
+            "task_type": classification.task_type.value,
+            "complexity": classification.complexity.value,
+            "risk": classification.risk.value,
+            "historical_evidence": evidence,
+            "candidates": ordered_candidates,
+            "alternatives": [
+                {
+                    "route": item["route"],
+                    "eligible": item["eligible"],
+                    "score": round(item["score"], 2),
+                    "reason": "; ".join(item["rationale"]),
+                }
+                for item in ordered_candidates
+                if item["route"] != selected
+            ],
+        }
+
+    def preview_task(
+        self,
+        text: str,
+        *,
+        source: str = "api",
+        attachments: Optional[list[str]] = None,
+        outcome_contract: Optional[dict] = None,
+        execution_profile: str = "auto",
+    ) -> dict:
+        """Return the editable contract and explainable route without model calls."""
+        raw = (text or "").strip()
+        if not raw and not attachments:
+            raise ValueError("task text or an attachment is required")
+        raw = raw or "(see attached)"
+        attachment_ids = attachments or []
+        full_text = raw + attachment_context(self.uploads, attachment_ids)
+        contract = self._outcome_contract(
+            full_text,
+            outcome_contract,
+            has_attachments=bool(attachment_ids),
+        )
+        profile = self._execution_profile(execution_profile)
+        routing = self._routing_decision(
+            full_text,
+            contract,
+            profile,
+            has_attachments=bool(attachment_ids),
+        )
+        contract = contract.model_copy(
+            update={
+                "execution_profile": profile,
+                "execution_mode": routing["selected_route"],
+                "auto_routed": (
+                    profile == "auto"
+                    and routing["selected_route"] == "build_team"
+                ),
+            }
+        )
+        return {
+            "source": source,
+            "outcome_contract": contract.model_dump(),
+            "execution_profile": profile,
+            "recommended_profile": routing["selected_route"],
+            "routing_decision": routing,
+            "classification": {
+                "task_type": routing["task_type"],
+                "complexity": routing["complexity"],
+                "risk": routing["risk"],
+            },
+        }
+
+    def start_task(
+        self,
+        text: str,
+        *,
+        source: str = "api",
+        background: bool = False,
+        attachments: Optional[list[str]] = None,
+        outcome_contract: Optional[dict] = None,
+        execution_profile: str = "auto",
+        playbook_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+    ) -> tuple[str, Session | Goal]:
+        """Central intake router used by the API, clones, and playbooks."""
+        preview = self.preview_task(
+            text,
+            source=source,
+            attachments=attachments,
+            outcome_contract=outcome_contract,
+            execution_profile=execution_profile,
+        )
+        route = preview["routing_decision"]["selected_route"]
+        contract = preview["outcome_contract"]
+        if route == "build_team":
+            goal = self.create_goal(
+                text,
+                background=background,
+                outcome_contract=contract,
+                execution_profile=execution_profile,
+                playbook_id=playbook_id,
+                routing_decision=preview["routing_decision"],
+            )
+            return "goal", goal
+        runner = self.submit_background if background else self.run
+        session = runner(
+            text,
+            source=source,
+            attachments=attachments,
+            outcome_contract=contract,
+            execution_profile=execution_profile,
+            routing_decision=preview["routing_decision"],
+            playbook_id=playbook_id,
+            parent_session_id=parent_session_id,
+        )
+        return "session", session
+
     def _open(self, text: str, source: str, budgets: Optional[Budgets],
-              attachments: Optional[list[str]] = None) -> Session:
+              attachments: Optional[list[str]] = None,
+              outcome_contract: Optional[dict] = None,
+              execution_profile: str = "auto",
+              routing_decision: Optional[dict] = None,
+              playbook_id: Optional[str] = None,
+              parent_session_id: Optional[str] = None) -> Session:
         """Create a session, stamping the backend, the active workspace root
         (so file skills operate in that project; None ⇒ per-session sandbox),
         and folding any attachment text into the task the council reads."""
         if self.backend == "cli" and not self.registry.names():
             raise ValueError(
                 "no AI models are enabled; enable at least one model before starting a task")
-        full_text = (text or "") + attachment_context(self.uploads, attachments or [])
-        session = intake.receive(full_text, source, self.manager, budgets)
+        raw_text = (text or "").strip()
+        if not raw_text and attachments:
+            raw_text = "(see attached)"
+        full_text = raw_text + attachment_context(self.uploads, attachments or [])
+        contract = self._outcome_contract(
+            full_text,
+            outcome_contract,
+            has_attachments=bool(attachments),
+        )
+        profile = self._execution_profile(execution_profile)
+        routing = routing_decision or self._routing_decision(
+            full_text,
+            contract,
+            profile,
+            has_attachments=bool(attachments),
+        )
+        selected_route = routing.get("selected_route") or "focused"
+        contract_budget = None
+        if budgets is None and contract.budgets:
+            contract_budget = Budgets.model_validate(contract.budgets)
+        session = intake.receive(
+            full_text, source, self.manager, budgets or contract_budget
+        )
+        session.task.original_text = raw_text
+        session.outcome_contract = contract.model_copy(
+            update={
+                "execution_profile": profile,
+                "execution_mode": selected_route,
+            }
+        ).model_dump()
+        session.execution_profile = profile
+        session.routing_decision = dict(routing)
+        session.playbook_id = playbook_id
+        session.parent_session_id = parent_session_id
         session.backend = self.backend
-        session.panel = list(self.panel)
-        session.required_frontier_authors = [
-            seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in session.panel
-        ]
+        # Focused is lead-driven; council preserves the configured discussion
+        # panel. Best-of-all is different: its product promise is one independent
+        # candidate attempt from EVERY enabled model, even when the ordinary
+        # panel is intentionally configured as a two-seat duo.
+        if selected_route == "focused":
+            session.panel = []
+        elif selected_route == "best_of_n":
+            session.panel = self._effective_resource_roster()
+        else:
+            session.panel = list(self.panel)
+        # A blind tournament has no privileged author quorum: every enabled seat
+        # gets the same candidate contract and runnable files advance on merit.
+        session.required_frontier_authors = (
+            [] if selected_route == "best_of_n" else [
+                seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in session.panel
+            ]
+        )
         session.cli_timeouts = dict(self.settings.cli_timeouts or {})
-        session.integration_review_enabled = self.settings.integration_review_enabled
+        # Best-of-all has one explicit promise: select the strongest validated
+        # candidate. Do not turn that winner into a separate merged alternative.
+        session.integration_review_enabled = bool(
+            self.settings.integration_review_enabled
+            and selected_route != "best_of_n"
+        )
         active = self.workspaces.active()
         session.workspace_root = active.root if active else None
         # Established folder is PER TASK: interpret a path the user referenced in
         # the prompt (a file → its parent). None ⇒ the greenfield gate may ask.
-        session.established_root = extract_established_root(text or "")
+        session.established_root = (
+            contract.established_root or extract_established_root(raw_text)
+        )
         # An explicit "save it in <X>" destination (distinct from a read source
         # the task also names) — promote delivers HERE, so "read from A, save to
         # B" lands in B and never overwrites A.
-        session.delivery_root = extract_delivery_target(text or "")
+        session.delivery_root = (
+            contract.delivery_root or extract_delivery_target(raw_text)
+        )
         self._preflight_panel(session)
         # If the SOURCE folder already holds a file matching this task's deliverable
         # by title, it is a prior/existing version (not an authorized input) — seats
@@ -685,6 +1155,20 @@ class GangOf8Service:
             rec = self.uploads.get(uid)
             if rec:
                 session.attachments.append({"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
+        self.store.log_event(
+            session.session_id,
+            "outcome_contract_frozen",
+            {
+                "version": contract.version,
+                "outcome": contract.outcome[:300],
+                "profile": profile,
+                "route": selected_route,
+                "playbook_id": playbook_id,
+            },
+        )
+        self.store.log_event(
+            session.session_id, "routing_decided", session.routing_decision
+        )
         self.store.save_session(session)
         # Sweep old scratch sandboxes so they don't pile up forever. Background so
         # it never delays starting the run; the new session is already active and
@@ -742,7 +1226,7 @@ class GangOf8Service:
             raise ValueError("no model is available to enhance with")
         result = self.registry.call(agent, role,
                                     f"{AMPLIFY_PROMPT}\n\nRAW PROMPT TO AMPLIFY:\n{raw}",
-                                    timeout_s=180)
+                                    timeout_s=0)
         enhanced = _strip_fence(result.content or "")
         if not enhanced:
             raise RuntimeError("the lead model returned nothing")
@@ -762,16 +1246,40 @@ class GangOf8Service:
                 "model": result.model, "saved": saved}
 
     def run(self, text: str, source: str = "cli", budgets: Optional[Budgets] = None,
-            attachments: Optional[list[str]] = None) -> Session:
-        session = self._open(text, source, budgets, attachments)
+            attachments: Optional[list[str]] = None,
+            outcome_contract: Optional[dict] = None,
+            execution_profile: str = "auto",
+            routing_decision: Optional[dict] = None,
+            playbook_id: Optional[str] = None,
+            parent_session_id: Optional[str] = None) -> Session:
+        session = self._open(
+            text, source, budgets, attachments,
+            outcome_contract=outcome_contract,
+            execution_profile=execution_profile,
+            routing_decision=routing_decision,
+            playbook_id=playbook_id,
+            parent_session_id=parent_session_id,
+        )
         return self._run_owned(session, self._run_full, background=False)
 
     def submit_background(self, text: str, source: str = "api",
                           budgets: Optional[Budgets] = None,
-                          attachments: Optional[list[str]] = None) -> Session:
+                          attachments: Optional[list[str]] = None,
+                          outcome_contract: Optional[dict] = None,
+                          execution_profile: str = "auto",
+                          routing_decision: Optional[dict] = None,
+                          playbook_id: Optional[str] = None,
+                          parent_session_id: Optional[str] = None) -> Session:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
-        session = self._open(text, source, budgets, attachments)
+        session = self._open(
+            text, source, budgets, attachments,
+            outcome_contract=outcome_contract,
+            execution_profile=execution_profile,
+            routing_decision=routing_decision,
+            playbook_id=playbook_id,
+            parent_session_id=parent_session_id,
+        )
         self._run_owned(session, self._run_full, background=True)
         return session
 
@@ -912,11 +1420,26 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         ws = self.workspaces.get(workspace_id) if workspace_id else self.workspaces.active()
         if ws is None:
             raise WorkspaceError("no workspace to empty")
-        root = Path(ws.root)
+        root = Path(ws.root).resolve()
+        app_root = Path(__file__).resolve().parent.parent
+        data_root = self._data_dir.resolve()
+        home_root = Path.home().resolve()
+        anchor = Path(root.anchor).resolve()
+        if (
+            root in {anchor, home_root, app_root, data_root}
+            or root in app_root.parents
+            or root in data_root.parents
+            or (root / ".git").exists()
+        ):
+            raise WorkspaceError(
+                "refusing to empty a filesystem, home, application, data, or Git root"
+            )
         removed = 0
         if root.is_dir():
             for child in root.iterdir():
-                if child.is_dir():
+                if child.is_symlink():
+                    child.unlink()
+                elif child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
                 else:
                     child.unlink()
@@ -1261,6 +1784,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             active_workspace=self.workspaces.active(),
             workspace_count=len(self.workspaces.list()),
             panel=self.panel,
+            best_of_all_roster=self._effective_resource_roster(),
             role_agents=self.role_agents,
             api_key_status=self.api_key_status,
             api_key_names=self.KNOWN_API_KEYS,
@@ -1284,6 +1808,454 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def get(self, session_id: str) -> Optional[dict]:
         return self.store.load_session(session_id)
 
+    @staticmethod
+    def _record_dict(record) -> dict:
+        return record.model_dump() if hasattr(record, "model_dump") else dict(record)
+
+    @classmethod
+    def _steering_dict(cls, command) -> dict:
+        data = cls._record_dict(command)
+        if command.kind in {"constraint", "focus"}:
+            data["payload"] = {"text": command.directive}
+        elif command.kind == "increase_budget":
+            try:
+                data["payload"] = json.loads(command.directive or "{}")
+            except (json.JSONDecodeError, TypeError):
+                data["payload"] = {"agent_calls": command.amount}
+        else:
+            data["payload"] = {}
+        return data
+
+    def clone_session(
+        self, session_id: str, *, run: bool = False, background: bool = True
+    ) -> dict:
+        """Clone intent, never mutable run state, approvals, or artifact leases."""
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        text = (
+            session.task.original_text
+            or session.task.text.split(
+                "\n\nAttachments provided by the user:", 1
+            )[0].strip()
+        )
+        attachment_records = [
+            dict(item)
+            for item in session.attachments
+            if item.get("id") and self.uploads.get(str(item.get("id")))
+        ]
+        attachment_ids = [str(item["id"]) for item in attachment_records]
+        template = {
+            "text": text,
+            "execution_profile": session.execution_profile,
+            "outcome_contract": session.outcome_contract,
+            "attachments": attachment_records,
+            "source_session_id": session_id,
+        }
+        if not run:
+            return {"template": template}
+        kind, item = self.start_task(
+            text,
+            source="clone",
+            background=background,
+            attachments=attachment_ids,
+            outcome_contract=session.outcome_contract,
+            execution_profile=session.execution_profile,
+            playbook_id=session.playbook_id,
+            parent_session_id=session_id,
+        )
+        if kind == "goal":
+            payload = self.get_goal(item.goal_id) or item.model_dump()
+        else:
+            payload = {
+                "session_id": item.session_id,
+                "status": item.status.value,
+                "outcome_contract": item.outcome_contract,
+                "execution_profile": item.execution_profile,
+                "routing_decision": item.routing_decision,
+            }
+        payload["kind"] = kind
+        return payload
+
+    def artifact_manifest(self, session_id: str) -> dict:
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        return build_artifact_manifest(session)
+
+    def _artifact_item(self, session: Session, artifact_id: str) -> tuple[dict, Path]:
+        manifest = build_artifact_manifest(session)
+        item = next(
+            (
+                candidate
+                for candidate in manifest.get("artifacts", [])
+                if candidate.get("artifact_id") == artifact_id
+            ),
+            None,
+        )
+        if item is None:
+            raise KeyError(artifact_id)
+        try:
+            path = resolve_artifact(session, artifact_id)
+        except (FileNotFoundError, PermissionError, ValueError):
+            raise KeyError(artifact_id) from None
+        if not path.is_file():
+            raise KeyError(artifact_id)
+        return item, path
+
+    def preview_artifact(self, session_id: str, artifact_id: str) -> dict:
+        """Return bounded inert text/HTML, or a safe raster image path."""
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        item, path = self._artifact_item(session, artifact_id)
+        media_type = str(item.get("media_type") or "application/octet-stream")
+        kind = str(item.get("kind") or "binary")
+        if media_type in {
+            "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"
+        }:
+            return {
+                "kind": "image",
+                "media_type": media_type,
+                "file_path": str(path),
+            }
+        if media_type == "image/svg+xml":
+            # SVG is active XML rather than a passive raster image. Show its
+            # source as inert text; never hand it to an unrestricted document
+            # context as though it were PNG/JPEG.
+            kind = "code"
+        if kind not in {"text", "html", "markdown", "code", "data", "table"}:
+            return {
+                "kind": "binary",
+                "media_type": media_type,
+                "content": "",
+                "truncated": False,
+                "message": "This artifact is available for download but has no inline preview.",
+            }
+        max_bytes = 250_000
+        with path.open("rb") as handle:
+            raw = handle.read(max_bytes + 1)
+        clipped = raw[:max_bytes]
+        return {
+            "kind": kind,
+            "media_type": media_type,
+            "content": clipped.decode("utf-8", errors="replace"),
+            "truncated": len(raw) > len(clipped),
+        }
+
+    def download_artifact(self, session_id: str, artifact_id: str) -> dict:
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        item, path = self._artifact_item(session, artifact_id)
+        return {
+            "name": item.get("name") or path.name,
+            "media_type": item.get("media_type") or "application/octet-stream",
+            "file_path": str(path),
+        }
+
+    def list_steering_commands(self, session_id: str) -> list[dict]:
+        if self.manager.load(session_id) is None:
+            raise KeyError(session_id)
+        return [
+            self._steering_dict(command)
+            for command in self.workbench.list_steering(
+                session_id=session_id, include_inactive=True
+            )
+        ]
+
+    def add_steering_command(
+        self, session_id: str, kind: str, payload: Optional[dict] = None
+    ) -> dict:
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        if session.status in {
+            SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled
+        }:
+            raise ValueError("steering is only available while a session is active")
+        normalized = (kind or "").strip().lower()
+        values = payload or {}
+        if normalized in {"constraint", "focus"}:
+            directive = str(values.get("text") or "").strip()
+            if not directive:
+                raise ValueError(f"{normalized} requires non-empty text")
+            if len(directive) > 2000:
+                raise ValueError("steering text is limited to 2000 characters")
+            command = SteeringCommand(
+                session_id=session_id,
+                kind=normalized,
+                directive=directive,
+                durable=True,
+                status="active",
+            )
+        elif normalized == "finish_now":
+            command = SteeringCommand(
+                session_id=session_id,
+                kind=normalized,
+                durable=False,
+                status="pending",
+            )
+        elif normalized == "increase_budget":
+            increments = {
+                "agent_calls": max(0, min(int(values.get("agent_calls") or 0), 200)),
+                "rounds": max(0, min(int(values.get("rounds") or 0), 20)),
+                "duration_seconds": max(
+                    0, min(int(values.get("duration_seconds") or 0), 14_400)
+                ),
+            }
+            if not any(increments.values()):
+                raise ValueError("increase_budget requires a positive increment")
+            command = SteeringCommand(
+                session_id=session_id,
+                kind=normalized,
+                directive=json.dumps(increments, sort_keys=True),
+                amount=increments["agent_calls"],
+                durable=False,
+                status="pending",
+            )
+        else:
+            raise ValueError(
+                "kind must be constraint, focus, increase_budget, or finish_now"
+            )
+        saved = self.workbench.add_steering(command)
+        self.store.log_event(
+            session_id,
+            "steering_added",
+            {
+                "command_id": saved.command_id,
+                "kind": saved.kind,
+                "durable": saved.durable,
+            },
+        )
+        return self._steering_dict(saved)
+
+    def revoke_steering_command(self, session_id: str, command_id: str) -> dict:
+        command = self.workbench.get_steering(command_id)
+        if command is None or command.session_id != session_id:
+            raise KeyError(command_id)
+        revoked = self.workbench.revoke_steering(command_id)
+        if revoked is None:
+            raise KeyError(command_id)
+        if revoked.status == "applied":
+            raise ValueError("command already applied and can no longer be revoked")
+        if command.status != "revoked":
+            self.store.log_event(
+                session_id,
+                "steering_revoked",
+                {"command_id": command_id, "kind": command.kind},
+            )
+        return self._steering_dict(revoked)
+
+    def evaluate_session(
+        self,
+        session_id: str,
+        verdict: str,
+        *,
+        rating: Optional[int] = None,
+        notes: str = "",
+    ) -> dict:
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        if session.status not in {
+            SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled
+        }:
+            raise ValueError("evaluate the run after it reaches a terminal outcome")
+        normalized = (verdict or "").strip().lower().replace(" ", "_")
+        normalized = {
+            "partial": "partly_satisfied",
+            "failure": "failed",
+        }.get(normalized, normalized)
+        allowed = {
+            "success", "satisfied", "accepted", "useful",
+            "mixed", "partly_satisfied", "needs_work",
+            "failed", "rejected", "not_satisfied", "unsatisfied",
+        }
+        if normalized not in allowed:
+            raise ValueError(
+                "verdict must describe a satisfied, mixed, or unsuccessful result"
+            )
+        if rating is not None and not 1 <= int(rating) <= 5:
+            raise ValueError("rating must be between 1 and 5")
+        clean_notes = (notes or "").strip()[:4000]
+        existing = self.workbench.get_evaluation(session_id)
+        try:
+            start = datetime.fromisoformat(session.created_at)
+            end = datetime.fromisoformat(session.updated_at)
+            elapsed = max(0.0, (end - start).total_seconds())
+        except (TypeError, ValueError):
+            elapsed = session.agent_attempt_duration_ms / 1000
+        manifest = build_artifact_manifest(session)
+        promoted = any(
+            action.kind in {"promote", "promote_batch"}
+            and action.status == "executed"
+            for action in session.proposed_actions
+        )
+        negative = normalized in {
+            "failed", "rejected", "not_satisfied", "unsatisfied", "needs_work"
+        }
+        values = {
+            "session_id": session_id,
+            "verdict": normalized,
+            "rating": int(rating) if rating is not None else None,
+            "promoted": promoted,
+            "rejection_reason": clean_notes if negative else "",
+            "notes": clean_notes,
+            "elapsed_seconds": elapsed,
+            "model_calls": session.agent_call_attempts,
+            "agent_calls": session.agent_calls,
+            "artifact_ids": [
+                item.get("artifact_id")
+                for item in manifest.get("artifacts", [])
+                if item.get("artifact_id")
+            ],
+            "metadata": {
+                "task_type": (
+                    session.classification.task_type.value
+                    if session.classification else
+                    session.outcome_contract.get("task_type", "")
+                ),
+                "complexity": (
+                    session.classification.complexity.value
+                    if session.classification else
+                    session.outcome_contract.get("complexity", "")
+                ),
+                "strategy": (
+                    session.routing_decision.get("selected_route")
+                    or session.execution_profile
+                ),
+                "profile": session.execution_profile,
+                "outcome": session.outcome,
+                "playbook_id": session.playbook_id,
+            },
+        }
+        if existing is not None:
+            values.update({
+                "evaluation_id": existing.evaluation_id,
+                "created_at": existing.created_at,
+            })
+        evaluation = RunEvaluation(**values)
+        saved = self.workbench.upsert_evaluation(evaluation)
+        self.store.log_event(
+            session_id,
+            "run_evaluated",
+            {"verdict": normalized, "rating": rating},
+        )
+        return self._record_dict(saved)
+
+    def session_evaluation(self, session_id: str) -> Optional[dict]:
+        if self.manager.load(session_id) is None:
+            raise KeyError(session_id)
+        evaluation = self.workbench.get_evaluation(session_id)
+        return self._record_dict(evaluation) if evaluation is not None else None
+
+    def _playbook_contract(self, contract: Optional[dict], task_template: str) -> dict:
+        cleaned = self._outcome_contract(task_template, contract).model_dump()
+        # A reusable procedure cannot silently retain machine-specific project
+        # locations from the run that inspired it.
+        cleaned["established_root"] = None
+        cleaned["delivery_root"] = None
+        return cleaned
+
+    def save_playbook(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        task_template: str = "",
+        outcome_contract: Optional[dict] = None,
+        execution_profile: str = "auto",
+        playbook_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        existing = self.workbench.get_playbook(playbook_id) if playbook_id else None
+        if playbook_id and existing is None:
+            raise KeyError(playbook_id)
+        if session_id:
+            session = self.manager.load(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            task_template = (
+                session.task.original_text
+                or session.task.text.split(
+                    "\n\nAttachments provided by the user:", 1
+                )[0].strip()
+            )
+            outcome_contract = session.outcome_contract
+            execution_profile = session.execution_profile
+        clean_name = (name or "").strip()
+        clean_template = (task_template or "").split(
+            "\n\nAttachments provided by the user:", 1
+        )[0].strip()
+        if not clean_name:
+            raise ValueError("playbook name is required")
+        if not clean_template:
+            raise ValueError("playbook task template is required")
+        profile = self._execution_profile(execution_profile)
+        values = {
+            "name": clean_name[:120],
+            "description": (description or "").strip()[:1000],
+            "task_template": clean_template[:20_000],
+            "outcome_contract": self._playbook_contract(
+                outcome_contract, clean_template
+            ),
+            "execution_profile": profile,
+        }
+        if existing is not None:
+            values.update({
+                "playbook_id": existing.playbook_id,
+                "created_at": existing.created_at,
+            })
+        playbook = Playbook(**values)
+        saved = (
+            self.workbench.upsert_playbook(playbook)
+            if existing is not None
+            else self.workbench.create_playbook(playbook)
+        )
+        return self._record_dict(saved)
+
+    def list_playbooks(self) -> list[dict]:
+        return [
+            self._record_dict(playbook)
+            for playbook in self.workbench.list_playbooks()
+        ]
+
+    def delete_playbook(self, playbook_id: str) -> bool:
+        return bool(self.workbench.delete_playbook(playbook_id))
+
+    def run_playbook(
+        self,
+        playbook_id: str,
+        *,
+        text: Optional[str] = None,
+        background: bool = True,
+    ) -> dict:
+        playbook = self.workbench.get_playbook(playbook_id)
+        if playbook is None:
+            raise KeyError(playbook_id)
+        task_text = (text or "").strip() or playbook.task_template
+        kind, item = self.start_task(
+            task_text,
+            source="playbook",
+            background=background,
+            outcome_contract=playbook.outcome_contract,
+            execution_profile=playbook.execution_profile,
+            playbook_id=playbook_id,
+        )
+        if kind == "goal":
+            payload = self.get_goal(item.goal_id) or item.model_dump()
+        else:
+            payload = {
+                "session_id": item.session_id,
+                "status": item.status.value,
+                "outcome_contract": item.outcome_contract,
+                "execution_profile": item.execution_profile,
+                "routing_decision": item.routing_decision,
+            }
+        payload["kind"] = kind
+        return payload
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session only after revoking/cancelling any live worker."""
         session = self.manager.load(session_id)
@@ -1291,6 +2263,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 SessionStatus.done, SessionStatus.failed, SessionStatus.cancelled}:
             cancellation.request(session_id)
             self.store.revoke_worker_lease(session_id)
+        self.workbench.revoke_session_steering(session_id)
+        for command in self.workbench.list_steering(
+                session_id=session_id, include_inactive=True):
+            self.workbench.delete_steering(command.command_id)
+        self.workbench.delete_evaluation(session_id)
         return self.store.delete_session(session_id)
 
     def delete_all_history(self) -> dict[str, int]:
@@ -1309,6 +2286,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if session is not None and session.status not in terminal:
                 cancellation.request(session_id)
                 self.store.revoke_worker_lease(session_id)
+            self.workbench.revoke_session_steering(session_id)
+            for command in self.workbench.list_steering(
+                    session_id=session_id, include_inactive=True):
+                self.workbench.delete_steering(command.command_id)
+            self.workbench.delete_evaluation(session_id)
 
         goals_deleted = self.goals.remove_all()
         sessions_deleted = self.store.delete_all_sessions()
@@ -1317,11 +2299,444 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             "goals_deleted": goals_deleted,
         }
 
+    _CORRECTIVE_FOLLOWUP_RE = re.compile(
+        r"\b(?:fix|fixed|change|update|modify|adjust|correct|repair|patch|"
+        r"debug|broken|bug|wrong|mismatch|inconsistent|except|"
+        r"does(?:n't| not)|did(?:n't| not)|is(?:n't| not)|are(?:n't| not)|"
+        r"was(?:n't| not)|were(?:n't| not)|can(?:not|'t| not)|"
+        r"won(?:'t| not)|fails?|issue|problem|add|remove|replace|prefer|"
+        r"instead|should|supposed to|blurr(?:y|ed|iness)|too fast|too slow|"
+        r"not agree)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _followup_artifact_records(session: Session) -> list[dict]:
+        """Exact recorded artifacts eligible to anchor a corrective follow-up."""
+        manifest = build_artifact_manifest(session)
+        records = [
+            item for item in manifest.get("artifacts", [])
+            if item.get("state") in {"verified", "delivered"}
+            and item.get("relative_path")
+        ]
+        records.sort(
+            key=lambda item: (
+                0 if item.get("delivered") else 1,
+                str(item.get("relative_path") or "").casefold(),
+            )
+        )
+        # A final-batch release can record both staging and delivered copies of
+        # the same logical path. Bind repairs to the delivered copy (sorted
+        # first) and count that path once when deciding whether selection is
+        # ambiguous.
+        unique: dict[str, dict] = {}
+        for item in records:
+            key = str(item.get("relative_path") or "").casefold()
+            unique.setdefault(key, item)
+        return list(unique.values())
+
+    def _followup_revision_records(
+        self,
+        session: Session,
+        directive: str,
+        artifact_id: Optional[str],
+        latest_contract: OutcomeContract,
+        current_contract: OutcomeContract,
+    ) -> tuple[bool, list[dict]]:
+        """Recognize a correction and bind it to exact recorded artifact bytes.
+
+        The latest sentence is not classified in a vacuum: defect/change
+        language on a completed output is a revision even when it contains no
+        words such as "code" or "HTML". Ambiguous multi-artifact repairs fail
+        closed instead of expanding into a whole-folder council run.
+        """
+        records = self._followup_artifact_records(session)
+        has_output_context = bool(
+            records
+            or session.required_files
+            or session.release_verified_hashes
+            or session.verified_output_hashes
+        )
+        prior_output_type = current_contract.task_type in {
+            TaskType.code.value,
+            TaskType.content.value,
+            TaskType.design.value,
+        }
+        explicit_revision = (
+            latest_contract.task_type in {
+                TaskType.code.value,
+                TaskType.content.value,
+                TaskType.design.value,
+            }
+            or bool(self._CORRECTIVE_FOLLOWUP_RE.search(directive or ""))
+        )
+        corrective = bool(
+            has_output_context and (prior_output_type or session.goal_release)
+            and explicit_revision
+        )
+        if not corrective:
+            return False, []
+
+        if artifact_id:
+            try:
+                selected_path = resolve_artifact(session, artifact_id)
+            except KeyError as exc:
+                raise ValueError(
+                    "the selected artifact is no longer available on this session"
+                ) from exc
+            selected = [
+                item for item in records
+                if Path(str(item.get("path") or "")).resolve()
+                == selected_path.resolve()
+            ]
+            if not selected:
+                raise ValueError(
+                    "the selected artifact is not a verified or delivered output"
+                )
+            return True, selected
+
+        lower = (directive or "").casefold()
+        path_mentions = [
+            item for item in records
+            if "/" in str(item.get("relative_path") or "")
+            and str(item.get("relative_path") or "").casefold() in lower
+        ]
+        if len(path_mentions) == 1:
+            return True, path_mentions
+        if len(path_mentions) > 1:
+            names = ", ".join(
+                str(item.get("relative_path")) for item in path_mentions
+            )
+            raise ValueError(
+                "this correction names multiple artifacts; select one exact "
+                f"artifact for a surgical repair: {names}"
+            )
+        name_mentions = [
+            item for item in records
+            if str(item.get("name") or "").casefold() in lower
+        ]
+        if len(name_mentions) == 1:
+            return True, name_mentions
+        if len(name_mentions) > 1:
+            names = ", ".join(
+                str(item.get("relative_path")) for item in name_mentions
+            )
+            raise ValueError(
+                "that filename matches multiple artifacts; select the exact "
+                f"artifact to repair: {names}"
+            )
+        if len(records) == 1:
+            return True, records
+        # Released apps commonly include one runnable artifact plus supporting
+        # repository notes.  A defect report about "the app" should bind to
+        # that sole implementation file instead of forcing the operator to
+        # spell out index.html merely because README.md was also delivered.
+        implementation = [
+            item for item in records
+            if str(item.get("kind") or "") in {"html", "code"}
+        ]
+        auxiliary_names = {
+            "readme", "license", "licence", "changelog", "contributing",
+            "authors", "notice",
+        }
+        auxiliary = [
+            item for item in records
+            if str(item.get("kind") or "") in {"markdown", "text"}
+            and Path(str(item.get("name") or "")).stem.casefold()
+            in auxiliary_names
+        ]
+        if (
+            len(implementation) == 1
+            and len(implementation) + len(auxiliary) == len(records)
+        ):
+            return True, implementation
+        if not records:
+            raise ValueError(
+                "this looks like a correction, but the completed run has no "
+                "recorded verified artifact to revise"
+            )
+        names = ", ".join(str(item.get("relative_path")) for item in records[:8])
+        raise ValueError(
+            "this correction could apply to multiple artifacts; name the exact "
+            f"file in your response or select its artifact first: {names}"
+        )
+
+    def _followup_revision_context(
+        self,
+        session: Session,
+        directive: str,
+        artifact_id: Optional[str],
+        latest_contract: OutcomeContract,
+        current_contract: OutcomeContract,
+    ) -> tuple[Session, bool, list[dict]]:
+        """Find the nearest durable output in the conversation/goal lineage.
+
+        A failed or answer-only follow-up has no artifacts of its own.  The
+        next user correction must still revise the released bytes it was
+        discussing, while remaining a child of the latest conversational turn.
+        """
+        candidates: list[Session] = []
+        seen: set[str] = set()
+        cursor: Optional[Session] = session
+        while cursor is not None and cursor.session_id not in seen:
+            candidates.append(cursor)
+            seen.add(cursor.session_id)
+            cursor = (
+                self.manager.load(cursor.parent_session_id)
+                if cursor.parent_session_id else None
+            )
+
+        goal = self.goals.get(session.goal_id) if session.goal_id else None
+        if (
+            goal
+            and goal.release_session_id
+            and goal.release_session_id not in seen
+        ):
+            released = self.manager.load(goal.release_session_id)
+            if released is not None:
+                candidates.append(released)
+
+        output_context_seen = False
+        for candidate in candidates:
+            records = self._followup_artifact_records(candidate)
+            output_context_seen = output_context_seen or bool(
+                records
+                or candidate.required_files
+                or candidate.release_verified_hashes
+                or candidate.verified_output_hashes
+            )
+            # Do not let an unsuccessful revision with only required-file
+            # metadata shadow the actual verified release farther up-chain.
+            if not records:
+                continue
+            if artifact_id and not any(
+                item.get("artifact_id") == artifact_id for item in records
+            ):
+                continue
+            try:
+                source_contract = OutcomeContract.model_validate(
+                    candidate.outcome_contract
+                )
+            except (TypeError, ValueError):
+                source_contract = current_contract
+            corrective, selected = self._followup_revision_records(
+                candidate,
+                directive,
+                artifact_id,
+                latest_contract,
+                source_contract,
+            )
+            if corrective:
+                return candidate, True, selected
+
+        if artifact_id:
+            raise ValueError(
+                "the selected artifact is no longer available in this "
+                "conversation"
+            )
+        if (
+            output_context_seen
+            and bool(self._CORRECTIVE_FOLLOWUP_RE.search(directive or ""))
+        ):
+            raise ValueError(
+                "this looks like a correction, but the conversation has no "
+                "recorded verified artifact to revise"
+            )
+        return session, False, []
+
+    @staticmethod
+    def _merged_followup_contract(
+        current: OutcomeContract,
+        latest: OutcomeContract,
+        *,
+        corrective: bool,
+        targets: list[str],
+    ) -> OutcomeContract:
+        def merged_items(left: list[str], right: list[str]) -> list[str]:
+            return list(dict.fromkeys(
+                item for item in [*left, *right] if str(item).strip()
+            ))
+
+        amended_outcome = current.outcome
+        if latest.outcome and latest.outcome != amended_outcome:
+            amended_outcome = (
+                f"{amended_outcome}\nLatest user amendment: {latest.outcome}"
+            ).strip()
+        deliverables = merged_items(current.deliverables, latest.deliverables)
+        acceptance = merged_items(
+            current.acceptance_criteria, latest.acceptance_criteria
+        )
+        if corrective:
+            deliverables = list(dict.fromkeys([
+                *targets,
+                *deliverables,
+            ]))
+            acceptance = list(dict.fromkeys([
+                f"Apply the requested correction to {name} and preserve all "
+                "unrelated behavior."
+                for name in targets
+            ] + acceptance))
+        return current.model_copy(update={
+            "outcome": amended_outcome,
+            "deliverables": deliverables,
+            "acceptance_criteria": acceptance,
+            "constraints": merged_items(current.constraints, latest.constraints),
+            "exclusions": merged_items(current.exclusions, latest.exclusions),
+            "established_root": (
+                latest.established_root or current.established_root
+            ),
+            "delivery_root": latest.delivery_root or current.delivery_root,
+            # A terse defect report must not downgrade a code/output contract
+            # into an answer-only question.
+            "task_type": (
+                TaskType.code.value
+                if corrective
+                else latest.task_type
+            ),
+            "complexity": (
+                Complexity.standard.value
+                if corrective
+                else latest.complexity
+            ),
+            "risk": current.risk if corrective else latest.risk,
+            "execution_mode": "focused" if corrective else current.execution_mode,
+            "execution_profile": (
+                "focused" if corrective else current.execution_profile
+            ),
+            "budgets": (
+                config.budgets_for(Complexity.standard)
+                if corrective else current.budgets
+            ),
+            "has_attachments": (
+                current.has_attachments or latest.has_attachments
+            ),
+            "rationale": (
+                f"{current.rationale}; amended by a user follow-up"
+                + (
+                    "; exact-artifact corrective revision"
+                    if corrective else ""
+                )
+            ).strip("; "),
+        })
+
+    def _continue_as_child(
+        self,
+        parent: Session,
+        directive_turn: str,
+        turn_text: str,
+        attachments: list[str],
+        contract: OutcomeContract,
+        revision_records: list[dict],
+        background: bool,
+        revision_source: Optional[Session] = None,
+    ) -> Session:
+        """Open a clean child so released evidence remains immutable."""
+        corrective = bool(revision_records)
+        routing = {
+            "policy_version": "followup-router.v1",
+            "requested_profile": "focused",
+            "selected_route": "focused",
+            "recommended_profile": "focused",
+            "reason": (
+                "exact-artifact corrective follow-up"
+                if corrective else
+                "post-release conversational follow-up"
+            ),
+            "task_type": contract.task_type,
+            "complexity": contract.complexity,
+            "risk": contract.risk,
+            "candidates": [],
+            "alternatives": [],
+        }
+        child = self._open(
+            directive_turn or "(see attached)",
+            "followup",
+            None,
+            attachments=attachments,
+            outcome_contract=contract.model_dump(),
+            execution_profile="focused",
+            routing_decision=routing,
+            playbook_id=parent.playbook_id,
+            parent_session_id=parent.session_id,
+        )
+        history = list(parent.turns)
+        if not history:
+            history.append({"role": "user", "text": parent.task.text})
+            if parent.final:
+                history.append(
+                    {"role": "council", "text": parent.final.answer}
+                )
+        child.turns = [*history, {"role": "user", "text": turn_text}]
+        child.goal_id = parent.goal_id
+        child.goal_epoch = parent.goal_epoch
+        child.goal_milestone = None
+        child.goal_release = False
+        child.goal_background = False
+        child.collaboration_mode = "tournament"
+        child.delivery_mode = "immediate"
+        child.work_package_id = ""
+        child.work_package_owner = ""
+        artifact_context = (
+            revision_source if corrective and revision_source else parent
+        )
+        child.workspace_root = artifact_context.workspace_root
+        child.established_root = artifact_context.established_root
+        child.delivery_root = artifact_context.delivery_root
+        child.established_asked = artifact_context.established_asked
+        child.acceptance_commands = list(artifact_context.acceptance_commands)
+        if corrective:
+            targets: list[str] = []
+            base_hashes: dict[str, str] = {}
+            source_spaces: dict[str, str] = {}
+            for record in revision_records:
+                name = str(record.get("relative_path") or "").replace("\\", "/")
+                if not name or name in targets:
+                    continue
+                targets.append(name)
+                base_hashes[name] = str(
+                    record.get("sha256") or record.get("hash") or ""
+                )
+                source_spaces[name] = str(record.get("space") or "")
+            child.required_files = targets
+            child.revision_targets = targets
+            child.revision_base_hashes = base_hashes
+            child.revision_source_spaces = source_spaces
+            child.runtime_dependencies = []
+            child.dependency_hashes = {}
+            child.assembly_mode = ""
+            child.assembly_template = ""
+            child.assembly_result = {}
+        self.store.log_event(
+            parent.session_id,
+            "followup_child_created",
+            {
+                "child_session_id": child.session_id,
+                "corrective": corrective,
+                "targets": list(child.revision_targets),
+            },
+        )
+        self.store.log_event(
+            child.session_id,
+            "conversation_continued",
+            {
+                "parent_session_id": parent.session_id,
+                "turn": len(child.turns),
+                "corrective": corrective,
+                "targets": list(child.revision_targets),
+            },
+        )
+        self.store.save_session(child)
+        return self._run_owned(
+            child, self._run_full, background=background
+        )
+
     def continue_session(self, session_id: str, text: str, background: bool = True,
-                         attachments: Optional[list[str]] = None) -> Session:
+                         attachments: Optional[list[str]] = None,
+                         artifact_id: Optional[str] = None) -> Session:
         """Continue the conversation: the human responds to the council's
         conclusion and the council deliberates AGAIN with the full thread as
-        context — no starting over. Re-opens a settled (done) session.
+        context without starting over. Actionable responses run in a focused
+        child so the settled session remains immutable.
         Responses are multi-modal like the original task: document/PDF text is
         folded into the turn, and image attachments join session.attachments so
         vision-capable agents see them on every subsequent call."""
@@ -1332,49 +2747,88 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             raise KeyError(f"session {session_id} not found")
         if session.status != SessionStatus.done:
             raise ValueError(f"cannot continue a session in status '{session.status.value}'")
+        if self.is_terminal_acknowledgement(
+            text,
+            attachments=attachments,
+            artifact_id=artifact_id,
+        ):
+            # A completed result has nothing left to approve. Record the human
+            # signal for the audit trail, but do not mutate the conversation,
+            # reopen the contract, or inherit the prior execution strategy.
+            self.store.log_event(
+                session_id,
+                "result_acknowledged",
+                {"intent": "accept_completed_result"},
+            )
+            return session
         self._ensure_adapters(session)
         # seed turn-one history for sessions created before the conversation feature
         if not session.turns:
             session.turns.append({"role": "user", "text": session.task.text})
             if session.final:
                 session.turns.append({"role": "council", "text": session.final.answer})
-        turn_text = ((text or "").strip() or "(see attached)") \
-            + attachment_context(self.uploads, attachments or [])
-        session.turns.append({"role": "user", "text": turn_text})
-        for uid in attachments or []:
-            rec = self.uploads.get(uid)
-            if rec:
-                session.attachments.append(
-                    {"id": rec["id"], "name": rec["name"], "kind": rec["kind"]})
-        # reset per-turn deliberation state (keep turns, backend, roots, files)
-        session.rounds = []
-        session.contributions = []
-        session.disagreements = []
-        session.truth_claims = []
-        session.proposed_actions = []
-        session.approvals = []
-        session.input_requests = []
-        session.unresolved = []
-        session.tools_called = []
-        session.agent_calls = 0
-        session.successful_agent_calls = {}
-        session.final = None
-        session.stop_reason = None
-        session.current_round = 0
-        session.classification = None
-        session.risk_exceeds_boundary = False
-        session.blocked_on_missing_info = False
-        session.status = SessionStatus.received  # re-open (bypass terminal transition)
-        cancellation.clear(session_id)
-        self.store.log_event(session_id, "conversation_continued", {"turn": len(session.turns)})
-        self.store.save_session(session)
-        return self._run_owned(session, self._run_full, background=background)
+        directive_turn = (text or "").strip() or "(see attached)"
+        turn_text = directive_turn + attachment_context(
+            self.uploads, attachments or []
+        )
+        # A follow-up is an explicit human amendment to the definition of done.
+        # Preserve the original contract for auditability while folding the new
+        # outcome, checks, and boundaries into what every remaining seat sees.
+        latest_contract = self._outcome_contract(
+            directive_turn, has_attachments=bool(attachments)
+        )
+        try:
+            current_contract = OutcomeContract.model_validate(
+                session.outcome_contract
+            )
+        except (TypeError, ValueError):
+            current_contract = self._outcome_contract(session.task.text)
+
+        revision_source, corrective, revision_records = (
+            self._followup_revision_context(
+                session,
+                directive_turn,
+                artifact_id,
+                latest_contract,
+                current_contract,
+            )
+        )
+        targets = [
+            str(item.get("relative_path") or "").replace("\\", "/")
+            for item in revision_records
+            if item.get("relative_path")
+        ]
+        amended_contract = self._merged_followup_contract(
+            current_contract,
+            latest_contract,
+            corrective=corrective,
+            targets=targets,
+        )
+        # A completed result is immutable audit evidence. Every actionable
+        # response continues in a focused child: cancelling or failing that
+        # follow-up can never erase the result it was responding to, and a
+        # question cannot accidentally inherit a prior Best-of-all fan-out.
+        return self._continue_as_child(
+            session,
+            directive_turn,
+            turn_text,
+            list(attachments or []),
+            amended_contract,
+            revision_records,
+            background,
+            revision_source=revision_source,
+        )
 
     # ---- Goals (/goal): long-horizon objectives, milestone by milestone -------
 
     def create_goal(
         self, text: str, background: bool = False,
         participation_mode: Optional[str] = None,
+        outcome_contract: Optional[dict] = None,
+        execution_profile: str = "build_team",
+        playbook_id: Optional[str] = None,
+        parent_goal_id: Optional[str] = None,
+        routing_decision: Optional[dict] = None,
     ) -> Goal:
         """Open a goal: the architect decomposes it into milestone-sized
         deliverables, repairing a rejected contract when necessary, then the
@@ -1386,8 +2840,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             raw = raw[5:].strip()
         if not raw:
             raise ValueError("goal text is empty")
-        established = extract_established_root(raw)
-        delivery = extract_delivery_target(raw)
+        profile = self._execution_profile(execution_profile)
+        contract = self._outcome_contract(raw, outcome_contract)
+        routing = routing_decision or self._routing_decision(
+            raw, contract, "build_team", has_attachments=False
+        )
+        contract = contract.model_copy(
+            update={
+                "execution_profile": profile,
+                "execution_mode": "build_team",
+                "auto_routed": profile == "auto",
+            }
+        )
+        established = contract.established_root or extract_established_root(raw)
+        delivery = contract.delivery_root or extract_delivery_target(raw)
         active = self.workspaces.active()
         if not established and active:
             established = active.root
@@ -1398,6 +2864,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             )
         goal = Goal(
             text=raw,
+            outcome_contract=contract.model_dump(),
+            execution_profile=profile,
+            routing_decision=routing,
+            playbook_id=playbook_id,
+            parent_goal_id=parent_goal_id,
             collaboration_mode="build_team",
             delivery_mode="final_batch",
             background=background,
@@ -1410,11 +2881,43 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         goal.staging_root = str((self._data_dir / "goal-workspaces" / goal.goal_id / "stage").resolve())
         self.goals.save(goal)
         self.store.log_event("-", "goal_created",
-                             {"goal_id": goal.goal_id, "chars": len(raw)})
+                             {"goal_id": goal.goal_id, "chars": len(raw),
+                              "profile": profile, "route": "build_team",
+                              "playbook_id": playbook_id})
         if background:
             self._pool.submit(self._plan_and_start_safely, goal.goal_id)
             return goal
         return self._plan_and_start(goal.goal_id)
+
+    def clone_goal(
+        self, goal_id: str, *, run: bool = False, background: bool = True
+    ) -> dict:
+        """Copy a goal's durable intent into a fresh, independently planned run."""
+        goal = self.goals.get(goal_id)
+        if goal is None:
+            raise KeyError(goal_id)
+        template = {
+            "text": goal.text,
+            "execution_profile": goal.execution_profile,
+            "outcome_contract": goal.outcome_contract,
+            "participation_mode": goal.participation_mode,
+            "source_goal_id": goal_id,
+        }
+        if not run:
+            return {"template": template}
+        cloned = self.create_goal(
+            goal.text,
+            background=background,
+            participation_mode=goal.participation_mode,
+            outcome_contract=goal.outcome_contract,
+            execution_profile=goal.execution_profile,
+            playbook_id=goal.playbook_id,
+            parent_goal_id=goal_id,
+            routing_decision=goal.routing_decision,
+        )
+        payload = self.get_goal(cloned.goal_id) or cloned.model_dump()
+        payload["kind"] = "goal"
+        return payload
 
     def _plan_and_start_safely(self, goal_id: str) -> None:
         """Worker guard — a goal must never die silently in a thread."""
@@ -1838,6 +3341,125 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
     # ---- Goal v2: transactional planner/advance ownership -------------------
 
+    def _goal_agent_call(
+        self,
+        goal: Goal,
+        token: str,
+        agent: str,
+        role: Role,
+        prompt: str,
+        timeout_s: int = 0,
+    ):
+        """Run and persist a supervised planning call before a Session exists."""
+        adapter = self.registry.get(agent)
+        streaming = bool(getattr(adapter, "streams_progress", False))
+        hard_timeout = (
+            config.OPENROUTER_HARD_TIMEOUT if streaming else max(0, int(timeout_s))
+        )
+        call_id = f"goalcall_{goal.goal_id}_{time.monotonic_ns()}"
+        started_at = utcnow()
+        activity = {
+            "call_id": call_id,
+            "agent": agent,
+            "role": role.value,
+            "state": "running",
+            "started_at": started_at,
+            "last_progress_at": started_at,
+            "progress_chars": 0,
+            "progress_detail": "planning request dispatched",
+            "timeout_s": hard_timeout,
+            "timeout_policy": (
+                "hard_deadline" if hard_timeout > 0 else "operator_supervised"
+            ),
+            "stall_timeout_s": (
+                config.OPENROUTER_OUTPUT_STALL_TIMEOUT if streaming else None
+            ),
+            "operator_checkin_s": (
+                config.MODEL_OPERATOR_CHECKIN_SECONDS
+                if hard_timeout == 0 else None
+            ),
+            "operator_stoppable": True,
+        }
+        goal.active_agent_calls = [activity]
+        if not self.goals.save_owned(goal, token):
+            raise SessionCancelled()
+        self.store.log_event(
+            "-",
+            "goal_agent_call_started",
+            {"goal_id": goal.goal_id, **activity},
+        )
+        last_save = [0.0]
+        last_chars = [0]
+
+        def _record_progress(chars: int, detail: str, tail: str = "") -> None:
+            now = time.monotonic()
+            if chars <= last_chars[0] and detail == "output":
+                return
+            last_chars[0] = max(last_chars[0], int(chars))
+            current = next(
+                (
+                    item for item in goal.active_agent_calls
+                    if item.get("call_id") == call_id
+                ),
+                None,
+            )
+            if current is None:
+                return
+            current["last_progress_at"] = utcnow()
+            current["progress_chars"] = last_chars[0]
+            current["progress_detail"] = str(detail or "output")[:80]
+            if tail:
+                current["tail"] = str(tail)[-400:]
+            if now - last_save[0] >= 2.0:
+                last_save[0] = now
+                self.goals.save_owned(goal, token)
+
+        cancellation.set_current_session(goal.goal_id)
+        cancellation.set_current_call(call_id)
+        cancellation.set_call_kind("planning")
+        cancellation.register_progress(goal.goal_id, call_id, _record_progress)
+        try:
+            result = self.registry.call(
+                agent, role, prompt, timeout_s=hard_timeout
+            )
+            if (
+                cancellation.is_requested(goal.goal_id)
+                or not self.goals.lease_is_current(goal.goal_id, token)
+            ):
+                raise SessionCancelled()
+            self.store.log_event(
+                "-",
+                "goal_agent_call_finished",
+                {
+                    "goal_id": goal.goal_id,
+                    "call_id": call_id,
+                    "agent": agent,
+                    "role": role.value,
+                    "duration_ms": result.duration_ms,
+                },
+            )
+            return result
+        except AgentCallStopped:
+            self.store.log_event(
+                "-",
+                "goal_agent_call_stopped",
+                {
+                    "goal_id": goal.goal_id,
+                    "call_id": call_id,
+                    "agent": agent,
+                    "role": role.value,
+                },
+            )
+            raise
+        finally:
+            cancellation.unregister_progress(goal.goal_id, call_id)
+            cancellation.clear_call(goal.goal_id, call_id)
+            cancellation.set_current_call(None)
+            cancellation.set_call_kind(None)
+            cancellation.set_current_session(None)
+            goal.active_agent_calls = []
+            self.goals.save_owned(goal, token)
+
     def _plan_and_start(self, goal_id: str) -> Goal:
         """Plan only while owning the goal, then bind milestone 1 atomically."""
         goal = self.goals.claim_worker_lease(goal_id, {"planning"})
@@ -1849,6 +3471,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         token = goal.worker_lease
         start_epoch: Optional[int] = None
         try:
+            goal_contract_text = execution_text(
+                goal.text, goal.outcome_contract
+            )
             agent, role = self._goal_planner()
             milestones: list[GoalMilestone] = []
             rationale = ""
@@ -1856,7 +3481,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             call_error = ""
             repair_count = 0
             if agent:
-                prompt = goals.plan_prompt(goal.text, goal.build_roster or self.panel)
+                prompt = goals.plan_prompt(
+                    goal_contract_text, goal.build_roster or self.panel
+                )
                 rejected_plan = ""
                 for attempt in range(config.GOAL_PLAN_REPAIR_ATTEMPTS + 1):
                     # A model call can outlive a concurrent Cancel. Do not spend
@@ -1871,8 +3498,25 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     goal.model_calls_by_seat[agent] = (
                         goal.model_calls_by_seat.get(agent, 0) + 1)
                     try:
-                        result = self.registry.call(
-                            agent, role, prompt, timeout_s=config.GOAL_PLAN_TIMEOUT)
+                        result = self._goal_agent_call(
+                            goal,
+                            token,
+                            agent,
+                            role,
+                            prompt,
+                            timeout_s=config.GOAL_PLAN_TIMEOUT,
+                        )
+                    except AgentCallStopped:
+                        goal.status = "paused"
+                        goal.last_error = (
+                            f"{agent} planning was stopped by the operator; "
+                            "resume when you want to retry planning"
+                        )
+                        goal.plan_rationale = goal.last_error
+                        self.goals.save_owned(goal, token)
+                        return self.goals.get(goal.goal_id) or goal
+                    except SessionCancelled:
+                        return self.goals.get(goal.goal_id) or goal
                     except Exception as e:  # noqa: BLE001
                         label = "plan repair call" if repair_count else "planning call"
                         call_error = f"{label} failed ({str(e)[:200]})"
@@ -1889,7 +3533,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     candidate = goals.parse_milestones(rejected_plan)
                     candidate_errors: list[str] = []
                     if not candidate:
-                        if goals.requires_delivery_contract(goal.text):
+                        if goals.requires_delivery_contract(goal_contract_text):
                             candidate_errors.append(
                                 "planner did not produce a delivery contract")
                     else:
@@ -1914,7 +3558,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             )
                         if not candidate_errors:
                             candidate, candidate_errors = self._normalize_work_packages(
-                                candidate, goal.text,
+                                candidate, goal_contract_text,
                                 roster=goal.build_roster or self.panel,
                             )
 
@@ -1945,7 +3589,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         },
                     )
                     prompt = goals.plan_repair_prompt(
-                        goal.text,
+                        goal_contract_text,
                         goal.build_roster or self.panel,
                         rejected_plan,
                         validation_errors,
@@ -1961,14 +3605,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self.goals.save_owned(goal, token)
                 return self.goals.get(goal.goal_id) or goal
             if not milestones:
-                if goals.requires_delivery_contract(goal.text):
+                if goals.requires_delivery_contract(goal_contract_text):
                     goal.status = "paused"
                     goal.last_error = "planner did not produce a delivery contract"
                     goal.plan_rationale = call_error or rationale or goal.last_error
                     self.goals.save_owned(goal, token)
                     return self.goals.get(goal.goal_id) or goal
                 milestones = [GoalMilestone(
-                    index=0, title=goal.text[:80], task_text=goal.text,
+                    index=0, title=goal.text[:80], task_text=goal_contract_text,
                     contract_declared=True, requires_delivery=False,
                 )]
                 rationale = (rationale or "plan was not parseable") + " - analysis-only milestone"
@@ -1985,6 +3629,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                  {"goal_id": goal.goal_id, "milestones": len(milestones),
                                   "planned_by": goal.planned_by, "epoch": goal.epoch})
         finally:
+            cancellation.clear(goal.goal_id)
             self.goals.release_worker_lease(goal.goal_id, token)
         current = self.goals.get(goal.goal_id)
         if current and current.status == "running" and current.epoch == start_epoch:
@@ -2060,7 +3705,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if (current.delivery_mode != "final_batch"
                 and (current.current_index != index or current.current is None)):
             return None
-        session = self._open(goals.compose_milestone_task(current, index), "goal", None, None)
+        session = self._open(
+            goals.compose_milestone_task(current, index),
+            "goal",
+            None,
+            None,
+            outcome_contract=current.outcome_contract,
+            execution_profile=current.execution_profile,
+            routing_decision=current.routing_decision,
+            playbook_id=current.playbook_id,
+        )
         bound = self.goals.bind_milestone(
             current.goal_id, index, current.epoch, session.session_id)
         if bound is None:
@@ -3001,13 +4655,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return
         session = self._open(
             f"[FINAL BATCH RELEASE] {goal.text}\nReview and release all staged package outputs together.",
-            "goal-release", None, None)
+            "goal-release", None, None,
+            outcome_contract=goal.outcome_contract,
+            execution_profile=goal.execution_profile,
+            routing_decision=goal.routing_decision,
+            playbook_id=goal.playbook_id,
+        )
         session.goal_id = goal.goal_id
         session.goal_epoch = goal.epoch
         session.goal_release = True
         # Semantic verification must evaluate the original brief, not the short
         # coordinator wrapper used to create this release session.
         session.task.text = goal.text
+        session.task.original_text = goal.text
         session.collaboration_mode = "build_team"
         session.delivery_mode = "final_batch"
         session.workspace_root = goal.staging_root
@@ -3860,8 +5520,64 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def _goal_now_line(goal: Goal, related: list[dict]) -> str:
         """Plain-language current activity for a goal card."""
         if goal.status == "planning":
+            active = next(iter(goal.active_agent_calls or []), None)
+            if active:
+                agent = active.get("agent") or "model"
+                chars = int(active.get("progress_chars") or 0)
+                return (
+                    f"{agent} planning the build"
+                    + (f" ({chars:,} characters streamed)" if chars else "")
+                )
             return "planning the build"
         if goal.status == "completed":
+            followups = [
+                item for item in related
+                if item.get("parent_session_id")
+            ]
+            live = [
+                item for item in followups
+                if item.get("status") not in ("done", "failed", "cancelled")
+            ]
+            if live:
+                current = max(
+                    live, key=lambda item: item.get("updated_at") or ""
+                )
+                targets = current.get("revision_targets") or []
+                calls = current.get("active_agent_calls") or []
+                actor = next(
+                    (
+                        call.get("agent")
+                        for call in calls
+                        if call.get("agent")
+                    ),
+                    "",
+                )
+                if targets:
+                    files = ", ".join(targets[:2])
+                    prefix = f"{actor} revising" if actor else "revising"
+                    return f"{prefix} {files}"
+                return (
+                    f"{actor} reviewing your follow-up"
+                    if actor else "reviewing your follow-up"
+                )
+            revisions = [
+                item for item in followups
+                if item.get("revision_targets")
+            ]
+            if revisions:
+                latest = max(
+                    revisions, key=lambda item: item.get("updated_at") or ""
+                )
+                if (
+                    latest.get("status") == "done"
+                    and latest.get("outcome") == "succeeded"
+                ):
+                    return "released - latest correction applied"
+                if latest.get("status") in ("failed", "cancelled") or (
+                    latest.get("status") == "done"
+                    and latest.get("outcome") != "succeeded"
+                ):
+                    return "released - latest correction needs attention"
             return "released"
         if goal.status == "cancelled":
             return "cancelled"
@@ -3902,17 +5618,39 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         for goal in items:
             data = goal.model_dump()
             related = [item for item in sessions if item.get("goal_id") == goal.goal_id]
-            terminal_goal = goal.status in ("cancelled", "completed", "failed")
             live_related = [
                 item for item in related
                 if item.get("status") not in ("done", "failed", "cancelled")
             ]
+            live_followups = [
+                item for item in live_related if item.get("parent_session_id")
+            ]
+            live_revision = next(
+                (
+                    item for item in live_followups
+                    if item.get("revision_targets")
+                ),
+                None,
+            )
+            # The released Goal ledger stays completed and immutable, while a
+            # post-release child can still be live and actionable in the view.
+            terminal_goal = (
+                goal.status in ("cancelled", "failed")
+                or (goal.status == "completed" and not live_followups)
+            )
             approvals = (0 if terminal_goal else
                          sum(item.get("pending_approvals", 0) for item in live_related))
             inputs = (0 if terminal_goal else
                       sum(item.get("pending_inputs", 0) for item in live_related))
-            active_calls = (0 if terminal_goal else
-                            sum(len(item.get("active_agent_calls") or []) for item in live_related))
+            planning_calls = [] if terminal_goal else list(goal.active_agent_calls or [])
+            active_calls = (
+                0 if terminal_goal else
+                len(planning_calls)
+                + sum(
+                    len(item.get("active_agent_calls") or [])
+                    for item in live_related
+                )
+            )
             package_views: list[dict] = []
             for package in goal.milestones:
                 package_data = package.model_dump()
@@ -4047,7 +5785,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 )
                 if expected_roster else None
             )
-            if goal.status in ("cancelled", "completed", "failed"):
+            if goal.status == "completed" and live_followups:
+                display_status = (
+                    "revising" if live_revision else "following_up"
+                )
+            elif goal.status in ("cancelled", "completed", "failed"):
                 display_status = goal.status
             elif approvals:
                 display_status = "awaiting_approval"
@@ -4061,16 +5803,42 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     (item for item in related if item.get("pending_approvals")), None)
                 actionable = actionable or next(
                     (item for item in related if item.get("pending_inputs")), None)
-                if actionable is None and goal.release_session_id:
-                    actionable = by_id.get(goal.release_session_id)
+                if actionable is None:
+                    actionable = next(
+                        (
+                            item for item in live_followups
+                            if item.get("status") not in
+                            ("done", "failed", "cancelled")
+                        ),
+                        None,
+                    )
                 if actionable is None:
                     current = goal.current
                     actionable = (by_id.get(current.session_id)
                                   if current and current.session_id else None)
+                if actionable is None and goal.release_session_id:
+                    actionable = by_id.get(goal.release_session_id)
                 if actionable is None:
                     actionable = next((item for item in related
                                        if item.get("status") not in
                                        ("done", "failed", "cancelled")), None)
+            revision_sessions = [
+                {
+                    "session_id": item.get("session_id"),
+                    "parent_session_id": item.get("parent_session_id"),
+                    "status": item.get("status"),
+                    "outcome": item.get("outcome"),
+                    "targets": item.get("revision_targets") or [],
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
+                }
+                for item in related
+                if item.get("parent_session_id")
+                and item.get("revision_targets")
+            ]
+            revision_sessions.sort(
+                key=lambda item: item.get("created_at") or ""
+            )
             data.update({
                 "display_status": display_status,
                 "active_packages": (0 if terminal_goal else
@@ -4079,6 +5847,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "pending_approvals": approvals,
                 "pending_inputs": inputs,
                 "active_agent_calls": active_calls,
+                "planning_agent_calls": planning_calls,
                 "agent_call_attempts": sum(
                     item.get("agent_call_attempts", 0) for item in related
                 ),
@@ -4086,6 +5855,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     item.get("agent_attempt_duration_ms", 0) for item in related
                 ),
                 "actionable_session_id": actionable.get("session_id") if actionable else None,
+                "revision_sessions": revision_sessions,
+                "latest_revision_session_id": (
+                    revision_sessions[-1]["session_id"]
+                    if revision_sessions else None
+                ),
             })
             views.append(data)
         return views
@@ -4100,6 +5874,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def cancel_goal(self, goal_id: str) -> dict:
         """Cancel a goal and its running milestone session. Cancelled is
         terminal — use resume on a PAUSED goal to retry a milestone."""
+        existing = self.goals.get(goal_id)
+        if existing is None:
+            raise KeyError(f"goal {goal_id} not found")
+        if existing.active_agent_calls:
+            # Planning has no milestone Session yet, so use the goal id as its
+            # cancellation scope and kill the registered API/CLI call directly.
+            cancellation.request(goal_id)
         goal = self.goals.cancel(goal_id)
         if goal is None:
             raise KeyError(f"goal {goal_id} not found")
@@ -4125,6 +5906,39 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     pass
             self.store.log_event("-", "goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
             return goal.model_dump()
+
+    def stop_goal_agent_call(self, goal_id: str, call_id: str) -> dict:
+        """Stop the current planning model without cancelling the goal."""
+        goal = self.goals.get(goal_id)
+        if goal is None:
+            raise KeyError(f"goal {goal_id} not found")
+        activity = next(
+            (
+                item for item in goal.active_agent_calls
+                if item.get("call_id") == call_id
+            ),
+            None,
+        )
+        if activity is None:
+            raise KeyError(f"active planning call {call_id} not found")
+        cancellation.request_call(goal_id, call_id)
+        self.store.log_event(
+            "-",
+            "goal_agent_call_stop_requested",
+            {
+                "goal_id": goal_id,
+                "call_id": call_id,
+                "agent": activity.get("agent"),
+                "role": activity.get("role"),
+                "progress_chars": activity.get("progress_chars", 0),
+            },
+        )
+        return {
+            "goal_id": goal_id,
+            "call_id": call_id,
+            "agent": activity.get("agent"),
+            "status": "stop_requested",
+        }
 
     def _grant_streak_review_retry(self, goal_id: str) -> None:
         """An explicit human resume of a breaker-paused goal IS the human
@@ -4865,6 +6679,40 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.store.log_event(session_id, "session_cancelled", {"from": previous})
         self._maybe_advance_goal(session, background=True)
         return {"session_id": session_id, "status": "cancelled"}
+
+    def stop_agent_call(self, session_id: str, call_id: str) -> dict:
+        """Stop one supervised model call while sibling seats keep working."""
+        session = self.manager.load(session_id)
+        if session is None:
+            raise KeyError(f"session {session_id} not found")
+        activity = next(
+            (
+                item for item in session.active_agent_calls
+                if item.get("call_id") == call_id
+            ),
+            None,
+        )
+        if activity is None:
+            raise KeyError(f"active call {call_id} not found")
+        if not activity.get("operator_stoppable"):
+            raise ValueError("this call does not support individual stopping")
+        cancellation.request_call(session_id, call_id)
+        self.store.log_event(
+            session_id,
+            "agent_call_stop_requested",
+            {
+                "call_id": call_id,
+                "agent": activity.get("agent"),
+                "role": activity.get("role"),
+                "progress_chars": activity.get("progress_chars", 0),
+            },
+        )
+        return {
+            "session_id": session_id,
+            "call_id": call_id,
+            "agent": activity.get("agent"),
+            "status": "stop_requested",
+        }
 
     def list(self) -> list[dict]:
         return self.store.list_sessions()
