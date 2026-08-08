@@ -506,8 +506,8 @@ def test_benny_scenario_wires_source_dest_and_classifies_content(tmp_path):
 
     # Classification is pinned on a path-neutral rendering of the same directive.
     # CODE_WORDS are matched against the whole text rather than the directive, so
-    # an ambient temp path that happens to contain "code" (a checkout under
-    # .../Desktop/Code/... does) classifies a children's story as code. That
+    # an ambient temp path that happens to contain "code" (any checkout beneath
+    # a directory of that name does) classifies a children's story as code. That
     # sensitivity belongs to the classifier, not to this end-to-end wiring test,
     # which must not depend on where the repository is checked out.
     neutral = ("You are a children's book author. Read the first story at: "
