@@ -1,0 +1,68 @@
+Gang of 8
+
+Copyright © 2026 DigitalGods. All rights reserved.
+
+PROPRIETARY — SOURCE-AVAILABLE, NO LICENSE GRANTED
+
+This software and its source code (the "Software") are published publicly for
+reference, evaluation, and discussion only. Publishing the source code does not
+place it in the public domain, does not make it open source, and does not grant
+any license to it.
+
+No permission is granted to any person to use, copy, modify, merge, publish,
+distribute, sublicense, sell, or create derivative works of the Software, in
+whole or in part, for commercial or non-commercial purposes, except as expressly
+permitted below or under a separate written agreement signed by the copyright
+holder.
+
+PERMITTED WITHOUT A SEPARATE AGREEMENT
+
+  1. Viewing and reading the source code.
+  2. Running an unmodified copy locally for the sole purpose of personal
+     evaluation of the Software.
+  3. Quoting short excerpts for commentary, review, teaching, or news reporting,
+     with attribution, to the extent permitted by applicable copyright law.
+  4. Copying that is a necessary technical incident of the platform hosting this
+     repository, as described under PLATFORM TERMS below.
+
+All other rights are reserved.
+
+PLATFORM TERMS
+
+Where this repository is hosted on a platform whose terms of service require the
+copyright holder to grant other users of that platform limited rights — such as
+the right to view the repository or to fork it within the platform — those
+rights are granted solely to the extent those terms require, and no further.
+Forking within the hosting platform grants no right to use, modify, distribute,
+relicense, or publish the Software outside that platform.
+
+CONTRIBUTIONS
+
+Contributions are accepted at the sole discretion of the copyright holder. By
+submitting a contribution — a pull request, patch, code in an issue, or any
+other submission — you assign to the copyright holder all right, title, and
+interest in that contribution. Where such assignment is not permitted by
+applicable law, you instead grant the copyright holder a perpetual, worldwide,
+irrevocable, royalty-free, sublicensable, transferable, exclusive license to use
+the contribution for any purpose. You represent that you have the right to make
+that assignment or grant.
+
+THIRD-PARTY COMPONENTS
+
+The Software depends on third-party packages that are not covered by this
+license and remain governed by their own licenses. This license applies only to
+the Software's own source code as published in this repository.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+LICENSING ENQUIRIES
+
+To request a license beyond the permissions above, open an issue at
+https://github.com/Digitalgods2/gangof8
