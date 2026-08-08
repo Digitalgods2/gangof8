@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import __version__, config, reporting, security, skills
+from . import __version__, reporting, security, skills
 from .models import Role
 from .service import GangOf8Service
 from .settings import SettingsProfile

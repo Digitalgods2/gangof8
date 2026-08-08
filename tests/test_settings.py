@@ -59,7 +59,8 @@ def test_defaults_when_no_file(tmp_path):
 def test_preflight_removes_unauthenticated_panel_seat(tmp_path):
     svc = GangOf8Service(data_dir=tmp_path, panel=["authless", "mock"])
     svc.registry.register(_UnauthenticatedPanelAdapter())
-    session = svc._open("Explain SQLite.", source="test", budgets=None)
+    session = svc._open("Explain SQLite.", source="test", budgets=None,
+                        execution_profile="council")
 
     assert session.panel == ["mock"]
     assert any("authless" in note and "unavailable before run" in note

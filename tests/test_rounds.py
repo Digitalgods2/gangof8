@@ -197,7 +197,7 @@ def test_panel_seats_run_concurrently(tmp_path):
     svc = GangOf8Service(data_dir=tmp_path, panel=["alpha", "beta", "gamma"])
     for name in ("alpha", "beta", "gamma"):
         svc.registry.register(ProbeSeat(name, shared))
-    session = svc.run(TASK, source="test")
+    session = svc.run(TASK, source="test", execution_profile="council")
     assert session.status == SessionStatus.done
     assert shared.calls == 3
     assert shared.max_running >= 2, "panel seats should overlap, not serialize"
@@ -216,7 +216,7 @@ def test_failing_seat_is_dropped_not_fatal(tmp_path):
 
     svc = GangOf8Service(data_dir=tmp_path, panel=["mock", "boom"])
     svc.registry.register(BoomSeat())
-    session = svc.run(TASK, source="test")
+    session = svc.run(TASK, source="test", execution_profile="council")
     assert session.status == SessionStatus.done
     assert session.final is not None
     assert "panel_seat_dropped" in _events(svc, session)
@@ -332,7 +332,7 @@ def test_stub_panel_and_failed_lead_cannot_false_success_an_output_task(tmp_path
     svc.registry.register(gemini)
     svc.registry.register(failed)
 
-    session = svc.run("Write report.md containing a launch checklist.", source="test")
+    session = svc.run("Write report.md containing a launch checklist.", source="test", execution_profile="council")
 
     assert session.classification.produces_output is True
     assert session.status == SessionStatus.failed
@@ -532,7 +532,7 @@ def test_stubbing_panel_seat_is_dropped_from_synthesis(tmp_path):
     svc.registry.register(HealthySeat())
     svc.registry.register(DebrisSeat())
     svc.registry.register(lead)
-    session = svc.run(TASK, source="test")
+    session = svc.run(TASK, source="test", execution_profile="council")
     assert session.status == SessionStatus.done
     assert "panel take from alpha" in lead.synthesis_prompt
     assert "file_path" not in lead.synthesis_prompt, "debris kept out of the synthesis"
@@ -652,7 +652,7 @@ class SubstantialLead:
 
 def test_substantial_done_synthesis_is_the_final_answer(tmp_path):
     svc = _svc(tmp_path, SubstantialLead())
-    session = svc.run(TASK, source="test")
+    session = svc.run(TASK, source="test", execution_profile="council")
     assert session.status == SessionStatus.done
     assert "Verdict first" in session.final.answer
     assert "ROUND" not in session.final.answer, "the control marker is stripped"
@@ -812,7 +812,7 @@ def test_contributions_record_the_model_that_produced_them(tmp_path):
 
     svc = GangOf8Service(data_dir=tmp_path, panel=["alpha"])
     svc.registry.register(NamedModelSeat())
-    session = svc.run(TASK, source="test")
+    session = svc.run(TASK, source="test", execution_profile="council")
     panelist = next(c for c in session.contributions if c.role == Role.panelist)
     assert panelist.model == "alpha-9000"
     # the mock adapter reports no model — attribution stays honest, not invented

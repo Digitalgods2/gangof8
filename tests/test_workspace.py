@@ -7,6 +7,7 @@ sessions capture the active workspace at submit time. No workspace ⇒ unchanged
 sandbox behaviour.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,13 @@ def test_store_normalizes_stray_backslashes_on_posix(tmp_path, monkeypatch):
     store = WorkspaceStore(tmp_path / "data")
     ws = store.add("proj", str(tmp_path) + "\\sub\\dir")
     assert ws.root == str((tmp_path / "sub" / "dir").resolve())
-    assert not (tmp_path.parent / f"{tmp_path.name}\\sub\\dir").exists()
+    if os.name != "nt":
+        # Only a real POSIX host can tell the two apart: on Windows the backslash
+        # is a genuine separator, so the "bogus single component" this guards
+        # against is indistinguishable from the correct nested path. os.name is
+        # used rather than sys.platform because the monkeypatch above rebinds
+        # sys.platform on the shared sys module, not just inside workspaces.
+        assert not (tmp_path.parent / f"{tmp_path.name}\\sub\\dir").exists()
 
 
 def test_store_rejects_blank_name_and_file_root(tmp_path):

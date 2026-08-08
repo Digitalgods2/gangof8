@@ -24,6 +24,14 @@ def session(service):
     return service.run(TASK, source="test")
 
 
+@pytest.fixture()
+def council_session(service):
+    """Auto-routing sends a compact question down the lean 'focused' path, which
+    never convenes the panel. Tests about council/panel composition ask for that
+    route explicitly rather than depending on what auto-routing picks."""
+    return service.run(TASK, source="test", execution_profile="council")
+
+
 def test_session_completes_state_machine(session):
     assert session.session_id.startswith("s_")
     assert session.status == SessionStatus.done
@@ -39,9 +47,10 @@ def test_classification(session):
     assert cls.tools_allowed is False
 
 
-def test_council_is_lead_plus_panel(session):
+def test_council_is_lead_plus_panel(council_session):
     """The council activates coordinator + lead + the panel seats + summarizer;
     the specialist talents are listed but inactive (available for delegation)."""
+    session = council_session
     active = session.council.active_roles()
     assert {Role.coordinator, Role.lead, Role.panelist, Role.summarizer} <= active
     # specialists are present but inactive until the lead pulls one in
@@ -54,8 +63,9 @@ def test_council_is_lead_plus_panel(session):
     assert len(session.council.members) == 13 + len(session.panel)
 
 
-def test_single_round_when_lead_declares_done(session):
+def test_single_round_when_lead_declares_done(council_session):
     # the mock lead emits no ROUND: marker, which defaults to DONE — one round
+    session = council_session
     assert len(session.rounds) == 1
     assert "panel round 1" in session.rounds[0].goal
     assert session.rounds[0].agents == [Role.panelist, Role.lead]

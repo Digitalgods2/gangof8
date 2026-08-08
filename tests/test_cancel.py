@@ -76,7 +76,7 @@ def test_precancel_skips_preround_web_research(service, monkeypatch):
 
     called = {"overview": False}
 
-    def _boom(session):
+    def _boom(session, data_dir=None):
         called["overview"] = True
         return "SHOULD-NOT-RUN"
 
@@ -98,7 +98,7 @@ def test_cancel_during_preround_overview_is_prompt(service, monkeypatch):
     started = threading.Event()
     release = threading.Event()  # never set during the run: the search stays slow
 
-    def _slow(session):
+    def _slow(session, data_dir=None):
         started.set()
         release.wait(timeout=10)  # simulate a slow, un-abortable web search
         return "late overview"
@@ -239,7 +239,8 @@ def test_cancel_aborts_while_a_panel_seat_is_stuck(tmp_path):
     # panel = default 'mock' seat (fast) + the stuck seat; lead resolves to 'mock'
     svc = GangOf8Service(data_dir=tmp_path, panel=["mock", "stuck"])
     svc.registry.register(StuckSeat())
-    s = svc._open("compare SQLite vs JSON for session logs", "test", None)
+    s = svc._open("compare SQLite vs JSON for session logs", "test", None,
+                   execution_profile="council")
 
     out: dict = {}
     worker = threading.Thread(target=lambda: out.update(session=svc._safely(s, svc._run_full)))

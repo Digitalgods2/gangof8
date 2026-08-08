@@ -132,7 +132,8 @@ def test_run_salvages_a_delivered_file_when_lead_fails(tmp_path):
     svc.registry.register(LeadTimesOut())
     svc.registry.register(PanelWithFile())
 
-    session = svc.run("write a single-file game.html", source="test")
+    session = svc.run("write a single-file game.html", source="test",
+                      execution_profile="council")
 
     events = [__import__("json").loads(line)["event"]
               for line in svc.store.session_log_path(session.session_id)

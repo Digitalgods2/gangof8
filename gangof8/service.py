@@ -51,7 +51,6 @@ from .loop import (
 from .models import (
     Budgets,
     Complexity,
-    Council,
     CouncilMember,
     FinalAnswer,
     Goal,
@@ -838,6 +837,7 @@ class GangOf8Service:
         execution_profile: str,
         *,
         has_attachments: bool,
+        require_eligible: bool = True,
     ) -> dict:
         profile = self._execution_profile(execution_profile)
         classification = classifier.classify(text, self.role_agents)
@@ -920,12 +920,21 @@ class GangOf8Service:
             )
 
         if profile != "auto":
-            if not candidates[profile]["eligible"]:
+            if not candidates[profile]["eligible"] and require_eligible:
                 raise ValueError(
                     f"execution profile '{profile}' is not available for this task"
                 )
             selected = profile
-            reason = "selected explicitly by the user"
+            if candidates[profile]["eligible"]:
+                reason = "selected explicitly by the user"
+            else:
+                # The caller owns this route by construction (a /goal build is a
+                # build team whatever the classifier makes of the brief). Keep
+                # the route but record that scoring would not have offered it.
+                candidates[profile]["rationale"].append(
+                    "route fixed by the caller; scoring did not rank it eligible"
+                )
+                reason = "fixed by the caller despite scoring it ineligible"
         else:
             selected = max(
                 (
@@ -2843,7 +2852,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         profile = self._execution_profile(execution_profile)
         contract = self._outcome_contract(raw, outcome_contract)
         routing = routing_decision or self._routing_decision(
-            raw, contract, "build_team", has_attachments=False
+            raw, contract, "build_team", has_attachments=False,
+            require_eligible=False,
         )
         contract = contract.model_copy(
             update={
