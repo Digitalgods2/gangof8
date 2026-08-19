@@ -1183,6 +1183,7 @@ class GangOf8Service:
         # it never delays starting the run; the new session is already active and
         # therefore protected.
         self._pool.submit(self._gc_sandboxes)
+        self._pool.submit(self._gc_cli_scratch)
         return session
 
     def _gc_sandboxes(self, keep: Optional[int] = None) -> dict:
@@ -1190,8 +1191,11 @@ class GangOf8Service:
         without bound. KEEPS: every sandbox belonging to a still-active/paused
         session (its files may still be needed to resume or promote), plus the
         `keep` most-recently-touched of the rest (so recent runs stay openable in
-        the dashboard). Never touches the shared 'cli-neutral' folder or anything
-        that isn't a session sandbox. Best-effort — never raises."""
+        the dashboard). Only session sandboxes; the CLI scratch root is swept by
+        _gc_cli_scratch. Best-effort — never raises.
+
+        A session's quarantined ungoverned writes live inside its sandbox, so
+        they are retired with it and need no separate bound."""
         import shutil
 
         keep = config.SANDBOX_KEEP if keep is None else keep
@@ -1217,6 +1221,60 @@ class GangOf8Service:
             pass
         if removed:
             self.store.log_event("-", "sandboxes_gc", {"removed": removed, "kept": keep})
+        return {"removed": removed}
+
+    def _gc_cli_scratch(self) -> dict:
+        """Sweep SANDBOX_ROOT/cli-neutral, the root every local CLI seat runs in.
+
+        Three things collect there and none of them used to be cleaned:
+
+        - `call-*` — one per agent call. Normally removed the moment the call
+          ends; a killed server or a hard crash strands them. Swept once they
+          are older than CLI_SCRATCH_MAX_AGE_HOURS and no live call owns them.
+        - `_ungoverned` — writes that could not be attributed to a session.
+          Bounded to the newest UNGOVERNED_ORPHAN_KEEP.
+        - anything else — legacy debris from when every call shared this one
+          directory, plus whatever a seat drops straight into the root.
+
+        Never deletes a directory a running call still owns, whatever its age:
+        a call has no fixed duration, so an age threshold alone would eventually
+        delete live scratch out from under a working seat. Best-effort."""
+        import shutil
+        import time as _time
+
+        from .adapters.cli import live_call_dirs
+
+        root = config.SANDBOX_ROOT / "cli-neutral"
+        removed = 0
+        try:
+            if not root.is_dir():
+                return {"removed": 0}
+            live = live_call_dirs()
+            cutoff = _time.time() - config.CLI_SCRATCH_MAX_AGE_HOURS * 3600
+            keep_orphans = config.UNGOVERNED_ORPHAN_KEEP
+            for entry in root.iterdir():
+                if str(entry) in live:
+                    continue
+                if entry.name == "_ungoverned":
+                    if not entry.is_dir():
+                        continue
+                    kids = sorted((k for k in entry.iterdir()),
+                                  key=_dir_mtime, reverse=True)
+                    for stale in kids[keep_orphans:]:
+                        shutil.rmtree(stale, ignore_errors=True) if stale.is_dir()                             else stale.unlink(missing_ok=True)
+                        removed += 1
+                    continue
+                if config.CLI_SCRATCH_MAX_AGE_HOURS and _dir_mtime(entry) > cutoff:
+                    continue  # recent — a call may be about to use it
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            pass
+        if removed:
+            self.store.log_event("-", "cli_scratch_gc", {"removed": removed})
         return {"removed": removed}
 
     def enhance_prompt(self, text: str) -> dict:

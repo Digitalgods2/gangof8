@@ -60,6 +60,20 @@ def _neutral_cwd() -> str:
     return str(_neutral_root())
 
 
+# Call directories currently in use. The scratch sweep consults this so it can
+# never delete the working directory of a call that is still running — a call
+# has no fixed duration (timeout_s=0 means operator-supervised), so an age
+# threshold alone would eventually be wrong.
+_LIVE_DIRS: set[str] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def live_call_dirs() -> set[str]:
+    """Snapshot of the call directories in use right now (read by the sweep)."""
+    with _LIVE_LOCK:
+        return set(_LIVE_DIRS)
+
+
 def _call_dir() -> Path:
     """A FRESH, EMPTY directory for one CLI call.
 
@@ -82,6 +96,36 @@ def _call_dir() -> Path:
     return Path(tempfile.mkdtemp(prefix="call-", dir=str(_neutral_root())))
 
 
+# Scratch subdirectory of a call directory that holds the seat's TEMP/TMP.
+# Contained on purpose, and not reported as an ungoverned write: a tool writing
+# its own temp files is normal, and only DELIBERATE output is a governance
+# signal worth surfacing to the human.
+_TMP_SUBDIR = "_tmp"
+
+
+def _contained_env(call_dir: Optional[str]) -> Optional[dict]:
+    """Point the seat's TEMP/TMP inside its own call directory.
+
+    A CLI seat that cannot write to its cwd will still happily write to the
+    user's %TEMP%, which is shared with every other program on the machine and
+    survives the run. Redirecting it keeps that spill inside the directory the
+    coordinator already owns and garbage-collects.
+
+    HOME/USERPROFILE are deliberately left ALONE: every seat reads its own
+    credentials from under the real home directory, so redirecting it would
+    break authentication for whichever seats are enabled."""
+    if not call_dir:
+        return None
+    env = os.environ.copy()
+    tmp = Path(call_dir) / _TMP_SUBDIR
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(tmp)
+    return env
+
+
 def _quarantine_call_dir(d: Path, sid: Optional[str]) -> list[str]:
     """Empty call directory → removed. Anything the seat wrote → MOVED into
     the owning session's sandbox under '_ungoverned/', never deleted.
@@ -94,6 +138,7 @@ def _quarantine_call_dir(d: Path, sid: Optional[str]) -> list[str]:
     but they are quarantined out of the shared root, bound to the session that
     produced them, and reported so they cannot be silently presented as
     delivered output. Returns the relative paths written."""
+    _shutil.rmtree(d / _TMP_SUBDIR, ignore_errors=True)  # contained scratch, not output
     try:
         written = sorted(str(f.relative_to(d)) for f in d.rglob("*") if f.is_file())
     except OSError:
@@ -189,10 +234,14 @@ class CliAdapter:
         d = _call_dir()
         previous = getattr(_CALL_DIR, "path", None)
         _CALL_DIR.path = str(d)
+        with _LIVE_LOCK:
+            _LIVE_DIRS.add(str(d))
         try:
             result = self._dispatch(role, prompt, timeout_s, images)
         finally:
             _CALL_DIR.path = previous
+            with _LIVE_LOCK:
+                _LIVE_DIRS.discard(str(d))
             written = _quarantine_call_dir(d, sid)
         result.ungoverned_writes = written
         return result
@@ -245,12 +294,13 @@ class CliAdapter:
             raise AgentError(f"{self.agent} CLI not found on PATH ({cmd[0]!r})")
         sid = cancellation.current_session()
         call_id = cancellation.current_call()
+        isolated = getattr(_CALL_DIR, "path", None)
         try:
             proc = subprocess.Popen(
                 [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                cwd=(getattr(_CALL_DIR, "path", None)
-                     or self._cwd_override or _neutral_cwd()),
+                cwd=(isolated or self._cwd_override or _neutral_cwd()),
+                env=_contained_env(isolated),
             )
         except (OSError, FileNotFoundError) as e:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e
@@ -262,7 +312,7 @@ class CliAdapter:
             deadline = None if timeout_s <= 0 else max(30, timeout_s)
             out, err = proc.communicate(input=prompt, timeout=deadline)
         except subprocess.TimeoutExpired as e:
-            proc.kill()
+            cancellation.kill_tree(proc)
             try:
                 proc.communicate(timeout=5)
             except Exception:  # noqa: BLE001

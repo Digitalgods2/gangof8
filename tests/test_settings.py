@@ -342,6 +342,65 @@ def test_gc_sandboxes_keeps_active_and_recent_deletes_the_rest(tmp_path, monkeyp
     assert out["removed"] == 4
 
 
+def test_gc_cli_scratch_sweeps_stale_dirs_but_never_a_live_call(tmp_path, monkeypatch):
+    """The CLI scratch root is where every local CLI seat runs. Per-call dirs
+    are normally removed as each call ends, but a killed server strands them,
+    and before per-call isolation this one directory silently accumulated 36
+    files across unrelated sessions. It must be swept — except for whatever a
+    running call still owns, since a call has no fixed duration."""
+    import os
+    from gangof8 import config
+    from gangof8.adapters import cli as cli_mod
+
+    svc = GangOf8Service(data_dir=tmp_path / "data")
+    sbroot = tmp_path / "sandbox"
+    (sbroot / "cli-neutral").mkdir(parents=True)
+    monkeypatch.setattr(config, "SANDBOX_ROOT", sbroot)
+    neutral = sbroot / "cli-neutral"
+
+    old = 1000.0                       # far older than the age threshold
+    stale = neutral / "call-stale"; stale.mkdir()
+    live = neutral / "call-live"; live.mkdir()
+    legacy = neutral / "index.html"; legacy.write_text("x", encoding="utf-8")
+    recent = neutral / "call-recent"; recent.mkdir()
+    for d in (stale, live, legacy):
+        os.utime(d, (old, old))
+
+    monkeypatch.setattr(cli_mod, "_LIVE_DIRS", {str(live)})
+    out = svc._gc_cli_scratch()
+
+    remaining = {e.name for e in neutral.iterdir()}
+    assert "call-live" in remaining, "a running call's dir is never swept"
+    assert "call-recent" in remaining, "too recent to be an orphan"
+    assert "call-stale" not in remaining
+    assert "index.html" not in remaining, "legacy shared-dir debris is swept"
+    assert out["removed"] == 2
+
+
+def test_gc_cli_scratch_bounds_unattributable_quarantine(tmp_path, monkeypatch):
+    """Ungoverned writes that belong to a session are retired with that
+    session's sandbox. The ones that could not be attributed have no such
+    owner, so they need their own bound or they grow forever."""
+    import os
+    from gangof8 import config
+
+    svc = GangOf8Service(data_dir=tmp_path / "data")
+    sbroot = tmp_path / "sandbox"
+    ung = sbroot / "cli-neutral" / "_ungoverned"
+    ung.mkdir(parents=True)
+    monkeypatch.setattr(config, "SANDBOX_ROOT", sbroot)
+    monkeypatch.setattr(config, "UNGOVERNED_ORPHAN_KEEP", 2)
+    for i in range(5):
+        d = ung / f"call-{i}"
+        d.mkdir()
+        os.utime(d, (1000 + i, 1000 + i))
+
+    out = svc._gc_cli_scratch()
+
+    assert {d.name for d in ung.iterdir()} == {"call-4", "call-3"}
+    assert out["removed"] == 3
+
+
 def test_cli_timeouts_persist_and_flow_onto_the_session(tmp_path):
     svc = GangOf8Service(data_dir=tmp_path)
     svc.update_settings({"cli_timeouts": {"claude": 480, "gemini": 200}})
