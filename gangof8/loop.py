@@ -1604,10 +1604,74 @@ def _run_delegations(
     return out + resolve_batch(consults, extra, call)
 
 
+def _flush_delegate_writes(
+    session: Session, governance: Governance, store: LogStore,
+) -> list[str]:
+    """Make a delegated talent's authored files REAL on disk at the delegation
+    barrier — before the lead's follow-up call, not after the whole round loop.
+
+    Captured ARTIFACT blocks used to sit at status 'proposed' until step 7b
+    (_execute_actions, after every round has run). Inside the loop the lead
+    reads through _resolve_skill_requests, which goes straight to the executor
+    and only sees real bytes — so a lead that delegated, then asked to read
+    what its talent had just written, got 'file not found in any space' and
+    re-planned around content that existed only in the session record. Live
+    failure: a research/PDF run spent its entire 30-minute wall budget and 12
+    calls with six unwritten files (~100k chars of research, architecture, and
+    a build pipeline) trapped as proposals, while the lead kept waiting for a
+    manuscript that was never going to appear.
+
+    Only FREE council-space writes/edits are flushed here. run_tests can need
+    approval and promote crosses the user boundary; both stay for 7b, which
+    owns pausing — this helper never transitions the session. Whatever runs
+    here is left 'executed', which 7b skips, so the pass stays idempotent.
+    """
+    written: list[str] = []
+    for action in list(session.proposed_actions):
+        if action.status != "proposed" or action.kind not in ("write_file", "edit_file"):
+            continue
+        # The lead's own draft is collected and executed by 7b; panel drafts are
+        # advisory. This barrier exists for the DELEGATED talents' output only.
+        if action.role in (Role.lead, Role.implementer, Role.panelist):
+            continue
+        skill = get_skill(action.kind)
+        # Never create an approval here: request_approval would append a pending
+        # ApprovalRequest that 7b would then duplicate. Anything gated is left
+        # untouched at 'proposed' for the pass that can actually pause.
+        if skill is None or skill.requires_approval:
+            continue
+        governance.authorize_action(session, action)  # role check; free skill -> None
+        if action.status == "denied":
+            session.unresolved.append(f"action '{action.kind}' denied: {action.error}")
+            continue
+        try:
+            result = executor.execute(session, action, store.data_dir)
+        except ExecutionError as e:
+            action.status = "failed"
+            action.error = str(e)
+            session.unresolved.append(f"artifact '{action.filename}' failed: {e}")
+            store.log_event(session.session_id, "action_failed",
+                            {"action_id": action.action_id, "error": str(e)})
+            continue
+        action.status = "executed"
+        action.result_path = result
+        session.files_changed.append(result)
+        session.tools_called.append(action.kind)
+        written.append(action.filename)
+        store.log_event(
+            session.session_id, "action_executed",
+            {"action_id": action.action_id, "kind": action.kind, "result": result[:500]},
+        )
+    if written:
+        store.log_event(session.session_id, "delegate_artifacts_written", {"files": written})
+        store.save_session(session)
+    return written
+
+
 def _resolve_delegations(
     session: Session, council: Council, lead: CouncilMember, prompt: str,
-    contribution: Contribution, call: AgentCall, store: LogStore,
-    recall: Optional[AgentCall] = None,
+    contribution: Contribution, call: AgentCall, governance: Governance,
+    store: LogStore, recall: Optional[AgentCall] = None,
 ) -> Contribution:
     """Handle the lead's CONSULT:/DELEGATE: lines (level 1), letting each consulted
     specialist itself consult ONE bounded level deeper (the sub-agent tier — see
@@ -1618,6 +1682,10 @@ def _resolve_delegations(
                                call, store, depth=1, produce_call=recall)
     if not results:
         return contribution
+    # The talents' files become real BEFORE the lead is re-called, so the next
+    # 'SKILL: read_file <that file>' resolves instead of sending the lead off to
+    # re-plan around work it cannot see.
+    _flush_delegate_writes(session, governance, store)
     followup = (
         f"{prompt}\n\nResults from the talents you pulled in (use these; finish the "
         "task now — do not request the same help again):\n" + "\n\n".join(results)
@@ -3461,8 +3529,8 @@ def _run_panel_rounds(
         c = lead_call(lead, p)
         c = _resolve_skill_requests(session, lead, p, c, call, governance, store,
                                     recall=lead_call)
-        c = _resolve_delegations(session, council, lead, p, c, call, store,
-                                 recall=lead_call)
+        c = _resolve_delegations(session, council, lead, p, c, call, governance,
+                                 store, recall=lead_call)
         # A synthesis that only ANNOUNCES or ATTEMPTS the work ("I'll read the
         # files, then deliver..." / blocked tool-call debris / a dangling
         # SKILL: request the chain never satisfied) must not be accepted as
@@ -3485,8 +3553,8 @@ def _run_panel_rounds(
             c = lead_call(lead, nudge)
             c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store,
                                         recall=lead_call)
-            c = _resolve_delegations(session, council, lead, nudge, c, call, store,
-                                     recall=lead_call)
+            c = _resolve_delegations(session, council, lead, nudge, c, call, governance,
+                                     store, recall=lead_call)
             if rounds.reply_is_stub(c.content, skills_resolved=True):
                 session.unresolved.append(
                     "lead synthesis was a stub twice; final answer composed from "

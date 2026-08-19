@@ -298,7 +298,8 @@ def test_consults_run_after_delegates_and_see_their_files(store, session):
             return _contribution(m.role, m.agent, "reviewed: sound")
         return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
 
-    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                                    Governance(store), store)
     roles = [r for r, _ in calls]
     assert roles.index(Role.critic) > roles.index(Role.code_generator)
     critic_prompt = next(p for r, p in calls if r == Role.critic)
@@ -324,7 +325,8 @@ def test_delegation_reseats_on_distinct_model_after_first_failure(store, session
             return _contribution(m.role, m.agent, "the loop is sound")
         return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
 
-    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                                    Governance(store), store)
     assert seen[:2] == ["codex", "claude"], "fail once, then use a distinct seat"
     assert out.content.startswith("integrated")
     assert not any("failed" in u for u in session.unresolved), \
@@ -428,7 +430,8 @@ def test_delegation_retries_once_on_agent_error(store, session):
             return _contribution(m.role, m.agent, "the loop is sound")
         return _contribution(m.role, m.agent, "integrated. ROUND: DONE")
 
-    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                                    Governance(store), store)
     assert attempts["n"] == 2, "one retry before giving up"
     assert out.content.startswith("integrated")
     assert not any("failed" in u for u in session.unresolved), \
