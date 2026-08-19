@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -332,6 +333,77 @@ def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
         raise ExecutionError(str(e)) from e
 
 
+def session_deps_dir(session: Session, data_dir: Path) -> Path:
+    """Where a session's approved third-party packages live.
+
+    Inside the session's own sandbox, never the coordinator's environment:
+    approving a build's dependencies must not permanently mutate the Python
+    the coordinator itself runs on, and it must be undoable. Living in the
+    sandbox means the packages are retired by the same sweep as the rest of
+    the session's scratch."""
+    return artifacts_dir(data_dir, session.session_id) / "_deps"
+
+
+def build_env(session: Session, data_dir: Path) -> Optional[dict]:
+    """Environment for a BUILD: the session's own packages on PYTHONPATH.
+
+    Returns None when the session has installed nothing, so an ordinary build
+    inherits the environment unchanged."""
+    deps = session_deps_dir(session, data_dir)
+    if not deps.is_dir():
+        return None
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{deps}{os.pathsep}{existing}" if existing else str(deps)
+    return env
+
+
+def _install_deps(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Install the third-party packages a build needs, after human approval.
+
+    This is a real escalation and is treated as one. Running a script the human
+    just read is not the same as fetching and executing arbitrary package code
+    from the network, so INSTALL is a separate action with its own approval
+    card naming exactly which packages it will fetch.
+
+    Three things keep it bounded:
+
+    - Only package NAMES, extras, and a version bound survive validation. A URL,
+      a VCS ref, a local path, or a pip option would let the code come from
+      somewhere the human never saw on the card.
+    - Packages install into the SESSION's directory, not the coordinator's
+      environment, so an approval cannot permanently change the interpreter the
+      coordinator runs on and the sweep can undo it.
+    - --no-input and a finite timeout: a prompt nobody can answer must fail, not
+      hang the run.
+    """
+    raw = _arg(action, "packages")
+    try:
+        specs = validation.approved_package_specs(raw)
+    except validation.ValidationCommandError as e:
+        raise ExecutionError(str(e)) from e
+    target = session_deps_dir(session, data_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    argv = [
+        sys.executable, "-m", "pip", "install",
+        "--target", str(target),
+        "--no-input", "--disable-pip-version-check", "--no-color",
+        *specs,
+    ]
+    try:
+        report = validation.run(
+            argv, target, config.INSTALL_TIMEOUT, config.RUN_TESTS_OUTPUT_MAX_CHARS)
+    except validation.ValidationCommandError as e:
+        raise ExecutionError(f"install failed: {e}") from e
+    # validation.run reports the exit status on its own line; a non-zero pip is
+    # a failed install, not an install that merely printed warnings.
+    if "\n[exit " in report:
+        raise ExecutionError(f"install failed for {', '.join(specs)}\n{report}")
+    installed = sorted(p.name for p in target.glob("*.dist-info"))
+    action.args["installed_into"] = str(target)
+    return f"installed into the session: {', '.join(specs)}\n{report}\ndist-info: {', '.join(installed)}"
+
+
 def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Run an approved build in a council space and capture the files it PRODUCES.
 
@@ -362,7 +434,8 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
         _assert_outside_established(session, path)
     try:
         argv = validation.approved_build_argv(cmd)
-        report = validation.run(argv, cwd, config.BUILD_TIMEOUT, config.BUILD_OUTPUT_MAX_CHARS)
+        report = validation.run(argv, cwd, config.BUILD_TIMEOUT, config.BUILD_OUTPUT_MAX_CHARS,
+                                env=build_env(session, data_dir))
     except validation.ValidationCommandError as e:
         raise ExecutionError(str(e)) from e
 
@@ -1392,6 +1465,22 @@ SKILLS: dict[str, Skill] = {
         mutates=True,
         idempotency="unknown",
     ),
+    "install_deps": Skill(
+        name="install_deps",
+        description=(
+            "Install the third-party packages a build needs, into this session only. "
+            "Always human-approved: it fetches and runs code from the network."
+        ),
+        category="install",
+        risk=Risk.high,
+        requires_approval=True,
+        allowed_roles=[Role.lead, Role.implementer, Role.code_generator, Role.architect],
+        inputs=["packages"],
+        primary_input="packages",
+        permitted_spaces=[SANDBOX],
+        mutates=True,
+        idempotency="idempotent",
+    ),
     "build_artifact": Skill(
         name="build_artifact",
         description=(
@@ -1460,6 +1549,7 @@ HANDLERS: dict[str, Handler] = {
     "edit_file": _edit_file,
     "run_tests": _run_tests,
     "build_artifact": _build_artifact,
+    "install_deps": _install_deps,
     "stage": _stage,
     "promote": _promote,
     "promote_batch": _promote_batch,

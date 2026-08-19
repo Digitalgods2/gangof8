@@ -370,6 +370,9 @@ RUN_TESTS_TIMEOUT = 300
 # A BUILD produces the deliverable, so it gets a longer bound than a test run:
 # rendering a document is slower than checking one.
 BUILD_TIMEOUT = max(30, int(os.environ.get("GANGOF8_BUILD_TIMEOUT", "600")))
+# Installing a build's dependencies reaches the network, so it gets its own
+# bound rather than sharing the build's.
+INSTALL_TIMEOUT = max(30, int(os.environ.get("GANGOF8_INSTALL_TIMEOUT", "600")))
 # The goal loop: when a build's test run fails, the lead is shown the failure
 # and asked to repair the code (EDIT/ARTIFACT blocks), then the tests re-run —
 # up to this many attempts, all BEFORE anything is promoted. The count persists

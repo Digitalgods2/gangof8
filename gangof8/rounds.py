@@ -313,6 +313,12 @@ def _output_contract(session: Session) -> str:
         "The build runs in the council space after explicit human approval; each "
         "PRODUCES file must really appear or the build fails. Never claim a binary "
         "deliverable you did not produce this way — describing one does not create it.\n"
+        "If the build needs third-party packages, ask for them by name on their own "
+        "line — the user approves the packages separately from the build:\n"
+        "INSTALL: reportlab, pdfplumber\n"
+        "Names with an optional single version bound only (reportlab>=4.2). URLs, "
+        "VCS refs, paths and pip options are refused. Packages install for this "
+        "session alone, not into the coordinator's environment.\n"
     )
 
 
