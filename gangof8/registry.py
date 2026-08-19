@@ -40,6 +40,14 @@ class AdapterResult(BaseModel):
     # knows it — every take should be attributable to a model, not just a
     # vendor seat. None ⇒ the backend's own default, unknown to us.
     model: Optional[str] = None
+    # Files a local CLI seat wrote straight into its own working directory,
+    # i.e. side effects that never passed the executor or the approval kernel.
+    # Every CLI seat is a subprocess running with the user's own privileges, so
+    # this is a property of the seat CLASS, not of any one vendor: each CLI is
+    # asked to stay read-only, but that is the tool's own promise and not all
+    # of them can enforce it on every platform. This reports what actually
+    # happened instead of trusting the flag. API-backed seats never set it.
+    ungoverned_writes: list[str] = []
 
 
 class Adapter(Protocol):

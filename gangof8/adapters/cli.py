@@ -18,8 +18,10 @@ import copy
 import json
 import os
 import shutil
+import shutil as _shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -40,18 +42,72 @@ def _err_tail(text: str, limit: int = 300) -> str:
     return t if len(t) <= limit else "… " + t[-limit:]
 
 
-def _neutral_cwd() -> str:
-    """CLI subprocesses run from an EMPTY, neutral directory — never the
-    server's own repo/cwd. A CLI agent with latent tool instincts (claude
-    attempting Read calls, codex scanning its workspace) must not perceive —
-    or ungovernedly read — whatever folder the server happens to run in.
-    Project content reaches agents only through the governed overview and
-    SKILL reads. (Live failure: a claude lead running with cwd=the repo said
-    \"I'm running in the actual repo\" and emitted tool-call debris instead of
-    a synthesis.)"""
+# The cwd of the CLI call running on THIS thread. The adapter instance is
+# shared across the panel fan-out, so the per-call directory cannot live on
+# self — see CliAdapter.call.
+_CALL_DIR = threading.local()
+
+
+def _neutral_root() -> Path:
     d = config.SANDBOX_ROOT / "cli-neutral"
     d.mkdir(parents=True, exist_ok=True)
-    return str(d)
+    return d
+
+
+def _neutral_cwd() -> str:
+    """Fallback cwd for CLI invocations made outside a governed agent call
+    (auth_status). Governed calls get their own directory — see _call_dir."""
+    return str(_neutral_root())
+
+
+def _call_dir() -> Path:
+    """A FRESH, EMPTY directory for one CLI call.
+
+    CLI subprocesses must never run from the server's own repo/cwd: an agent
+    with latent tool instincts (claude attempting Read calls, codex scanning
+    its workspace) must not perceive — or ungovernedly read — whatever folder
+    the server happens to run in. (Live failure: a claude lead running with
+    cwd=the repo said "I'm running in the actual repo" and emitted tool-call
+    debris instead of a synthesis.)
+
+    It must also never be SHARED. Every call used to run from one persistent
+    'cli-neutral' directory, and a CLI seat can write into its cwd despite the
+    no-side-effect flags below — so that directory silently accumulated 36
+    files across unrelated sessions (another task's index.html, a whole
+    manuscript/ and output/ tree, browser-tool logs). A later session's seat
+    could read an earlier one's leftovers, and the directory the docstring
+    called 'empty' had not been empty for weeks. Any seat can be the lead and
+    any seat can leave debris, so the isolation is per CALL, not per vendor.
+    """
+    return Path(tempfile.mkdtemp(prefix="call-", dir=str(_neutral_root())))
+
+
+def _quarantine_call_dir(d: Path, sid: Optional[str]) -> list[str]:
+    """Empty call directory → removed. Anything the seat wrote → MOVED into
+    the owning session's sandbox under '_ungoverned/', never deleted.
+
+    These files are, by definition, side effects that did not pass through the
+    executor or the approval kernel. Applies to every local CLI seat equally —
+    each one is a subprocess with the user's privileges, whatever its own
+    sandbox flag claims. They are not deleted because a binary deliverable (a
+    PDF) has no governed path today and destroying it would lose real work —
+    but they are quarantined out of the shared root, bound to the session that
+    produced them, and reported so they cannot be silently presented as
+    delivered output. Returns the relative paths written."""
+    try:
+        written = sorted(str(f.relative_to(d)) for f in d.rglob("*") if f.is_file())
+    except OSError:
+        return []
+    if not written:
+        _shutil.rmtree(d, ignore_errors=True)
+        return []
+    dest_root = (config.SANDBOX_ROOT / sid / "_ungoverned") if sid         else (_neutral_root() / "_ungoverned")
+    try:
+        dest_root.mkdir(parents=True, exist_ok=True)
+        _shutil.move(str(d), str(dest_root / d.name))
+    except OSError:
+        pass  # leave it where it is rather than lose the bytes
+    return written
 
 
 class CliAdapter:
@@ -125,6 +181,24 @@ class CliAdapter:
             clone.model = pinned
             clone.role_models = {}
             return clone.call(role, prompt, timeout_s, images)
+        # An explicit cwd is a caller-owned disposable review copy — it is meant
+        # to be inspected, and the caller cleans it up.
+        if self._cwd_override:
+            return self._dispatch(role, prompt, timeout_s, images)
+        sid = cancellation.current_session()
+        d = _call_dir()
+        previous = getattr(_CALL_DIR, "path", None)
+        _CALL_DIR.path = str(d)
+        try:
+            result = self._dispatch(role, prompt, timeout_s, images)
+        finally:
+            _CALL_DIR.path = previous
+            written = _quarantine_call_dir(d, sid)
+        result.ungoverned_writes = written
+        return result
+
+    def _dispatch(self, role: Role, prompt: str, timeout_s: int,
+                  images: list[dict] | None = None) -> AdapterResult:
         t0 = time.monotonic()
         model = self.model  # the pinned model; branches refine it when they know more
         if self.agent == "claude":
@@ -175,7 +249,8 @@ class CliAdapter:
             proc = subprocess.Popen(
                 [exe, *cmd[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                cwd=self._cwd_override or _neutral_cwd(),
+                cwd=(getattr(_CALL_DIR, "path", None)
+                     or self._cwd_override or _neutral_cwd()),
             )
         except (OSError, FileNotFoundError) as e:
             raise AgentError(f"{self.agent} CLI not runnable: {e}") from e

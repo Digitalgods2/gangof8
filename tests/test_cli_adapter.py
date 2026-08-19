@@ -172,15 +172,63 @@ def test_no_gemini_key_anywhere_falls_back_to_the_cli(stub_run, monkeypatch):
 def test_cli_subprocess_runs_from_a_neutral_cwd(stub_run):
     """The agent CLI must never inherit the server's cwd (the repo): a model
     with latent tool instincts would perceive — and could ungovernedly read —
-    whatever folder the server runs in. It runs from an empty sandbox dir."""
+    whatever folder the server runs in. It runs from a fresh empty dir under
+    the neutral root, and an empty one is removed when the call ends."""
     from gangof8 import config
 
     calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "ok"})))
     CliAdapter("claude").call(Role.lead, "hello", timeout_s=60)
     cwd = Path(calls["cwd"])
-    assert cwd == config.SANDBOX_ROOT / "cli-neutral"
-    assert cwd.is_dir()
+    assert cwd.parent == config.SANDBOX_ROOT / "cli-neutral"
+    assert cwd != config.SANDBOX_ROOT / "cli-neutral", "not the shared root"
     assert Path.cwd() != cwd, "must not be the server's own cwd"
+    assert not cwd.exists(), "an empty call dir is cleaned up"
+
+
+def test_each_cli_call_gets_its_own_directory(stub_run):
+    """REGRESSION: every call used to share one persistent 'cli-neutral' dir,
+    so one session's agent could read what another session's agent had left
+    behind (live: 36 accumulated files, including an unrelated task's
+    index.html and a whole manuscript/ tree)."""
+    seen = []
+    for _ in range(2):
+        calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "ok"})))
+        CliAdapter("claude").call(Role.lead, "hello", timeout_s=60)
+        seen.append(calls["cwd"])
+    assert seen[0] != seen[1]
+
+
+def test_files_a_cli_writes_itself_are_quarantined_and_reported(stub_run, monkeypatch):
+    """REGRESSION: the CLIs write into their cwd despite the no-side-effect
+    flags (codex's --sandbox read-only is unenforced on Windows). Such a file
+    never passed the executor or the approval kernel, so it must not stay in
+    the shared root, and the run must not be able to present it as delivered
+    output. Live: a 'succeeded' answer linked a 431KB PDF that no proposed
+    action had ever produced."""
+    from gangof8 import cancellation, config
+    from gangof8.adapters import cli as cli_mod
+
+    calls = stub_run(_Proc(stdout=json.dumps({"is_error": False, "result": "ok"})))
+
+    real_popen = cli_mod.subprocess.Popen
+
+    def writing_popen(*args, **kwargs):
+        # the "agent" writes a file into its working directory, as codex did
+        Path(kwargs["cwd"], "output").mkdir(parents=True, exist_ok=True)
+        Path(kwargs["cwd"], "output", "sneaky.pdf").write_bytes(b"%PDF-1.4 ...")
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod.subprocess, "Popen", writing_popen)
+    monkeypatch.setattr(cancellation, "current_session", lambda: "s_test")
+
+    result = CliAdapter("claude").call(Role.lead, "hello", timeout_s=60)
+
+    assert result.ungoverned_writes == [str(Path("output/sneaky.pdf"))]
+    assert not Path(calls["cwd"]).exists(), "moved out of the neutral root"
+    quarantine = config.SANDBOX_ROOT / "s_test" / "_ungoverned"
+    survivors = [f for f in quarantine.rglob("sneaky.pdf")]
+    assert survivors, "quarantined into the session sandbox, never deleted"
+    assert survivors[0].read_bytes() == b"%PDF-1.4 ..."
 
 
 def test_claude_is_error_raises(stub_run):

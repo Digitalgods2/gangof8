@@ -547,6 +547,23 @@ def _agent_call(
             {"round": contribution.round, "role": member.role.value,
              "agent": member.agent, "chars": len(result.content)},
         )
+        # A seat that wrote files itself bypassed the executor and the approval
+        # kernel entirely — true of ANY local CLI seat, since each is a
+        # subprocess with the user's privileges. The bytes are quarantined in
+        # the session sandbox by the adapter; surface them here so a run cannot
+        # claim an ungoverned file as a delivered artifact (live: a 'succeeded'
+        # answer linked a PDF that no proposed action had ever produced).
+        if getattr(result, "ungoverned_writes", None):
+            store.log_event(
+                session.session_id, "ungoverned_cli_write",
+                {"call_id": call_id, "agent": member.agent,
+                 "role": member.role.value, "files": result.ungoverned_writes[:50]},
+            )
+            session.unresolved.append(
+                f"{member.agent} wrote {len(result.ungoverned_writes)} file(s) outside "
+                "the governed path; quarantined under the session sandbox in "
+                "'_ungoverned/': " + ", ".join(result.ungoverned_writes[:10])
+            )
         # Persist NOW: the dashboard polls the stored snapshot, and deliberation
         # otherwise saves only at status transitions — a whole round of panel
         # takes, syntheses, and talent answers stayed invisible until the run
