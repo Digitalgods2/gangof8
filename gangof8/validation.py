@@ -108,6 +108,25 @@ def approved_test_argv(command: str) -> list[str]:
     return [resolved, *args[1:]]
 
 
+def approved_build_argv(command: str) -> list[str]:
+    """Parse a human-approved BUILD command without invoking a shell.
+
+    Same direct-tool allowlist as a functional test: a build legitimately runs a
+    project script (`python make_pdf.py`), which is already permitted, while
+    shells, shell metacharacters, and -c/-m stay blocked. Those smuggle
+    arbitrary inline code past the approval card, and the card only works as a
+    gate if the command the human reads is the command that runs.
+
+    Installing dependencies is deliberately NOT permitted here: pip executes
+    arbitrary package code and reaches the network, which is a different
+    decision from running a build the human just read. A build that needs
+    missing packages fails with a clear error instead."""
+    try:
+        return approved_test_argv(command)
+    except ValidationCommandError as e:
+        raise ValidationCommandError(str(e).replace("RUNTESTS", "BUILD")) from e
+
+
 def run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> str:
     """Run an already-parsed argv with bounded output; never shell-expand it."""
     try:

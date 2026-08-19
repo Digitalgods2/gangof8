@@ -7,6 +7,8 @@ write_file-only. The kernel role-gates actions and rejects unknown skills
 without killing the session.
 """
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -36,10 +38,21 @@ def session(tmp_path) -> Session:
 def test_registry_contains_skills():
     expected = {"write_file", "read_file", "search_project", "list_dir",
                 "web_search", "web_fetch", "edit_file", "run_tests", "stage",
-        "promote", "promote_batch", "git_snapshot"}
+        "promote", "promote_batch", "git_snapshot", "build_artifact"}
     assert set(SKILLS) == expected
     assert set(HANDLERS) == expected
     assert all(isinstance(s, Skill) for s in SKILLS.values())
+
+
+def test_build_artifact_metadata():
+    """The only governed route to a binary deliverable — so it executes code and
+    must always be human-approved, and it may never target the user's folder."""
+    s = get_skill("build_artifact")
+    assert s.requires_approval is True
+    assert s.risk == Risk.high
+    assert s.inputs == ["command", "produces", "target"]
+    assert set(s.permitted_spaces) == {"sandbox", "workspace"}
+    assert Role.lead in s.allowed_roles and Role.code_generator in s.allowed_roles
 
 
 def test_search_project_metadata():
@@ -547,3 +560,73 @@ def test_source_read_allowed_when_no_candidate_shares_its_name(tmp_path):
     action = ProposedAction(session_id=session.session_id, kind="read_file",
                             role=Role.researcher, args={"filename": str(est / "notes.txt")})
     assert execute(session, action, tmp_path) == "NOTES"
+
+
+# --- build_artifact: the governed route to a binary deliverable ---------------
+
+
+def _build_action(session, command, produces, target="workspace"):
+    return ProposedAction(
+        session_id=session.session_id, kind="build_artifact", role=Role.lead,
+        filename=command,
+        args={"command": command, "produces": produces, "target": target})
+
+
+def test_build_produces_a_binary_and_records_its_outputs(tmp_path, session):
+    """REGRESSION: ARTIFACT carries text, so a PDF (or any binary) had no
+    governed path at all. A run whose deliverable was binary therefore shipped
+    the wrong format, or a seat produced it outside the kernel where nothing
+    verified or promoted it. BUILD closes that: the human approves an exact
+    command, the outputs it declared must really appear, and they are hashed."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    session.workspace_root = str(ws)
+    (ws / "make.py").write_text(
+        "from pathlib import Path\nPath('out.bin').write_bytes(bytes(range(256)))\n",
+        encoding="utf-8")
+
+    action = _build_action(session, "python make.py", "out.bin")
+    result = execute(session, action, tmp_path)
+
+    produced = ws / "out.bin"
+    assert produced.read_bytes() == bytes(range(256)), "real binary bytes, not text"
+    assert "PRODUCED:" in result
+    assert json.loads(action.args["produced_paths"]) == [str(produced)]
+    digest = hashlib.sha256(bytes(range(256))).hexdigest()
+    assert json.loads(action.args["produced_hashes"])["out.bin"] == digest
+
+
+def test_build_that_produces_nothing_fails_instead_of_reporting_success(tmp_path, session):
+    """A command that exits 0 without producing what it promised is a FAILED
+    build. Declaring the outputs up front is what makes this verifiable rather
+    than a licence to run code."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    session.workspace_root = str(ws)
+    (ws / "make.py").write_text("print('looks fine')\n", encoding="utf-8")
+
+    action = _build_action(session, "python make.py", "book.pdf")
+    with pytest.raises(ExecutionError, match="did not produce book.pdf"):
+        execute(session, action, tmp_path)
+
+
+def test_build_refuses_a_shell_and_cannot_escape_the_council_space(tmp_path, session):
+    """The approval card only works as a gate if the command the human reads is
+    the command that runs, and a build must never be able to name its way into
+    the user's own folder."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    session.workspace_root = str(ws)
+
+    with pytest.raises(ExecutionError):
+        execute(session, _build_action(session, "bash -c 'rm -rf /'", "x.bin"), tmp_path)
+    with pytest.raises(ExecutionError):
+        execute(session, _build_action(session, "python make.py", "../escaped.bin"), tmp_path)
+
+
+def test_build_always_requires_approval(session, governance):
+    """It executes code: there is no auto-run path, unlike a static check."""
+    action = _build_action(session, "python make.py", "out.pdf")
+    approval = governance.authorize_action(session, action)
+    assert approval is not None, "a build must never run without a human decision"
+    assert "python make.py" in approval.action, "the card names the exact command"
