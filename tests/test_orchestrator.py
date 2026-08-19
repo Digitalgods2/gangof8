@@ -6,10 +6,14 @@ capped folded-summary pipe (which would truncate a whole file to nothing).
 
 import pytest
 
-from gangof8 import loop, rounds
+from pathlib import Path
+
+from gangof8 import executor, loop, rounds
+from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (Classification, Complexity, Contribution,
-                                Council, CouncilMember, Risk, Role, TaskType)
+                                Council, CouncilMember, ProposedAction, Risk,
+                                Role, TaskType)
 from gangof8.sessions import SessionManager
 
 GAME_HTML = "<!doctype html>\n<html><body><script>go()</script></body></html>"
@@ -55,7 +59,8 @@ def test_delegated_talent_artifacts_are_captured_directly(store, session):
                                  f"Here is the game.\nARTIFACT: game.html\n{GAME_HTML}")
         return _contribution(member.role, "PROMOTE: game.html\nROUND: DONE")
 
-    out = loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    out = loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                                    Governance(store), store)
 
     writes = [a for a in session.proposed_actions if a.kind == "write_file"]
     assert len(writes) == 1
@@ -68,6 +73,42 @@ def test_delegated_talent_artifacts_are_captured_directly(store, session):
     assert "do NOT re-emit" in lead_followup
     assert GAME_HTML not in lead_followup, "file body never folded into the lead context"
     assert out.content.startswith("PROMOTE:")
+
+
+def test_delegated_talent_files_are_on_disk_before_the_lead_is_recalled(store, session):
+    """REGRESSION: a talent's captured file must be REAL on disk at the
+    delegation barrier, not merely 'proposed'.
+
+    Live failure: proposals stayed unexecuted until step 7b (after the whole
+    round loop), but the lead reads through the executor inside the loop — so
+    'SKILL: read_file <the file the talent just wrote>' returned 'file not
+    found in any space' and the lead re-planned around work it could not see,
+    burning its entire wall budget with the files trapped in the session record.
+    """
+    lead = _member(Role.lead)
+    coder = _member(Role.code_generator, agent="coder-model")
+    council = Council(members=[lead, coder])
+    contribution = _contribution(
+        Role.lead, "DELEGATE: code_generator - author the complete game.html")
+    readback: list[str] = []
+
+    def call(member, prompt):
+        if member.role == Role.code_generator:
+            return _contribution(Role.code_generator,
+                                 f"Done.\nARTIFACT: game.html\n{GAME_HTML}")
+        # the lead does exactly what the live run did: read the talent's file
+        action = ProposedAction(session_id=session.session_id, kind="read_file",
+                                role=Role.lead, args={"filename": "game.html"})
+        readback.append(executor.execute(session, action, store.data_dir))
+        return _contribution(member.role, "integrated. ROUND: DONE")
+
+    loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                              Governance(store), store)
+
+    write = next(a for a in session.proposed_actions if a.kind == "write_file")
+    assert write.status == "executed", "flushed at the barrier, not left proposed"
+    assert Path(write.result_path).read_text(encoding="utf-8") == GAME_HTML
+    assert readback and GAME_HTML in readback[0], "the lead could read it back"
 
 
 def test_consult_reply_artifacts_are_not_captured(store, session):
@@ -83,7 +124,8 @@ def test_consult_reply_artifacts_are_not_captured(store, session):
             return _contribution(Role.critic, f"ARTIFACT: sketch.html\n{GAME_HTML}")
         return _contribution(member.role, "integrated. ROUND: DONE")
 
-    loop._resolve_delegations(session, council, lead, "P", contribution, call, store)
+    loop._resolve_delegations(session, council, lead, "P", contribution, call,
+                              Governance(store), store)
     assert [a for a in session.proposed_actions if a.kind == "write_file"] == []
 
 

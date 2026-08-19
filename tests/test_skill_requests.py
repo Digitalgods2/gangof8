@@ -293,7 +293,7 @@ def test_delegation_grants_specific_talent(store, session):
     })
 
     out = loop._resolve_delegations(
-        session, council, lead, "ORIGINAL", contribution, call, store
+        session, council, lead, "ORIGINAL", contribution, call, Governance(store), store
     )
 
     assert out.content.startswith("ARTIFACT:")
@@ -310,7 +310,7 @@ def test_delegation_to_unavailable_talent_is_refused(store, session):
     call, calls = _role_recording_call({Role.lead: "continuing"})
 
     out = loop._resolve_delegations(
-        session, council, lead, "ORIGINAL", contribution, call, store
+        session, council, lead, "ORIGINAL", contribution, call, Governance(store), store
     )
 
     assert out.content == "continuing"
