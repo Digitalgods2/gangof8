@@ -13,6 +13,9 @@ This shared, thread-safe registry bridges them:
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 import threading
 
 _lock = threading.Lock()
@@ -95,6 +98,37 @@ def report_progress(chars: int = 0, detail: str = "output", tail: str = "") -> N
             pass
 
 
+def kill_tree(proc) -> None:
+    """Kill a CLI seat's WHOLE process tree, not just the process we spawned.
+
+    Every local CLI seat shells out further: the seat's launcher spawns a
+    runtime which spawns the actual agent binary, four levels deep in one
+    observed run. Popen.kill() terminates only the direct child, so a
+    cancelled or timed-out call left the real agent alive — still running, and
+    still able to write files with the user's privileges long after the
+    coordinator considered the call over. Applies to whichever seats are
+    enabled; nothing here is vendor-specific.
+
+    Best-effort and never raises: the tree kill is attempted first, and the
+    direct kill always runs as the fallback."""
+    pid = getattr(proc, "pid", None)
+    if pid and os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif pid:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (OSError, AttributeError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001 — already gone is success
+        pass
+
+
 # --- subprocess registry ------------------------------------------------------
 def register_proc(session_id: str | None, proc) -> None:
     if not session_id:
@@ -108,10 +142,7 @@ def register_proc(session_id: str | None, proc) -> None:
             _call_procs.setdefault(key, set()).add(proc)
             requested = key in _call_requested
     if requested:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        kill_tree(proc)
 
 
 def unregister_proc(session_id: str | None, proc) -> None:
@@ -194,10 +225,7 @@ def request_call(session_id: str, call_id: str) -> None:
         fns = list(_call_cancelers.get(key, ()))
         procs = list(_call_procs.get(key, ()))
     for proc in procs:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        kill_tree(proc)
     for fn in fns:
         try:
             fn()

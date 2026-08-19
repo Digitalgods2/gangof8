@@ -35,6 +35,15 @@ SANDBOX_ROOT = Path(os.environ.get("GANGOF8_SANDBOX", str(_default_sandbox_root(
 # runs can still be opened/inspected) plus every still-active/paused one, and
 # deletes the rest.
 SANDBOX_KEEP = int(os.environ.get("GANGOF8_SANDBOX_KEEP", "25"))
+# The per-call CLI working directories (SANDBOX_ROOT/cli-neutral) are removed as
+# each call ends, but a killed server or a hard crash can strand one. Sweep
+# anything older than this that no live call still owns. Hours, 0 disables.
+CLI_SCRATCH_MAX_AGE_HOURS = max(0, int(
+    os.environ.get("GANGOF8_CLI_SCRATCH_MAX_AGE_HOURS", "6")))
+# Quarantined ungoverned writes that could not be attributed to a session are
+# kept out of the shared root but still need a bound: keep this many newest.
+UNGOVERNED_ORPHAN_KEEP = max(0, int(
+    os.environ.get("GANGOF8_UNGOVERNED_ORPHAN_KEEP", "10")))
 
 # A panel round costs len(panel)+1 calls (every seat + the lead synthesis), so
 # the call budgets carry real multi-round headroom. The terminators are
