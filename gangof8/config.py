@@ -367,6 +367,9 @@ BATCH_PROMOTE_DIFF_MAX_CHARS = int(
 # own sandbox/workspace (the spaces model gates only promote); keep it time-
 # and output-bounded.
 RUN_TESTS_TIMEOUT = 300
+# A BUILD produces the deliverable, so it gets a longer bound than a test run:
+# rendering a document is slower than checking one.
+BUILD_TIMEOUT = max(30, int(os.environ.get("GANGOF8_BUILD_TIMEOUT", "600")))
 # The goal loop: when a build's test run fails, the lead is shown the failure
 # and asked to repair the code (EDIT/ARTIFACT blocks), then the tests re-run —
 # up to this many attempts, all BEFORE anything is promoted. The count persists
@@ -378,6 +381,7 @@ MAX_TEST_FIX_ATTEMPTS = 3
 # always enter this bounded loop instead of jumping straight to a false done.
 MAX_ARTIFACT_REPAIR_ATTEMPTS = 2
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
+BUILD_OUTPUT_MAX_CHARS = int(os.environ.get("GANGOF8_BUILD_OUTPUT_MAX_CHARS", "4000"))
 # Existing-file revisions are authored as compact patches, not as several
 # competing whole-file rewrites.  The primary author gets the exact source up
 # to this cap so it can make a grounded edit without a chain of rediscovery

@@ -77,6 +77,19 @@ RUNTESTS_MARKER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# 'BUILD: <command>' + 'PRODUCES: <files>' proposes running a build whose OUTPUT
+# is the deliverable. This is the only governed route to a file the council
+# cannot type out — a PDF, an archive, anything binary. ARTIFACT carries a text
+# body by definition, so without this a task whose deliverable is binary has no
+# governed path at all: the run either ships the wrong format (a manuscript
+# where a PDF was wanted) or a seat quietly produces it outside the kernel,
+# where nothing verifies, records, or promotes it.
+BUILD_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?BUILD(?:\*\*)?[ \t]*:[ \t]*(?P<cmd>.+?)[ \t]*\r?\n"
+    r"[ \t]*(?:\*\*)?PRODUCES(?:\*\*)?[ \t]*:[ \t]*(?P<produces>.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # 'PROMOTE: <filename>' proposes copying a council file into the established
 # folder, the approval-gated boundary that touches real user code.
 PROMOTE_MARKER = re.compile(
@@ -89,7 +102,7 @@ PROMOTE_MARKER = re.compile(
 # a file body is not mistaken for a block boundary.
 BLOCK_START = re.compile(
     r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:OLD/NEW[ \t]+)?"
-    r"(?:ARTIFACT|EDIT(?:[ \t]*#?\d+)?|RUN_?TESTS|PROMOTE)(?:\*\*)?[ \t]*:",
+    r"(?:ARTIFACT|EDIT(?:[ \t]*#?\d+)?|RUN_?TESTS|BUILD|PROMOTE)(?:\*\*)?[ \t]*:",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -179,6 +192,16 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="run_tests", role=role,
             filename=cmd or "pytest -q", args={"command": cmd})))
+    for m in BUILD_MARKER.finditer(text):
+        cmd = (m.group("cmd") or "").strip()
+        produces = [f for f in (canonical_protocol_filename(p)
+                                for p in (m.group("produces") or "").split(",")) if f]
+        if not cmd or not produces:
+            continue
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="build_artifact", role=role,
+            # the command IS the identity: it is what the approval card shows
+            filename=cmd, args={"command": cmd, "produces": ",".join(produces)})))
     for m in PROMOTE_MARKER.finditer(text):
         fn = canonical_protocol_filename(m.group("file"))
         if not fn:

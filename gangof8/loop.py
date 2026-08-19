@@ -755,11 +755,23 @@ def _requires_file_output(session: Session) -> bool:
     return expects_output and not analysis_only_package
 
 
+def _build_outputs(action: ProposedAction) -> list[str]:
+    """The files an executed build declared and actually produced."""
+    try:
+        return list(json.loads(action.args.get("produced_paths") or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _has_executed_file_mutation(session: Session) -> bool:
-    """Return true only for a real non-panel write/edit/delivery action."""
+    """Return true only for a real non-panel write/edit/delivery action.
+
+    A build counts: the executor confirmed every file it declared and hashed
+    them, which is the same standard of proof as an authored artifact — and for
+    a binary deliverable it is the ONLY way to meet it."""
     return any(
         action.role != Role.panelist
-        and action.kind in {"write_file", "edit_file", "promote"}
+        and action.kind in {"write_file", "edit_file", "promote", "build_artifact"}
         and action.status == "executed"
         and bool(action.result_path)
         for action in session.proposed_actions
@@ -4141,7 +4153,7 @@ def _collect_proposals(session: Session, store: LogStore) -> None:
     guard: the lead's own draft still needs collecting, or its PROMOTE lines
     would be dropped exactly when a talent authored the files."""
     if any(a.role in (Role.lead, Role.implementer) for a in session.proposed_actions
-           if a.kind in ("write_file", "edit_file", "run_tests", "promote")):
+           if a.kind in ("write_file", "edit_file", "run_tests", "build_artifact", "promote")):
         return
     draft = next(
         (c for c in reversed(session.contributions) if c.role in (Role.lead, Role.implementer)),
@@ -5403,6 +5415,12 @@ def _execute_actions(
                 action.result_path = result  # path for writes/edits/promote; output for run_tests
                 if action.kind in ("write_file", "edit_file", "promote", "stage"):
                     session.files_changed.append(result)
+                elif action.kind == "build_artifact":
+                    # A build's OUTPUTS are the deliverable, not its console log.
+                    # Register each produced path so verification, promote, and
+                    # the artifact workbench treat them like any authored file.
+                    session.files_changed.extend(_build_outputs(action))
+                    session.unresolved.append(f"build '{action.filename}':\n{result}")
                 else:  # run_tests (or other non-file actions) — keep the output visible
                     session.unresolved.append(f"{action.kind} '{action.filename}':\n{result}")
                 session.tools_called.append(action.kind)

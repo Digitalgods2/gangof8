@@ -305,6 +305,14 @@ def _output_contract(session: Session) -> str:
         "RUNTESTS: node --check path/to/file.js\n"
         "RUNTESTS: python -m py_compile path/to/file.py\n"
         "Functional RUNTESTS commands require explicit human approval and must name the command.\n"
+        "ARTIFACT can only carry TEXT. When the deliverable is a file you cannot type "
+        "out — a PDF, an image, an archive — author the generator as an ARTIFACT and "
+        "then build it, naming every file the build must produce:\n"
+        "BUILD: python make_book.py --in book.md --out book.pdf\n"
+        "PRODUCES: book.pdf\n"
+        "The build runs in the council space after explicit human approval; each "
+        "PRODUCES file must really appear or the build fails. Never claim a binary "
+        "deliverable you did not produce this way — describing one does not create it.\n"
     )
 
 

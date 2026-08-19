@@ -332,6 +332,60 @@ def _run_tests(session: Session, action: ProposedAction, data_dir: Path) -> str:
         raise ExecutionError(str(e)) from e
 
 
+def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) -> str:
+    """Run an approved build in a council space and capture the files it PRODUCES.
+
+    The council can only type text, so ARTIFACT can never deliver a PDF, an
+    archive, or any other binary. This is the governed route to one: the human
+    approves an exact command, the coordinator runs it bounded and without a
+    shell, and every file the seat declared must actually appear. The declared
+    outputs then behave like any other authored artifact — hashed, recorded in
+    files_changed, and promotable through the same approval gate.
+
+    Declaring the outputs up front is what makes this verifiable rather than a
+    licence to run code: a build that exits 0 but produces nothing, or produces
+    something other than what it promised, fails here instead of being reported
+    as a success."""
+    cmd = (_arg(action, "command") or "").strip()
+    produces = [f for f in (p.strip() for p in (_arg(action, "produces") or "").split(","))
+                if f]
+    if not produces:
+        raise ExecutionError("BUILD must declare the files it PRODUCES")
+    target = _space_arg(action, SANDBOX, _WRITE_SPACES)
+    cwd = space_root(session, data_dir, target)
+    _assert_outside_established(session, cwd)
+    cwd.mkdir(parents=True, exist_ok=True)
+    # Resolve every declared output inside the space FIRST: a build must not be
+    # able to name its way out of the council's own area.
+    outputs = {name: resolve_in_workspace(cwd, name) for name in produces}
+    for path in outputs.values():
+        _assert_outside_established(session, path)
+    try:
+        argv = validation.approved_build_argv(cmd)
+        report = validation.run(argv, cwd, config.BUILD_TIMEOUT, config.BUILD_OUTPUT_MAX_CHARS)
+    except validation.ValidationCommandError as e:
+        raise ExecutionError(str(e)) from e
+
+    missing = [n for n, path in outputs.items() if not path.is_file()]
+    if missing:
+        raise ExecutionError(
+            f"build did not produce {', '.join(missing)}\n{report}")
+    empty = [n for n, path in outputs.items() if path.stat().st_size == 0]
+    if empty:
+        raise ExecutionError(f"build produced empty file(s): {', '.join(empty)}\n{report}")
+
+    digests = {}
+    for name, path in outputs.items():
+        digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    # The loop reads these back to register the outputs as real deliverables.
+    action.args["produced_paths"] = json.dumps([str(p) for p in outputs.values()])
+    action.args["produced_hashes"] = json.dumps(digests)
+    listing = "\n".join(
+        f"  {name}  {outputs[name].stat().st_size} bytes  sha256={digests[name][:16]}…"
+        for name in produces)
+    return f"{report}\nPRODUCED:\n{listing}"
+
+
 def is_automatic_static_test(session: Session, action: ProposedAction, data_dir: Path) -> bool:
     """Whether a RUNTESTS action is a parse/compile-only safe check."""
     try:
@@ -1338,6 +1392,22 @@ SKILLS: dict[str, Skill] = {
         mutates=True,
         idempotency="unknown",
     ),
+    "build_artifact": Skill(
+        name="build_artifact",
+        description=(
+            "Run an approved build command in a council space and capture the files it "
+            "produces — the only governed route to a binary deliverable (PDF, archive)."
+        ),
+        category="code_exec",
+        risk=Risk.high,
+        requires_approval=True,
+        allowed_roles=[Role.lead, Role.implementer, Role.code_generator, Role.architect],
+        inputs=["command", "produces", "target"],
+        primary_input="command",
+        permitted_spaces=[SANDBOX, WORKSPACE],
+        mutates=True,
+        idempotency="unknown",
+    ),
     "stage": Skill(
         name="stage",
         description="Keep a sandbox file by moving it up into the permanent workspace. Free, no approval.",
@@ -1389,6 +1459,7 @@ HANDLERS: dict[str, Handler] = {
     "web_fetch": _web_fetch,
     "edit_file": _edit_file,
     "run_tests": _run_tests,
+    "build_artifact": _build_artifact,
     "stage": _stage,
     "promote": _promote,
     "promote_batch": _promote_batch,
