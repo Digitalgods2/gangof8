@@ -10,11 +10,13 @@ approval card is accepted.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 class ValidationCommandError(ValueError):
@@ -108,6 +110,50 @@ def approved_test_argv(command: str) -> list[str]:
     return [resolved, *args[1:]]
 
 
+# A dependency is a NAME (optionally with extras and a version range) and
+# nothing else. Everything pip can be told to fetch from somewhere the human
+# did not read — a URL, a VCS ref, a local path, 'pkg @ https://…', an
+# alternate index — is rejected here, because the approval card shows this
+# string and the card is only a gate if the string cannot mean something else.
+# One version constraint per package, not a compound range: comma separates
+# packages here AND clauses inside a PEP 508 range, so 'a, b>=1,<2' is genuinely
+# ambiguous. A single bound is enough to pin a build, and refusing the ambiguity
+# beats guessing which comma the model meant.
+_PACKAGE_SPEC = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"            # PEP 508 name
+    r"(?:\[[A-Za-z0-9._,-]+\])?"                              # optional extras
+    r"(?:\s*(?:===|==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9._*+!-]+)?$"  # optional version
+)
+# '<' and '>' are omitted deliberately: they are version operators here, and
+# specs are passed to pip as argv elements with shell=False, so they are never
+# redirections. The regex above is what constrains where they may appear.
+_SPEC_FORBIDDEN = set(":/\\@;&|`$()'\"")
+
+
+def approved_package_specs(raw: str) -> list[str]:
+    """Parse an INSTALL list into plain package requirements, or refuse.
+
+    Only names, extras, and version ranges survive. pip options are rejected
+    outright: -e, --index-url, --find-links and friends redirect where the code
+    comes from, which is exactly the thing the human is being asked to approve.
+    """
+    specs = [s.strip() for s in (raw or "").split(",") if s.strip()]
+    if not specs:
+        raise ValidationCommandError("INSTALL must name at least one package")
+    if len(specs) > 20:
+        raise ValidationCommandError("INSTALL is limited to 20 packages at a time")
+    for spec in specs:
+        if spec.startswith("-"):
+            raise ValidationCommandError(
+                f"pip options are not allowed in INSTALL: {spec!r}")
+        if any(ch in _SPEC_FORBIDDEN for ch in spec):
+            raise ValidationCommandError(
+                f"INSTALL takes package names only — no URLs, paths, or VCS refs: {spec!r}")
+        if not _PACKAGE_SPEC.match(spec):
+            raise ValidationCommandError(f"not a valid package requirement: {spec!r}")
+    return specs
+
+
 def approved_build_argv(command: str) -> list[str]:
     """Parse a human-approved BUILD command without invoking a shell.
 
@@ -117,22 +163,23 @@ def approved_build_argv(command: str) -> list[str]:
     arbitrary inline code past the approval card, and the card only works as a
     gate if the command the human reads is the command that runs.
 
-    Installing dependencies is deliberately NOT permitted here: pip executes
-    arbitrary package code and reaches the network, which is a different
-    decision from running a build the human just read. A build that needs
-    missing packages fails with a clear error instead."""
+    Installing dependencies is deliberately not reachable from here: pip
+    executes arbitrary package code and reaches the network, which is a
+    different decision from running a build the human just read. That is what
+    INSTALL / approved_package_specs is for — its own action, its own card."""
     try:
         return approved_test_argv(command)
     except ValidationCommandError as e:
         raise ValidationCommandError(str(e).replace("RUNTESTS", "BUILD")) from e
 
 
-def run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int) -> str:
+def run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int,
+        env: Optional[dict] = None) -> str:
     """Run an already-parsed argv with bounded output; never shell-expand it."""
     try:
         proc = subprocess.run(
             argv, shell=False, cwd=str(cwd), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout_s,
+            encoding="utf-8", errors="replace", timeout=timeout_s, env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise ValidationCommandError(f"command timed out after {timeout_s}s") from e

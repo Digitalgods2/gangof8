@@ -141,6 +141,15 @@ class Governance:
                 details = promote_diff(session, self.store.data_dir, fname)
             except Exception as e:  # noqa: BLE001 — never let preview failure block the gate
                 details = f"(could not build diff preview: {e})"
+        elif skill.category == "install":
+            # Never describe an install as happening "in the workspace": the card
+            # is the whole gate, and what it must convey is that this fetches and
+            # runs third-party code from the network — scoped to this session,
+            # not the coordinator's environment.
+            summary = (
+                f"install packages from PyPI into session {session.session_id} only: "
+                f"{action.args.get('packages') or action.filename}"
+            )
         else:
             where = (
                 f"workspace {session.workspace_root}" if session.workspace_root

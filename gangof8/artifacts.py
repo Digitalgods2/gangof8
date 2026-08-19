@@ -90,6 +90,17 @@ BUILD_MARKER = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# 'INSTALL: <packages>' proposes installing the third-party packages a BUILD
+# needs. Kept a SEPARATE decision from the build itself: running a script the
+# human just read is not the same as fetching and executing arbitrary package
+# code from the network, so each gets its own approval card naming exactly what
+# it does. Packages install into the session's own directory, never the
+# coordinator's environment.
+INSTALL_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?INSTALL(?:\*\*)?[ \t]*:[ \t]*(?P<packages>.+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # 'PROMOTE: <filename>' proposes copying a council file into the established
 # folder, the approval-gated boundary that touches real user code.
 PROMOTE_MARKER = re.compile(
@@ -102,7 +113,7 @@ PROMOTE_MARKER = re.compile(
 # a file body is not mistaken for a block boundary.
 BLOCK_START = re.compile(
     r"^[ \t]*(?:={3,}[ \t]*)?(?:\*\*)?(?:OLD/NEW[ \t]+)?"
-    r"(?:ARTIFACT|EDIT(?:[ \t]*#?\d+)?|RUN_?TESTS|BUILD|PROMOTE)(?:\*\*)?[ \t]*:",
+    r"(?:ARTIFACT|EDIT(?:[ \t]*#?\d+)?|RUN_?TESTS|BUILD|INSTALL|PROMOTE)(?:\*\*)?[ \t]*:",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -192,6 +203,15 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
         found.append((m.start(), ProposedAction(
             session_id=sid, kind="run_tests", role=role,
             filename=cmd or "pytest -q", args={"command": cmd})))
+    for m in INSTALL_MARKER.finditer(text):
+        packages = ", ".join(
+            p.strip() for p in (m.group("packages") or "").split(",") if p.strip())
+        if not packages:
+            continue
+        found.append((m.start(), ProposedAction(
+            session_id=sid, kind="install_deps", role=role,
+            # the package list IS the identity: it is what the approval card shows
+            filename=packages, args={"packages": packages})))
     for m in BUILD_MARKER.finditer(text):
         cmd = (m.group("cmd") or "").strip()
         produces = [f for f in (canonical_protocol_filename(p)

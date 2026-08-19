@@ -38,7 +38,8 @@ def session(tmp_path) -> Session:
 def test_registry_contains_skills():
     expected = {"write_file", "read_file", "search_project", "list_dir",
                 "web_search", "web_fetch", "edit_file", "run_tests", "stage",
-        "promote", "promote_batch", "git_snapshot", "build_artifact"}
+        "promote", "promote_batch", "git_snapshot", "build_artifact",
+                "install_deps"}
     assert set(SKILLS) == expected
     assert set(HANDLERS) == expected
     assert all(isinstance(s, Skill) for s in SKILLS.values())
@@ -630,3 +631,61 @@ def test_build_always_requires_approval(session, governance):
     approval = governance.authorize_action(session, action)
     assert approval is not None, "a build must never run without a human decision"
     assert "python make.py" in approval.action, "the card names the exact command"
+
+
+# --- install_deps: asking before fetching third-party code --------------------
+
+
+def test_install_deps_metadata():
+    """It fetches and executes code from the network, so it is always gated —
+    and under its own category, so approving installs is a separate standing
+    decision from approving builds."""
+    s = get_skill("install_deps")
+    assert s.requires_approval is True
+    assert s.risk == Risk.high
+    assert s.category == "install"
+    assert s.inputs == ["packages"]
+
+
+def test_install_approval_card_names_the_packages_and_the_scope(session, governance):
+    """The card IS the gate: it must say what is fetched and that the blast
+    radius is this session, never 'in workspace <path>' — installs do not go
+    to the workspace."""
+    session.workspace_root = "C:/somewhere/ws"
+    action = ProposedAction(
+        session_id=session.session_id, kind="install_deps", role=Role.lead,
+        filename="reportlab", args={"packages": "reportlab, pdfplumber"})
+    card = governance.authorize_action(session, action)
+    assert card is not None
+    assert "reportlab, pdfplumber" in card.action
+    assert session.session_id in card.action
+    assert "workspace" not in card.action
+
+
+def test_install_refuses_anything_but_package_names(session, tmp_path):
+    """A URL, a VCS ref, a path, or a pip option would let the code come from
+    somewhere the human never read on the card."""
+    for bad in ("evil @ https://attacker/x.whl", "--index-url http://attacker",
+                "git+https://x/y.git", "../../local", "-e ."):
+        action = ProposedAction(
+            session_id=session.session_id, kind="install_deps", role=Role.lead,
+            filename=bad, args={"packages": bad})
+        with pytest.raises(ExecutionError):
+            execute(session, action, tmp_path)
+
+
+def test_build_sees_session_packages_but_the_coordinator_env_is_untouched(tmp_path, session):
+    """Approving a build's dependencies must not permanently mutate the Python
+    the coordinator itself runs on. Packages land in the session's own
+    directory and reach the build through PYTHONPATH."""
+    from gangof8 import config
+    from gangof8.skills import build_env, session_deps_dir
+
+    assert build_env(session, tmp_path) is None, "no install yet: inherit the environment"
+
+    deps = session_deps_dir(session, tmp_path)
+    deps.mkdir(parents=True)
+    assert deps.is_relative_to(config.SANDBOX_ROOT), "session scratch, not the venv"
+
+    env = build_env(session, tmp_path)
+    assert str(deps) in env["PYTHONPATH"]
