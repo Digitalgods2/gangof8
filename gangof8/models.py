@@ -514,6 +514,15 @@ class Session(BaseModel):
     collaboration_integration_status: str = "not_started"
     package_started_at: Optional[str] = None
     package_deadline_at: Optional[str] = None
+    # What each talent has ALREADY delivered this session: role name -> the
+    # filenames it authored into the council space. The fan-out cap
+    # (budgets.max_delegations) is per SCAN, so nothing stopped the lead
+    # re-commissioning work that had already come back — one live run paid
+    # deepseek twice to research the same recipes and twice to write the same
+    # generator. A role that has delivered is refused a second production
+    # grant and pointed at its own output instead.
+    delegation_ledger: dict[str, list[str]] = {}
+    delegations_used: int = 0
     # The mandatory independent review: verdict, reviewer, and findings from a
     # seat that did NOT author the deliverable. Advisory — deterministic gates
     # still decide what ships — but a FAIL caps the reported confidence.
