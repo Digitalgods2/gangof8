@@ -81,25 +81,43 @@ def delegation_contract(council: "Council", role_agents: dict[Role, str] | None,
         origin = (member.agent if member else None) or mapping.get(role) or "?"
         lines.append(f"- {role.value} ({origin}): {talent}")
     menu = "\n".join(lines)
+    # The file-authoring mechanics that follow this block are long, concrete and
+    # imperative ("emit each file literally, with its COMPLETE contents"). Four
+    # lines of "you are the organizer" lost that argument every time: the lead
+    # authored whole deliverables alone while nine mapped talents across five
+    # models sat idle. So state the DIVISION OF LABOUR explicitly, say that the
+    # mechanics below belong to whoever authors, and show one worked example —
+    # models copy a demonstrated shape far more reliably than an exhortation.
     author = (
-        "This task ships FILES — DELEGATE the authoring itself, e.g. "
-        "'DELEGATE: code_generator - author the complete <filename>, implementing "
-        "<the agreed design>'. A delegated talent's ARTIFACT/EDIT blocks are "
-        "captured directly as real files in the council space; you then review "
-        "them and emit the PROMOTE lines yourself.\n") if produces_output else ""
+        "\nTHIS TASK SHIPS FILES. The substantive authoring is a talent's job, "
+        "not yours. Everything after this section describes HOW A FILE IS "
+        "WRITTEN — it applies to whoever writes it, which for real content is "
+        "the talent you delegate to. A delegated talent's ARTIFACT/EDIT blocks "
+        "are captured directly as real files in the council space.\n"
+        "Your own reply carries the ASSIGNMENTS, and later the governed lines "
+        "only you may emit: BUILD/PRODUCES, INSTALL, PROMOTE.\n"
+        "A first reply on a substantial build should look like this:\n"
+        "  DELEGATE: researcher - gather the source material for X, with citations\n"
+        "  DELEGATE: implementer - author the complete <filename> covering X\n"
+        "  CONSULT: critic - what would make this deliverable fail acceptance?\n"
+        "Then their work returns and you integrate, verify and deliver it.\n"
+        "Author a file yourself ONLY when it is small glue, or when a talent "
+        "already returned the content and you are assembling it.\n"
+    ) if produces_output else ""
     return (
         "YOU are the LEAD — the organizer and integrator, NOT the doer. Break the "
         "task into focused assignments, hand each to the right talent below, then "
-        "integrate their results and quality-gate the whole. Author work yourself "
-        "only when it is trivial glue; a substantive piece done solo should be "
-        "the justified exception, not the default. One line per assignment:\n"
+        "integrate their results and quality-gate the whole. Doing a substantive "
+        "piece solo when a mapped talent exists for it is a FAILURE of your role, "
+        "not efficiency: these are different models, and a second one seeing the "
+        "work is the point. One line per assignment:\n"
         "CONSULT: <talent> - <specific question>   (advice/verification returns to you)\n"
         "DELEGATE: <talent> - <specific subtask>   (the talent produces that piece)\n"
         "Their results come back and you are re-called to integrate and finish. "
         "When results already appear below, integrate them NOW — do not "
         "re-request the same work.\n"
-        f"{author}"
         f"Available talents:\n{menu}\n"
+        f"{author}"
     )
 
 
@@ -291,17 +309,20 @@ def _output_contract(session: Session) -> str:
         names = ", ".join(f".{fmt}" for fmt in formats)
         required = (
             f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
-            f"nothing else, so you CANNOT type it out. Authoring a generator is only "
-            f"half the job and does not satisfy the task — in the same reply you must "
-            f"also RUN it via INSTALL (if it needs packages) and BUILD/PRODUCES, "
+            f"nothing else, so nobody can type it out. A generator alone does not "
+            f"satisfy the task: once the generator exists — whoever authored it — the "
+            f"run must RUN it via INSTALL (if it needs packages) and BUILD/PRODUCES "
             f"naming the {names} file, and PROMOTE that file rather than the script. "
-            f"A run that ends holding only source code has produced nothing and the "
-            f"delivery gate will fail it.\n\n"
+            f"Those governed lines are YOURS to emit as lead. A run that ends holding "
+            f"only source code has produced nothing and the delivery gate will fail "
+            f"it.\n\n"
         )
     else:
         required = ""
     return (
         required
+        + "FILE-WRITING MECHANICS (these apply to WHOEVER authors a file — a talent "
+        "you delegated to, or you when it is glue):\n"
         + "If the task needs files (code, docs, config), emit each file literally in "
         "this format, with its COMPLETE contents — never a summary of what the file "
         "would contain:\n"
