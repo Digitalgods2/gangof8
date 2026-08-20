@@ -65,6 +65,12 @@ BUDGETS_BY_COMPLEXITY: dict[Complexity, Budgets] = {
 # reply is fed back — the RESULT: block survives whole, the preamble is what
 # gets truncated (see rounds.split_result_block).
 DELEGATION_RESULT_MAX_CHARS = 2500
+# budgets.max_delegations bounds ONE scan. Across rounds a lead that keeps
+# re-planning could fan out without limit, so this is the session-wide
+# backstop — generous enough for genuine multi-part work, finite enough that a
+# re-planning loop cannot bill indefinitely.
+MAX_SESSION_DELEGATIONS = max(1, int(
+    os.environ.get("GANGOF8_MAX_SESSION_DELEGATIONS", "12")))
 # Independent sibling consults (a seat emitting several CONSULT: lines at once) run
 # concurrently — each is a blocking CLI call, so this is the real wall-clock win.
 # This caps how many agent subprocesses run at once MACHINE-WIDE (the CLIs are

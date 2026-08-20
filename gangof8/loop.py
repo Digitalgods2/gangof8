@@ -1725,6 +1725,33 @@ def _delegation_decision(role: Optional[Role]) -> tuple[bool, str]:
     return True, "granted"
 
 
+def _repeat_delivery_refusal(session: Session, role: Role, kind: str) -> str:
+    """Refuse a SECOND production grant to a talent that already delivered.
+
+    ``budgets.max_delegations`` bounds fan-out per SCAN, so across rounds a lead
+    could re-commission work it already had. Live: deepseek was paid twice to
+    research the same recipes and twice to author the same generator, because
+    each round's scan started from a fresh budget.
+
+    Only DELEGATE (production) is refused, and only when that role already put
+    files into the council space — a talent whose first grant produced nothing
+    is genuinely worth retrying. CONSULT stays free: advice is cheap, does not
+    author, and is how the lead should be asking follow-up questions anyway.
+    Returns '' when the grant may proceed.
+    """
+    if kind != "delegate":
+        return ""
+    delivered = list((session.delegation_ledger or {}).get(role.value) or [])
+    if not delivered:
+        return ""
+    return (
+        f"already delivered: {role.value} authored {', '.join(delivered)} earlier "
+        "in this run and they are captured in the council space. Integrate that "
+        "work, or CONSULT this talent for a specific follow-up question — do not "
+        "re-commission it."
+    )
+
+
 _DELEGATION_FALLBACK_ROLES: dict[Role, tuple[Role, ...]] = {
     Role.code_generator: (Role.implementer, Role.architect, Role.lead),
     Role.implementer: (Role.code_generator, Role.lead, Role.architect),
@@ -1832,6 +1859,11 @@ def _resolve_one_delegation(
     ok, why = _delegation_decision(role)
     if ok and role == requester.role:
         ok, why = False, "a seat cannot consult itself"  # no trivial self-loop
+    if ok and role is not None:
+        with _SESSION_LOCK:
+            repeat = _repeat_delivery_refusal(session, role, kind)
+        if repeat:
+            ok, why = False, repeat
     if not ok or role is None:
         with _SESSION_LOCK:
             store.log_event(sid, "delegation_denied",
@@ -1893,6 +1925,12 @@ def _resolve_one_delegation(
             if captured:
                 with _SESSION_LOCK:
                     _append_proposals(session, store, captured)
+                    # Record the delivery so a later round cannot re-commission
+                    # the same talent for work it already handed back.
+                    ledger = session.delegation_ledger.setdefault(role.value, [])
+                    for action in captured:
+                        if action.filename and action.filename not in ledger:
+                            ledger.append(action.filename)
                     store.log_event(sid, "delegate_artifacts_captured",
                                     {"talent": role.value, "agent": helper.agent,
                                      "files": [a.filename for a in captured]})
@@ -1961,7 +1999,33 @@ def _run_delegations(
     if not reqs:
         return []
     can_subconsult = depth < session.budgets.max_delegation_depth
-    batch = reqs[: session.budgets.max_delegations]
+    # Asking the SAME talent for the same kind of grant twice in one reply is
+    # always waste — keep the first line and drop the duplicates before they
+    # each cost a call. (The cross-round case is handled by the delivery ledger
+    # in _repeat_delivery_refusal.)
+    deduped: list = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for m in reqs:
+        role = _parse_role(m.group("talent"))
+        key = (m.group("kind").lower(), role.value if role else m.group("talent").lower())
+        if key in seen_pairs:
+            store.log_event(session.session_id, "delegation_deduped",
+                            {"kind": key[0], "to": key[1], "depth": depth})
+            continue
+        seen_pairs.add(key)
+        deduped.append(m)
+    # A session-wide backstop: max_delegations bounds ONE scan, so a lead that
+    # keeps re-planning across rounds could otherwise fan out without limit.
+    remaining = max(0, config.MAX_SESSION_DELEGATIONS - session.delegations_used)
+    batch = deduped[: min(session.budgets.max_delegations, remaining)]
+    if deduped and not batch:
+        store.log_event(session.session_id, "delegation_budget_exhausted",
+                        {"used": session.delegations_used,
+                         "cap": config.MAX_SESSION_DELEGATIONS})
+        return [f"CONSULT/DELEGATE: refused - this run has used its "
+                f"{config.MAX_SESSION_DELEGATIONS} delegations; integrate what you "
+                "already have and finish."]
+    session.delegations_used += len(batch)
     # Two phases: DELEGATE lines (production) resolve FIRST, then CONSULT lines
     # (advice/review) with the delegates' freshly authored files folded into
     # their context — so "coder writes, critic reviews the actual file" works
