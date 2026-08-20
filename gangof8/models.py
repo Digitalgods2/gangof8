@@ -514,6 +514,10 @@ class Session(BaseModel):
     collaboration_integration_status: str = "not_started"
     package_started_at: Optional[str] = None
     package_deadline_at: Optional[str] = None
+    # The mandatory independent review: verdict, reviewer, and findings from a
+    # seat that did NOT author the deliverable. Advisory — deterministic gates
+    # still decide what ships — but a FAIL caps the reported confidence.
+    review: dict = {}
     # The LLM intent pass (intent.py): what a model read the task as asking for.
     # Kept as the raw payload for audit — the classification it produced is
     # already merged into `classification`.

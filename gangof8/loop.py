@@ -908,6 +908,138 @@ def _maybe_ask_intent(
     return True
 
 
+def _review_seats(session: Session, council: Council, registry: AgentRegistry,
+                  author: str) -> list[CouncilMember]:
+    """Seats that may CHECK the deliverable, best first: registered models that
+    did not author it.
+
+    Ordered by the roles the user already mapped for checking (critic,
+    fact_validator, red_team, ...) so an existing Settings role mapping decides
+    who reviews — then any other registered seat. This is why the council lists
+    nine talents across five models: the mapping is the product, it just was
+    never obligatory. Returning a LIST (not one seat) is what lets a transient
+    upstream failure fall through to the next model instead of dropping the
+    check entirely.
+    """
+    names = set(registry.names())
+    by_role = {m.role.value: m.agent for m in council.members if m.agent}
+    ordered: list[str] = []
+    for role_name in config.REVIEW_ROLE_PREFERENCE:
+        agent = by_role.get(role_name)
+        if agent and agent != author and agent in names and agent not in ordered:
+            ordered.append(agent)
+    for member in council.members:
+        agent = member.agent
+        if (agent and agent != author and agent in names
+                and agent != "system" and agent not in ordered):
+            ordered.append(agent)
+    for name in sorted(names):
+        if name != author and name not in ordered:
+            ordered.append(name)
+    return [CouncilMember(role=Role.critic, agent=a, active=True) for a in ordered]
+
+
+def _review_deliverable(
+    session: Session, council: Council, registry: AgentRegistry, store: LogStore,
+    executed: list[ProposedAction],
+) -> None:
+    """One model that did not write it checks the deliverable before delivery.
+
+    The floor of "one to do, one to check", guaranteed on EVERY route — not a
+    routing profile, not a setting, and not dependent on session.panel (which
+    the default route empties). Dynamic CONSULT/DELEGATE is untouched; this only
+    makes the second pair of eyes obligatory.
+
+    Advisory by design. The deterministic gates still decide what ships; a
+    reviewer's FAIL is recorded, surfaced in the run's unresolved risks, and
+    caps the reported confidence, so a categorical miss (a generator where a PDF
+    was wanted) can no longer be reported as an unqualified success. It does not
+    block delivery on one model's opinion.
+    """
+    if session.review or config.REVIEW_MODE == "off":
+        return
+    if config.REVIEW_MODE != "on" and (session.backend or config.BACKEND) == "mock":
+        return
+    files: list[tuple[str, str]] = []
+    for action in executed:
+        try:
+            text = Path(action.result_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if text.strip():
+            files.append((action.filename, text))
+    # A BUILD's outputs ARE the deliverable, and they are usually binary — the
+    # reviewer must be told they exist or it judges the generator alone and
+    # rightly calls it "a script, not a PDF". Live: glm failed a run whose PDF
+    # had in fact been built, because this list omitted it. Binary bytes are
+    # useless in a prompt, so they are described (name, size, provenance) rather
+    # than dumped; the executor already confirmed and hashed them.
+    for action in session.proposed_actions:
+        if (action.kind != "build_artifact" or action.status != "executed"
+                or action.role == Role.panelist):
+            continue
+        for produced in _build_outputs(action):
+            path = Path(produced)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            files.append((
+                path.name,
+                f"[BINARY DELIVERABLE — {size:,} bytes, produced and verified by "
+                f"the approved build '{action.filename}'. Its bytes are not shown "
+                "because they are not text. This file EXISTS and is what ships.]",
+            ))
+    if not files:
+        return
+    author = next((c.agent for c in reversed(session.contributions)
+                   if c.role in (Role.lead, Role.implementer) and c.agent), "the author")
+    candidates = _review_seats(session, council, registry, author)
+    if not candidates:
+        # A single-model installation genuinely cannot check itself. Say so
+        # rather than pretending a review happened.
+        session.review = {"verdict": "skipped", "reason": "no second model is enabled"}
+        store.log_event(session.session_id, "review_skipped",
+                        {"reason": "no second model is enabled", "author": author})
+        return
+    prompt = rounds.deliverable_review_prompt(session, files, author)
+    # A transient upstream failure on ONE seat must not silently drop the check
+    # when four other models are enabled and idle. Live: glm returned a truncated
+    # HTTP payload and the whole review vanished. Try the next eligible seat.
+    reply = None
+    reviewer = None
+    failures: list[str] = []
+    for candidate in candidates[:config.REVIEW_SEAT_ATTEMPTS]:
+        try:
+            reply = _agent_call(session, registry, store, candidate, prompt,
+                                timeout_s=config.REVIEW_TIMEOUT or None)
+            reviewer = candidate
+            break
+        except (AgentError, AgentInputRequired) as e:
+            failures.append(f"{candidate.agent}: {str(e)[:120]}")
+            store.log_event(session.session_id, "review_seat_failed",
+                            {"reviewer": candidate.agent, "reason": str(e)[:200]})
+        except BudgetExceeded as e:
+            failures.append(f"{candidate.agent}: {str(e)[:120]}")
+            break
+    if reply is None or reviewer is None:
+        session.review = {"verdict": "skipped",
+                          "reason": "; ".join(failures)[:400] or "no reviewer answered"}
+        store.log_event(session.session_id, "review_skipped",
+                        {"reason": "; ".join(failures)[:300]})
+        return
+    verdict, findings = rounds.parse_review(reply.content)
+    session.review = {"verdict": verdict or "no_verdict", "reviewer": reviewer.agent,
+                      "author": author, "findings": findings,
+                      "files": [name for name, _ in files]}
+    store.log_event(session.session_id, "deliverable_reviewed", session.review)
+    if verdict == "fail":
+        for finding in findings or ["the independent reviewer rejected the deliverable"]:
+            note = f"independent review ({reviewer.agent}): {finding}"
+            if note not in session.unresolved:
+                session.unresolved.append(note)
+
+
 def _frontier_seats(session: Session) -> tuple[str, ...]:
     """Frontier-class seats for THIS session.
 
@@ -4395,6 +4527,18 @@ def _deliberate(
         store.save_session(session)
         return session
 
+    # Deterministic gates have passed. Before ANY of it crosses into the user's
+    # folder, one model that did not write it reads it — the "one to do, one to
+    # check" floor, on every route. Advisory: it records and surfaces findings,
+    # it does not veto. Runs before the promote so its verdict is part of what
+    # the human sees when they approve.
+    _review_deliverable(
+        session, council, registry, store,
+        [a for a in session.proposed_actions
+         if a.kind in _FILE_OUTPUT_KINDS and a.status == "executed"
+         and a.result_path and a.role != Role.panelist],
+    )
+
     # Verified — NOW deliver (the one approval gate) and, if the destination is
     # unknown, ask the delivery-target question.
     _ensure_deliverable_promotes(session, store)
@@ -4433,6 +4577,20 @@ def _deliberate(
     # Record this turn in the conversation: the human's message (the original task
     # on turn one; on a follow-up it was appended by continue_session) and the
     # council's conclusion. The human can now respond and keep the thread going.
+    # An independent FAIL cannot be reported as an unqualified success. The
+    # deterministic gates decide what ships, so this does not block delivery —
+    # but the run that shipped a PDF generator and called itself high-confidence
+    # is exactly what an unheeded review looks like.
+    if session.final and (session.review or {}).get("verdict") == "fail":
+        session.final.confidence = "low"
+        reviewer = session.review.get("reviewer", "an independent seat")
+        note = (f"\n\nIndependent review by {reviewer} did NOT pass this "
+                "deliverable — see the unresolved risks below.")
+        if note.strip() not in (session.final.answer or ""):
+            session.final.answer = (session.final.answer or "") + note
+        store.log_event(sid, "review_failed_confidence_capped",
+                        {"reviewer": reviewer,
+                         "findings": session.review.get("findings", [])})
     if not session.turns:
         session.turns.append({"role": "user", "text": session.task.text})
     session.turns.append({"role": "council", "text": session.final.answer})

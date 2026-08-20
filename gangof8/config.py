@@ -337,6 +337,35 @@ INTENT_CLARIFY_CONFIDENCE = float(
 INTENT_CLARIFY = os.environ.get(
     "GANGOF8_INTENT_CLARIFY", "1").strip().lower() not in {"0", "false", "no", "off"}
 
+# ---------------------------------------------------------------------------
+# MANDATORY INDEPENDENT REVIEW — "one to do, one to check", on every route.
+#
+# The council already lists nine talents backed by five models and tells the
+# lead to delegate. Nothing REQUIRED any of it, so the lead routinely authored a
+# whole deliverable alone and shipped it: a run that produced only a generator
+# script reported high confidence with no second model ever having looked at it.
+# The one mechanism that was meant to catch this (the independent release gate)
+# lives on the best-of-N path only and is gated on session.panel, which the
+# default route empties — so on an ordinary task it never ran.
+#
+# This is not a routing profile and needs no choice from the user: whenever a
+# run produces a file deliverable, ONE enabled seat that did not author it
+# reviews the result before delivery. Dynamic CONSULT/DELEGATE stays exactly as
+# it is; this only guarantees the floor of two models.
+REVIEW_MODE = os.environ.get("GANGOF8_REVIEW", "auto").strip().lower()
+REVIEW_TIMEOUT = max(0, int(os.environ.get("GANGOF8_REVIEW_TIMEOUT", "180")))
+# Roles the user already mapped for checking, in preference order. The reviewer
+# is drawn from these first so an existing Settings role mapping is what decides
+# who checks — falling back to any enabled seat that is not the author.
+REVIEW_ROLE_PREFERENCE = ("critic", "fact_validator", "red_team", "architect")
+# How many seats to try before giving up on the review. One transient upstream
+# error must not drop the check when other models are enabled and idle.
+REVIEW_SEAT_ATTEMPTS = max(1, int(os.environ.get("GANGOF8_REVIEW_SEAT_ATTEMPTS", "3")))
+# Per-file budget for the review prompt. A reviewer answering "is this the
+# thing the user asked for?" needs to SEE the artifact, but a 50KB generator
+# does not need to arrive whole to reveal that it is a generator.
+REVIEW_FILE_MAX_CHARS = int(os.environ.get("GANGOF8_REVIEW_FILE_MAX_CHARS", "12000"))
+
 # How many seats a duo panel convenes (lead + reviewers). This is the spend dial
 # for a duo roster: it caps both the native seats and the OpenRouter seats that
 # backfill for disabled CLIs, so the two can never disagree about panel size.

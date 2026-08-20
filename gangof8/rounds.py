@@ -1429,3 +1429,74 @@ def round_summaries(session: Session) -> str:
         gist = " ".join((synth.content if synth else "").split())[:config.ROUND_SUMMARY_CHARS]
         lines.append(f"round {spec.round + 1}: {gist or '(no synthesis recorded)'}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Mandatory independent review: one seat that did NOT author the deliverable
+# checks it before delivery. Deliberately narrow — this reviewer does not
+# redesign, rewrite, or bikeshed; it answers whether the thing the user asked
+# for is actually what was produced.
+# ---------------------------------------------------------------------------
+REVIEW_MARKER = re.compile(
+    r"^[ \t]*(?:\*\*)?REVIEW(?:\*\*)?[ \t]*:[ \t]*(?:\*\*)?[ \t]*(?P<verdict>PASS|FAIL)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def deliverable_review_prompt(session: Session, files: list[tuple[str, str]],
+                              author: str) -> str:
+    """Ask a second model whether the delivered artifact IS the deliverable.
+
+    Framed around the request, not around code quality. The failure this exists
+    to catch is categorical — a script where a PDF was wanted, an empty shell
+    where content was wanted, a stub where a whole file was wanted — not style.
+    """
+    listing = "\n\n".join(
+        f"--- {name} ({len(body)} chars) ---\n{body[:config.REVIEW_FILE_MAX_CHARS]}"
+        + ("\n[... truncated for review ...]"
+           if len(body) > config.REVIEW_FILE_MAX_CHARS else "")
+        for name, body in files
+    )
+    return (
+        f"TASK THE USER ASKED FOR:\n{_execution_task(session)}\n\n"
+        f"WHAT {author} PRODUCED — these exact files are about to be delivered:\n"
+        f"{listing}\n\n"
+        "You are the INDEPENDENT REVIEWER. You did not write this and you are "
+        "not rewriting it. Answer one question: is this actually the thing the "
+        "user asked for?\n\n"
+        "Judge ONLY these, in order:\n"
+        "1. WRONG KIND OF ARTIFACT — the deliverable is a different kind of "
+        "thing than was requested (a program that would produce the output "
+        "instead of the output; a plan instead of the work; a stub instead of a "
+        "complete file).\n"
+        "2. MISSING — something the request explicitly named is absent.\n"
+        "3. INCOMPLETE — the file is cut off, or a section is a placeholder.\n"
+        "4. FALSE CLAIM — the work claims something the bytes do not support.\n\n"
+        "Do NOT fail it for style, structure, naming, formatting, efficiency, "
+        "or choices you would have made differently. Unstated details the author "
+        "reasonably assumed are NOT defects.\n\n"
+        "Reply in exactly this form and nothing else:\n"
+        "REVIEW: PASS\n"
+        "or\n"
+        "REVIEW: FAIL\n"
+        "FINDINGS:\n"
+        "- <one concrete defect, naming the file>\n"
+        "- <another, if any>\n"
+    )
+
+
+def parse_review(reply: str) -> tuple[str, list[str]]:
+    """('pass'|'fail'|'', findings). An empty verdict means the reviewer did not
+    answer in the contract — treated as no opinion, never as a failure."""
+    match = REVIEW_MARKER.search(reply or "")
+    if not match:
+        return "", []
+    verdict = match.group("verdict").lower()
+    findings: list[str] = []
+    for line in (reply or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("- ", "* ", "• ")):
+            text = stripped[2:].strip()
+            if text and text.lower() not in {"none", "n/a", "none.", "no defects"}:
+                findings.append(text[:400])
+    return verdict, findings[:8]
