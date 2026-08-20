@@ -86,3 +86,55 @@ def test_safe_task_never_pauses(service):
     session = service.run("What is SQLite?", source="test")
     assert session.status == SessionStatus.done
     assert session.approvals == []
+
+
+def _promote_session(tmp_path, existing: str, replacement: str):
+    """A session whose sandbox holds `replacement` for a file that already
+    exists in the user's established folder as `existing`."""
+    from gangof8 import executor
+    from gangof8.models import ProposedAction
+
+    established = tmp_path / "delivered"
+    established.mkdir()
+    (established / "gen.py").write_text(existing, encoding="utf-8")
+    store = LogStore(tmp_path / "data")
+    session = SessionManager(store).create("deliver", source="test")
+    session.established_root = str(established)
+    sandbox = executor.artifacts_dir(store.data_dir, session.session_id)
+    sandbox.mkdir(parents=True, exist_ok=True)
+    (sandbox / "gen.py").write_text(replacement, encoding="utf-8")
+    action = ProposedAction(session_id=session.session_id, kind="promote",
+                            filename="gen.py", args={"filename": "gen.py"})
+    return session, action, Governance(store)
+
+
+def test_destructive_promote_is_named_in_the_approval(tmp_path):
+    """Replacing a file with a fraction of itself must SAY so.
+
+    Regression: a truncated council copy replaced a 49,283-byte delivered file
+    with 514 bytes. The diff was shown and approved, but nothing stated that
+    99% of the file was being deleted.
+    """
+    session, action, gov = _promote_session(
+        tmp_path, "x = 1\n" + "# body\n" * 500, "x = 1\n")
+    approval = gov.authorize_action(session, action)
+    assert approval is not None
+    assert "DESTRUCTIVE promote" in approval.action
+    assert "removing 99" in approval.action and "%" in approval.action
+
+
+def test_standing_promote_approval_does_not_cover_a_destructive_promote(tmp_path):
+    """'Approve all promote' saves identical clicks; it is not consent to gut
+    an existing file. That promote stops for its own decision."""
+    session, action, gov = _promote_session(
+        tmp_path, "x = 1\n" + "# body\n" * 500, "x = 1\n")
+    session.standing_approvals.append("promote")
+    assert gov.authorize_action(session, action) is not None
+
+
+def test_standing_promote_approval_still_covers_an_ordinary_promote(tmp_path):
+    """A normal delivery must not start prompting again."""
+    body = "x = 1\n" + "# body\n" * 500
+    session, action, gov = _promote_session(tmp_path, body, body + "y = 2\n")
+    session.standing_approvals.append("promote")
+    assert gov.authorize_action(session, action) is None

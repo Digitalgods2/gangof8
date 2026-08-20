@@ -536,6 +536,33 @@ def _promote_dest(session: Session, data_dir: Path, raw_name: str) -> Path:
     return resolve_space(session, data_dir, ESTABLISHED, raw_name)
 
 
+def promote_shrink(session: Session, data_dir: Path, raw_name: str) -> Optional[tuple[int, int, float]]:
+    """(old_bytes, new_bytes, fraction_removed) when a promote SHRINKS an
+    existing file materially, else None.
+
+    A unified diff tells the whole truth but does not make this particular truth
+    legible: replacing a 49,283-byte file with 514 bytes renders as hundreds of
+    red lines that read like any other large edit. One live promote did exactly
+    that — a parser bug had truncated the council's copy, the diff was approved,
+    and the good delivered file was destroyed. The gate needs to SAY the number.
+    """
+    try:
+        src = _promote_source(session, data_dir, raw_name)
+        dst = _promote_dest(session, data_dir, raw_name)
+        if src is None or not dst.is_file():
+            return None
+        old_size = dst.stat().st_size
+        new_size = src.stat().st_size
+    except (OSError, ExecutionError):
+        return None
+    if old_size < config.PROMOTE_SHRINK_MIN_BYTES or new_size >= old_size:
+        return None
+    removed = (old_size - new_size) / old_size
+    if removed < config.PROMOTE_SHRINK_FRACTION:
+        return None
+    return old_size, new_size, removed
+
+
 def promote_diff(session: Session, data_dir: Path, raw_name: str) -> str:
     """Unified diff of what `promote` would change at the delivery target: the
     existing file there (if any) → the council version. Shown in the approval so

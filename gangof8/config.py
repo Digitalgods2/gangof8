@@ -309,8 +309,38 @@ PANEL_SEATS_BY_BACKEND: dict[str, list[str]] = {
 # want candidate diversity. An explicit settings.panel_seats roster always
 # wins over either mode.
 PANEL_MODE = os.environ.get("GANGOF8_PANEL_MODE", "duo").strip().lower()
-# How many seats a duo panel convenes (lead + reviewers).
-DUO_PANEL_SIZE = 2
+# ---------------------------------------------------------------------------
+# INTENT PASS — one cheap model call that decides what the task MEANS.
+#
+# classifier.py is deliberately rule-based ("Phase 0"), so until this existed
+# the layer deciding what the user asked for was re.search over word lists: a
+# request to "compile a pdf of Escoffier's recipes" matched the CODE_WORDS entry
+# 'compile', was typed as software work, and shipped a generator script instead
+# of the book. No amount of extra keywords fixes that class of failure; a model
+# reading the sentence does.
+#
+# "off" disables it (pure rule-based, the old behavior), "auto" runs it whenever
+# a real backend is configured, "on" runs it even on the mock backend.
+INTENT_MODE = os.environ.get("GANGOF8_INTENT", "auto").strip().lower()
+# Seat that answers it. Empty ⇒ the summarizer's model (typically the cheap fast
+# seat), falling back to the lead. This call is small and never authors.
+INTENT_SEAT = os.environ.get("GANGOF8_INTENT_SEAT", "").strip()
+INTENT_TIMEOUT = max(0, int(os.environ.get("GANGOF8_INTENT_TIMEOUT", "90")))
+# Below this confidence AND with a concrete either/or on the table, the
+# coordinator ASKS the user instead of guessing. Deliberately strict: a system
+# that asks about everything is its own kind of useless, so both conditions must
+# hold and the question is asked at most once per session.
+INTENT_CLARIFY_CONFIDENCE = float(
+    os.environ.get("GANGOF8_INTENT_CLARIFY_CONFIDENCE", "0.7")
+)
+# Set to 0 to keep the intent pass but never pause for a clarifying question.
+INTENT_CLARIFY = os.environ.get(
+    "GANGOF8_INTENT_CLARIFY", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# How many seats a duo panel convenes (lead + reviewers). This is the spend dial
+# for a duo roster: it caps both the native seats and the OpenRouter seats that
+# backfill for disabled CLIs, so the two can never disagree about panel size.
+DUO_PANEL_SIZE = max(1, int(os.environ.get("GANGOF8_DUO_PANEL_SIZE", "2")))
 # Goals default to a frontier-only build roster; set to 1 to let enabled
 # budget (OpenRouter) seats join every goal as before.
 GOAL_FULL_ROSTER = os.environ.get(
@@ -360,6 +390,15 @@ APPROVAL_CATEGORIES = [
 # promote (workspace → established folder) is the ONE approval-gated boundary
 # that touches real user code; cap the diff shown in its approval card.
 PROMOTE_DIFF_MAX_CHARS = 6000
+# A promote that REPLACES an existing file with a much smaller one is treated as
+# destructive: the approval says so in words, and a session-wide "approve all
+# promote" does NOT cover it — that one still stops for its own decision.
+# Standing approval exists to save N identical clicks on a routine delivery, not
+# to pre-authorize deleting the contents of a file the user already has.
+PROMOTE_SHRINK_FRACTION = float(
+    os.environ.get("GANGOF8_PROMOTE_SHRINK_FRACTION", "0.5"))
+PROMOTE_SHRINK_MIN_BYTES = int(
+    os.environ.get("GANGOF8_PROMOTE_SHRINK_MIN_BYTES", "1024"))
 BATCH_PROMOTE_DIFF_MAX_CHARS = int(
     os.environ.get("GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS", "60000"))
 

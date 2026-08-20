@@ -89,6 +89,15 @@ class Settings(BaseModel):
     # focused owner+verifier path for small work. ``full_council`` always runs
     # the artifact-aware challenge wave; ``focused`` preserves the lean path.
     participation_mode: Literal["focused", "adaptive", "full_council"] = "adaptive"
+    # Default execution profile for tasks submitted without one. "auto" lets the
+    # outcome router choose, which for any ordinary-length request scores
+    # `focused` (55+8) above `council` (48+8) — and `focused` empties the panel,
+    # so a multi-model installation runs single-model on almost everything.
+    # Setting this to "council" or "best_of_n" makes that a deliberate choice
+    # instead of a threshold artifact. A per-task profile still overrides it.
+    default_execution_profile: Literal[
+        "auto", "focused", "council", "best_of_n", "build_team"
+    ] = "auto"
 
 
 # Portable profiles use an explicit allowlist.  Do not replace this with a
@@ -110,6 +119,7 @@ PORTABLE_SETTINGS_FIELDS = (
     "rounds_per_consent",
     "integration_review_enabled",
     "participation_mode",
+    "default_execution_profile",
     "ui",
 )
 

@@ -28,6 +28,34 @@ SPECIALIST_ROLES = (
 )
 
 
+def resolve_frontier_authors(roster) -> list[str]:
+    """Which seats count as FRONTIER-CLASS for a given enabled roster.
+
+    ``config.FRONTIER_AUTHOR_SEATS`` names a preference (claude, codex by
+    default), not a hard membership test. When none of those seats is available
+    the role must PASS to the enabled roster, exactly as role assignment already
+    passes a disabled seat's roles along (``service._apply_seat_disables``).
+
+    Without this the two disagreed in a way that quietly removed capability:
+    with claude and codex switched off, nothing satisfied the membership test,
+    so ``required_frontier_authors`` was empty on every run and the independent
+    release inspection returned "not required" — the third layer of the
+    verification stack silently turned itself off rather than being carried out
+    by the models that were actually enabled.
+
+    The fallback keeps the SIZE of the configured frontier group so a small
+    privileged author set stays small; it does not promote the whole roster.
+    Pass the roster in takeover order (``service._enabled_role_fallbacks``).
+    """
+    from . import config
+
+    seats = list(dict.fromkeys(s for s in (roster or []) if s))
+    preferred = [s for s in config.FRONTIER_AUTHOR_SEATS if s in seats]
+    if preferred:
+        return preferred
+    return seats[:max(1, len(config.FRONTIER_AUTHOR_SEATS))]
+
+
 def build_council(
     cls: Classification,
     role_agents: dict[Role, str] | None = None,

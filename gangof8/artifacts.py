@@ -254,6 +254,38 @@ def html_doc_end(low: str) -> int:
     return idx + len("</html>")
 
 
+# Source files a model may follow with Markdown release notes, and which the
+# fallback below therefore trims.
+_TRAILING_PROSE_SUFFIXES = (
+    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".css", ".py",
+)
+# Languages where '# ' STARTS A COMMENT, so a Markdown-heading match is not
+# evidence of trailing prose — it is ordinary source.
+#
+# This cost a live deliverable. A 54,000-character reportlab generator was cut
+# to 514 bytes at its first comment:
+#
+#     sys.exit(1)                       <- previous line ends in ')'
+#                                       <- blank
+#     # Global Registries to track ...  <- matched '^\s*#{1,6}\s+', file cut HERE
+#
+# The remains were still valid Python, so ast.parse passed, verification passed,
+# and the truncated file was promoted over the good copy already on disk. Every
+# Python artifact this system produced was exposed: a comment following any line
+# ending in ')', ';', '}' or ']' triggers it, which is most Python ever written.
+# CSS ids ('#header {') and JS private fields ('#count') have no space after the
+# hash and never matched, which is why this only ever bit Python.
+_HASH_COMMENT_SUFFIXES = (".py",)
+_PRESENTATION_TAIL = (
+    r"\*\*(?:what|summary|implementation|features?|"
+    r"changes?|notes?|files?|how\b)[^*]*\*\*"
+)
+_PRESENTATION_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s+|" + _PRESENTATION_TAIL + r")", re.IGNORECASE)
+_PRESENTATION_BOLD_ONLY = re.compile(
+    r"^\s*(?:" + _PRESENTATION_TAIL + r")", re.IGNORECASE)
+
+
 def clean_artifact_body(raw: str, filename: str = "") -> str:
     """Extract the real file body from an agent's ARTIFACT content."""
     t = raw.strip()
@@ -281,12 +313,11 @@ def clean_artifact_body(raw: str, filename: str = "") -> str:
     # not broadly guess where arbitrary prose begins; trim only unmistakable
     # presentation headings after a plausible complete source statement.  The
     # normal syntax/acceptance gate still validates the resulting candidate.
-    if name.endswith((".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".css", ".py")):
+    if name.endswith(_TRAILING_PROSE_SUFFIXES):
         lines = t.splitlines()
-        presentation = re.compile(
-            r"^\s*(?:#{1,6}\s+|\*\*(?:what|summary|implementation|features?|"
-            r"changes?|notes?|files?|how\b)[^*]*\*\*)",
-            re.IGNORECASE,
+        presentation = (
+            _PRESENTATION_BOLD_ONLY if name.endswith(_HASH_COMMENT_SUFFIXES)
+            else _PRESENTATION_HEADING
         )
         for i, line in enumerate(lines):
             if i < 4 or not presentation.match(line):

@@ -177,3 +177,59 @@ def test_docs_and_static_do_not_contain_common_mojibake():
         if any(mark in text for mark in bad):
             offenders.append(str(path))
     assert offenders == []
+
+
+def test_python_comment_does_not_truncate_the_file():
+    """A '# ' line is a COMMENT in Python, never a Markdown heading.
+
+    Regression: the trailing-prose fallback cut .py artifacts at the first
+    comment following any line ending in ')', ';', '}' or ']'. A live 54,000
+    character generator was stored as 514 bytes, still parsed as valid Python,
+    passed verification, and was promoted over the good delivered copy.
+    """
+    source = (
+        "import sys\n\n"
+        "def main():\n"
+        '    print("hello")\n'
+        "    sys.exit(0)\n\n"
+        "# Configuration constants\n"
+        "WIDTH = 100\n"
+        "HEIGHT = 200\n\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+    body = artifacts.clean_artifact_body(source, "app.py")
+    assert body == source.strip()
+    assert "WIDTH = 100" in body
+    assert body.rstrip().endswith("main()")
+
+
+def test_python_artifact_keeps_every_byte_through_parse_proposals():
+    source = (
+        "import os\n\n"
+        "def build():\n"
+        "    os.makedirs('out', exist_ok=True)\n\n"
+        "# Registries used by the second pass\n"
+        "REGISTRY = {}\n"
+    )
+    text = f"ARTIFACT: gen.py\n{source}END_ARTIFACT\nPROMOTE: gen.py\n"
+    write = artifacts.parse_proposals("s_1", text)[0]
+    assert write.kind == "write_file"
+    assert "REGISTRY = {}" in write.content
+
+
+def test_markdown_release_notes_are_still_trimmed_from_python():
+    """The fallback must keep working for its actual purpose."""
+    source = "import os\n\ndef go():\n    os.getcwd()\n"
+    body = artifacts.clean_artifact_body(
+        source + "\n**Summary of changes**\nAdded a go() helper.\n", "app.py")
+    assert "Summary of changes" not in body
+    assert body.endswith("os.getcwd()")
+
+
+def test_markdown_heading_still_trims_javascript():
+    source = "const a = 1;\n\nfunction go() {\n  console.log(a);\n}\n"
+    body = artifacts.clean_artifact_body(
+        source + "\n### Implementation notes\nIt logs.\n", "app.js")
+    assert "Implementation notes" not in body
+    assert body.endswith("}")

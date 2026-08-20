@@ -28,6 +28,7 @@ from . import (
     executor,
     goals,
     intake,
+    intent,
     reporting,
     rounds,
     smoke,
@@ -37,6 +38,7 @@ from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
 from .adapters.openrouter import OpenRouterAdapter
 from .secrets import SecretStore
+from .roles import resolve_frontier_authors
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
@@ -366,6 +368,17 @@ class GangOf8Service:
                  if self._seat_enabled(seat)]
         return local + self._openrouter_fallbacks()
 
+    def _frontier_seats(self) -> list[str]:
+        """Frontier-class seats for the CURRENTLY enabled roster.
+
+        Reads through ``resolve_frontier_authors`` rather than
+        ``config.FRONTIER_AUTHOR_SEATS`` directly so that disabling claude and
+        codex re-points the privileged author/verifier role at the models that
+        remain, instead of leaving it unfilled and silently skipping the work
+        it guards.
+        """
+        return resolve_frontier_authors(self._enabled_role_fallbacks())
+
     def _apply_seat_disables(self, base: dict) -> dict:
         """Move roles from disabled seats onto the enabled roster round-robin.
 
@@ -397,6 +410,15 @@ class GangOf8Service:
         one independent frontier reviewer; "council" convenes every
         configured seat plus enabled OpenRouter seats. An explicit
         settings.panel_seats roster is the user's choice and always wins.
+
+        Turning a frontier CLI off HANDS ITS SEAT OVER to an enabled OpenRouter
+        model — it does not shrink the council. Role assignment already
+        inherits this way (``_apply_seat_disables``); without the same backfill
+        here the two disagreed: disabling claude and codex left a role map
+        spanning five models but a panel of one, so every round ran solo on the
+        last frontier seat standing while four enabled, registered, paid-for
+        OpenRouter seats sat idle. Disabling every CLI must leave a working
+        council, not an empty one.
         """
         import shutil
 
@@ -422,6 +444,18 @@ class GangOf8Service:
                     n for n, on in (self.settings.openrouter_enabled or {}).items()
                     if on and self._openrouter_slug(n)
                 )
+            elif self.secrets.has("openrouter"):
+                # DUO_PANEL_SIZE is the single dial for how many seats a duo
+                # convenes and therefore for what it costs. Backfill fills the
+                # gap up to it and the trim below caps at the same number, so
+                # the two can never disagree: a full frontier roster is
+                # untouched at the default, and raising the dial adds OpenRouter
+                # seats rather than silently doing nothing.
+                for seat in self._openrouter_fallbacks():
+                    if len(seats) >= config.DUO_PANEL_SIZE:
+                        break
+                    if seat not in seats:
+                        seats.append(seat)
         if config.PANEL_MODE != "council":
             seats = seats[:config.DUO_PANEL_SIZE]
         return [s for s in seats if s in self.registry.names()]
@@ -709,9 +743,34 @@ class GangOf8Service:
         "yes thanks",
     }
 
-    @classmethod
-    def _execution_profile(cls, value: Optional[str]) -> str:
-        profile = (value or "auto").strip().lower().replace("-", "_")
+    def _sys_log(self, event: str, payload: Optional[dict] = None) -> None:
+        """Log an event that belongs to no single session.
+
+        These used to be written under the literal session id "-", which
+        produced a `data/sessions/-.jsonl` holding goal lifecycle events next to
+        sandbox garbage collection — attached to a session that does not exist,
+        and unreachable from the goal they describe. Goal events now land in
+        that goal's own log; the rest go to one service log.
+        """
+        goal_id = (payload or {}).get("goal_id")
+        self.store.log_event(
+            f"goal-{goal_id}" if goal_id else "_service", event, payload or {})
+
+    def _execution_profile(self, value: Optional[str]) -> str:
+        """Resolve a requested profile, falling back to the configured default.
+
+        An unspecified profile used to mean "auto" unconditionally, and auto
+        scores `focused` above `council` for any request under 60 words — so a
+        multi-model installation ran single-model on nearly everything without
+        anyone choosing that. ``settings.default_execution_profile`` makes it a
+        decision. An explicit per-task profile still wins.
+        """
+        cls = type(self)
+        requested = (value or "").strip()
+        if not requested or requested.lower() == "auto":
+            requested = getattr(
+                self.settings, "default_execution_profile", "auto") or "auto"
+        profile = requested.strip().lower().replace("-", "_")
         aliases = {
             "full_council": "council",
             "parallel_candidates": "best_of_n",
@@ -1124,11 +1183,17 @@ class GangOf8Service:
             session.panel = self._effective_resource_roster()
         else:
             session.panel = list(self.panel)
+        # Frontier-class membership follows the ENABLED roster, not a fixed list
+        # of vendor names: switching claude and codex off hands the role to the
+        # models that are actually running instead of leaving it unfilled.
+        session.frontier_author_seats = resolve_frontier_authors(
+            self._enabled_role_fallbacks())
         # A blind tournament has no privileged author quorum: every enabled seat
         # gets the same candidate contract and runnable files advance on merit.
         session.required_frontier_authors = (
             [] if selected_route == "best_of_n" else [
-                seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in session.panel
+                seat for seat in session.frontier_author_seats
+                if seat in session.panel
             ]
         )
         session.cli_timeouts = dict(self.settings.cli_timeouts or {})
@@ -1220,7 +1285,7 @@ class GangOf8Service:
         except OSError:
             pass
         if removed:
-            self.store.log_event("-", "sandboxes_gc", {"removed": removed, "kept": keep})
+            self._sys_log("sandboxes_gc", {"removed": removed, "kept": keep})
         return {"removed": removed}
 
     def _gc_cli_scratch(self) -> dict:
@@ -1274,7 +1339,7 @@ class GangOf8Service:
         except OSError:
             pass
         if removed:
-            self.store.log_event("-", "cli_scratch_gc", {"removed": removed})
+            self._sys_log("cli_scratch_gc", {"removed": removed})
         return {"removed": removed}
 
     def enhance_prompt(self, text: str) -> dict:
@@ -1511,7 +1576,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 else:
                     child.unlink()
                 removed += 1
-        self.store.log_event("-", "workspace_emptied", {"id": ws.id, "removed": removed})
+        self._sys_log("workspace_emptied", {"id": ws.id, "removed": removed})
         return {"emptied": ws.id, "removed": removed}
 
     def _run_full(self, session: Session) -> Session:
@@ -1853,6 +1918,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             panel=self.panel,
             best_of_all_roster=self._effective_resource_roster(),
             role_agents=self.role_agents,
+            frontier_seats=self._frontier_seats(),
             api_key_status=self.api_key_status,
             api_key_names=self.KNOWN_API_KEYS,
         )
@@ -2948,7 +3014,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         )
         goal.staging_root = str((self._data_dir / "goal-workspaces" / goal.goal_id / "stage").resolve())
         self.goals.save(goal)
-        self.store.log_event("-", "goal_created",
+        self._sys_log("goal_created",
                              {"goal_id": goal.goal_id, "chars": len(raw),
                               "profile": profile, "route": "build_team",
                               "playbook_id": playbook_id})
@@ -2992,7 +3058,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         try:
             self._plan_and_start(goal_id)
         except Exception as e:  # noqa: BLE001 — last-resort containment
-            self.store.log_event("-", "goal_error", {"goal_id": goal_id, "detail": str(e)})
+            self._sys_log("goal_error", {"goal_id": goal_id, "detail": str(e)})
             goal = self.goals.claim_worker_lease(goal_id, {"planning"})
             if goal is not None:
                 goal.status = "failed"
@@ -3048,7 +3114,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 copied += 1
             except OSError:
                 continue
-        self.store.log_event("-", "goal_stage_seeded",
+        self._sys_log("goal_stage_seeded",
                              {"goal_id": goal.goal_id, "files": copied, "root": str(stage)})
 
     def _normalize_work_packages(
@@ -3139,7 +3205,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 and any(Path(name).suffix.lower() in code_suffixes
                         for name in package.required_files))
         ]
-        frontier = [seat for seat in config.FRONTIER_AUTHOR_SEATS if seat in seats]
+        frontier = [seat for seat in self._frontier_seats() if seat in seats]
         targets = sorted(
             code_indices,
             key=lambda i: (not bool(milestones[i].release_files), i),
@@ -3393,8 +3459,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self._route_around_unavailable_owners(current)
         ready = [i for i in range(len(current.milestones)) if self._package_ready(current, i)]
         if ready:
-            self.store.log_event(
-                "-", "goal_package_wave_started",
+            self._sys_log("goal_package_wave_started",
                 {
                     "goal_id": current.goal_id,
                     "packages": [current.milestones[i].package_id for i in ready],
@@ -3451,9 +3516,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         goal.active_agent_calls = [activity]
         if not self.goals.save_owned(goal, token):
             raise SessionCancelled()
-        self.store.log_event(
-            "-",
-            "goal_agent_call_started",
+        self._sys_log("goal_agent_call_started",
             {"goal_id": goal.goal_id, **activity},
         )
         last_save = [0.0]
@@ -3495,9 +3558,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 or not self.goals.lease_is_current(goal.goal_id, token)
             ):
                 raise SessionCancelled()
-            self.store.log_event(
-                "-",
-                "goal_agent_call_finished",
+            self._sys_log("goal_agent_call_finished",
                 {
                     "goal_id": goal.goal_id,
                     "call_id": call_id,
@@ -3508,9 +3569,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             )
             return result
         except AgentCallStopped:
-            self.store.log_event(
-                "-",
-                "goal_agent_call_stopped",
+            self._sys_log("goal_agent_call_stopped",
                 {
                     "goal_id": goal.goal_id,
                     "call_id": call_id,
@@ -3638,8 +3697,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                 f"{repair_count} rejected attempt"
                                 f"{'s' if repair_count != 1 else ''}"
                             )
-                            self.store.log_event(
-                                "-", "goal_plan_repaired",
+                            self._sys_log("goal_plan_repaired",
                                 {"goal_id": goal.goal_id, "attempts": repair_count},
                             )
                         break
@@ -3648,8 +3706,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     if attempt >= config.GOAL_PLAN_REPAIR_ATTEMPTS:
                         break
                     repair_count += 1
-                    self.store.log_event(
-                        "-", "goal_plan_repair_requested",
+                    self._sys_log("goal_plan_repair_requested",
                         {
                             "goal_id": goal.goal_id,
                             "attempt": repair_count,
@@ -3693,7 +3750,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if not self.goals.save_owned(goal, token):
                 return self.goals.get(goal.goal_id) or goal
             start_epoch = goal.epoch
-            self.store.log_event("-", "goal_planned",
+            self._sys_log("goal_planned",
                                  {"goal_id": goal.goal_id, "milestones": len(milestones),
                                   "planned_by": goal.planned_by, "epoch": goal.epoch})
         finally:
@@ -3742,7 +3799,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if not self.seat_health.is_unavailable(package.owner):
                 continue
             replacement = next(
-                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                (seat for seat in self._frontier_seats()
                  if seat in self.panel and seat != package.owner
                  and not self.seat_health.is_unavailable(seat)),
                 None,
@@ -3750,8 +3807,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if replacement is None:
                 continue
             reason = self.seat_health.state(package.owner)
-            self.store.log_event(
-                "-", "package_owner_rerouted_seat_unavailable",
+            self._sys_log("package_owner_rerouted_seat_unavailable",
                 {"goal_id": goal.goal_id, "package": package.index + 1,
                  "from_owner": package.owner, "to_owner": replacement,
                  "seat_state": reason,
@@ -3808,9 +3864,11 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if seat and seat != milestone.owner
         ]
         session.assembly_mode, session.assembly_template = self._assembly_contract(milestone)
+        session.frontier_author_seats = self._frontier_seats()
         session.required_frontier_authors = (
             [milestone.owner]
-            if (not session.assembly_mode and milestone.owner in config.FRONTIER_AUTHOR_SEATS)
+            if (not session.assembly_mode
+                and milestone.owner in session.frontier_author_seats)
             else []
         )
         if bound.delivery_mode == "final_batch":
@@ -4167,7 +4225,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             return sealed
 
         enabled_frontier = [
-            seat for seat in config.FRONTIER_AUTHOR_SEATS
+            seat for seat in self._frontier_seats()
             if seat in self.panel and seat in self.registry.names()
         ]
         if not enabled_frontier:
@@ -4612,8 +4670,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             f"a budget of {budget}; pausing for cost review — resume grants "
             f"another {config.GOAL_MAX_MODEL_CALLS} calls"
         )[:300]
-        self.store.log_event(
-            "-", "goal_budget_reached",
+        self._sys_log("goal_budget_reached",
             {"goal_id": goal.goal_id, "used": goal.model_calls_used,
              "budget": budget, "by_seat": dict(goal.model_calls_by_seat)},
         )
@@ -4631,8 +4688,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self._goal_call_budget(goal) + config.GOAL_MAX_MODEL_CALLS)
             goal.last_error = ""
             self.goals.save_owned(goal, token)
-            self.store.log_event(
-                "-", "goal_budget_extended",
+            self._sys_log("goal_budget_extended",
                 {"goal_id": goal_id, "budget": goal.model_calls_budget},
             )
         finally:
@@ -4686,8 +4742,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "accepted assembly output is stale — inputs were rebuilt "
                 "after acceptance (" + ", ".join(stale[:6]) + "); reassembling"
             )
-            self.store.log_event(
-                "-", "assembly_reopened_stale_inputs",
+            self._sys_log("assembly_reopened_stale_inputs",
                 {"goal_id": goal.goal_id, "package": package.index + 1,
                  "stale": stale[:12]},
             )
@@ -4712,14 +4767,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 goal.status = "paused"
                 goal.release_status = "failed"
                 goal.last_error = "final release has no verified output files"
-                self.store.log_event(
-                    "-", "goal_release_blocked",
+                self._sys_log("goal_release_blocked",
                     {"goal_id": goal.goal_id, "reason": goal.last_error},
                 )
                 return
             goal.status = "completed"
             goal.release_status = "released"
-            self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
+            self._sys_log("goal_completed", {"goal_id": goal.goal_id})
             return
         session = self._open(
             f"[FINAL BATCH RELEASE] {goal.text}\nReview and release all staged package outputs together.",
@@ -5318,7 +5372,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         escalated_from = ""
         if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
             replacement = next(
-                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                (seat for seat in self._frontier_seats()
                  if seat in self.panel and seat != provider.owner
                  and not self.seat_health.is_unavailable(seat)),
                 None,
@@ -5468,8 +5522,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             goal.status = "paused"
                             failed = [m.index for m in goal.milestones if m.status == "failed"]
                             goal.current_index = min(failed or remaining or [len(goal.milestones)])
-                            self.store.log_event(
-                                "-", "goal_drained",
+                            self._sys_log("goal_drained",
                                 {"goal_id": goal.goal_id, "reason": goal.last_error},
                             )
                         self.goals.save_owned(goal, token)
@@ -5479,7 +5532,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             self._prepare_goal_release(goal)
                         elif goal.delivery_mode != "final_batch":
                             goal.status = "completed"
-                            self.store.log_event("-", "goal_completed", {"goal_id": goal.goal_id})
+                            self._sys_log("goal_completed", {"goal_id": goal.goal_id})
                         if self.goals.save_owned(goal, token):
                             # Release prep may instead have reopened a stale
                             # assembly package; that rebuild must be scheduled,
@@ -5519,8 +5572,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         )
                         if self.goals.save_owned(goal, token):
                             schedule_ready = True
-                        self.store.log_event(
-                            "-", (
+                        self._sys_log((
                                 "assembly_template_rebuild_scheduled"
                                 if fault_scope == "template" else
                                 "assembly_dependency_rebuild_scheduled"
@@ -5538,8 +5590,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         # breaker inside _invalidate_assembly_input_provider —
                         # preserve that diagnostic instead of the generic one.
                         self.goals.save_owned(goal, token)
-                        self.store.log_event(
-                            "-", "goal_paused",
+                        self._sys_log("goal_paused",
                             {"goal_id": goal.goal_id, "reason": goal.last_error},
                         )
                     else:
@@ -5557,8 +5608,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             or f"milestone {idx + 1} failed"
                         )[:300]
                         self.goals.save_owned(goal, token)
-                        self.store.log_event(
-                            "-", "goal_draining" if sibling_running else "goal_paused",
+                        self._sys_log("goal_draining" if sibling_running else "goal_paused",
                             {"goal_id": goal.goal_id, "reason": goal.last_error},
                         )
                 elif session.status == SessionStatus.cancelled:
@@ -5570,8 +5620,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     goal.status = "draining" if sibling_running else "paused"
                     goal.last_error = f"milestone {idx + 1} was cancelled"
                     self.goals.save_owned(goal, token)
-                    self.store.log_event(
-                        "-", "goal_draining" if sibling_running else "goal_paused",
+                    self._sys_log("goal_draining" if sibling_running else "goal_paused",
                         {"goal_id": goal.goal_id, "reason": goal.last_error},
                     )
             finally:
@@ -5581,7 +5630,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if current and current.status == "running" and current.epoch == session.goal_epoch:
                     self._start_ready_packages(current, background=background)
         except Exception as e:  # noqa: BLE001
-            self.store.log_event("-", "goal_advance_error",
+            self._sys_log("goal_advance_error",
                                  {"goal_id": session.goal_id, "detail": str(e)})
 
     @staticmethod
@@ -5972,7 +6021,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     self.cancel_session(goal.release_session_id)
                 except (KeyError, ValueError):
                     pass
-            self.store.log_event("-", "goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
+            self._sys_log("goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
             return goal.model_dump()
 
     def stop_goal_agent_call(self, goal_id: str, call_id: str) -> dict:
@@ -5990,9 +6039,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if activity is None:
             raise KeyError(f"active planning call {call_id} not found")
         cancellation.request_call(goal_id, call_id)
-        self.store.log_event(
-            "-",
-            "goal_agent_call_stop_requested",
+        self._sys_log("goal_agent_call_stop_requested",
             {
                 "goal_id": goal_id,
                 "call_id": call_id,
@@ -6028,8 +6075,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if reduced != goal.assembly_fault_streak:
                 goal.assembly_fault_streak = reduced
                 self.goals.save_owned(goal, token)
-                self.store.log_event(
-                    "-", "assembly_fault_streak_review_retry",
+                self._sys_log("assembly_fault_streak_review_retry",
                     {"goal_id": goal_id, "streak": dict(reduced)},
                 )
         finally:
@@ -6093,7 +6139,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     if scheduled["fault_scope"] == "template" else
                     "assembly_dependency_rebuild_scheduled"
                 )
-                self.store.log_event("-", event, scheduled)
+                self._sys_log(event, scheduled)
 
     def _reopen_release_regression_package(self, goal_id: str) -> str:
         """Turn a failed final release verification back into a package rebuild.
@@ -6213,8 +6259,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         finally:
             self.goals.release_worker_lease(goal_id, token)
             if scheduled:
-                self.store.log_event(
-                    "-", "release_regression_rebuild_scheduled", scheduled)
+                self._sys_log("release_regression_rebuild_scheduled", scheduled)
 
     def _reopen_direct_release_owner(self, goal: Goal, token: str) -> str:
         """Attribute a failed release verification straight to the package
@@ -6259,8 +6304,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 f"output {streak - 1} times in a row without resolving it; pausing "
                 "for human review instead of rebuilding it again"
             )[:300]
-            self.store.log_event(
-                "-", "release_owner_fault_loop_detected",
+            self._sys_log("release_owner_fault_loop_detected",
                 {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
                  "streak": streak},
             )
@@ -6271,7 +6315,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         escalated_from = ""
         if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
             replacement = next(
-                (seat for seat in config.FRONTIER_AUTHOR_SEATS
+                (seat for seat in self._frontier_seats()
                  if seat in self.panel and seat != provider.owner
                  and not self.seat_health.is_unavailable(seat)),
                 None,
@@ -6279,8 +6323,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if replacement:
                 escalated_from = provider.owner
                 provider.owner = replacement
-                self.store.log_event(
-                    "-", "release_owner_fault_escalated",
+                self._sys_log("release_owner_fault_escalated",
                     {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
                      "from_owner": escalated_from, "to_owner": replacement,
                      "streak": streak},
@@ -6306,8 +6349,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         )[:300]
         if not self.goals.save_owned(goal, token):
             return ""
-        self.store.log_event(
-            "-", "release_regression_owner_reopened",
+        self._sys_log("release_regression_owner_reopened",
             {"goal_id": goal.goal_id, "provider_package": provider.index + 1,
              "owner": provider.owner, "defects": len(defects)},
         )
@@ -6440,7 +6482,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             replanning = self.goals.replan(goal_id)
             if replanning is None:
                 raise ValueError("goal changed while attempting to restart planning")
-            self.store.log_event("-", "goal_replanning", {"goal_id": goal_id})
+            self._sys_log("goal_replanning", {"goal_id": goal_id})
             if background:
                 self._pool.submit(self._plan_and_start_safely, goal_id)
                 return self.get_goal(goal_id) or replanning.model_dump()
@@ -6455,8 +6497,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         recovered = self._recover_verified_goal_packages(goal_id)
         goal = self.goals.get(goal_id) or goal
         if recovered:
-            self.store.log_event(
-                "-", "goal_packages_recovered",
+            self._sys_log("goal_packages_recovered",
                 {"goal_id": goal_id, "packages": recovered},
             )
         if (goal.milestones
@@ -6473,8 +6514,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 goal = self.goals.resume(goal_id)
                 if goal is None:
                     raise ValueError("goal changed while attempting to resume")
-                self.store.log_event(
-                    "-", "goal_resumed",
+                self._sys_log("goal_resumed",
                     {"goal_id": goal_id, "epoch": goal.epoch})
                 self._start_ready_packages(goal, background=background)
                 return self.get_goal(goal_id) or goal.model_dump()
@@ -6523,7 +6563,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         goal = self.goals.resume(goal_id)
         if goal is None:
             raise ValueError("goal changed while attempting to resume")
-        self.store.log_event("-", "goal_resumed", {"goal_id": goal_id, "epoch": goal.epoch})
+        self._sys_log("goal_resumed", {"goal_id": goal_id, "epoch": goal.epoch})
         self._start_ready_packages(goal, background=background)
         return self.get_goal(goal_id) or goal.model_dump()
 
@@ -6553,7 +6593,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     continue
                 parked = self.goals.park_active(goal.goal_id, "interrupted by a server restart")
                 if parked is not None:
-                    self.store.log_event("-", "goal_paused",
+                    self._sys_log("goal_paused",
                                          {"goal_id": parked.goal_id, "reason": parked.last_error})
         except Exception:  # noqa: BLE001 — a bad record must not stop the server
             pass
@@ -6575,8 +6615,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def goal_timeline(self, goal_id: str) -> dict:
         """One ordered story for a whole goal, plus a derived postmortem.
 
-        Events are logged per-session (goal-scoped ones under "-" with a
-        goal_id payload), so a goal's narrative was previously scattered
+        Events are logged per-session (goal-scoped ones in that goal's own log,
+        or the legacy shared "-" log for goals created before that split, both
+        keyed by a goal_id payload), so a goal's narrative was previously scattered
         across files and only recoverable by hand. This merges every related
         log, and summarizes what a human wants after the fact: duration,
         spend per seat, packages/owners/attempts, and how attempts were
@@ -6609,10 +6650,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             for record in read_log(meta["session_id"]):
                 record["session_id"] = meta["session_id"]
                 events.append(record)
-        for record in read_log("-"):
-            if (record.get("payload") or {}).get("goal_id") == goal_id:
-                record["session_id"] = "-"
-                events.append(record)
+        # Goal-scoped events now live in this goal's own log. Goals created
+        # before that still have theirs in the shared "-" log, so read both and
+        # keep filtering on goal_id — a legacy timeline must not go blank.
+        for source in (f"goal-{goal_id}", "-"):
+            for record in read_log(source):
+                if (record.get("payload") or {}).get("goal_id") == goal_id:
+                    record["session_id"] = source
+                    events.append(record)
         events.sort(key=lambda record: record.get("ts") or "")
         events = events[-400:]
 
@@ -7042,6 +7087,33 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 return self._authorize_goal_release(session)
             self.store.save_session(session)
             return resume_deliberation(
+                session, self.manager, self.registry, self.governance,
+                self.store, role_agents=self.role_agents,
+            )
+
+        # Intent clarification, asked BEFORE any work: the request read two ways
+        # and the coordinator stopped rather than guessing. Fold the answer into
+        # the task text the classifier and every prompt read, then start the run
+        # from the top — the intent pass re-reads it with the fork settled and
+        # `intent_clarified` guarantees the question is never asked twice.
+        if req.agent == "system" and req.purpose == "clarify_intent":
+            parsed = intent.Intent(**(session.intent or {}))
+            chosen = intent.selected_option(parsed, req.answer or "")
+            session.intent_clarification = chosen
+            session.intent_reviewed = False  # re-read the task, fork resolved
+            session.task.text = (
+                f"{session.task.text}\n\n"
+                f"[Clarified by the user] {parsed.ambiguity.strip()} "
+                f"→ {chosen}"
+            ).strip()
+            session.turns.append({
+                "role": "user",
+                "text": f"Clarification: {chosen}",
+            })
+            self.store.log_event(session.session_id, "intent_clarified", {
+                "answer": req.answer, "resolved_to": chosen})
+            self.store.save_session(session)
+            return run_session(
                 session, self.manager, self.registry, self.governance,
                 self.store, role_agents=self.role_agents,
             )

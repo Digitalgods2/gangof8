@@ -117,6 +117,12 @@ class Classification(BaseModel):
     match_source: bool = False  # output must MATCH a named source's structure/format
     #                             exactly (a "matched set") — structural fidelity is
     #                             a hard requirement the judges/finisher must weigh
+    deliverable_formats: list[str] = []  # non-text output formats the task NAMES as
+    #                             its deliverable ("pdf", "docx", "zip"). ARTIFACT
+    #                             cannot carry these, so the delivery gate requires a
+    #                             real produced file of that format — a generator
+    #                             script is not the deliverable. Never set on a
+    #                             `code` task, where the source IS the deliverable.
 
 
 class CouncilMember(BaseModel):
@@ -508,6 +514,19 @@ class Session(BaseModel):
     collaboration_integration_status: str = "not_started"
     package_started_at: Optional[str] = None
     package_deadline_at: Optional[str] = None
+    # The LLM intent pass (intent.py): what a model read the task as asking for.
+    # Kept as the raw payload for audit — the classification it produced is
+    # already merged into `classification`.
+    intent: dict = {}
+    intent_reviewed: bool = False   # the pass ran (or was deliberately skipped)
+    intent_clarified: bool = False  # the ambiguity question was asked ONCE
+    intent_clarification: str = ""  # what the user answered, verbatim
+    # The seats that count as FRONTIER-CLASS for THIS run, resolved from the
+    # enabled roster at submit time (roles.resolve_frontier_authors). Frozen on
+    # the session so a settings change mid-run cannot move the goalposts. Empty
+    # on sessions persisted before this field existed — readers fall back to
+    # config.FRONTIER_AUTHOR_SEATS so those resume exactly as they ran.
+    frontier_author_seats: list[str] = []
     # Frontier models are implementation quorum, not optional late judges.
     required_frontier_authors: list[str] = []
     frontier_author_recoveries: dict[str, int] = {}
