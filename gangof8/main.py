@@ -306,6 +306,9 @@ def get_session(session_id: str) -> dict:
         raise HTTPException(status_code=404, detail="session not found")
     # Old persisted sessions predate these audit fields; expose explicit empty
     # values so API/UI consumers never have to guess whether a key disappeared.
+    data.setdefault("intent", {})
+    data.setdefault("intent_clarification", "")
+    data.setdefault("frontier_author_seats", [])
     data.setdefault("required_frontier_authors", [])
     data.setdefault("frontier_author_recoveries", {})
     data.setdefault("candidate_author_recoveries", {})

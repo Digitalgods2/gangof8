@@ -24,6 +24,7 @@ def _path_status(path: Path) -> dict:
 def collect_runtime_diagnostics(
     *, data_dir: Path, backend: str, settings, active_workspace, workspace_count: int,
     panel: list[str], best_of_all_roster: list[str], role_agents: dict,
+    frontier_seats: list[str],
     api_key_status: Callable[[str], dict],
     api_key_names: tuple[str, ...],
 ) -> dict:
@@ -52,7 +53,11 @@ def collect_runtime_diagnostics(
         "build_call_limits": {
             "author_timeout_s": config.PANEL_AUTHOR_TIMEOUT,
             "retry_timeout_s": config.PANEL_RETRY_TIMEOUT,
-            "frontier_author_seats": list(config.FRONTIER_AUTHOR_SEATS),
+            # The RESOLVED roster actually in force, not the configured
+            # preference — with claude/codex disabled these differ, and the
+            # resolved list is what every gate reads.
+            "frontier_author_seats": list(frontier_seats),
+            "frontier_author_seats_configured": list(config.FRONTIER_AUTHOR_SEATS),
             "frontier_author_timeout_s": config.FRONTIER_AUTHOR_TIMEOUT,
             "package_author_deadline_s": config.PACKAGE_AUTHOR_DEADLINE,
             "package_author_wave_timeout_s": config.PACKAGE_AUTHOR_WAVE_TIMEOUT,

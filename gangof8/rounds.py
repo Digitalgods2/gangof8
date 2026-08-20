@@ -282,8 +282,27 @@ def _output_contract(session: Session) -> str:
             "The coordinator will ask the user for the destination and get their "
             "approval before anything lands.\n"
         )
+    # The BUILD paragraph below is easy to read as optional. When the user NAMED
+    # the output format, say so first and say it as a requirement: the live
+    # failure was a seat that authored a perfect 49KB PDF generator, emitted
+    # PROMOTE for the script, and called the cookbook delivered.
+    formats = list(getattr(session.classification, "deliverable_formats", None) or [])
+    if formats:
+        names = ", ".join(f".{fmt}" for fmt in formats)
+        required = (
+            f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
+            f"nothing else, so you CANNOT type it out. Authoring a generator is only "
+            f"half the job and does not satisfy the task — in the same reply you must "
+            f"also RUN it via INSTALL (if it needs packages) and BUILD/PRODUCES, "
+            f"naming the {names} file, and PROMOTE that file rather than the script. "
+            f"A run that ends holding only source code has produced nothing and the "
+            f"delivery gate will fail it.\n\n"
+        )
+    else:
+        required = ""
     return (
-        "If the task needs files (code, docs, config), emit each file literally in "
+        required
+        + "If the task needs files (code, docs, config), emit each file literally in "
         "this format, with its COMPLETE contents — never a summary of what the file "
         "would contain:\n"
         "ARTIFACT: <filename>\n"
@@ -405,7 +424,11 @@ def lead_prompt(
     overview = f"{established_overview}\n\n" if established_overview else ""
     contract = _output_contract(session) if produces else (
         "Produce the actual answer the task asks for — complete, concrete, and "
-        "ready to use. Do not ask the human questions; state assumptions and answer.\n"
+        "ready to use. Do not ask the human about details you can reasonably "
+        "assume (styling, length, tone, naming) — state the assumption and "
+        "answer. The one exception: if the request genuinely reads two ways and "
+        "the two readings produce DIFFERENT deliverables, ask that single "
+        "question instead of guessing.\n"
     )
     return (
         f"Task: {_execution_task(session)}\n"
@@ -861,7 +884,9 @@ def panel_prompt(
         "task: the answer or design as you see it, the strongest objections, and "
         f"{disagree}"
         f"{_panel_file_contract(session)}"
-        "Do not ask the human questions; state assumptions and proceed.\n"
+        "Do not ask the human about details you can reasonably assume — state "
+        "the assumption and proceed. Ask only if the request reads two ways and "
+        "the readings produce DIFFERENT deliverables.\n"
         f"{_skill_hints(session, Role.panelist, readable)}"
         f"{overview}"
         f"{ctx_block}"
@@ -1334,7 +1359,11 @@ def synthesis_prompt(
     overview = f"{established_overview}\n\n" if established_overview else ""
     contract = _output_contract(session) if produces else (
         "Produce the actual answer the task asks for — complete, concrete, and "
-        "ready to use. Do not ask the human questions; state assumptions and answer.\n"
+        "ready to use. Do not ask the human about details you can reasonably "
+        "assume (styling, length, tone, naming) — state the assumption and "
+        "answer. The one exception: if the request genuinely reads two ways and "
+        "the two readings produce DIFFERENT deliverables, ask that single "
+        "question instead of guessing.\n"
     )
     panel_block = ""
     if panel_results:

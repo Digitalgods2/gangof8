@@ -24,6 +24,27 @@ class BudgetExceeded(Exception):
     pass
 
 
+def _is_destructive_promote(session: Session, data_dir: Path, action, skill) -> bool:
+    """Whether this promote would gut a file the user already has.
+
+    Kept outside the standing-approval shortcut on purpose. "Approve all
+    promote" is meant to spare the human N identical clicks on a routine
+    delivery; it must never become blanket consent to replace an existing file
+    with a fraction of itself. A live run did exactly that — a truncated council
+    copy landed over a good 49KB deliverable — so this class of promote always
+    stops for its own decision, standing grant or not.
+    """
+    if skill.category != "promote" or action.kind != "promote":
+        return False
+    try:
+        from .skills import promote_shrink
+        return promote_shrink(
+            session, data_dir, action.args.get("filename") or action.filename
+        ) is not None
+    except Exception:  # noqa: BLE001 — a preview failure must never open the gate
+        return False
+
+
 class Governance:
     def __init__(self, store: LogStore):
         self.store = store
@@ -89,7 +110,8 @@ class Governance:
         # A standing grant ("approve all <category>" on an earlier approval in
         # THIS session) clears the action without another pause — one deliberate
         # human decision instead of N identical clicks.
-        if skill.category in session.standing_approvals:
+        if skill.category in session.standing_approvals and not _is_destructive_promote(
+                session, self.store.data_dir, action, skill):
             self.store.log_event(
                 session.session_id, "standing_approval_used",
                 {"action_id": action.action_id, "kind": action.kind,
@@ -136,6 +158,26 @@ class Governance:
                 overwrite = False
             summary = (f"promote: {fname} → {where}"
                        + (" (OVERWRITES an existing file)" if overwrite else " (new file)"))
+            try:
+                from .skills import promote_shrink
+                shrink = promote_shrink(session, self.store.data_dir, fname)
+            except Exception:  # noqa: BLE001
+                shrink = None
+            if shrink is not None:
+                old_size, new_size, removed = shrink
+                # Say the number. A 99% deletion rendered as a wall of red diff
+                # lines reads like any other large edit.
+                summary = (
+                    f"DESTRUCTIVE promote: {fname} → {where} — REPLACES an existing "
+                    f"{old_size:,}-byte file with {new_size:,} bytes, removing "
+                    f"{removed:.1%} of it. Confirm the council's copy is complete "
+                    "before approving."
+                )
+                self.store.log_event(
+                    session.session_id, "destructive_promote_flagged",
+                    {"filename": fname, "old_bytes": old_size,
+                     "new_bytes": new_size, "removed_fraction": round(removed, 4)},
+                )
             try:
                 from .skills import promote_diff
                 details = promote_diff(session, self.store.data_dir, fname)

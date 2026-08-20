@@ -20,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import assembly, browser_acceptance, config, executor, rounds, skills, smoke, validation
+from . import (assembly, browser_acceptance, classifier, config, executor, intent,
+               rounds, skills, smoke, validation)
 from .artifacts import (
     ARTIFACT_MARKER as _ARTIFACT_MARKER,
     BLOCK_START as _BLOCK_START,
@@ -30,12 +31,13 @@ from .artifacts import (
     parse_proposals as _parse_proposals_impl,
     strip_code_fence as _strip_code_fence,
 )
-from .classifier import classify
+from .classifier import binary_format_of, classify
 from .composer import compose, fallback_final, parse_final
 from .executor import ExecutionError
 from .governance import ApprovalRequired, BudgetExceeded, Governance
 from .logstore import LogStore
 from .models import (
+    Classification,
     CollaborationAssignment,
     Complexity,
     Contribution,
@@ -755,12 +757,248 @@ def _requires_file_output(session: Session) -> bool:
     return expects_output and not analysis_only_package
 
 
+def _intent_seat(session: Session, role_agents: Optional[dict[Role, str]],
+                 registry: AgentRegistry) -> Optional[CouncilMember]:
+    """Who answers the intent pass: a cheap seat that never authors.
+
+    Defaults to the SUMMARIZER's model — conventionally the fast/cheap seat in
+    this installation — and falls back to the lead so the pass still runs on a
+    single-seat roster. Returns None when nothing is registered, which makes the
+    whole pass a no-op rather than an error.
+    """
+    mapping = role_agents or config.ROLE_AGENTS
+    names = registry.names()
+    candidates = [
+        config.INTENT_SEAT,
+        mapping.get(Role.summarizer),
+        mapping.get(Role.lead),
+    ]
+    for name in candidates:
+        if name and name in names:
+            return CouncilMember(role=Role.coordinator, agent=name, active=True)
+    return None
+
+
+def _intent_enabled(session: Session) -> bool:
+    """Whether to spend one call reading the task with a model.
+
+    'auto' (the default) skips the mock backend so the deterministic test suite
+    and offline runs behave exactly as before; 'on' forces it everywhere.
+    """
+    mode = config.INTENT_MODE
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return (session.backend or config.BACKEND) != "mock"
+
+
+def _refine_classification(
+    session: Session, registry: AgentRegistry, store: LogStore,
+    cls: Classification, task_text: str,
+    role_agents: Optional[dict[Role, str]],
+) -> Classification:
+    """One cheap model call that reads the task, before anything expensive runs.
+
+    Fail-open at every step: disabled, no seat, a failed call, an unparseable
+    reply, or a reply that names nothing useful all leave the rule-based
+    classification exactly as it was. The pass can improve the reading or raise
+    a question about it; it can never block a run by itself.
+    """
+    if session.intent_reviewed or not _intent_enabled(session):
+        return cls
+    session.intent_reviewed = True
+    member = _intent_seat(session, role_agents, registry)
+    if member is None:
+        store.log_event(session.session_id, "intent_skipped",
+                        {"reason": "no registered seat"})
+        return cls
+    prompt = intent.intent_prompt(task_text, cls)
+    if session.intent_clarification:
+        prompt += (
+            "\nThe user has already been asked about this and answered: "
+            f"{session.intent_clarification!r}. Treat that as settled — report "
+            "no ambiguity and give the reading it implies.\n"
+        )
+    try:
+        reply = _agent_call(session, registry, store, member, prompt,
+                            timeout_s=config.INTENT_TIMEOUT or None)
+    except (AgentError, BudgetExceeded, AgentInputRequired) as e:
+        store.log_event(session.session_id, "intent_skipped",
+                        {"reason": str(e)[:200], "agent": member.agent})
+        return cls
+    parsed = intent.parse_intent(reply.content)
+    if parsed is None:
+        store.log_event(session.session_id, "intent_skipped",
+                        {"reason": "reply was not parseable JSON",
+                         "agent": member.agent})
+        return cls
+
+    session.intent = parsed.model_dump()
+    new_type = None
+    if parsed.task_type:
+        try:
+            new_type = TaskType(parsed.task_type)
+        except ValueError:
+            new_type = None
+    # A revision session has already been pinned to `code` against the exact
+    # recorded artifact; the intake analyst does not get to re-open that.
+    if session.revision_targets:
+        new_type = None
+    changed = bool(
+        (new_type is not None and new_type != cls.task_type)
+        or parsed.deliverable_formats != cls.deliverable_formats
+    )
+    refined = classifier.with_intent(
+        cls,
+        task_type=new_type,
+        produces_output=parsed.produces_output,
+        deliverable_formats=parsed.deliverable_formats,
+        note=(f"intent pass ({member.agent}, confidence {parsed.confidence:.2f}): "
+              f"{parsed.deliverable or 'no deliverable stated'}"),
+    )
+    store.log_event(session.session_id, "intent_reviewed", {
+        "agent": member.agent,
+        "deliverable": parsed.deliverable,
+        "confidence": parsed.confidence,
+        "task_type": refined.task_type.value,
+        "was_task_type": cls.task_type.value,
+        "deliverable_formats": refined.deliverable_formats,
+        "ambiguity": parsed.ambiguity,
+        "options": parsed.options,
+        "changed": changed,
+    })
+    return refined
+
+
+def _maybe_ask_intent(
+    session: Session, manager: SessionManager, store: LogStore,
+) -> bool:
+    """Ask ONE question when the reading genuinely forks. True ⇒ session paused.
+
+    Deliberately hard to trigger. A coordinator that asks about everything is
+    its own kind of useless, so all of these must hold: the analyst reported a
+    concrete either/or, it was not confident, the user has not already been
+    asked, and this is a real user request rather than a machine-generated
+    package/goal prompt (those are written by the coordinator itself — there is
+    nobody to clarify with and no ambiguity to resolve).
+    """
+    if not config.INTENT_CLARIFY or session.intent_clarified:
+        return False
+    if session.work_package_id or session.goal_id or session.goal_release:
+        return False
+    if not session.intent:
+        return False
+    parsed = intent.Intent(**session.intent)
+    if not parsed.is_ambiguous():
+        return False
+    session.intent_clarified = True
+    req = InputRequest(
+        session_id=session.session_id, agent="system", role=Role.coordinator,
+        round=session.current_round, purpose="clarify_intent", resume_token="",
+        question=intent.clarifying_question(parsed),
+    )
+    session.input_requests.append(req)
+    session.stop_reason = "the request reads two ways; asking before spending a run"
+    store.log_event(session.session_id, "intent_clarification_requested", {
+        "ambiguity": parsed.ambiguity, "options": parsed.options,
+        "confidence": parsed.confidence,
+    })
+    manager.transition(session, SessionStatus.awaiting_input)
+    return True
+
+
+def _frontier_seats(session: Session) -> tuple[str, ...]:
+    """Frontier-class seats for THIS session.
+
+    Resolved from the enabled roster at submit time and frozen on the session,
+    so a settings change mid-run cannot move the goalposts. Sessions persisted
+    before the field existed fall back to the configured names and therefore
+    resume exactly as they originally ran.
+    """
+    return tuple(session.frontier_author_seats or config.FRONTIER_AUTHOR_SEATS)
+
+
 def _build_outputs(action: ProposedAction) -> list[str]:
     """The files an executed build declared and actually produced."""
     try:
         return list(json.loads(action.args.get("produced_paths") or "[]"))
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+def _produced_deliverable_formats(session: Session) -> set[str]:
+    """Normalized formats of every file this run actually landed on disk.
+
+    Includes the outputs of an executed BUILD, which are the deliverable itself
+    and never appear as write_file actions — the executor confirmed and hashed
+    them, so they count with exactly the same standing as an authored artifact.
+    """
+    produced: set[str] = set()
+    for action in session.proposed_actions:
+        if action.role == Role.panelist or action.status != "executed":
+            continue
+        if action.kind == "build_artifact":
+            names = _build_outputs(action)
+        elif action.kind in _FILE_OUTPUT_KINDS and action.result_path:
+            names = [action.filename, action.result_path]
+        else:
+            continue
+        for name in names:
+            fmt = binary_format_of(name)
+            if fmt:
+                produced.add(fmt)
+    return produced
+
+
+def _ensure_deliverable_promotes(session: Session, store: LogStore) -> None:
+    """Safety net: a BUILT deliverable gets a promote proposal even if the seat
+    emitted none. Without it a run could approve the build, produce the PDF, and
+    still hand the user only the generator script that happened to carry a
+    PROMOTE line. Still human-gated — this proposes; nothing lands without the
+    approval, and the destination question is asked as usual."""
+    if session.delivery_mode == "final_batch":
+        return
+    wanted = set(getattr(session.classification, "deliverable_formats", None) or [])
+    if not wanted:
+        return
+    already = {a.filename for a in session.proposed_actions
+               if a.kind == "promote" and a.filename}
+    missing: list[ProposedAction] = []
+    seen: set[str] = set()
+    for action in session.proposed_actions:
+        if (action.kind != "build_artifact" or action.status != "executed"
+                or action.role == Role.panelist):
+            continue
+        for produced in _build_outputs(action):
+            name = Path(produced).name
+            if binary_format_of(name) not in wanted or name in already or name in seen:
+                continue
+            seen.add(name)
+            missing.append(ProposedAction(
+                session_id=session.session_id, kind="promote",
+                role=Role.implementer, filename=name, args={"filename": name}))
+    if missing:
+        _append_proposals(session, store, missing)
+        store.log_event(session.session_id, "deliverable_promote_autofilled",
+                        {"files": [a.filename for a in missing]})
+
+
+def _missing_deliverable_formats(session: Session) -> list[str]:
+    """Formats the task NAMED as its deliverable that no produced file matches.
+
+    ARTIFACT carries text by definition, so the only way a run lands a PDF, a
+    .docx or a .zip is an approved BUILD. Authoring the generator is half the
+    job. Without this check the gate only ever asked 'was a file written?' — a
+    49KB reportlab script answered yes, passed verification, and was reported
+    high-confidence as the finished cookbook while no PDF existed anywhere.
+    """
+    classification = session.classification
+    wanted = list(getattr(classification, "deliverable_formats", None) or [])
+    if not wanted:
+        return []
+    produced = _produced_deliverable_formats(session)
+    return [fmt for fmt in wanted if fmt not in produced]
 
 
 def _has_executed_file_mutation(session: Session) -> bool:
@@ -2178,7 +2416,7 @@ def _panel_one(
         and
         session.assembly_mode != assembly.HTML_INLINE
         and
-        timeout_s is not None and member.agent in config.FRONTIER_AUTHOR_SEATS
+        timeout_s is not None and member.agent in _frontier_seats(session)
     )
     recovery_ledger = (
         session.candidate_author_recoveries
@@ -2562,7 +2800,7 @@ def _package_author_timeout(session: Session, member: CouncilMember, retry: bool
         config.PANEL_RETRY_TIMEOUT
         if retry or session.assembly_mode == assembly.HTML_INLINE else
         config.FRONTIER_AUTHOR_TIMEOUT
-        if member.agent in config.FRONTIER_AUTHOR_SEATS else
+        if member.agent in _frontier_seats(session) else
         config.PANEL_AUTHOR_TIMEOUT
     )
     # A wave cap exists only when the operator explicitly configured a package
@@ -3258,7 +3496,7 @@ def _run_panel_rounds(
                                      ((config.PANEL_RETRY_TIMEOUT
                                        if assembly_package else
                                        config.FRONTIER_AUTHOR_TIMEOUT
-                                       if m.agent in config.FRONTIER_AUTHOR_SEATS
+                                       if m.agent in _frontier_seats(session)
                                        else config.PANEL_AUTHOR_TIMEOUT)
                                       if _produces else None)),
                 "panel")
@@ -3666,11 +3904,24 @@ def run_session(
                 "the parent code/output context"
             ),
         })
+    # 2b. INTENT PASS — a model reads the request before anything expensive
+    # happens. The rule-based pass above cannot tell "compile a pdf" from
+    # "compile the parser"; this can, and it costs one cheap call to find out
+    # rather than twelve calls and thirty minutes to be wrong.
+    cls = _refine_classification(
+        session, registry, store, cls, classification_text, role_agents)
     session.classification = cls
     if not session.budgets_locked:
         session.budgets = config.budgets_for(cls.complexity)
     store.log_event(sid, "classified", cls.model_dump())
     manager.transition(session, SessionStatus.classified)
+
+    # 2c. AMBIGUITY GATE — the one place the coordinator is allowed to ask what
+    # the user meant, and the only cheap moment to do it: nothing has been
+    # authored, nothing has been spent beyond the intent call.
+    if _maybe_ask_intent(session, manager, store):
+        store.save_session(session)
+        return session
 
     return _deliberate(session, manager, registry, governance, store, role_agents)
 
@@ -3826,7 +4077,7 @@ def _deliberate(
         wrapper.
         """
         timeout = (config.FRONTIER_AUTHOR_TIMEOUT
-                   if member.agent in config.FRONTIER_AUTHOR_SEATS
+                   if member.agent in _frontier_seats(session)
                    else config.PANEL_AUTHOR_TIMEOUT)
         return _agent_call(session, registry, store, member, prompt,
                            timeout_s=timeout,
@@ -4021,7 +4272,29 @@ def _deliberate(
             session.unresolved.append(
                 "artifact repair skipped: verification failure is an external dependency conflict")
             store.log_event(sid, "artifact_repair_skipped", {"reason": "external_dependency_conflict"})
-        while (not verified and not external_conflict and session.artifact_repair_attempts
+        # A missing BINARY deliverable is not an authoring defect — the bytes on
+        # disk may be perfect. What is missing is the governed step that RUNS
+        # them, so ask for that BEFORE the generic repair path, which can only
+        # return one replacement ARTIFACT and would rewrite the generator forever
+        # without ever producing the file. Terminates because every pass must add
+        # a build_artifact proposal, and the helper refuses past the attempt cap.
+        while (not verified and not external_conflict
+               and _missing_deliverable_formats(session)):
+            builds_before = sum(
+                1 for a in session.proposed_actions if a.kind == "build_artifact")
+            if _repair_missing_deliverable(
+                    session, manager, governance, store,
+                    owner_repair_call if package_owner else codifier_call):
+                return session  # paused for the build approval; resume re-enters here
+            if sum(1 for a in session.proposed_actions
+                   if a.kind == "build_artifact") == builds_before:
+                break  # nothing was even proposed — fail honestly rather than spin
+            verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
+        # Rewriting the generator cannot conjure a deliverable that was never
+        # built, so the generic author repair stays out of that case.
+        while (not verified and not external_conflict
+               and not _missing_deliverable_formats(session)
+               and session.artifact_repair_attempts
                < config.MAX_ARTIFACT_REPAIR_ATTEMPTS):
             if not _repair_artifact_failure(
                 session, manager, governance, store,
@@ -4036,7 +4309,28 @@ def _deliberate(
             and not _has_executed_file_mutation(session)
             and not session.files_changed
         )
-        if missing_output:
+        # Distinct from both cases below: files were written and they are fine,
+        # but none of them is the deliverable the user named. Saying "no file was
+        # written" here would be false and would send the user chasing the wrong
+        # problem.
+        missing_formats = _missing_deliverable_formats(session)
+        if missing_formats and not missing_output:
+            wanted = ", ".join(f".{fmt}" for fmt in missing_formats)
+            detail = (
+                f"the task asked for a {wanted} deliverable and no {wanted} file was "
+                "produced; only the source that would generate it exists"
+            )
+            if detail not in session.unresolved:
+                session.unresolved.append(detail)
+            session.quality_gate = {
+                "verdict": "FAIL",
+                "stage": "deliverable_format",
+                "detail": detail,
+            }
+            session.stop_reason = f"deliverable missing: no {wanted} file was produced"
+            store.log_event(sid, "deliverable_format_gate_failed",
+                            {"formats": missing_formats})
+        elif missing_output:
             detail = (
                 "required output task completed without an executed write_file, "
                 "edit_file, or promote action"
@@ -4053,26 +4347,43 @@ def _deliberate(
         else:
             session.stop_reason = "artifact verification failed; no file was delivered"
         manager.transition(session, SessionStatus.composing)
-        session.final = FinalAnswer(
-            answer=(
+        if missing_formats and not missing_output:
+            wanted = ", ".join(f".{fmt}" for fmt in missing_formats)
+            failure_answer = (
+                f"The run failed artifact verification: this task's deliverable is a "
+                f"{wanted} file and none was produced. Source that would generate it "
+                "may exist, but a generator is not the deliverable — nothing ran it, "
+                "so there is no file to deliver and this is not reported as a success."
+            )
+            failure_next = (
+                f"Rerun and require an approved BUILD that actually produces the "
+                f"{wanted} file (the council can only type text, so a build is the "
+                "only way it lands)."
+            )
+        elif missing_output:
+            failure_answer = (
                 "The run failed artifact verification because it did not produce "
                 "or modify the requested file. No write or edit action completed, "
                 "so no deliverable exists and this is not reported as a success."
-                if missing_output else
+            )
+            failure_next = (
+                "Retry with an available implementation author and require an "
+                "executed file write or edit before accepting the result."
+            )
+        else:
+            failure_answer = (
                 "The run failed artifact verification: the produced file is "
                 "missing, incomplete, or does NOT RUN (it threw on load), so it "
                 "was NOT delivered and this is NOT reported as a success. See the "
                 "unresolved risks below."
-            ),
+            )
+            failure_next = "Fix the file so it runs, then rerun the task."
+        session.final = FinalAnswer(
+            answer=failure_answer,
             confidence="low",
             assumptions=[],
             risks_unresolved=list(session.unresolved),
-            next_action=(
-                "Retry with an available implementation author and require an "
-                "executed file write or edit before accepting the result."
-                if missing_output else
-                "Fix the file so it runs, then rerun the task."
-            ),
+            next_action=failure_next,
         )
         if not session.turns:
             session.turns.append({"role": "user", "text": session.task.text})
@@ -4086,6 +4397,7 @@ def _deliberate(
 
     # Verified — NOW deliver (the one approval gate) and, if the destination is
     # unknown, ask the delivery-target question.
+    _ensure_deliverable_promotes(session, store)
     if _execute_actions(session, manager, governance, store):
         return session  # paused in awaiting_approval / awaiting_input
 
@@ -4735,11 +5047,11 @@ def _independent_frontier_release_gate(
         excluded.add(chair.agent)
     unique: dict[str, CouncilMember] = {}
     for member in council.members:
-        if (member.active and member.agent in config.FRONTIER_AUTHOR_SEATS
+        if (member.active and member.agent in _frontier_seats(session)
                 and member.agent not in unique):
             unique[member.agent] = member
     verifier = next(
-        (unique[agent] for agent in config.FRONTIER_AUTHOR_SEATS
+        (unique[agent] for agent in _frontier_seats(session)
          if agent in unique and agent not in excluded),
         None,
     )
@@ -5522,6 +5834,81 @@ def _run_test_fix_loop(
     return False
 
 
+def _repair_missing_deliverable(
+    session: Session, manager: SessionManager, governance: Governance, store: LogStore,
+    repair_call: AgentCall,
+) -> bool:
+    """Ask the author for the BUILD that turns its generator into the deliverable.
+
+    Deliberately separate from ``_repair_artifact_failure``: nothing is wrong
+    with the bytes on disk, so a replacement ARTIFACT repairs nothing. What is
+    missing is the governed step that RUNS them — and the generic repair path
+    accepts exactly one ARTIFACT block, so it can never emit INSTALL/BUILD.
+
+    Only INSTALL/BUILD/ARTIFACT proposals are accepted here; delivery still
+    goes through the ordinary promote gate afterwards. Returns True when the
+    session paused for the human (a build always needs approval), so the caller
+    stops instead of re-verifying a run still in flight.
+    """
+    missing = _missing_deliverable_formats(session)
+    if not missing:
+        return False
+    # Bounded by the number of builds already attempted — no new session state,
+    # and a seat that keeps proposing a build that does not produce the file
+    # cannot spin here.
+    attempts = sum(1 for a in session.proposed_actions if a.kind == "build_artifact")
+    if attempts >= config.MAX_ARTIFACT_REPAIR_ATTEMPTS:
+        return False
+    package_owner = next(
+        (member for member in session.council.members
+         if member.active and member.agent == session.work_package_owner),
+        None,
+    )
+    who = package_owner or _codifier(session)
+    if not (who and who.active):
+        return False
+
+    written = [a.filename for a in session.proposed_actions
+               if a.kind in ("write_file", "edit_file") and a.status == "executed"
+               and a.role != Role.panelist and a.filename]
+    wanted = ", ".join(f".{fmt}" for fmt in missing)
+    store.log_event(session.session_id, "deliverable_build_requested",
+                    {"formats": missing, "attempt": attempts + 1,
+                     "agent": who.agent, "written": written[:20]})
+    prompt = (
+        f"Task: {_execution_task(session)}\n\n"
+        f"The deliverable of this task is a {wanted} file, and no {wanted} file "
+        "exists. A script that WOULD produce one is not the deliverable.\n"
+        f"Already written into your sandbox: {', '.join(written) or '(nothing)'}\n\n"
+        "Reply with the governed build that actually produces the file, and nothing "
+        "else — no analysis, no code fences:\n"
+        "INSTALL: <comma-separated package names the build imports>   (omit if none)\n"
+        "BUILD: <one command, run from the sandbox, no shell operators or pipes>\n"
+        f"PRODUCES: <the {wanted} file that command writes>\n"
+        f"PROMOTE: <the same {wanted} file>\n\n"
+        "If no generator exists yet, emit it first as ONE complete ARTIFACT block, "
+        "then the lines above. The command must write its output into the sandbox "
+        "using a relative path. Every file named on PRODUCES must really appear or "
+        "the build fails."
+    )
+    try:
+        reply = repair_call(who, prompt)
+    except (AgentError, BudgetExceeded) as e:
+        store.log_event(session.session_id, "deliverable_build_failed",
+                        {"reason": str(e)[:300]})
+        return False
+    proposals = [a for a in _parse_proposals(session.session_id, reply.content)
+                 if a.kind in ("write_file", "install_deps", "build_artifact", "promote")]
+    if not any(a.kind == "build_artifact" for a in proposals):
+        store.log_event(session.session_id, "deliverable_build_failed",
+                        {"reason": "reply proposed no BUILD/PRODUCES"})
+        return False
+    for action in proposals:
+        action.role = Role.implementer
+    _append_proposals(session, store, proposals)
+    return _execute_actions(session, manager, governance, store, promotes=False)
+
+
 def _repair_artifact_failure(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     repair_call: AgentCall,
@@ -5889,6 +6276,16 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                 continue
             if required not in written:
                 failures.append(f"required artifact missing: {required}")
+
+    # The deliverable the user NAMED must exist, not a program that would create
+    # it. Prose is already refused as proof for file tasks; a generator script is
+    # the same claim wearing a file extension.
+    for fmt in _missing_deliverable_formats(session):
+        failures.append(
+            f"the task's deliverable is a .{fmt} file and no .{fmt} was produced; "
+            f"a script that would generate one is not the deliverable — it has to "
+            f"be run with 'BUILD: <command>' + 'PRODUCES: <name>.{fmt}'"
+        )
 
     # A later milestone must not silently build against a changed predecessor.
     # Only dependencies with an accepted delivery hash are constrained here;

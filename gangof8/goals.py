@@ -17,6 +17,7 @@ from typing import Optional
 
 from . import assembly, config
 from .models import Goal, GoalMilestone, utcnow
+from .roles import resolve_frontier_authors
 
 
 class GoalStore:
@@ -307,7 +308,9 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
     """
     seats = list(dict.fromkeys(s for s in (panel or []) if s))
     roster = ", ".join(seats) or "the available council"
-    frontier = [s for s in seats if s in config.FRONTIER_AUTHOR_SEATS] or seats[:1]
+    # Frontier-class membership follows the roster actually convened, so a
+    # non-frontier build team still names real primary authors here.
+    frontier = resolve_frontier_authors(seats)
     return (
         "You are the ARCHITECT for a BUILD TEAM. Decompose the goal into the "
         "FEWEST bounded, owned work packages that the deliverable's real "

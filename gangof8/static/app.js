@@ -2811,6 +2811,8 @@ let gemKey = {present: false, masked: null, source: null};
 
 // Tooltip text — purpose of each setting, shown on hover of the ⓘ marker.
 const TIPS = {
+  default_profile: "How a task is run when you do not pick a profile for it. 'Auto' lets the router choose — and for any request under ~60 words it scores Focused highest, which runs ONE model (the lead) with no panel. Pick Council or Best-of-N here if you want several models on ordinary tasks.",
+  panel_roster: "The exact seats that contribute every round. Leave empty to derive it automatically (installed CLI agents, plus OpenRouter seats backfilling for any you disabled). Ticking seats here overrides that entirely — your list wins over panel size and duo/council mode.",
   backend: "Which agent backend runs sessions. 'mock' is offline and free for testing; 'cli' runs the local claude/codex/gemini CLIs directly in generation mode, so the implementer emits real file contents — fully self-contained.",
   roles: "The 'lead' is the organizer: it breaks each task into assignments and hands them to the talents below, who do the actual work (coding, research, writing, verification). Map each role to a seat (claude, codex, gemini, or an OpenRouter seat) and optionally pin a MODEL for that role — the pin beats the seat's default only when this role runs (role pin › seat pin › CLI default). '(backend default)' uses the preset. The agent CLIs manage their own auth.",
   lead: "The organizer and integrator: decomposes the task, assigns the substantive work to the talents below, integrates their results, and decides when it's done — it authors only trivial glue itself.",
@@ -3144,6 +3146,19 @@ function renderSettings(s, seats) {
       <div class="sub">Each vendor offers its live models (👁 vision · 🧠 reasoning · 🔧 tools/coding, newest first) — pick one, or choose <b>custom slug…</b> to paste an exact id from openrouter.ai/models. Enabled seats join every panel round and are selectable in Role mapping. Billed by OpenRouter; data_collection = "deny".</div>
     </div>
 
+    <div class="sset s-panelroster">
+      <label>Panel roster ${tip("panel_roster")}</label>
+      <div class="field" style="flex-wrap:wrap;gap:10px">
+        ${(seats || []).map(x => `
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer;margin:0">
+            <input type="checkbox" class="panel_seat" data-seat="${esc(x.name)}"
+                   ${(s.panel_seats || []).includes(x.name) ? "checked" : ""}>
+            ${esc(x.label || x.name)}
+          </label>`).join("")}
+      </div>
+      <div class="sub">Leave every box unticked to derive the panel automatically. Tick any and that exact list becomes the panel, overriding duo/council mode and the panel-size cap. Disabled seats are still skipped.</div>
+    </div>
+
     <div class="sset s-roles">
       <label>Role mapping → agent · model ${tip("roles")}</label>
       ${roleCatalogWarn}
@@ -3182,6 +3197,14 @@ function renderSettings(s, seats) {
       <div class="field">${lbl("Council integration review", "integration_review")}
         <input type="checkbox" id="set_integration_review" ${s.integration_review_enabled ? "checked" : ""}></div>
       <div class="sub">After a best-of-N build vote, the codifier may offer a separately validated merge when candidates have complementary strengths. The voted winner remains the default, and the human chooses whether to use the integration.</div>
+      <div class="field">${lbl("Default run profile", "default_profile")}
+        <select id="set_default_profile">
+          <option value="auto" ${(s.default_execution_profile || "auto") === "auto" ? "selected" : ""}>Auto — router decides (usually one model)</option>
+          <option value="focused" ${s.default_execution_profile === "focused" ? "selected" : ""}>Focused — one lead, no panel</option>
+          <option value="council" ${s.default_execution_profile === "council" ? "selected" : ""}>Council — the panel deliberates every task</option>
+          <option value="best_of_n" ${s.default_execution_profile === "best_of_n" ? "selected" : ""}>Best-of-N — every enabled model submits a candidate</option>
+        </select></div>
+      <div class="sub">Applies to tasks submitted without an explicit profile. Auto scores Focused above Council for anything under ~60 words, and Focused convenes no panel — so on a multi-model install Auto means one model does nearly everything.</div>
       <div class="field">${lbl("Build participation", "participation")}
         <select id="set_participation_mode">
           <option value="focused" ${s.participation_mode === "focused" ? "selected" : ""}>Focused — owner + verifier</option>
@@ -3352,6 +3375,8 @@ async function saveSettings() {
     }
     if (v) cli_models[sel.dataset.seat] = v;
   });
+  const panel_seats = [];
+  document.querySelectorAll(".panel_seat").forEach(c => { if (c.checked) panel_seats.push(c.dataset.seat); });
   const cli_enabled = {};
   document.querySelectorAll(".cli_enable").forEach(c => { cli_enabled[c.dataset.seat] = c.checked; });
   const patch = {
@@ -3365,6 +3390,8 @@ async function saveSettings() {
     cli_timeouts: {},
     integration_review_enabled: document.getElementById("set_integration_review").checked,
     participation_mode: document.getElementById("set_participation_mode").value,
+    default_execution_profile: document.getElementById("set_default_profile").value,
+    panel_seats,
     risk_boundary: document.getElementById("set_risk").value,
     composer: {
       prose_min_chars: _num("set_prose", 200),

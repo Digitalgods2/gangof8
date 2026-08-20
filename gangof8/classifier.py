@@ -36,6 +36,121 @@ _FILE_ARTIFACT = re.compile(
 _DOC_ARTIFACT = re.compile(
     r"\b[\w\-]+\.(txt|md|markdown|rst|rtf|tex|docx?)\b", re.IGNORECASE
 )
+# ---------------------------------------------------------------------------
+# Deliverable FORMATS the council cannot type out.
+#
+# ARTIFACT blocks carry text by definition, so a PDF, a .docx, a .zip or an
+# image can only be produced by an approved BUILD. Naming one is a statement
+# about the FINISHED ARTIFACT — not evidence that the task is software work.
+#
+# Live failure this exists to stop: "research heavily the works of Auguste
+# Escoffier and compile a pdf of his recipes" matched the CODE_WORDS entry
+# 'compile', was typed `code`, and shipped a 49KB reportlab generator script
+# that nothing ever ran. No PDF was produced and no gate noticed one was
+# missing, so the run reported high confidence on a deliverable that did not
+# exist.
+# ---------------------------------------------------------------------------
+_BINARY_FORMAT_ALIASES = {
+    "pdf": "pdf",
+    "doc": "docx", "docx": "docx", "odt": "odt", "rtf": "rtf",
+    "xls": "xlsx", "xlsx": "xlsx", "ods": "ods",
+    "ppt": "pptx", "pptx": "pptx", "odp": "odp",
+    "epub": "epub", "mobi": "mobi",
+    "zip": "zip", "tar": "tar", "gz": "gz", "tgz": "tar", "7z": "7z", "rar": "rar",
+    "png": "png", "jpg": "jpg", "jpeg": "jpg", "gif": "gif", "bmp": "bmp",
+    "tif": "tiff", "tiff": "tiff", "webp": "webp", "ico": "ico",
+    "mp3": "mp3", "wav": "wav", "flac": "flac", "ogg": "ogg", "m4a": "m4a",
+    "mp4": "mp4", "mov": "mov", "avi": "avi", "webm": "webm", "mkv": "mkv",
+    "xlsm": "xlsx", "docm": "docx",
+}
+# "doc" and "tar" are ordinary English as often as they are formats, so they
+# count only with a leading dot (report.doc). Everything in this set is
+# unambiguous enough to count as a bare word ("compile a pdf"); "zip" is only
+# here because the output-cue rule below already rejects "zip code".
+_BARE_FORMAT_WORDS = {
+    "pdf", "docx", "docm", "xlsx", "xlsm", "pptx", "epub", "mobi", "zip",
+    "png", "jpg", "jpeg", "gif", "webp", "tiff", "mp3", "wav", "flac",
+    "mp4", "mov", "webm", "odt", "ods", "odp",
+}
+_BINARY_FORMAT_MENTION = re.compile(
+    r"(?:\.(?P<ext>"
+    + "|".join(sorted(_BINARY_FORMAT_ALIASES, key=len, reverse=True))
+    + r")|\b(?P<word>"
+    + "|".join(sorted(_BARE_FORMAT_WORDS, key=len, reverse=True))
+    + r"))\b",
+    re.IGNORECASE)
+
+# How far back from a format token to look for the cue that decides whether it
+# names an OUTPUT or an INPUT.
+_CUE_WINDOW = 60
+# "compile a pdf" / "export it as a docx" — the format is being PRODUCED.
+_OUTPUT_CUES = re.compile(
+    r"\b(compile|compiling|create|creating|make|making|generate|generating|"
+    r"produce|producing|build|building|export|exporting|render|rendering|"
+    r"convert|converting|output|outputting|save|saving|write|writing|turn|"
+    r"turning|assemble|assembling|deliver|delivering|publish|publishing|"
+    r"emit|emitting|prepare|preparing|format|formatted|formatting|bundle|"
+    r"bundling|package|packaging|ship|shipping|final|finished|deliverable|"
+    r"want|need|give me|send me|hand me|email me|as|into|to|in)\b",
+    re.IGNORECASE)
+# "summarize this pdf" / "read the attached docx" — the format is an INPUT.
+_INPUT_CUES = re.compile(
+    r"\b(read|reading|attached|attach|attachment|summari[sz]e|summari[sz]ing|"
+    r"from|parse|parsing|extract|extracting|analy[sz]e|analy[sz]ing|review|"
+    r"reviewing|open|opening|uploaded|provided|supplied|given|existing|"
+    r"this|these|those|my|our|their|the following)\b",
+    re.IGNORECASE)
+
+
+def _last_match_end(pattern: re.Pattern, window: str) -> int | None:
+    """Offset of the LAST match in the window, or None. Nearest cue to the
+    format token wins, so one sentence can name an input and an output
+    ("turn the attached pdf into a docx")."""
+    last = None
+    for m in pattern.finditer(window):
+        last = m.start()
+    return last
+
+
+def deliverable_formats(text: str) -> list[str]:
+    """Non-text output formats the task declares as its deliverable.
+
+    Only OUTPUT mentions count. The cue nearest the format token decides, which
+    keeps "summarize this pdf" (an input) apart from "compile a pdf" (the
+    deliverable) without needing to understand the sentence.
+    """
+    body = text or ""
+    found: list[str] = []
+    for m in _BINARY_FORMAT_MENTION.finditer(body):
+        token = m.group("ext") or m.group("word") or ""
+        fmt = _BINARY_FORMAT_ALIASES.get(token.lower())
+        if not fmt or fmt in found:
+            continue
+        window = body[max(0, m.start() - _CUE_WINDOW):m.start()]
+        out = _last_match_end(_OUTPUT_CUES, window)
+        inp = _last_match_end(_INPUT_CUES, window)
+        if out is None or (inp is not None and inp > out):
+            continue
+        found.append(fmt)
+    return found
+
+
+def binary_format_of(name: str) -> str:
+    """The normalized deliverable format of a filename, '' when it is not one.
+    Used by the delivery gate to tell a produced .pdf from its generator."""
+    raw = (name or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in raw:
+        return ""
+    return _BINARY_FORMAT_ALIASES.get(raw.rsplit(".", 1)[-1].lower(), "")
+
+
+# CODE_WORDS that mean "assemble/produce" in ordinary English just as readily as
+# they mean software work. On their own they must never type a document request
+# as code — "compile a pdf of his recipes" is a cookbook, not a build system.
+_AMBIGUOUS_CODE_WORDS = {"compile", "build", "package", "library", "program"}
+_STRONG_CODE_WORDS = [w for w in CODE_WORDS if w not in _AMBIGUOUS_CODE_WORDS]
+
+
 # Building something NEW (vs. examining/improving an existing folder). A
 # greenfield build needs a destination — the loop ASKS if none was referenced.
 GREENFIELD_WORDS = [
@@ -150,7 +265,22 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
     attachment_revision = attached_code and _any(
         _CODE_REVISION_WORDS, directive_lower
     )
-    code = (
+    # Read the deliverable format from the DIRECTIVE only. An attached PDF whose
+    # extracted text is appended to the task must not be mistaken for a PDF the
+    # run has to produce.
+    formats = deliverable_formats(directive_text)
+    # A declared non-text deliverable disarms the ambiguous code words. Without
+    # this "compile a pdf of his recipes" is typed `code` off the word 'compile'
+    # alone and the run ships a generator script instead of the book. A real
+    # programming signal (script/function/api/main.py/an attached source file)
+    # still wins — "write a python script that builds a pdf" is coding work.
+    ambiguous_code_only = bool(
+        formats
+        and not _any(_STRONG_CODE_WORDS, lower)
+        and not _EXECUTABLE_ARTIFACT.search(text)
+        and not attached_code
+    )
+    code = not ambiguous_code_only and (
         _any(CODE_WORDS, lower)
         or bool(_FILE_ARTIFACT.search(text))
         or attached_code
@@ -212,6 +342,33 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
             and not _EXECUTABLE_ARTIFACT.search(text)):
         task_type = TaskType.content
         notes.append("writing task producing a prose document — treated as content")
+
+    # Deliverable override: a named non-text format is a FILE the run must
+    # produce, whatever verb introduced it. Research that ends in "…and compile
+    # a pdf" is not a prose answer, and the analysis override above must not be
+    # allowed to strand it as one — a run typed `research` gets no file contract
+    # at all, so the PDF could never be built.
+    if formats:
+        if ambiguous_code_only:
+            notes.append(
+                "declares a non-text deliverable; ambiguous code words "
+                "(compile/build/package) alone do not make it a coding task")
+        if task_type in (TaskType.question, TaskType.research):
+            task_type = TaskType.content
+            notes.append(
+                f"names a non-text deliverable ({', '.join(formats)}) — treated "
+                "as content; the run must actually produce that file")
+    # On a genuine SOFTWARE task the source IS the deliverable, and a format
+    # named there usually describes a feature ("build a zip export for my app"),
+    # not the run's output. Only carry the requirement where the deliverable is
+    # a document/artifact, so the delivery gate stays conservative.
+    if formats and task_type == TaskType.code:
+        notes.append(
+            f"mentions {', '.join(formats)} inside a coding task — the source is "
+            "the deliverable, so no produced-file requirement is recorded")
+        formats = []
+    elif formats:
+        notes.append(f"deliverable format(s): {', '.join(formats)}")
 
     match_source = wants_matched_output(text)
     if match_source:
@@ -287,4 +444,73 @@ def classify(text: str, role_agents: dict | None = None) -> Classification:
         needs_governance=needs_governance,
         greenfield=greenfield,
         match_source=match_source,
+        deliverable_formats=formats,
     )
+
+
+def with_intent(
+    cls: Classification,
+    *,
+    task_type: TaskType | None = None,
+    produces_output: bool | None = None,
+    deliverable_formats: list[str] | None = None,
+    note: str = "",
+) -> Classification:
+    """Re-derive a Classification after the LLM intent pass revised the reading.
+
+    ``classify`` computes half a dozen flags FROM ``task_type`` (tools_allowed,
+    needs_facts, needs_design, produces_output, greenfield, skills_needed).
+    Patching task_type with ``model_copy`` alone would leave those stale — a
+    request re-typed from `code` to `content` would keep needs_design=True and
+    an "architecture" skill it no longer wants. Everything derived is recomputed
+    here so the two paths can never disagree.
+
+    Text-derived signals (complexity, risk, match_source, needs_governance) are
+    deliberately kept from the rule pass: they read the words, which is a job
+    regex does honestly.
+    """
+    new_type = task_type or cls.task_type
+    formats = list(cls.deliverable_formats if deliverable_formats is None
+                   else deliverable_formats)
+    # The source IS the deliverable on a software task, so a format named there
+    # describes a feature, not an output requirement (see classify()).
+    if new_type == TaskType.code:
+        formats = []
+
+    derived_output = new_type in (
+        TaskType.code, TaskType.content, TaskType.design, TaskType.action)
+    new_output = derived_output if produces_output is None else bool(produces_output)
+    # A named non-text deliverable is a file by definition; never let a model's
+    # produces_output=False strand a run that has to build a PDF.
+    if formats:
+        new_output = True
+
+    skills: list[str] = []
+    needs_facts = new_type in (
+        TaskType.question, TaskType.research, TaskType.design,
+        TaskType.content, TaskType.code)
+    needs_design = new_type in (TaskType.design, TaskType.code)
+    if needs_facts:
+        skills.append("research")
+    if needs_design:
+        skills.append("architecture")
+    if new_output:
+        skills.append("implementation")
+    if cls.quality_matters:
+        skills.append("critique")
+
+    rationale = cls.rationale
+    if note:
+        rationale = f"{rationale}; {note}" if rationale else note
+    return cls.model_copy(update={
+        "task_type": new_type,
+        "produces_output": new_output,
+        "deliverable_formats": formats,
+        "tools_allowed": new_type in (
+            TaskType.action, TaskType.code, TaskType.content, TaskType.design),
+        "needs_facts": needs_facts,
+        "needs_design": needs_design,
+        "greenfield": cls.greenfield and new_type == TaskType.code,
+        "skills_needed": skills,
+        "rationale": rationale,
+    })

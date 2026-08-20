@@ -295,7 +295,8 @@ def test_invalid_assembly_plan_is_repaired_with_exact_validator_feedback(
 
     events = [
         json.loads(line)["event"]
-        for line in service.store.session_log_path("-").read_text(encoding="utf-8").splitlines()
+        for line in service.store.session_log_path(
+            f"goal-{goal.goal_id}").read_text(encoding="utf-8").splitlines()
     ]
     assert events.index("goal_plan_repair_requested") < events.index("goal_plan_repaired")
     assert events.index("goal_plan_repaired") < events.index("goal_planned")
@@ -331,7 +332,8 @@ def test_invalid_plan_repair_is_bounded_and_never_starts_packages(tmp_path, monk
 
     events = [
         json.loads(line)["event"]
-        for line in service.store.session_log_path("-").read_text(encoding="utf-8").splitlines()
+        for line in service.store.session_log_path(
+            f"goal-{goal.goal_id}").read_text(encoding="utf-8").splitlines()
     ]
     assert events.count("goal_plan_repair_requested") == config.GOAL_PLAN_REPAIR_ATTEMPTS
     assert "goal_plan_repaired" not in events
