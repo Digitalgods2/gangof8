@@ -224,4 +224,9 @@ def test_lead_charter_is_orchestrator(session):
     council = Council(members=[_member(Role.lead)])
     p = rounds.synthesis_prompt(session, council, None, 0, [])
     assert "NOT the doer" in p
-    assert "DELEGATE the authoring itself" in p
+    # The charter must say the authoring belongs to a talent, and SHOW the shape
+    # of a delegating reply — four lines of exhortation lost to the 45 lines of
+    # file-authoring mechanics that follow, and the lead worked alone every time.
+    assert "The substantive authoring is a talent's job, not yours" in p
+    assert "DELEGATE: researcher" in p
+    assert "DELEGATE: implementer" in p
