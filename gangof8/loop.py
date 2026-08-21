@@ -6157,6 +6157,35 @@ def _suppress_satisfied_installs(session: Session, store: LogStore) -> list[str]
     return retired
 
 
+def _default_delivery_root(session: Session) -> Optional[str]:
+    """The active user workspace, when it already answers "where should these go?".
+
+    A workspace the user activated in Settings IS a stated destination. Asking
+    again is a question the machine can answer: the session captured that root
+    at submit time (``service`` sets ``workspace_root`` from the active
+    workspace), so the prompt was interrupting a run to re-ask something already
+    on file. Nothing is loosened by answering it here — every promote still
+    carries its own diff and its own approval, so the human still sees each file
+    and the folder it is going to before anything lands.
+
+    Goal spaces are deliberately excluded. For a goal milestone or a work
+    package, ``workspace_root`` is the goal's STAGING root — the council's own
+    assembly area, released later as one ``promote_batch``. Defaulting there
+    would "deliver" files into scratch, so a goal keeps asking.
+    """
+    root = session.workspace_root
+    if not root:
+        return None
+    if session.goal_id or session.work_package_id or session.delivery_mode != "immediate":
+        return None
+    try:
+        if not Path(root).is_dir():
+            return None
+    except OSError:
+        return None
+    return root
+
+
 def _execute_actions(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     promotes: bool = True,
@@ -6183,13 +6212,25 @@ def _execute_actions(
     if not promotes:
         needs_target = []
     if needs_target and not (session.established_root or session.delivery_root):
-        if session.established_asked:
+        workspace = _default_delivery_root(session)
+        if workspace:
+            session.delivery_root = workspace
+            store.log_event(sid, "delivery_target_defaulted",
+                            {"root": workspace, "reason": "active workspace"})
+            store.save_session(session)
+        elif session.established_asked:
             for a in needs_target:
                 a.status = "denied"
                 a.error = "no delivery target (files kept in the council workspace)"
                 session.unresolved.append(
                     f"'{a.filename}' not delivered: kept in the council workspace")
         else:
+            # Name the REAL folder each option means. "the council's
+            # workspace/sandbox" blurs two different places together, and with
+            # no workspace active the files are sitting in the per-session
+            # sandbox — so that option leaves a finished deliverable buried in
+            # an OS scratch directory the user never navigates to.
+            here = executor.artifacts_dir(store.data_dir, sid)
             req = InputRequest(
                 session_id=sid, agent="system", role=Role.coordinator,
                 round=session.current_round, purpose="promote_target", resume_token="",
@@ -6198,7 +6239,7 @@ def _execute_actions(
                     + ", ".join(a.filename for a in needs_target)
                     + ". Where should these files go? Reply with a folder path "
                       "(you'll approve each file with a diff), or 'workspace' to "
-                      "keep them in the council's workspace/sandbox."
+                      f"leave them where they are, in this session's sandbox ({here})."
                 ),
             )
             session.input_requests.append(req)
