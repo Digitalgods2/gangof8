@@ -5998,6 +5998,62 @@ def _suppress_package_promotes(session: Session, store: LogStore) -> list[str]:
     return suppressed
 
 
+def _suppress_satisfied_installs(session: Session, store: LogStore) -> list[str]:
+    """Retire INSTALL actions whose packages the build can already import.
+
+    INSTALL is the one action that reaches the network and runs third-party
+    code, so it is always human-approved. That approval is only meaningful if
+    it is asked for a real decision — and a seat proposing `INSTALL: reportlab`
+    is not reporting a missing package, it is reporting that its script says
+    `import reportlab`. It cannot see the machine; it is guessing, and it has to.
+
+    The coordinator does not have to guess. Checking before the card is raised
+    turns a needless high-risk prompt into no prompt at all: a real run asked
+    the human to approve fetching reportlab into a session whose interpreter
+    already had reportlab 5.0.0, and `pip install --target` — which never
+    consults site-packages — then re-downloaded it along with pillow and
+    charset-normalizer.
+
+    Only a request that is ENTIRELY satisfied is retired. If any package is
+    genuinely missing the card stands unchanged, because the human should see
+    the whole request they are approving, not a silently rewritten one.
+    """
+    retired: list[str] = []
+    for action in session.proposed_actions:
+        if action.kind != "install_deps" or action.status in ("denied", "executed"):
+            continue
+        raw = (action.args or {}).get("packages") or action.filename or ""
+        try:
+            specs = validation.approved_package_specs(raw)
+        except validation.ValidationCommandError:
+            # Not a request this pass may reason about; let the normal
+            # validation path refuse it with its own message.
+            continue
+        have = skills.already_available(specs, session, store.data_dir)
+        if len(have) != len(specs):
+            continue
+        summary = ", ".join(sorted(have.values()))
+        action.status = "executed"
+        action.args["already_available"] = summary
+        retired.append(summary)
+        if action.approval_id:
+            approval = next(
+                (item for item in session.approvals
+                 if item.approval_id == action.approval_id), None)
+            if approval is not None and approval.status == "pending":
+                approval.status = "denied"
+                approval.resolved_at = utcnow()
+                approval.resolved_by = "system"
+    if retired:
+        store.log_event(
+            session.session_id,
+            "installs_already_satisfied",
+            {"packages": retired, "reason": "already available to the build interpreter"},
+        )
+        store.save_session(session)
+    return retired
+
+
 def _execute_actions(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     promotes: bool = True,
@@ -6013,6 +6069,8 @@ def _execute_actions(
     # boundary, even if a parser, salvage path, or repair path synthesizes a
     # normal PROMOTE after the earlier suppression pass.
     _suppress_package_promotes(session, store)
+    # Ask nothing of the human that the machine can already answer.
+    _suppress_satisfied_installs(session, store)
     sid = session.session_id
     # A promote with no delivery target: ask the human WHERE at delivery time
     # (never up front — there may have been nothing to deliver). One question,
