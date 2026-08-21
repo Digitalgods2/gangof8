@@ -1190,6 +1190,9 @@ class GangOf8Service:
             self._enabled_role_fallbacks())
         # A blind tournament has no privileged author quorum: every enabled seat
         # gets the same candidate contract and runnable files advance on merit.
+        # The panel filter is load-bearing: this list is the AUTHOR QUORUM (a
+        # seat that must produce a candidate), not the inspector list, and a
+        # seat that is not participating cannot be required to author.
         session.required_frontier_authors = (
             [] if selected_route == "best_of_n" else [
                 seat for seat in session.frontier_author_seats

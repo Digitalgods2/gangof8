@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 
 import pytest
@@ -450,3 +451,151 @@ ArcadePortal.register(\"invaders\", \"SPACE INVADERS\", SpaceInvaders);
     assert {a.kind for a in session.proposed_actions} == {"edit_file"}
     sandbox_file = executor.artifacts_dir(store.data_dir, session.session_id) / "arcade.txt"
     assert "class SpaceInvaders extends Game" in sandbox_file.read_text(encoding="utf-8")
+
+
+def test_hand_typed_binary_file_does_not_satisfy_the_deliverable_format():
+    """A seat emits text, so a .pdf it types by hand is prose wearing an extension.
+
+    Counting it as the deliverable made the PDF look present, which suppressed
+    the BUILD requirement, so the generator that would have produced a real PDF
+    was never run and its crash was never discovered.
+    """
+    from gangof8.models import Classification, Complexity, Risk, TaskType
+
+    session = Session(
+        session_id="s_fmt",
+        task=Task(task_id="t", session_id="s_fmt", text="compile a pdf of the recipes"))
+    session.classification = Classification(
+        task_type=TaskType.content, complexity=Complexity.standard, risk=Risk.none,
+        deliverable_formats=["pdf"])
+    session.proposed_actions = [ProposedAction(
+        session_id="s_fmt", kind="write_file", role=Role.implementer,
+        filename="Book.pdf", status="executed", result_path="/tmp/Book.pdf")]
+
+    assert loop._produced_deliverable_formats(session) == set()
+    assert loop._missing_deliverable_formats(session) == ["pdf"]
+
+    session.proposed_actions.append(ProposedAction(
+        session_id="s_fmt", kind="build_artifact", role=Role.implementer,
+        args={"command": "python make.py",
+              "produced_paths": json.dumps(["/tmp/Book.pdf"])},
+        status="executed", result_path="/tmp/Book.pdf"))
+    assert loop._produced_deliverable_formats(session) == {"pdf"}
+    assert loop._missing_deliverable_formats(session) == []
+
+
+def test_corrective_followup_reads_its_base_from_the_parent_sandbox(tmp_path):
+    """The revision base must never resolve to the file being rewritten.
+
+    A follow-up owns a fresh sandbox, so a recorded "sandbox" source space
+    belongs to the parent run. Resolving it against the child reported the base
+    as missing, the repair then wrote it, and every later pass compared the
+    repair's own bytes to the parent hash and refused to overwrite — a loop no
+    repair could ever win.
+    """
+    data_dir = tmp_path / "data"
+    parent = executor.artifacts_dir(data_dir, "s_parent")
+    parent.mkdir(parents=True, exist_ok=True)
+    (parent / "Book.pdf").write_bytes(b"%PDF-1.7 original")
+
+    session = Session(
+        session_id="s_child", parent_session_id="s_parent",
+        revision_targets=["Book.pdf"],
+        revision_source_spaces={"Book.pdf": "sandbox"},
+        task=Task(task_id="t", session_id="s_child", text="the pdf is poor"))
+
+    found = loop._revision_source_for(session, data_dir, "Book.pdf")
+    assert found is not None and found.read_bytes() == b"%PDF-1.7 original"
+
+    # Once the repair writes into the child's own sandbox, that copy must still
+    # not be mistaken for the base it is supposed to be revising.
+    child = executor.artifacts_dir(data_dir, "s_child")
+    child.mkdir(parents=True, exist_ok=True)
+    (child / "Book.pdf").write_bytes(b"%PDF-1.7 rewritten")
+    again = loop._revision_source_for(session, data_dir, "Book.pdf")
+    assert again == found
+
+
+class _Reply:
+    def __init__(self, content): self.content = content
+
+
+def _review_session(sid="s_rev"):
+    session = Session(
+        session_id=sid, frontier_author_seats=["gemini", "deepseek"],
+        task=Task(task_id="t", session_id=sid, text="explain the mother sauces"))
+    council = Council(members=[
+        CouncilMember(role=Role.lead, agent="gemini", active=True),
+        CouncilMember(role=Role.critic, agent="glm", active=False),
+        CouncilMember(role=Role.fact_validator, agent="qwen", active=False),
+    ])
+    session.contributions.append(
+        Contribution(round=0, role=Role.lead, agent="gemini", content="done"))
+    return session, council
+
+
+class _NamesOnly:
+    def __init__(self, names): self._names = names
+
+    def names(self): return list(self._names)
+
+
+def test_answer_only_run_is_still_checked_by_a_second_model(tmp_path, monkeypatch):
+    """Gating the mandatory check on file artifacts left questions unchecked.
+
+    Every question and research task ran with exactly one model and nothing
+    verifying it — the precise case "one does, one checks" exists for.
+    """
+    store = LogStore(tmp_path)
+    session, council = _review_session()
+    monkeypatch.setattr(config, "REVIEW_MODE", "on")
+    seen: list[str] = []
+
+    def fake_call(sess, registry, st, member, prompt, timeout_s=None):
+        seen.append(member.agent)
+        return _Reply("REVIEW: PASS\n- none")
+
+    monkeypatch.setattr(loop, "_agent_call", fake_call)
+    loop._review_deliverable(session, council, _NamesOnly(["gemini", "glm", "qwen"]),
+                             store, [], answer="A veloute is a blond roux plus stock.")
+
+    assert session.review["verdict"] == "pass"
+    assert session.review["subject"] == "answer"
+    # The author must never be the checker.
+    assert seen and "gemini" not in seen
+
+
+def test_a_lone_review_fail_does_not_veto_but_two_agreeing_ones_do(tmp_path, monkeypatch):
+    """A FAIL only counts once a SECOND, different seat agrees with it.
+
+    One seat is allowed to be wrong — a live reviewer failed a run whose PDF had
+    in fact been built — so a lone FAIL stays advisory. Two agreeing seats are
+    what turns the check into something that can actually refuse delivery.
+    """
+    store = LogStore(tmp_path)
+    monkeypatch.setattr(config, "REVIEW_MODE", "on")
+    registry = _NamesOnly(["gemini", "glm", "qwen"])
+
+    def replies(sequence):
+        it = iter(sequence)
+
+        def fake_call(sess, reg, st, member, prompt, timeout_s=None):
+            return _Reply(next(it))
+        return fake_call
+
+    # First seat fails, second disagrees -> advisory only.
+    session, council = _review_session("s_rev_split")
+    monkeypatch.setattr(loop, "_agent_call", replies(
+        ["REVIEW: FAIL\n- wrong kind of artifact", "REVIEW: PASS\n- none"]))
+    loop._review_deliverable(session, council, registry, store, [], answer="an answer")
+    assert session.review["verdict"] == "fail"
+    assert session.review["confirmed"] is False
+
+    # Both seats fail -> confirmed, and the findings are surfaced.
+    session, council = _review_session("s_rev_agree")
+    monkeypatch.setattr(loop, "_agent_call", replies(
+        ["REVIEW: FAIL\n- wrong kind of artifact", "REVIEW: FAIL\n- agreed, it is a script"]))
+    loop._review_deliverable(session, council, registry, store, [], answer="an answer")
+    assert session.review["verdict"] == "fail"
+    assert session.review["confirmed"] is True
+    assert any("wrong kind of artifact" in u for u in session.unresolved)

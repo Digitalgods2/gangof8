@@ -941,20 +941,24 @@ def _review_seats(session: Session, council: Council, registry: AgentRegistry,
 
 def _review_deliverable(
     session: Session, council: Council, registry: AgentRegistry, store: LogStore,
-    executed: list[ProposedAction],
+    executed: list[ProposedAction], answer: str = "",
 ) -> None:
-    """One model that did not write it checks the deliverable before delivery.
+    """One model that did not write it checks the result before delivery.
 
     The floor of "one to do, one to check", guaranteed on EVERY route — not a
     routing profile, not a setting, and not dependent on session.panel (which
     the default route empties). Dynamic CONSULT/DELEGATE is untouched; this only
     makes the second pair of eyes obligatory.
 
-    Advisory by design. The deterministic gates still decide what ships; a
-    reviewer's FAIL is recorded, surfaced in the run's unresolved risks, and
-    caps the reported confidence, so a categorical miss (a generator where a PDF
-    was wanted) can no longer be reported as an unqualified success. It does not
-    block delivery on one model's opinion.
+    Covers answer-only runs too. Gating the check on file artifacts left every
+    question and research task with exactly one model and no checker at all,
+    which is the case the floor was introduced for; ``answer`` supplies the
+    subject when a run produced prose rather than files.
+
+    A FAIL is CONFIRMED by a second, different seat before it counts. One seat's
+    bad call must not veto a good build (a live reviewer already failed a run
+    whose PDF had in fact been built), but a confirmed FAIL is not commentary:
+    the caller refuses delivery on it.
     """
     if session.review or config.REVIEW_MODE == "off":
         return
@@ -990,6 +994,13 @@ def _review_deliverable(
                 f"the approved build '{action.filename}'. Its bytes are not shown "
                 "because they are not text. This file EXISTS and is what ships.]",
             ))
+    subject = "files"
+    if not files and answer.strip():
+        # An answer-only run: the prose IS the deliverable, so it is what gets
+        # checked. Without this the mandatory second pair of eyes silently did
+        # not apply to questions or research at all.
+        files = [("(the council's answer)", answer)]
+        subject = "answer"
     if not files:
         return
     author = next((c.agent for c in reversed(session.contributions)
@@ -1030,14 +1041,62 @@ def _review_deliverable(
         return
     verdict, findings = rounds.parse_review(reply.content)
     session.review = {"verdict": verdict or "no_verdict", "reviewer": reviewer.agent,
-                      "author": author, "findings": findings,
+                      "author": author, "findings": findings, "subject": subject,
                       "files": [name for name, _ in files]}
     store.log_event(session.session_id, "deliverable_reviewed", session.review)
-    if verdict == "fail":
-        for finding in findings or ["the independent reviewer rejected the deliverable"]:
-            note = f"independent review ({reviewer.agent}): {finding}"
-            if note not in session.unresolved:
-                session.unresolved.append(note)
+    if verdict != "fail":
+        return
+    # Escalate to a DIFFERENT seat rather than trusting or retrying this one.
+    session.review["confirmed"] = _confirm_review_failure(
+        session, registry, store, candidates, reviewer, prompt)
+    for finding in findings or ["the independent reviewer rejected the deliverable"]:
+        note = f"independent review ({reviewer.agent}): {finding}"
+        if note not in session.unresolved:
+            session.unresolved.append(note)
+
+
+def _confirm_review_failure(
+    session: Session, registry: AgentRegistry, store: LogStore,
+    candidates: list[CouncilMember], reviewer: CouncilMember, prompt: str,
+) -> bool:
+    """Does a second, independent seat agree the deliverable should be refused?
+
+    Only a confirmed FAIL blocks delivery. A single seat is allowed to be wrong
+    — and demonstrably is — so a lone FAIL degrades to the old advisory
+    treatment instead of destroying a good run. With no second seat available
+    the first verdict stands, because the alternative is to ignore the only
+    check that ran.
+    """
+    if not config.REVIEW_CONFIRM:
+        return True
+    others = [c for c in candidates if c.agent != reviewer.agent]
+    if not others:
+        return True
+    for candidate in others[:config.REVIEW_SEAT_ATTEMPTS]:
+        try:
+            reply = _agent_call(session, registry, store, candidate, prompt,
+                                timeout_s=config.REVIEW_TIMEOUT or None)
+        except (AgentError, AgentInputRequired) as e:
+            store.log_event(session.session_id, "review_seat_failed",
+                            {"reviewer": candidate.agent, "reason": str(e)[:200]})
+            continue
+        except BudgetExceeded:
+            break
+        verdict, findings = rounds.parse_review(reply.content)
+        agreed = verdict == "fail"
+        session.review["confirmer"] = candidate.agent
+        session.review["confirmer_verdict"] = verdict or "no_verdict"
+        if agreed:
+            for finding in findings or []:
+                note = f"independent review ({candidate.agent}): {finding}"
+                if note not in session.unresolved:
+                    session.unresolved.append(note)
+        store.log_event(session.session_id, "review_failure_confirmation",
+                        {"confirmer": candidate.agent,
+                         "verdict": verdict or "no_verdict", "agreed": agreed})
+        return agreed
+    # Nobody else answered; the one verdict that exists is the one we have.
+    return True
 
 
 def _frontier_seats(session: Session) -> tuple[str, ...]:
@@ -1060,23 +1119,24 @@ def _build_outputs(action: ProposedAction) -> list[str]:
 
 
 def _produced_deliverable_formats(session: Session) -> set[str]:
-    """Normalized formats of every file this run actually landed on disk.
+    """Binary deliverable formats this run actually BUILT.
 
-    Includes the outputs of an executed BUILD, which are the deliverable itself
-    and never appear as write_file actions — the executor confirmed and hashed
-    them, so they count with exactly the same standing as an authored artifact.
+    Only the outputs of an executed BUILD count. They never appear as write_file
+    actions, and the executor confirmed and hashed them, so they are the one
+    form of proof a binary format can have here.
     """
     produced: set[str] = set()
     for action in session.proposed_actions:
         if action.role == Role.panelist or action.status != "executed":
             continue
-        if action.kind == "build_artifact":
-            names = _build_outputs(action)
-        elif action.kind in _FILE_OUTPUT_KINDS and action.result_path:
-            names = [action.filename, action.result_path]
-        else:
+        # Only a BUILD can produce a binary format. A seat emits text, so a
+        # hand-typed file merely NAMED .pdf/.docx is prose wearing an extension
+        # — yet it used to satisfy this gate outright. Satisfying the gate made
+        # the deliverable look present, which suppressed the BUILD requirement,
+        # so the real generator was never run and its crash never surfaced.
+        if action.kind != "build_artifact":
             continue
-        for name in names:
+        for name in _build_outputs(action):
             fmt = binary_format_of(name)
             if fmt:
                 produced.add(fmt)
@@ -1182,7 +1242,26 @@ def _revision_assertions(session: Session, source: str) -> list[str]:
 
 
 def _revision_source_for(session: Session, data_dir, name: str) -> Optional[Path]:
-    """Find the pre-edit source without accidentally selecting this session's copy."""
+    """Find the pre-edit source without accidentally selecting this session's copy.
+
+    A corrective follow-up runs in its own sandbox, so a recorded "sandbox"
+    source space belongs to the PARENT run, not to this one.  Resolving it here
+    would hand back the very file being rewritten: the first pass reports the
+    base as missing, the repair then writes it, and every later pass compares
+    the repair's own output against the parent's hash and refuses to overwrite
+    "externally changed" bytes.  That loop can never be won, so the parent's
+    sandbox is consulted and this session's own sandbox is never a base.
+    """
+    own_sandbox = executor.artifacts_dir(Path(data_dir), session.session_id)
+
+    def _usable(candidate: Path) -> bool:
+        if not candidate.is_file():
+            return False
+        try:
+            return candidate.resolve().parent != own_sandbox.resolve()
+        except OSError:
+            return True
+
     preferred = (session.revision_source_spaces or {}).get(name)
     if preferred:
         try:
@@ -1190,11 +1269,23 @@ def _revision_source_for(session: Session, data_dir, name: str) -> Optional[Path
                 candidate = executor.resolve_in_workspace(
                     Path(session.delivery_root), name
                 )
+            elif preferred == "sandbox" and session.parent_session_id:
+                candidate = executor.resolve_in_workspace(
+                    executor.artifacts_dir(Path(data_dir), session.parent_session_id), name
+                )
             else:
                 candidate = executor.resolve_space(
                     session, Path(data_dir), preferred, name
                 )
-            if candidate.is_file():
+            if _usable(candidate):
+                return candidate
+        except (ExecutionError, OSError):
+            pass
+    if session.parent_session_id:
+        try:
+            candidate = executor.resolve_in_workspace(
+                executor.artifacts_dir(Path(data_dir), session.parent_session_id), name)
+            if _usable(candidate):
                 return candidate
         except (ExecutionError, OSError):
             pass
@@ -1205,7 +1296,7 @@ def _revision_source_for(session: Session, data_dir, name: str) -> Optional[Path
             candidate = executor.resolve_in_workspace(Path(root), name)
         except ExecutionError:
             continue
-        if candidate.is_file():
+        if _usable(candidate):
             return candidate
     return None
 
@@ -4593,15 +4684,52 @@ def _deliberate(
 
     # Deterministic gates have passed. Before ANY of it crosses into the user's
     # folder, one model that did not write it reads it — the "one to do, one to
-    # check" floor, on every route. Advisory: it records and surfaces findings,
-    # it does not veto. Runs before the promote so its verdict is part of what
-    # the human sees when they approve.
+    # check" floor, on every route. Runs before the promote so its verdict is
+    # part of what the human sees when they approve.
     _review_deliverable(
         session, council, registry, store,
         [a for a in session.proposed_actions
          if a.kind in _FILE_OUTPUT_KINDS and a.status == "executed"
          and a.result_path and a.role != Role.panelist],
     )
+
+    # A FAIL that two independent seats agree on stops the file here. It used to
+    # only cap the reported confidence while the deliverable shipped regardless,
+    # which is how a run that produced the wrong KIND of artifact still reached
+    # the user's folder. Nothing is deleted — the work stays in the sandbox for
+    # a follow-up — it simply is not promoted and is not called a success.
+    review = session.review or {}
+    if (config.REVIEW_BLOCKS_DELIVERY and review.get("verdict") == "fail"
+            and review.get("confirmed")):
+        reviewer = review.get("reviewer", "an independent seat")
+        confirmer = review.get("confirmer")
+        who = f"{reviewer} and {confirmer}" if confirmer else reviewer
+        store.log_event(sid, "review_blocked_delivery",
+                        {"reviewer": reviewer, "confirmer": confirmer,
+                         "findings": review.get("findings", [])})
+        session.final = FinalAnswer(
+            answer=(
+                f"Two independent reviewers ({who}) rejected this deliverable, so "
+                "it was NOT delivered and this is not reported as a success. The "
+                "work is still in the session sandbox; see the unresolved risks "
+                "below for what they found."
+            ),
+            confidence="low",
+            assumptions=[],
+            risks_unresolved=list(session.unresolved),
+            next_action=(
+                "Address the review findings and rerun, or reply in this session "
+                "to have the council revise the file in place."
+            ),
+        )
+        if not session.turns:
+            session.turns.append({"role": "user", "text": session.task.text})
+        session.turns.append({"role": "council", "text": session.final.answer})
+        session.outcome = "failed_verification"
+        manager.transition(session, SessionStatus.failed)
+        store.log_event(sid, "final_composed", session.final.model_dump())
+        store.save_session(session)
+        return session
 
     # Verified — NOW deliver (the one approval gate) and, if the destination is
     # unknown, ask the delivery-target question.
@@ -4638,27 +4766,41 @@ def _deliberate(
                 session.final = compose(session, council, compose_call)
             except AgentInputRequired as e:
                 return _pause_for_input(session, manager, store, e, purpose="compose")
+    # An answer-only run has no file to check before delivery, so its check runs
+    # HERE, on the composed answer. Skipping it left every question and research
+    # task with exactly one model and nothing verifying it — the precise gap the
+    # "one does, one checks" floor was meant to close.
+    if session.final and not session.review:
+        _review_deliverable(session, council, registry, store, [],
+                            answer=session.final.answer or "")
+
     # Record this turn in the conversation: the human's message (the original task
     # on turn one; on a follow-up it was appended by continue_session) and the
     # council's conclusion. The human can now respond and keep the thread going.
-    # An independent FAIL cannot be reported as an unqualified success. The
-    # deterministic gates decide what ships, so this does not block delivery —
-    # but the run that shipped a PDF generator and called itself high-confidence
-    # is exactly what an unheeded review looks like.
+    # An independent FAIL cannot be reported as an unqualified success. A
+    # rejected ANSWER is still shown — withholding the analysis helps nobody and
+    # no file is crossing into the user's folder — but it is surfaced, capped,
+    # and not recorded as a success.
+    rejected = False
     if session.final and (session.review or {}).get("verdict") == "fail":
         session.final.confidence = "low"
         reviewer = session.review.get("reviewer", "an independent seat")
-        note = (f"\n\nIndependent review by {reviewer} did NOT pass this "
-                "deliverable — see the unresolved risks below.")
+        rejected = bool(session.review.get("confirmed"))
+        confirmer = session.review.get("confirmer")
+        who = f"{reviewer} and {confirmer}" if rejected and confirmer else reviewer
+        verb = "did NOT pass" if rejected else "raised unresolved concerns about"
+        note = (f"\n\nIndependent review by {who} {verb} this "
+                "result — see the unresolved risks below.")
         if note.strip() not in (session.final.answer or ""):
             session.final.answer = (session.final.answer or "") + note
+        session.final.risks_unresolved = list(session.unresolved)
         store.log_event(sid, "review_failed_confidence_capped",
-                        {"reviewer": reviewer,
+                        {"reviewer": reviewer, "confirmed": rejected,
                          "findings": session.review.get("findings", [])})
     if not session.turns:
         session.turns.append({"role": "user", "text": session.task.text})
     session.turns.append({"role": "council", "text": session.final.answer})
-    session.outcome = "succeeded"
+    session.outcome = "failed_verification" if rejected else "succeeded"
     manager.transition(session, SessionStatus.done)
     store.log_event(sid, "final_composed", session.final.model_dump())
     store.save_session(session)
