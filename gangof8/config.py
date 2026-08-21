@@ -371,6 +371,14 @@ REVIEW_SEAT_ATTEMPTS = max(1, int(os.environ.get("GANGOF8_REVIEW_SEAT_ATTEMPTS",
 # thing the user asked for?" needs to SEE the artifact, but a 50KB generator
 # does not need to arrive whole to reveal that it is a generator.
 REVIEW_FILE_MAX_CHARS = int(os.environ.get("GANGOF8_REVIEW_FILE_MAX_CHARS", "12000"))
+# A FAIL used to be pure commentary: it capped the reported confidence and the
+# deliverable shipped anyway. A checker that cannot stop anything is not a
+# check. A FAIL is therefore CONFIRMED by a second, different seat first — one
+# flaky model must never be able to veto a good build — and only a confirmed
+# FAIL blocks a file from crossing into the user's folder.
+REVIEW_CONFIRM = os.environ.get("GANGOF8_REVIEW_CONFIRM", "1").strip() not in ("0", "false", "no")
+REVIEW_BLOCKS_DELIVERY = os.environ.get(
+    "GANGOF8_REVIEW_BLOCKS", "1").strip() not in ("0", "false", "no")
 
 # How many seats a duo panel convenes (lead + reviewers). This is the spend dial
 # for a duo roster: it caps both the native seats and the OpenRouter seats that

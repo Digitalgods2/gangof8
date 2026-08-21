@@ -21,7 +21,7 @@ python -m venv .venv
 
 # full local verification (mirrors .github/workflows/ci.yml + the JS checks)
 .\.venv\Scripts\python.exe -m ruff check gangof8 tests
-.\.venv\Scripts\python.exe -m pytest tests -q          # ~739 tests
+.\.venv\Scripts\python.exe -m pytest tests -q          # ~765 tests
 node --check gangof8\static\dashboard-utils.js
 node --check gangof8\static\app.js
 
@@ -106,9 +106,17 @@ never inside the repo), optional active **workspace**, per-goal **staging**, and
 
 `smoke.py` (fast headless Node check for runnable web files) → `browser_acceptance.py`
 (fail-closed real-browser gate for interactive HTML, via Playwright) → independent frontier
-release inspection. Deterministic gates decide; models only author and repair. For
-file-producing tasks, prose is never accepted as proof — success requires an executed write/edit
-plus artifact verification, otherwise the run ends `failed_verification`.
+release inspection (best-of-N only — its candidates come from panelists, so a single-author run
+never reaches it). Deterministic gates decide; models only author and repair. For file-producing
+tasks, prose is never accepted as proof — success requires an executed write/edit plus artifact
+verification, otherwise the run ends `failed_verification`. A binary deliverable (`.pdf`,
+`.docx`, …) counts only when an executed `BUILD` produced it: seats emit text, so a hand-typed
+file merely *named* `.pdf` is prose wearing an extension.
+
+On top of that, every route has a mandatory independent check (`_review_deliverable`): one
+enabled seat that did not author the result reads it before delivery — the file for build tasks,
+the composed answer for answer-only ones. A FAIL is confirmed by a second, different seat, and
+only a confirmed FAIL refuses delivery (`GANGOF8_REVIEW_CONFIRM`, `GANGOF8_REVIEW_BLOCKS`).
 
 ### Session lifecycle
 
@@ -140,7 +148,10 @@ dir per test and forces `config.WEB_ENABLED = False`, so tests never touch share
 or make real network calls — tests that need web access re-enable it explicitly. Because config
 values are module-level constants read at import, tests override them with
 `monkeypatch.setattr(config, …)` rather than environment variables. `MockAdapter` is how the
-loop is exercised end-to-end offline. pytest writes into `.pytest_tmp_run/` (gitignored).
+loop is exercised end-to-end offline. pytest uses its own default basetemp, which rotates per
+run and self-cleans; do not pin `--basetemp` at a fixed path inside the repo, because a single
+damaged ACL there makes every later run fail at setup with `WinError 5` and no way back without
+an elevated `takeown`.
 
 ## Cross-platform gotcha
 

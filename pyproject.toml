@@ -32,8 +32,10 @@ gangof8 = ["static/*", "default-settings.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--basetemp=.pytest_tmp_run"
-cache_dir = ".pytest_tmp_run/.pytest_cache"
+# No pinned basetemp. A fixed directory inside the repo accumulates across runs
+# and, once its ACL is damaged, poisons every later run at setup with WinError 5
+# and no way to recover without an elevated takeown. pytest's default basetemp
+# rotates per run and cleans up after itself, so the failure cannot persist.
 
 [tool.ruff]
 target-version = "py312"
