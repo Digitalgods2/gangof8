@@ -500,6 +500,71 @@ def _install_deps(session: Session, action: ProposedAction, data_dir: Path) -> s
             f"dist-info: {', '.join(installed)}")
 
 
+# Noise a build's own output is never hiding in: the session's installed
+# packages (thousands of files, all written by INSTALL, not by this build) and
+# the usual tool caches. Walking them would cost real time and bury the one
+# line that matters.
+_BUILD_SNAPSHOT_SKIP_DIRS = {
+    "_deps", "__pycache__", "node_modules", ".git", ".venv", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache",
+}
+# A build that writes more than this is not a build whose output we can usefully
+# name; stop walking rather than stall the run.
+_BUILD_SNAPSHOT_MAX_FILES = 4000
+# How many produced files the failure text names before it summarizes the rest.
+# This string is read by a human on an approval screen and by the repair round's
+# model — both stop reading long before a directory listing ends.
+_BUILD_PRODUCED_LIST_MAX = 12
+
+
+def _build_snapshot(root: Path) -> dict[str, tuple[int, int]]:
+    """`relative path -> (size, mtime_ns)` for the ordinary files under `root`.
+
+    Taken before and after a build so the failure text can say what the build
+    ACTUALLY wrote. Best-effort by design: a file that disappears or refuses to
+    stat mid-walk is simply not in the snapshot, which at worst costs one line
+    of diagnostics — never the build itself."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _BUILD_SNAPSHOT_SKIP_DIRS]
+        here = Path(dirpath)
+        for name in filenames:
+            try:
+                st = (here / name).stat()
+            except OSError:
+                continue
+            rel = (here / name).relative_to(root).as_posix()
+            snapshot[rel] = (st.st_size, st.st_mtime_ns)
+            if len(snapshot) >= _BUILD_SNAPSHOT_MAX_FILES:
+                return snapshot
+    return snapshot
+
+
+def _build_wrote(before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]],
+                 missing: list[str]) -> str:
+    """One readable line naming the files the build actually created or changed.
+
+    The motivating run: a seat declared ``PRODUCES: Escoffier_Master_Recipes.pdf``
+    while its generator wrote ``escoffier_recipes.pdf``. The build succeeded, a
+    real PDF sat in the sandbox, and the only thing anyone was told was that the
+    declared name was missing — so the repair round had nothing to correct
+    against and rewrote the generator blindly. The gate stays strict; what it
+    reports stops being a dead end.
+
+    Files whose extension matches a missing declared output are listed first:
+    that is almost always the rename the repair needs to see."""
+    produced = [name for name, stamp in sorted(after.items()) if before.get(name) != stamp]
+    if not produced:
+        return "the build wrote no new or modified files"
+    wanted_suffixes = {Path(name).suffix.lower() for name in missing if Path(name).suffix}
+    produced.sort(key=lambda name: (Path(name).suffix.lower() not in wanted_suffixes, name))
+    shown = produced[:_BUILD_PRODUCED_LIST_MAX]
+    listing = ", ".join(f"{name} ({after[name][0]} bytes)" for name in shown)
+    if len(produced) > len(shown):
+        listing += f", and {len(produced) - len(shown)} more file(s)"
+    return f"the build actually wrote: {listing}"
+
+
 def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Run an approved build in a council space and capture the files it PRODUCES.
 
@@ -528,6 +593,9 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
     outputs = {name: resolve_in_workspace(cwd, name) for name in produces}
     for path in outputs.values():
         _assert_outside_established(session, path)
+    # Snapshot BEFORE the command runs: when a declared output is missing, the
+    # only useful thing to say is what appeared instead.
+    before = _build_snapshot(cwd)
     try:
         argv = validation.approved_build_argv(cmd)
         report = validation.run(argv, cwd, config.BUILD_TIMEOUT, config.BUILD_OUTPUT_MAX_CHARS,
@@ -537,8 +605,12 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
 
     missing = [n for n, path in outputs.items() if not path.is_file()]
     if missing:
+        # Name the gap AND the evidence. A declared name that never appeared is
+        # a fixable mismatch (rename the declaration, or fix the generator's
+        # output path) only if the next reader can see which of the two it is.
         raise ExecutionError(
-            f"build did not produce {', '.join(missing)}\n{report}")
+            f"build did not produce {', '.join(missing)}\n"
+            f"{_build_wrote(before, _build_snapshot(cwd), missing)}\n{report}")
     empty = [n for n, path in outputs.items() if path.stat().st_size == 0]
     if empty:
         raise ExecutionError(f"build produced empty file(s): {', '.join(empty)}\n{report}")
