@@ -8,6 +8,7 @@ reverse), so the prompt layer stays cycle-free and independently testable.
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -276,6 +277,68 @@ def _skill_hints(session: Session, role: Role, readable: list[str] = ()) -> str:
 
 # The file-output contract: how the lead writes real files. Lifted from the old
 # implementer draft prompt so the materialize path stays consistent.
+# Libraries a generator for each deliverable format plausibly reaches for. Only
+# the ones actually INSTALLED are ever named, so this is a statement of fact
+# about the machine, never a recommendation to use something that is not there.
+_FORMAT_LIBRARIES: dict[str, tuple[str, ...]] = {
+    "pdf":  ("reportlab", "pypdf", "pypdf2", "fpdf2", "weasyprint", "pdfkit",
+             "matplotlib", "pillow"),
+    "docx": ("python-docx", "docxtpl"),
+    "xlsx": ("openpyxl", "xlsxwriter", "pandas"),
+    "pptx": ("python-pptx",),
+    "epub": ("ebooklib",),
+    "png":  ("pillow", "matplotlib"),
+    "jpg":  ("pillow",),
+    "svg":  ("svgwrite", "matplotlib"),
+    "zip":  (),
+}
+
+
+def build_environment_note(session: Session) -> str:
+    """The versions the build interpreter will actually import.
+
+    A seat writes library code from memory, and memory is a blend of every
+    version it ever read. One run produced a flawless reportlab 4 generator on
+    a machine running reportlab 5: two API details had moved
+    (``SimpleIndex``/``TableOfContents`` changed module, index callbacks moved
+    from ``setattr`` to ``setNamedCB``), the script died on import, and its own
+    error handler misreported the crash as a missing package -- which then sent
+    the repair round chasing an install for a library that was already there.
+    Nothing in that chain was discoverable by the author, because nobody told
+    it which version it was writing for.
+
+    So state the fact. Read installed metadata only -- never import anything --
+    and name only what is present.
+    """
+    formats = list(getattr(session.classification, "deliverable_formats", None) or [])
+    if not formats:
+        return ""
+    wanted: list[str] = []
+    for fmt in formats:
+        for lib in _FORMAT_LIBRARIES.get(str(fmt).lower().lstrip("."), ()):
+            if lib not in wanted:
+                wanted.append(lib)
+    if not wanted:
+        return ""
+    try:
+        from . import skills
+        found = skills.already_available(wanted, session, Path(config.DATA_DIR))
+    except Exception:
+        return ""
+    present = sorted(found.values())
+    if not present:
+        return ""
+    return (
+        f"BUILD ENVIRONMENT — Python {sys.version_info.major}.{sys.version_info.minor}, "
+        f"with these ALREADY INSTALLED: {', '.join(present)}. Write for THESE "
+        f"versions: an API that moved between major releases is the single most "
+        f"common way a generator that looks perfect fails on the first run. If "
+        f"you are unsure whether a name still lives where you remember it, import "
+        f"it from its defining module rather than a package re-export, and do not "
+        f"report a genuine failure as a missing package.\n\n"
+    )
+
+
 def deliverable_format_requirement(session: Session, can_build: bool) -> str:
     """State the NAMED output format as a requirement, to whoever is authoring.
 
@@ -299,8 +362,10 @@ def deliverable_format_requirement(session: Session, can_build: bool) -> str:
     if not formats:
         return ""
     names = ", ".join(f".{fmt}" for fmt in formats)
+    env = build_environment_note(session)
     if can_build:
         return (
+            env +
             f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
             f"nothing else, so nobody can type it out. A generator alone does not "
             f"satisfy the task: once the generator exists — whoever authored it — the "
@@ -311,7 +376,8 @@ def deliverable_format_requirement(session: Session, can_build: bool) -> str:
             f"it.\n\n"
         )
     return (
-        f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
+        env
+        + f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
         f"nothing else, so you cannot type one out, and a document in some other "
         f"format is NOT the deliverable — do not substitute .md, .html or .tex for "
         f"the {names} file. What you author is the GENERATOR that produces it, "
