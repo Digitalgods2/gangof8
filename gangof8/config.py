@@ -136,12 +136,19 @@ BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS = int(
 FRONTIER_VERIFY_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
 )
-# OpenRouter calls are human-supervised by default, including calls that have
-# not produced their first token yet. A positive value opts an installation
-# into an automatic no-output cutoff; zero leaves that decision to the
-# operator check-in.
+# A no-output cutoff for OpenRouter calls. This is NOT the "guessed wall clock"
+# the authoring deadlines above deliberately avoid: it measures silence, not
+# duration, so a productive stream is never interrupted (see openrouter.py —
+# the watchdog compares time since the LAST token, and a 32-minute call that
+# keeps emitting is untouched).
+#
+# It defaults ON because the operator check-in it used to defer to only helps
+# a human who is watching the dashboard. In one unattended run a glm seat held
+# a dead connection for 10m41s and returned nothing, and a kimi seat burned
+# 9m10s the same way; both ended in transport errors that were knowable from
+# the first silent minute. Three minutes without a single token is a dead call.
 OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
-    0, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "0"))
+    0, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
 )
 # Streaming API seats are progress-supervised instead of killed by an arbitrary
 # elapsed-time guess. Zero is the normal policy: productive output may continue
