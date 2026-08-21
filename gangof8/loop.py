@@ -1754,6 +1754,53 @@ def _conversation_overview(session: Session) -> str:
     return "\n\n".join(parts)
 
 
+# session_id -> why the proactive web lookup failed, so the end of the run can
+# explain the gap instead of leaving it to be inferred from an empty trail.
+_WEB_FAILURES: dict[str, str] = {}
+_WEB_SKILLS = ("web_search", "web_fetch")
+
+
+def _research_provenance_note(session: Session, store: LogStore) -> None:
+    """Say so when a task that asked for research did none.
+
+    A model answering from memory and a model answering from sources are not
+    the same claim, and only one of them is what "research heavily the works of
+    Auguste Escoffier" asks for. Every run to date performed ZERO web lookups
+    while producing content presented as researched -- the capability is
+    enabled and allowed to every role, but it is Google Search grounding via
+    the Gemini SDK and there was no key, so it was inert and silent.
+
+    Unverified recall is a legitimate result. Passing it off as research is not.
+    """
+    cls = session.classification
+    if not cls:
+        return
+    wanted = bool(cls.needs_facts) or "research" in [
+        str(s).lower() for s in (cls.skills_needed or [])]
+    if not wanted:
+        return
+    if any(t in _WEB_SKILLS for t in (session.tools_called or [])):
+        return
+    reason = _WEB_FAILURES.pop(session.session_id, "")
+    if not config.WEB_ENABLED:
+        # An operator who switched web access off already knows. This note is
+        # for the SILENT gap -- a capability that is enabled, permitted, and
+        # inert -- not for a choice somebody made deliberately.
+        return
+    if "api key" in reason.lower() or "gemini" in reason.lower():
+        why = ("no Gemini API key is configured — web_search is Google Search "
+               "grounding through that SDK, so it cannot run (Settings → API keys)")
+    elif reason:
+        why = f"the web lookup failed: {reason[:160]}"
+    else:
+        why = "no seat requested a web lookup"
+    note = (f"this task asked for research but NO web lookup was performed ({why}); "
+            f"the content is the models' own recall and is unverified against sources")
+    session.unresolved.append(note)
+    store.log_event(session.session_id, "research_unsourced",
+                    {"reason": why, "tools_called": list(session.tools_called or [])})
+
+
 def _web_overview(session: Session, data_dir: Path) -> str:
     """Proactively look up current info ONCE up front for fact-needing tasks with
     no local source — so the council has REAL web data even if the researcher
@@ -1771,7 +1818,14 @@ def _web_overview(session: Session, data_dir: Path) -> str:
     try:
         from . import web
         result = web.web_search(session.task.text, data_dir=data_dir)
-    except Exception:  # noqa: BLE001 — web is best-effort context
+    except Exception as e:  # noqa: BLE001 — web is best-effort context
+        # Best-effort must still be VISIBLE. This swallowed every failure, so a
+        # run asked to "research heavily" performed zero lookups, said nothing,
+        # and shipped a hundred recipes recalled from model memory. The most
+        # common cause is no Gemini API key: web_search is Google Search
+        # grounding through that SDK, so with no key the capability is present,
+        # permitted to every seat, and inert.
+        _WEB_FAILURES[session.session_id] = str(e)
         return ""
     if not result or not result.strip():
         return ""
@@ -4848,6 +4902,9 @@ def _deliberate(
         return session  # paused in awaiting_approval / awaiting_input
 
     # 10. Final response
+    # Before anything is summarised: if this task asked for research and no
+    # lookup happened, the result is recall, and the run has to say so.
+    _research_provenance_note(session, store)
     manager.transition(session, SessionStatus.composing)
     # A task that produced verified file artifacts gets a FAST, deterministic
     # summary built from the lead's own rationale + a real file manifest — no
