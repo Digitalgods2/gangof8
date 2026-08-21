@@ -237,6 +237,7 @@ _TIMELINE = {
     "standing_approval_used": ("🔓", "Standing approval used"),
     "paused_for_approval": ("⏸️", "Paused for approval"),
     "input_requested": ("❓", "Question to you"),
+    "delivery_target_defaulted": ("📁", "Delivering into the active workspace"),
     "input_answered": ("💡", "You answered"),
     "input_declined": ("🚫", "Input declined"),
     "seat_dropped": ("⚠️", "Seat dropped"),
