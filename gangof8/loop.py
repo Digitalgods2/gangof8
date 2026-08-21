@@ -6294,14 +6294,32 @@ def _repair_missing_deliverable(
                if a.kind in ("write_file", "edit_file") and a.status == "executed"
                and a.role != Role.panelist and a.filename]
     wanted = ", ".join(f".{fmt}" for fmt in missing)
+    # The previous attempt's real failure — without it this round is blind. One
+    # live run declared PRODUCES: Escoffier_Master_Recipes.pdf while its script
+    # wrote escoffier_recipes.pdf; the build gate rejected the mismatch (rightly),
+    # but the repair prompt never carried the rejection, so the seat rewrote the
+    # generator from scratch instead of correcting one filename.
+    last_failure = next(
+        (a.error for a in reversed(session.proposed_actions)
+         if a.kind == "build_artifact" and a.status == "failed" and a.error),
+        None,
+    )
+    previously = (
+        f"Your previous BUILD was rejected:\n{last_failure[:1500]}\n"
+        "Fix THAT — usually the declared PRODUCES name and the name the script "
+        "writes must be made identical. Do not start over if the generator works.\n\n"
+        if last_failure else ""
+    )
     store.log_event(session.session_id, "deliverable_build_requested",
                     {"formats": missing, "attempt": attempts + 1,
-                     "agent": who.agent, "written": written[:20]})
+                     "agent": who.agent, "written": written[:20],
+                     "previous_failure": (last_failure or "")[:500]})
     prompt = (
         f"Task: {_execution_task(session)}\n\n"
         f"The deliverable of this task is a {wanted} file, and no {wanted} file "
         "exists. A script that WOULD produce one is not the deliverable.\n"
         f"Already written into your sandbox: {', '.join(written) or '(nothing)'}\n\n"
+        f"{previously}"
         "Reply with the governed build that actually produces the file, and nothing "
         "else — no analysis, no code fences:\n"
         "INSTALL: <comma-separated package names the build imports>   (omit if none)\n"
