@@ -183,6 +183,8 @@ _TIMELINE = {
     "round_synthesized": ("🧩", "Round synthesized"),
     "panel_seat_dropped": ("⚠️", "Panel seat dropped"),
     "synthesis_stub_retry": ("✏️", "Lead re-asked (stub reply)"),
+    "synthesis_stub_escalated": ("⏫", "Synthesis escalated to another seat"),
+    "synthesis_stub_escalation_failed": ("⚠️", "Escalated synthesis seat failed"),
     "synthesis_final": ("📜", "Lead synthesis is the answer"),
     "test_fix_attempt": ("🔧", "Fixing failing tests"),
     "contribution": ("💬", "Agent contributed"),
