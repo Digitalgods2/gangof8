@@ -296,7 +296,8 @@ class GoalStore:
         return deleted
 
 
-def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
+def plan_prompt(goal_text: str, panel: Optional[list[str]] = None,
+                research_seats: Optional[list[str]] = None) -> str:
     """Ask the architect for an owned dependency graph in a strict format.
 
     Right-sizing is the first law of this prompt (ARCHITECTURE-REVIEW.md):
@@ -308,6 +309,12 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
     """
     seats = list(dict.fromkeys(s for s in (panel or []) if s))
     roster = ", ".join(seats) or "the available council"
+    # Gathering CONTENT has no seams: two researchers writing different recipes
+    # cannot disagree about an interface, because there is no interface. So the
+    # research roster is every enabled seat, while code authorship stays with
+    # the frontier seats the seam rule was written for.
+    gatherers = list(dict.fromkeys(s for s in (research_seats or seats) if s))
+    research_roster = ", ".join(gatherers) or roster
     # Frontier-class membership follows the roster actually convened, so a
     # non-frontier build team still names real primary authors here.
     frontier = resolve_frontier_authors(seats)
@@ -322,9 +329,23 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None) -> str:
         "RIGHT-SIZING RULES (checked deterministically; violations are "
         "rejected):\n"
         "- If the deliverable is a SINGLE artifact (one HTML file, one "
-        "script, one document), the plan is EXACTLY ONE package: one owner "
-        "authors the complete file end to end. No template package, no "
+        "script, one document), EXACTLY ONE package AUTHORS it: one owner "
+        "writes the complete file end to end. No template package, no "
         "staged fragments, no assembly step, no separate QA package.\n"
+        "- That cap is about AUTHORSHIP, not about the work. When the "
+        "deliverable carries a large body of content — N recipes, chapters, "
+        "entries, a glossary, a dataset — add RESEARCH packages that gather "
+        "that content in parallel. A research package outputs DATA ONLY "
+        "(.json, .md, .csv, .yaml, .txt), declares RELEASE: NONE, and is named "
+        "in the authoring package's AFTER list so the author embeds it. It "
+        "never contains a fragment of the artifact itself: gathering the "
+        "Béchamel entry creates no interface anyone can disagree about, while "
+        "handing someone 'the CSS half' of one file creates several.\n"
+        "- Split research by CONTENT RANGE, one package per bounded slice "
+        "(recipes 1-25, recipes 26-50, the glossary, the technique notes), and "
+        f"assign them across the research roster: {research_roster}. These "
+        "seats cost nothing while idle and the work is genuinely parallel. "
+        "Prose-only packages with OUTPUTS: NONE remain legitimate too.\n"
         "- Multi-artifact deliverables get at most one package per natural "
         "artifact boundary, and fewer whenever files are tightly coupled — "
         "files that share a runtime contract belong to ONE owner.\n"

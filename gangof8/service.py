@@ -3128,6 +3128,37 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self._sys_log("goal_stage_seeded",
                              {"goal_id": goal.goal_id, "files": copied, "root": str(stage)})
 
+    # Extensions that carry CONTENT rather than behaviour. A research package
+    # may only produce these: the moment a package emits code or markup it is
+    # authoring part of the artifact, and the single-author rule applies again.
+    _RESEARCH_SUFFIXES = (".json", ".md", ".markdown", ".yaml", ".yml",
+                          ".csv", ".tsv", ".txt", ".rst")
+
+    @staticmethod
+    def _is_research_package(package, release_paths: set) -> bool:
+        """True when a package only GATHERS content for another package.
+
+        The single-artifact cap exists because splitting authorship of one file
+        across owners produced seam defects on every boundary. Gathering the
+        content that file will contain is a different activity: two seats
+        researching different recipes share no interface, so there is nothing
+        for them to disagree about.
+
+        Deliberately structural. A package qualifies only if every output is a
+        data file and none of them reaches the user -- so "the CSS half of
+        index.html", the case the rule was written for, can never qualify.
+        """
+        outs = [str(n).replace("\\", "/") for n in (package.required_files or [])]
+        if not outs:
+            return False
+        if any(o in release_paths for o in outs):
+            return False
+        if package.release_files:
+            return False
+        return all(
+            o.lower().endswith(GangOf8Service._RESEARCH_SUFFIXES) for o in outs)
+
+
     def _normalize_work_packages(
         self, milestones: list[GoalMilestone], goal_text: str = "",
         roster: Optional[list[str]] = None,
@@ -3280,8 +3311,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         # legitimate separate package even in a single-artifact goal.
         # GANGOF8_GOAL_FULL_ROSTER=1 is an explicit operator choice of team
         # mode and bypasses the cap.
+        # A RESEARCH package gathers content the author embeds; it authors no
+        # part of the artifact, so it is not a seam on it. Recognised
+        # structurally rather than by a label the planner could simply assert:
+        # data-only outputs, and nothing it produces is released.
         file_packages = [
-            package for package in milestones if package.required_files
+            package for package in milestones
+            if package.required_files
+            and not self._is_research_package(package, release_paths)
         ]
         if (not config.GOAL_FULL_ROSTER
                 and len(release_paths) == 1 and len(file_packages) > 1):
@@ -3620,7 +3657,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             repair_count = 0
             if agent:
                 prompt = goals.plan_prompt(
-                    goal_contract_text, goal.build_roster or self.panel
+                    goal_contract_text, goal.build_roster or self.panel,
+                    # Code authorship stays frontier-only; content gathering may
+                    # use every enabled seat, because data has no seams.
+                    research_seats=self.panel,
                 )
                 rejected_plan = ""
                 for attempt in range(config.GOAL_PLAN_REPAIR_ATTEMPTS + 1):
