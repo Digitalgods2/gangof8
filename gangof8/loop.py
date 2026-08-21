@@ -4672,6 +4672,13 @@ def _deliberate(
                and _missing_deliverable_formats(session)):
             builds_before = sum(
                 1 for a in session.proposed_actions if a.kind == "build_artifact")
+            # A build that ran and produced nothing has tested THIS candidate,
+            # not the task. Spend the free retry (another seat's generator,
+            # already written and already paid for) before spending a model
+            # call repairing the one that just failed.
+            if any(a.kind == "build_artifact" and a.status == "failed"
+                   for a in session.proposed_actions):
+                _try_next_candidate(session, store)
             if _repair_missing_deliverable(
                     session, manager, governance, store,
                     owner_repair_call if package_owner else codifier_call):
@@ -5299,6 +5306,54 @@ def _apply_reply_edits(content: str, reply: str, sid: str) -> tuple[str, int]:
             content = norm.replace(old, new, 1)
             applied += 1
     return content, applied
+
+
+def _try_next_candidate(session: Session, store: LogStore) -> bool:
+    """Replace a winner whose BUILD failed with the next-ranked candidate.
+
+    Judges score a candidate by READING it. For a binary deliverable the only
+    property that finally decides the run is whether it RUNS, and nothing knows
+    that until the approved build executes. So a failed build is not
+    automatically an authoring defect to repair -- it is often just this
+    candidate, while four others sit unexecuted in the sandbox.
+
+    A live run ended exactly there: five generators authored, the winner
+    crashed on an import, the repair asked the same seat to fix the same file
+    twice, and the run died having executed one candidate out of five.
+
+    This costs no model call and needs no new approval. The winner ships to a
+    fixed filename, so swapping the bytes lets the command the human already
+    approved run again unchanged. Each candidate is offered at most once.
+    """
+    if not session.candidate_fallbacks:
+        return False
+    pool = {c.get("namespaced"): c for c in _collect_candidates(session)}
+    while session.candidate_fallbacks:
+        nxt = session.candidate_fallbacks.pop(0)
+        cand = pool.get(nxt)
+        if not cand or not (cand.get("content") or "").strip():
+            continue
+        base = _basename(cand["base"])
+        store.log_event(session.session_id, "candidate_fallback_shipped",
+                        {"agent": cand.get("agent"), "file": base,
+                         "from": nxt, "remaining": len(session.candidate_fallbacks),
+                         "reason": "the previous candidate's build did not produce the deliverable"})
+        session.unresolved.append(
+            f"build failed for the voted winner; shipped {cand.get('agent')}'s "
+            f"candidate instead")
+        # The previous rejection described a file that is no longer there.
+        # Leaving it 'failed' would feed _repair_missing_deliverable a stale
+        # error and send the next round chasing a defect this candidate may
+        # not have -- the exact trap that made a repair round re-propose an
+        # install for a wrong-import crash.
+        for a in session.proposed_actions:
+            if a.kind == "build_artifact" and a.status == "failed":
+                a.status = "denied"
+                a.error = f"superseded: shipped {cand.get('agent')}'s candidate instead"
+        _ship_winner(session, store, base, cand["content"])
+        store.save_session(session)
+        return True
+    return False
 
 
 def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> None:
@@ -5937,6 +5992,16 @@ def _run_best_of_n(session: Session, council: Council, panel: list[CouncilMember
         # winner and its credentials instead of an anonymous "voted winner"
         integration.judges = judged
         integration.chair = chair_action
+    # Keep the runner-ups in rank order. Judges score a candidate by reading it;
+    # for a binary deliverable the only thing that finally matters is whether it
+    # RUNS, and that is not known until the approved build executes. When the
+    # winner's build fails, the next candidate is a free retry — no model call,
+    # no new approval, the same command against different bytes. A run once
+    # ended holding five generators having executed exactly one of them.
+    session.candidate_fallbacks = [
+        c["namespaced"] for i, c in enumerate(ordered)
+        if i != wi and c.get("namespaced")
+    ]
     _ship_winner(session, store, base, content)
     return {"agent": winner["agent"], "file": base, "score": agg[label],
             "votes": votes[label], "judges": judged, "candidates": len(group),

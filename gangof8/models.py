@@ -548,6 +548,11 @@ class Session(BaseModel):
     candidate_author_recoveries: dict[str, int] = {}
     # Persist the real author/runtime funnel and semantic release gate.
     candidate_metrics: dict = {}
+    # Runner-up candidates in rank order (sandbox filenames, best first), kept
+    # so a winner whose BUILD fails can be replaced by the next candidate
+    # instead of repairing the same one until the attempt cap. A run once died
+    # holding five generators having executed exactly one of them.
+    candidate_fallbacks: list[str] = []
     quality_gate: dict = {}
     # Package artifact hashes captured by the deterministic verifier. Recovery
     # may adopt a completed attempt only when its current result paths still
