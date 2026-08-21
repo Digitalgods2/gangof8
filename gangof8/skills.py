@@ -15,10 +15,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+from importlib import metadata
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -358,6 +360,86 @@ def build_env(session: Session, data_dir: Path) -> Optional[dict]:
     return env
 
 
+# A requirement as INSTALL may state it: name, optional extras, at most one
+# version bound (validation.approved_package_specs enforces that grammar).
+_SPEC_PARTS = re.compile(
+    r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"(?:\[(?P<extras>[A-Za-z0-9._,-]+)\])?"
+    r"\s*(?P<bound>(?:===|==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9._*+!-]+)?$"
+)
+
+
+def _canonical(name: str) -> str:
+    """PEP 503 name normalization, so Report_Lab matches reportlab."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def _bound_is_met(have: str, bound: str) -> bool:
+    """True only when `have` PROVABLY satisfies `bound`; unsure ⇒ False.
+
+    Version ordering is not string ordering ('10' sorts below '9'), so this
+    defers to packaging rather than approximating. packaging is present in
+    practice but is not a declared dependency, so its absence is simply an
+    unprovable answer — and every unprovable answer means "install it".
+    """
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+    except Exception:
+        return False
+    try:
+        return Version(have) in SpecifierSet(bound)
+    except Exception:
+        return False
+
+
+def already_available(specs: list[str], session: Session, data_dir: Path) -> dict[str, str]:
+    """Which requested specs the BUILD interpreter can ALREADY resolve.
+
+    A seat cannot see the machine it runs on. It writes `import reportlab`, so
+    it proposes `INSTALL: reportlab` — because its script needs the module, not
+    because anything is missing. The coordinator CAN see, and it is the only
+    component that can, so it answers before a human is asked to approve a
+    network fetch. In a real run the human was asked to install reportlab into a
+    session whose interpreter already had reportlab: `pip install --target`
+    never consults site-packages, so it re-downloaded reportlab, pillow and
+    charset-normalizer and reported success.
+
+    Looks exactly where the build will look — the session's own deps directory
+    (build_env prepends it to PYTHONPATH) ahead of the coordinator's sys.path —
+    and reads INSTALLED METADATA rather than importing anything, because
+    importing a package to find out whether it exists runs its code.
+
+    Deliberately one-directional: anything undecidable is reported as NOT
+    available, so the fallback is always the install that would have happened
+    anyway. Extras are never treated as satisfied — the base distribution being
+    present says nothing about whether the extra's dependencies are.
+    """
+    deps = session_deps_dir(session, data_dir)
+    search = ([str(deps)] if deps.is_dir() else []) + [p for p in sys.path if p]
+    installed: dict[str, str] = {}
+    try:
+        for dist in metadata.distributions(path=search):
+            name = ((dist.metadata["Name"] if dist.metadata else "") or "").strip()
+            if name:
+                installed.setdefault(_canonical(name), dist.version)
+    except Exception:
+        return {}
+    found: dict[str, str] = {}
+    for spec in specs:
+        m = _SPEC_PARTS.match(spec.strip())
+        if not m or m.group("extras"):
+            continue
+        have = installed.get(_canonical(m.group("name")))
+        if have is None:
+            continue
+        bound = (m.group("bound") or "").strip()
+        if bound and not _bound_is_met(have, bound):
+            continue
+        found[spec] = f"{m.group('name')} {have}"
+    return found
+
+
 def _install_deps(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Install the third-party packages a build needs, after human approval.
 
@@ -382,13 +464,23 @@ def _install_deps(session: Session, action: ProposedAction, data_dir: Path) -> s
         specs = validation.approved_package_specs(raw)
     except validation.ValidationCommandError as e:
         raise ExecutionError(str(e)) from e
+    # Never fetch what the build can already import. This is the safety net for
+    # a card raised before this check existed (or by an older persisted
+    # session); loop._suppress_satisfied_installs normally retires the action
+    # earlier, so the human is not asked at all.
+    have = already_available(specs, session, data_dir)
+    wanted = [s for s in specs if s not in have]
+    skipped = ", ".join(sorted(have.values()))
+    if not wanted:
+        action.args["already_available"] = skipped
+        return f"nothing to install — already available to the build: {skipped}"
     target = session_deps_dir(session, data_dir)
     target.mkdir(parents=True, exist_ok=True)
     argv = [
         sys.executable, "-m", "pip", "install",
         "--target", str(target),
         "--no-input", "--disable-pip-version-check", "--no-color",
-        *specs,
+        *wanted,
     ]
     try:
         report = validation.run(
@@ -398,10 +490,14 @@ def _install_deps(session: Session, action: ProposedAction, data_dir: Path) -> s
     # validation.run reports the exit status on its own line; a non-zero pip is
     # a failed install, not an install that merely printed warnings.
     if "\n[exit " in report:
-        raise ExecutionError(f"install failed for {', '.join(specs)}\n{report}")
+        raise ExecutionError(f"install failed for {', '.join(wanted)}\n{report}")
     installed = sorted(p.name for p in target.glob("*.dist-info"))
     action.args["installed_into"] = str(target)
-    return f"installed into the session: {', '.join(specs)}\n{report}\ndist-info: {', '.join(installed)}"
+    if skipped:
+        action.args["already_available"] = skipped
+    note = f"\nalready available, not fetched: {skipped}" if skipped else ""
+    return (f"installed into the session: {', '.join(wanted)}{note}\n{report}\n"
+            f"dist-info: {', '.join(installed)}")
 
 
 def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) -> str:
