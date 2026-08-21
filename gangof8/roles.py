@@ -28,6 +28,46 @@ SPECIALIST_ROLES = (
 )
 
 
+# The talents that AUTHOR the deliverable itself. Delegation only buys a second
+# model's take when the author is not the lead, so these are the roles kept off
+# the lead's seat whenever inheritance has a choice.
+AUTHORING_ROLES = (
+    Role.code_generator,
+    Role.implementer,
+)
+
+
+def separate_authoring_from_lead(mapping: dict, pool, movable) -> dict:
+    """Keep INHERITED authoring roles off the lead's own seat.
+
+    Disabling a seat moves its roles onto the remaining roster round-robin
+    (``service._apply_seat_disables``). That split is even, but evenness is not
+    the property that matters here. With claude and codex switched off, a real
+    run put lead AND code_generator on the one surviving CLI seat: the lead —
+    correctly told to delegate rather than do the work itself — dutifully
+    delegated the authoring back to its own model. Seven calls, one model,
+    while an enabled OpenRouter seat holding implementer never ran.
+
+    So when an authoring role INHERITS onto the lead's seat and another enabled
+    seat exists, hand it to one of the others instead. Only roles this
+    inheritance actually moved are eligible: a role the user pinned to an
+    ENABLED seat is their explicit choice and is never overridden.
+
+    Pass the roster in takeover order (``service._enabled_role_fallbacks``).
+    """
+    lead_seat = mapping.get(Role.lead)
+    alternatives = [s for s in (pool or []) if s and s != lead_seat]
+    if not lead_seat or not alternatives:
+        return mapping
+    out = dict(mapping)
+    i = 0
+    for role in AUTHORING_ROLES:
+        if role in movable and out.get(role) == lead_seat:
+            out[role] = alternatives[i % len(alternatives)]
+            i += 1
+    return out
+
+
 def resolve_frontier_authors(roster) -> list[str]:
     """Which seats count as FRONTIER-CLASS for a given enabled roster.
 

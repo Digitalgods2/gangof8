@@ -38,7 +38,7 @@ from .adapters.cli import CliAdapter
 from .adapters.mock import MockAdapter
 from .adapters.openrouter import OpenRouterAdapter
 from .secrets import SecretStore
-from .roles import resolve_frontier_authors
+from .roles import resolve_frontier_authors, separate_authoring_from_lead
 from .composer import fallback_final
 from .governance import Governance
 from .logstore import LogStore
@@ -380,11 +380,17 @@ class GangOf8Service:
         return resolve_frontier_authors(self._enabled_role_fallbacks())
 
     def _apply_seat_disables(self, base: dict) -> dict:
-        """Move roles from disabled seats onto the enabled roster round-robin.
+        """Move roles from disabled seats onto the enabled roster round-robin,
+        then keep the inherited authoring roles off the lead's own seat.
 
         If every seat is disabled there is intentionally no invented fallback:
         disabled adapters remain unregistered and task submission fails clearly
         until the user enables at least one model.
+
+        The round-robin alone divides roles EVENLY but not USEFULLY: it can put
+        the lead and the authoring talent on the same seat, and a lead that
+        delegates to itself is one model doing the whole run. See
+        ``roles.separate_authoring_from_lead``.
         """
         disabled = {agent for agent in set(base.values()) if not self._seat_enabled(agent)}
         if not disabled:
@@ -393,12 +399,14 @@ class GangOf8Service:
         if not pool:
             return dict(base)
         out = dict(base)
+        inherited = set()
         i = 0
         for role, agent in base.items():
             if agent in disabled:
                 out[role] = pool[i % len(pool)]
+                inherited.add(role)
                 i += 1
-        return out
+        return separate_authoring_from_lead(out, pool, inherited)
 
     def _effective_panel(self) -> list[str]:
         """The seats that contribute every round. Explicit ctor arg › settings
