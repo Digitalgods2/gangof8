@@ -418,9 +418,9 @@ function bindComposerControls() {
   const profileHint = document.getElementById("profileHint");
   const hints = {
     auto: "Gang of 8 will explain its routing choice before starting.",
-    focused: "Uses the smallest capable group for a fast, direct result.",
+    focused: "Uses the smallest capable group for a fast, direct result. Cheapest route, and the right default for building one thing.",
     council: "Invites broad critique and synthesis across the council.",
-    best_of_n: "Every enabled AI independently attempts one complete artifact. Runnable candidates are validated, compared anonymously, and the strongest is selected.",
+    best_of_n: "MOST EXPENSIVE ROUTE. Every enabled seat writes a COMPLETE solution and all but one are discarded, so cost scales with the number of seats and the run is the slowest of any route. Candidates are compared anonymously and the strongest ships. Worth it when you want competing whole answers to choose between — not when you want one thing built.",
     build_team: "Creates owned packages. Independent packages run in parallel; an atomic deliverable may use one owner plus council review.",
   };
   const updateHint = () => {
