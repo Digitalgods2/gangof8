@@ -1669,7 +1669,13 @@ SKILLS: dict[str, Skill] = {
         category="install",
         risk=Risk.high,
         requires_approval=True,
-        allowed_roles=[Role.lead, Role.implementer, Role.code_generator, Role.architect],
+        # The codifier/chair (summarizer seat) FINISHES the deliverable on the
+        # best-of-N route and drives the missing-deliverable repair. Without it
+        # here, that route could not produce a binary at all: its panel seats
+        # author candidates and its chair assembles them, and neither could
+        # reach the only governed path to a PDF.
+        allowed_roles=[Role.lead, Role.implementer, Role.code_generator,
+                       Role.architect, Role.summarizer],
         inputs=["packages"],
         primary_input="packages",
         permitted_spaces=[SANDBOX],
@@ -1685,7 +1691,13 @@ SKILLS: dict[str, Skill] = {
         category="code_exec",
         risk=Risk.high,
         requires_approval=True,
-        allowed_roles=[Role.lead, Role.implementer, Role.code_generator, Role.architect],
+        # The codifier/chair (summarizer seat) FINISHES the deliverable on the
+        # best-of-N route and drives the missing-deliverable repair. Without it
+        # here, that route could not produce a binary at all: its panel seats
+        # author candidates and its chair assembles them, and neither could
+        # reach the only governed path to a PDF.
+        allowed_roles=[Role.lead, Role.implementer, Role.code_generator,
+                       Role.architect, Role.summarizer],
         inputs=["command", "produces", "target"],
         primary_input="command",
         permitted_spaces=[SANDBOX, WORKSPACE],

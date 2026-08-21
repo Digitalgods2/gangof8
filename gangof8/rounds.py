@@ -276,6 +276,52 @@ def _skill_hints(session: Session, role: Role, readable: list[str] = ()) -> str:
 
 # The file-output contract: how the lead writes real files. Lifted from the old
 # implementer draft prompt so the materialize path stays consistent.
+def deliverable_format_requirement(session: Session, can_build: bool) -> str:
+    """State the NAMED output format as a requirement, to whoever is authoring.
+
+    Easy to read as optional otherwise: the live failure was a seat that authored
+    a perfect 49KB PDF generator, emitted PROMOTE for the script, and called the
+    cookbook delivered.
+
+    This has to reach every seat that authors a deliverable, not just the lead.
+    A run asked for a PDF on the best-of-N route and got five candidates in .md,
+    .html and .tex — every panel seat did something sensible with the only thing
+    it had been told, because the format requirement lived exclusively in the
+    LEAD's prompt. A contract the authoring model never sees is not a contract.
+
+    ``can_build`` says whether this reader may emit the governed BUILD/INSTALL
+    lines itself (``skills.SKILLS['build_artifact'].allowed_roles``). A panel
+    seat may not, so telling it to "run the build" would only produce a denied
+    action — it is told to author the GENERATOR instead, which is what the
+    downstream chair needs from it anyway.
+    """
+    formats = list(getattr(session.classification, "deliverable_formats", None) or [])
+    if not formats:
+        return ""
+    names = ", ".join(f".{fmt}" for fmt in formats)
+    if can_build:
+        return (
+            f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
+            f"nothing else, so nobody can type it out. A generator alone does not "
+            f"satisfy the task: once the generator exists — whoever authored it — the "
+            f"run must RUN it via INSTALL (if it needs packages) and BUILD/PRODUCES "
+            f"naming the {names} file, and PROMOTE that file rather than the script. "
+            f"Those governed lines are YOURS to emit. A run that ends holding "
+            f"only source code has produced nothing and the delivery gate will fail "
+            f"it.\n\n"
+        )
+    return (
+        f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
+        f"nothing else, so you cannot type one out, and a document in some other "
+        f"format is NOT the deliverable — do not substitute .md, .html or .tex for "
+        f"the {names} file. What you author is the GENERATOR that produces it, "
+        f"complete with all of the content baked in, plus any data files it reads. "
+        f"You do not run it yourself: the build is a governed step the finishing "
+        f"seat performs after selection. Make the generator complete and runnable "
+        f"as written — it is judged on the {names} file it would produce.\n\n"
+    )
+
+
 def _output_contract(session: Session) -> str:
     if session.established_root:
         promote = (
@@ -300,25 +346,7 @@ def _output_contract(session: Session) -> str:
             "The coordinator will ask the user for the destination and get their "
             "approval before anything lands.\n"
         )
-    # The BUILD paragraph below is easy to read as optional. When the user NAMED
-    # the output format, say so first and say it as a requirement: the live
-    # failure was a seat that authored a perfect 49KB PDF generator, emitted
-    # PROMOTE for the script, and called the cookbook delivered.
-    formats = list(getattr(session.classification, "deliverable_formats", None) or [])
-    if formats:
-        names = ", ".join(f".{fmt}" for fmt in formats)
-        required = (
-            f"THE DELIVERABLE OF THIS TASK IS A {names} FILE. ARTIFACT holds text and "
-            f"nothing else, so nobody can type it out. A generator alone does not "
-            f"satisfy the task: once the generator exists — whoever authored it — the "
-            f"run must RUN it via INSTALL (if it needs packages) and BUILD/PRODUCES "
-            f"naming the {names} file, and PROMOTE that file rather than the script. "
-            f"Those governed lines are YOURS to emit as lead. A run that ends holding "
-            f"only source code has produced nothing and the delivery gate will fail "
-            f"it.\n\n"
-        )
-    else:
-        required = ""
+    required = deliverable_format_requirement(session, can_build=True)
     return (
         required
         + "FILE-WRITING MECHANICS (these apply to WHOEVER authors a file — a talent "
@@ -949,7 +977,8 @@ def _panel_file_contract(session: Session) -> str:
                 "envelope; no plan, SKILL lines, or PROMOTE.\n"
             )
         return (
-            f"You are the ACCOUNTABLE OWNER of this build package, not a candidate in a "
+            deliverable_format_requirement(session, can_build=True)
+            + f"You are the ACCOUNTABLE OWNER of this build package, not a candidate in a "
             f"contest. Produce the substantive implementation assigned to you now. "
             f"The coordinator may assign exact sibling outputs to implementation "
             f"sub-agents while you retain package accountability. Required staged "
@@ -960,7 +989,8 @@ def _panel_file_contract(session: Session) -> str:
             "release. Honor other owners' interfaces and do not recreate their files.\n"
         )
     return (
-        "This is a BEST-OF-N build: emit YOUR COMPLETE candidate implementation "
+        deliverable_format_requirement(session, can_build=False)
+        + "This is a BEST-OF-N build: emit YOUR COMPLETE candidate implementation "
         "as a block —\n"
         "ARTIFACT: <filename>\n<full file contents>\nEND_ARTIFACT\n"
         "— raw bytes inside that envelope (no ``` fences). Every "
@@ -1008,6 +1038,27 @@ def _source_fidelity_block(session: Session, source: str) -> str:
         "instruction might tell you to strip.\n")
 
 
+def _judge_format_note(session: Session) -> str:
+    """Tell judges what the candidates are TRYING to be.
+
+    When the task names a binary format the candidates are generators, not the
+    document itself. A judge that does not know this ranks a hand-typed .md above
+    a correct generator and re-introduces the wrong-format bug at selection time.
+    """
+    formats = list(getattr(session.classification, "deliverable_formats", None) or [])
+    if not formats:
+        return ""
+    names = ", ".join(f".{fmt}" for fmt in formats)
+    return (
+        f"THE DELIVERABLE IS A {names} FILE, which cannot be typed out, so a correct "
+        f"candidate is the GENERATOR that produces it. Score each candidate on the "
+        f"{names} file it would produce when run — the completeness of the content it "
+        f"bakes in, and whether it would run as written. A candidate that is merely a "
+        f"document in another format has not done the task, however polished."
+        + chr(10) + chr(10)
+    )
+
+
 def score_candidates_prompt(session: Session, labeled: list[tuple], source: str = "") -> str:
     """A blind scoring pass: the judge sees each candidate's FULL body labeled
     'Candidate N' with author identity stripped, scores each on the criteria,
@@ -1039,6 +1090,8 @@ def score_candidates_prompt(session: Session, labeled: list[tuple], source: str 
         "looks.\n"
     ) if has_runtime else ""
     return (
+        _judge_format_note(session)
+        +
         f"Task the candidates implement: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"You are an impartial JUDGE. Below are {n} independent candidate "
@@ -1146,6 +1199,12 @@ def chair_finish_prompt(session: Session, candidates: list[dict], filename: str,
             f"SOURCES: <Candidate numbers>\nARTIFACT: {filename}\n"
             "<complete integrated file contents>\nEND_ARTIFACT\n")
     return (
+        # The chair FINISHES the deliverable, so a named binary format is its
+        # problem above anyone else's: candidates arrive in whatever text form
+        # their authors could type, and turning the winner into that file is
+        # this seat's job. It is allowed to emit BUILD/INSTALL (see skills.py).
+        deliverable_format_requirement(session, can_build=True)
+        +
         f"Task the candidates implement: {_execution_task(session)}\n"
         f"{_GOVERNANCE_CONTEXT}"
         f"{CHAIR_CHARTER}"
