@@ -3619,6 +3619,51 @@ def _prepare_deterministic_assembly(session: Session, store: LogStore) -> bool:
     return True
 
 
+def _synthesis_escalation_seat(
+    session: Session, council: Council, registry: Optional[AgentRegistry],
+    stubbed: str,
+) -> Optional[CouncilMember]:
+    """A DIFFERENT enabled seat to hand a stubbed lead synthesis to.
+
+    ARCHITECTURE-REVIEW.md §4 P5 — "escalate, don't repeat": a failed attempt
+    never goes back to the same seat with the same brief. Live session
+    s_20260821_5502ddcc is exactly that failure: the lead seat (gemini on the
+    CLI adapter) returned a synthesis that only ANNOUNCED the work, was re-asked
+    with a strongly worded nudge, announced it again, and the run degraded to
+    composing from the panel views with "lead synthesis was a stub twice" in
+    unresolved. Re-wording the prompt is not a second attempt — it is the same
+    model, with the same context, failing the same way. This is the same family
+    of defect as the role redistribution that could seat the lead and the
+    authoring talent on one model, so "delegation" looped back to the seat that
+    was already stuck: one model failing twice is not a second opinion.
+
+    Ordering reuses ``_review_seats`` — the existing "an enabled seat that did
+    not author this" idiom — so the roles the user already mapped for checking
+    come first, then the rest of the council in roster order, then any other
+    registered seat. Seats that ``seat_health`` has marked hard-unavailable
+    (quota_exhausted / auth_expired / offline) are skipped: another attempt
+    against them is guaranteed wasted, which is the whole point of escalating.
+
+    Returns None on a single-seat installation (or when no other seat can
+    answer), and the caller then keeps today's nudge-the-same-seat behaviour
+    followed by the composer rescue. This path must never fail harder than it
+    already does.
+    """
+    if registry is None or not callable(getattr(registry, "names", None)):
+        return None
+    health = getattr(registry, "health", None)
+    for candidate in _review_seats(session, council, registry, stubbed):
+        if not candidate.agent or candidate.agent == stubbed:
+            continue
+        if health is not None and health.is_unavailable(candidate.agent):
+            continue
+        # It is taking over the LEAD's job for this round, so it is called with
+        # the lead's role (and the lead's longer authoring timeout), not as a
+        # reviewer.
+        return CouncilMember(role=Role.lead, agent=candidate.agent, active=True)
+    return None
+
+
 def _run_panel_rounds(
     session: Session,
     manager: SessionManager,
@@ -3632,6 +3677,7 @@ def _run_panel_rounds(
     established_overview: str,
     start: float,
     codifier_call: Optional[AgentCall] = None,
+    registry: Optional[AgentRegistry] = None,
 ) -> bool:
     """Drive panel rounds until the lead declares DONE, the human declines more
     rounds, or budget/wall-time headroom runs out. Returns True when the session
@@ -4088,29 +4134,85 @@ def _run_panel_rounds(
         # A synthesis that only ANNOUNCES or ATTEMPTS the work ("I'll read the
         # files, then deliver..." / blocked tool-call debris / a dangling
         # SKILL: request the chain never satisfied) must not be accepted as
-        # DONE — re-call once demanding the result now. A second stub is noted
-        # and the composer synthesizes from the panel views instead (the proven
-        # rescue path).
+        # DONE — one more attempt has to actually deliver the result.
+        #
+        # That second attempt goes to a DIFFERENT enabled seat wherever one
+        # exists. Re-calling the seat that just stubbed, with nothing changed
+        # but the wording of the prompt, is not a second attempt (§4 P5,
+        # "escalate, don't repeat"); live session s_20260821_5502ddcc proved it
+        # by watching the same lead announce the work twice in a row and end up
+        # in the composer rescue anyway. Same family as the lead/talent
+        # collision fixed in role redistribution: asking the model that already
+        # failed is not a second opinion.
+        #
+        # A single-seat installation, or one where every other seat is
+        # hard-unavailable, still gets exactly today's behaviour: nudge the same
+        # seat, then note the double stub and let the composer synthesize from
+        # the panel views (the proven rescue path). Either way only ONE extra
+        # call is spent — no runaway re-calling.
         if rounds.reply_is_stub(c.content, skills_resolved=True):
+            stub_head = c.content.strip()[:300]
             store.log_event(sid, "synthesis_stub_retry",
-                            {"round": r, "stub": c.content.strip()[:200]})
+                            {"round": r, "stub": stub_head[:200]})
             nudge = (
                 f"{p}\n\nIMPORTANT: your previous reply only ANNOUNCED or "
                 f"ATTEMPTED what you were going to do — it began: "
-                f"\"{c.content.strip()[:300]}\". You cannot go off and do "
+                f"\"{stub_head}\". You cannot go off and do "
                 "anything outside this reply, and any tool-call syntax you emit "
                 "is ignored — you have NO native tools here. Deliver the "
                 "complete result NOW, in this reply, as plain text. If you need "
                 "file contents first, emit 'SKILL: read_file <path>' lines and "
                 "the results will be handed back to you."
             )
-            c = lead_call(lead, nudge)
-            c = _resolve_skill_requests(session, lead, nudge, c, call, governance, store,
-                                        recall=lead_call)
-            c = _resolve_delegations(session, council, lead, nudge, c, call, governance,
-                                     store, recall=lead_call)
+            escalation = _synthesis_escalation_seat(session, council, registry, lead.agent)
+            retried = None
+            if escalation is not None:
+                handoff = (
+                    f"{p}\n\nIMPORTANT: the lead seat ({lead.agent}) was asked "
+                    "for this synthesis and did not deliver it — its reply only "
+                    f"ANNOUNCED or ATTEMPTED the work, beginning: \"{stub_head}\". "
+                    "You are taking the synthesis over. You cannot go off and do "
+                    "anything outside this reply, and any tool-call syntax you "
+                    "emit is ignored — you have NO native tools here. Deliver the "
+                    "complete result NOW, in this reply, as plain text. If you "
+                    "need file contents first, emit 'SKILL: read_file <path>' "
+                    "lines and the results will be handed back to you."
+                )
+                store.log_event(sid, "synthesis_stub_escalated",
+                                {"round": r, "from": lead.agent, "to": escalation.agent,
+                                 "stub": stub_head[:200]})
+                try:
+                    retried = lead_call(escalation, handoff)
+                    retried = _resolve_skill_requests(
+                        session, escalation, handoff, retried, call, governance, store,
+                        recall=lead_call)
+                    retried = _resolve_delegations(
+                        session, council, escalation, handoff, retried, call, governance,
+                        store, recall=lead_call)
+                except AgentError as exc:
+                    # The escalation target was reachable in principle but the
+                    # call failed. Fall back to the old same-seat nudge rather
+                    # than losing the second attempt entirely — escalating must
+                    # never make this path worse than it was.
+                    store.log_event(sid, "synthesis_stub_escalation_failed",
+                                    {"round": r, "seat": escalation.agent,
+                                     "error": str(exc)[:200]})
+                    escalation = None
+            if retried is None:
+                retried = lead_call(lead, nudge)
+                retried = _resolve_skill_requests(
+                    session, lead, nudge, retried, call, governance, store,
+                    recall=lead_call)
+                retried = _resolve_delegations(
+                    session, council, lead, nudge, retried, call, governance,
+                    store, recall=lead_call)
+            c = retried
             if rounds.reply_is_stub(c.content, skills_resolved=True):
                 session.unresolved.append(
+                    (f"lead synthesis was a stub, and the escalation to "
+                     f"{escalation.agent} stubbed too; final answer composed "
+                     "from the panel views instead")
+                    if escalation is not None else
                     "lead synthesis was a stub twice; final answer composed from "
                     "the panel views instead")
         decision, why = rounds.parse_round_decision(c.content)
@@ -4392,7 +4494,8 @@ def _deliberate(
                 # selects a runnable implementation.
                 if _run_panel_rounds(session, manager, council, lead, call, lead_call,
                                      governance, store, role_agents, established_overview,
-                                     start, codifier_call=codifier_call):
+                                     start, codifier_call=codifier_call,
+                                     registry=registry):
                     return session  # paused for round consent
 
             # 7. Mid-flight approval gate (only trips if governance flagged something).
