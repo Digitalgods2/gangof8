@@ -632,6 +632,11 @@ pre.diff .d-meta { color:var(--dim); display:block; }
                            background:var(--bg); border:1px solid var(--line-strong);
                            border-radius:8px; font:12px var(--font); }
 .composer-options span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* opt-in for the comparison routes — a toggle, not another field label */
+#advWrap { display:flex; align-items:center; gap:5px; flex:0 0 auto; cursor:pointer;
+           color:var(--dim); font-weight:500; white-space:nowrap; }
+#advWrap:hover { color:var(--text); }
+#advWrap input { accent-color:var(--accent); margin:0; cursor:pointer; }
 #contractOverlay { position:fixed; inset:0; z-index:var(--z-contract); display:none; align-items:center;
                    justify-content:center; padding:22px; background:rgba(5,5,10,.78);
                    backdrop-filter:blur(7px); }

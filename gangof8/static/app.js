@@ -426,6 +426,29 @@ function bindComposerControls() {
   const updateHint = () => {
     if (profileHint && profile) profileHint.textContent = hints[profile.value] || hints.auto;
   };
+  // Council and Best-of-all compare whole answers across seats, which costs a
+  // multiple of the other routes and discards all but one result. They stay
+  // available, but behind a deliberate opt-in rather than sitting in the list
+  // as peers of the route you almost always want.
+  const ADV_KEY = "gangof8.advancedRoutes";
+  const advBox = document.getElementById("advancedRoutes");
+  const advOpts = profile ? [...profile.querySelectorAll("option[data-advanced]")] : [];
+  const applyAdvanced = () => {
+    const on = !!advBox?.checked;
+    advOpts.forEach(o => { o.hidden = !on; o.disabled = !on; });
+    if (!on && profile && advOpts.some(o => o.value === profile.value)) {
+      profile.value = "auto";   // never leave a hidden route selected
+      updateHint();
+    }
+  };
+  if (advBox) {
+    try { advBox.checked = localStorage.getItem(ADV_KEY) === "1"; } catch (e) { /* private mode */ }
+    advBox.addEventListener("change", () => {
+      try { localStorage.setItem(ADV_KEY, advBox.checked ? "1" : "0"); } catch (e) { /* ignore */ }
+      applyAdvanced();
+    });
+  }
+  applyAdvanced();
   profile?.addEventListener("change", updateHint);
   updateHint();
 }
