@@ -175,10 +175,13 @@
     <select id="executionProfile" title="Choose how much of the council to engage">
       <option value="auto">Auto · recommended route</option>
       <option value="focused">Focused · smallest capable team (cheapest)</option>
-      <option value="council">Council · broad deliberation</option>
-      <option value="best_of_n">Best-of-all · every AI writes a full solution (highest cost)</option>
+      <option value="council" data-advanced="1">Council · broad deliberation</option>
+      <option value="best_of_n" data-advanced="1">Best-of-all · every AI writes a full solution (highest cost)</option>
       <option value="build_team">Planned build · parallel when decomposable</option>
     </select>
+    <label id="advWrap" title="Show the comparison routes: every seat answers (Council) or every seat writes a complete solution and all but one is discarded (Best-of-all)">
+      <input type="checkbox" id="advancedRoutes"> Advanced
+    </label>
     <span id="profileHint">Gang of 8 will explain its routing choice before starting.</span>
   </div>
   <div class="crow">
