@@ -6465,6 +6465,62 @@ def _run_test_fix_loop(
     return False
 
 
+# 'pip install foo bar', 'python -m pip install foo', 'Install it with: foo'
+_INSTALL_ADVICE = re.compile(
+    r"(?:pip\s+install|install\s+it\s+with|requires?|please\s+install)\s*:?\s*"
+    r"(?P<names>[A-Za-z0-9][A-Za-z0-9._\- ]{0,80})",
+    re.IGNORECASE,
+)
+
+
+def _false_install_claim(session: Session, failure_text: str, store: LogStore) -> str:
+    """Correct a build failure that blames a package which is actually installed.
+
+    A crashing script explains its own crash, and it is guessing. One run died
+    on a reportlab API that had moved between major versions; its except-handler
+    printed "ReportLab is required. Install it with: pip install reportlab
+    pypdf". reportlab WAS installed. The repair round read that sentence,
+    proposed the install, had it correctly suppressed as already-present, and
+    re-ran the identical broken build -- then gave up.
+
+    The coordinator can settle this: it can read installed metadata and the
+    script cannot lie to it. When the script's advice contradicts the machine,
+    say so plainly, because the alternative is a repair round spending its one
+    call on a package that was never missing.
+    """
+    text = str(failure_text or "")
+    if not text:
+        return ""
+    names: list[str] = []
+    for m in _INSTALL_ADVICE.finditer(text):
+        for tok in re.split(r"[\s,]+", m.group("names")):
+            tok = tok.strip().strip(".,:;'\"")
+            # keep plausible distribution names only
+            if tok and re.fullmatch(r"[A-Za-z][A-Za-z0-9._\-]{1,40}", tok):
+                if tok.lower() not in ("it", "with", "the", "and", "python", "pip", "install"):
+                    names.append(tok)
+    if not names:
+        return ""
+    try:
+        from . import skills
+        have = skills.already_available(list(dict.fromkeys(names)), session, store.data_dir)
+    except Exception:
+        return ""
+    if not have:
+        return ""
+    present = ", ".join(sorted(have.values()))
+    store.log_event(session.session_id, "build_selfdiagnosis_corrected",
+                    {"claimed_missing": sorted(set(names)), "actually_installed": present})
+    return (
+        f"CORRECTION — that message is the script's own guess about its own crash, "
+        f"and it is wrong. {present} IS installed and importable by the interpreter "
+        f"that ran the build. Do NOT propose INSTALL for it. The real cause is in "
+        f"the code: most often a name imported from a package re-export that moved "
+        f"in a newer major version, or an API that changed signature. Read the "
+        f"traceback rather than the script's error message.\n\n"
+    )
+
+
 def _repair_missing_deliverable(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     repair_call: AgentCall,
@@ -6515,7 +6571,8 @@ def _repair_missing_deliverable(
     )
     previously = (
         f"Your previous BUILD was rejected:\n{last_failure[:1500]}\n"
-        "Fix THAT — usually the declared PRODUCES name and the name the script "
+        + _false_install_claim(session, last_failure, store)
+        + "Fix THAT — usually the declared PRODUCES name and the name the script "
         "writes must be made identical. Do not start over if the generator works.\n\n"
         if last_failure else ""
     )
