@@ -35,11 +35,48 @@ build goal.
 |---|---|---|
 | Start it with | Any normal prompt | `/goal <objective>`, or a substantial build brief auto-routed from `/tasks` |
 | Best for | Questions, research, reviews, designs, and bounded deliverables | Multi-file builds, overhauls, and long objectives |
-| Council behavior | Every enabled seat produces an independent take or candidate | The architect creates owned work packages with dependencies |
+| Council behavior | Routed: one lead with specialists on demand, a full panel of independent takes, or a blind best-of-N tournament | The architect creates owned work packages with dependencies, plus parallel research packages for content-heavy goals |
 | Model ownership | Competing whole solutions, followed by blind selection | One named model atomically authors each cohesive package; models run in parallel across packages |
 | Concurrency | Panel calls, smoke checks, and judge waves run in parallel | Descriptive contract work may overlap; runtime consumers wait for accepted provider bytes |
 | Integration | Blind best-of-N plus a strong finishing/chair pass | A hard-after QA owner inspects actual staging before deterministic assembly |
 | Delivery | A governed `promote` action for the session | Browser/semantic acceptance, then one hash-bound diff and approval |
+
+### Choosing the route
+
+A router reads each request and picks the smallest shape that fits, explaining
+its choice before the run starts. The composer's **Execution** selector offers
+`Auto`, `Focused` and `Planned build`; an **Advanced** checkbox reveals the two
+comparison routes, `Council` and `Best-of-all`.
+
+They sit behind an opt-in because they cost a multiple of the others: every
+enabled seat writes a complete answer and all but one is discarded, so spend
+scales with the seat count. That is worth paying when you want competing whole
+answers to choose between, and wasteful when you want one thing built. Nothing
+is removed — both routes stay fully available to anyone who ticks the box, and
+to the API.
+
+### One model does, another checks
+
+Whichever route runs, **a seat that did not author the result reads it before
+delivery** — the file for a build, the composed answer for a question. This is a
+floor, not a routing profile and not a setting you have to find: a single-model
+run still gets a second pair of eyes.
+
+A FAIL must be **confirmed by a second, different seat** before it can refuse
+delivery, so one reviewer's bad call cannot veto a good build, while a confirmed
+FAIL is not commentary. See `GANGOF8_REVIEW`, `GANGOF8_REVIEW_CONFIRM` and
+`GANGOF8_REVIEW_BLOCKS`.
+
+### Research provenance
+
+`web_search` is Google Search grounding through the Gemini SDK, so it needs a
+Gemini API key. **Without one it is enabled, permitted to every seat, and
+inert** — the models answer from their own recall instead.
+
+That is a legitimate result, but it is not the same claim as researched content,
+so a run that asked for research and performed no lookup now says so in its
+result: what the reason was, and that the output is unverified against sources.
+Add the key in **Settings → API keys** to make research real.
 
 This distinction preserves the reason for using several models. A tournament
 is useful when several independent answers improve selection. A build team is
@@ -573,6 +610,30 @@ status pills (see `NEXT-LEVEL.md` for the design rationale):
   seats, OpenRouter seats, and goal planning whether they are streaming or
   still waiting for first output. Keeping waiting does not restart the call.
 
+### Research packages
+
+A single-artifact goal is capped at **one authoring package**: one owner writes
+the complete file end to end. Splitting authorship of one file across owners is
+what turned a single HTML page into nine staged files across eight owners and
+283 model calls, with every defect on a seam.
+
+That cap is about authorship, not about the work. When the deliverable carries a
+large body of content — N recipes, chapters, entries, a glossary, a dataset —
+the architect may add **research packages** that gather it in parallel:
+
+- outputs are data only (`.json`, `.md`, `.csv`, `.yaml`, `.txt`),
+- `RELEASE: NONE`, so nothing they produce reaches the user directly,
+- named in the authoring package's `AFTER:` list, so the author embeds them,
+- split by content range and assigned across **every enabled seat**, including
+  the OpenRouter seats that are otherwise idle during a goal.
+
+Two seats researching different recipes share no interface, so there is nothing
+for them to disagree about — while handing two owners "the CSS half" of one file
+creates several seams. The validator enforces that distinction structurally
+rather than trusting a label: a package qualifies only when every output is a
+data file and none of them is released, so a staged markup fragment is still
+rejected as authorship.
+
 ## Timeouts, failures, and recovery
 
 Model calls have no coordinator wall-clock deadline by default: elapsed time is
@@ -609,6 +670,17 @@ Gang of 8 handles failures as follows:
   productive generation from a call still waiting for output;
 - bounded artifact and test repair loops re-run verification after changes,
   stay on the exact path, and return package code to its owner;
+- an OpenRouter call that produces **no token** for `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT`
+  seconds is cut off. It measures silence rather than elapsed time, so a long
+  productive stream is never interrupted while a dead connection is not waited on;
+- a lead synthesis that only announces the work is retried **on a different
+  seat**, not re-asked of the model that just failed; when no other seat is
+  available the original same-seat nudge remains the fallback;
+- in best-of-N, a winner whose approved `BUILD` produces nothing is replaced by
+  the **next-ranked candidate** before any model is asked to repair it. Judges
+  score a candidate by reading it, and whether it runs is only known once the
+  build executes, so a failed build often means this candidate rather than this
+  task. It costs no model call and no new approval;
 - exhausted recovery does not report success;
 - cancellation immediately closes registered HTTP/CLI work, revokes the worker
   lease, clears persisted active calls, and records the session terminal, so a
@@ -701,6 +773,8 @@ request named actions, which Gang of 8 validates and executes.
 | `write_file` | Write a file in a council space | No approval |
 | `edit_file` | Replace a unique snippet in a council-space file | No approval |
 | `run_tests` | Run bounded verification in a council space | Recognized static checks can auto-run; functional execution requires approval |
+| `install_deps` | Fetch the third-party packages a build imports, into this session only | Approval required |
+| `build_artifact` | Run a declared command and capture the files it produces — the only governed route to a binary deliverable | Approval required |
 | `stage` | Move sandbox work into an active council workspace | No approval |
 | `promote` | Copy an ordinary session artifact to the real destination | Approval required |
 | `promote_batch` | Release a goal's complete verified manifest | One final-batch approval required |
@@ -709,6 +783,19 @@ An ordinary session can grant a standing approval for a category with
 `approve_all`, avoiding repeated approvals of the same category in that
 session. Build-team goals do not rely on standing per-file promotion approval;
 they suppress intermediate promotions and create one `promote_batch` action.
+`install_deps` is checked before you are asked: the coordinator reads installed
+metadata and drops any package the build interpreter can already import, so a
+request that is entirely satisfied never raises an approval at all. Anything it
+cannot prove — a declared extra, an unparsable version bound — falls through to
+installing.
+
+A `build_artifact` that exits cleanly without producing what it declared fails,
+and the failure names **what the build actually wrote**, so a mismatch between
+the declared `PRODUCES:` name and the file the script emits is correctable in one
+round instead of provoking a blind rewrite. If a failing build blames a package
+that is demonstrably installed, the repair round is told so explicitly and
+forbidden from proposing the install.
+
 The live, reader-safe v1 catalogue is available at `GET /capabilities`.
 Dispatch revalidates roles, declared inputs, permitted spaces, and the trusted
 handler, including when resuming older persisted sessions.
@@ -1058,7 +1145,7 @@ Common environment variables:
 | `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls for non-build-team frontier tournament authors | `1` |
 | `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Optional independent frontier release deadline; `0` disables | `0` |
 | `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
-| `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Optional no-model-output deadline; `0` leaves the decision to the operator | `0` |
+| `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Cut off an OpenRouter call that has produced no token for this long. Measures silence, not duration, so a productive stream is never interrupted; `0` disables | `180` |
 | `GANGOF8_OPENROUTER_HARD_TIMEOUT` | Optional hard deadline for streaming OpenRouter calls; `0` disables | `0` |
 | `GANGOF8_OPENROUTER_OPERATOR_CHECKIN_SECONDS` | Legacy alias for the model check-in interval | `300` |
 | `GANGOF8_CODIFIER_TIMEOUT` | Optional finishing-pass hard deadline; `0` disables | `0` |
@@ -1067,6 +1154,37 @@ Common environment variables:
 | `GANGOF8_JUDGE_FIRST_WAVE` | Judges called before early-stop evaluation | `2` |
 | `GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS` | Aggregate final-batch diff display cap | `60000` |
 | `GANGOF8_ALLOW_REMOTE` | Explicitly allow non-loopback serving | unset |
+| `GANGOF8_AGENT_TIMEOUT_DEFAULT` | Fallback per-call deadline when no role-specific one applies; `0` disables | `0` |
+| `GANGOF8_CLAUDE_TIMEOUT`, `GANGOF8_CODEX_TIMEOUT`, `GANGOF8_GEMINI_TIMEOUT` | Per-CLI-seat deadline override; `0` disables | `0` |
+| `GANGOF8_DUO_PANEL_SIZE` | Seats a `duo` panel convenes (lead + reviewers) | `2` |
+| `GANGOF8_REVIEW` | Independent pre-delivery review of every result | `1` |
+| `GANGOF8_REVIEW_BLOCKS` | A confirmed FAIL refuses delivery | `1` |
+| `GANGOF8_REVIEW_CONFIRM` | Require a second, different seat to confirm a FAIL | `1` |
+| `GANGOF8_REVIEW_SEAT_ATTEMPTS` | Seats tried before the review is abandoned | `2` |
+| `GANGOF8_REVIEW_TIMEOUT` | Review-call deadline | `180` |
+| `GANGOF8_REVIEW_FILE_MAX_CHARS` | Bytes of a deliverable shown to the reviewer | see `config.py` |
+| `GANGOF8_INTENT` | Intent pass: `auto`, `on`, `off` — one cheap call that decides what the task MEANS | `auto` |
+| `GANGOF8_INTENT_SEAT` | Seat used for the intent pass | first enabled |
+| `GANGOF8_INTENT_TIMEOUT` | Intent-pass deadline | `90` |
+| `GANGOF8_INTENT_CLARIFY` | Ask the human when intent stays ambiguous | `1` |
+| `GANGOF8_INTENT_CLARIFY_CONFIDENCE` | Confidence below which the run asks | see `config.py` |
+| `GANGOF8_BUILD_TIMEOUT` | `BUILD` command deadline | `600` |
+| `GANGOF8_BUILD_OUTPUT_MAX_CHARS` | Build console output kept in the record | see `config.py` |
+| `GANGOF8_INSTALL_TIMEOUT` | `INSTALL` (pip) deadline | `600` |
+| `GANGOF8_WEB` | Enable governed web lookups | `1` |
+| `GANGOF8_WEB_MODEL` | Model used for Google Search grounding | see `config.py` |
+| `GANGOF8_MAX_SESSION_DELEGATIONS` | Delegation fan-out ceiling per session | see `config.py` |
+| `GANGOF8_MAX_PARALLEL_SMOKE` | Concurrent headless smoke checks | see `config.py` |
+| `GANGOF8_BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS` | Same-seat retries for a candidate that produced nothing usable | `1` |
+| `GANGOF8_BEST_OF_N_LINKED_CANDIDATE_MAX_BYTES` | Cap on a linked multi-file candidate | see `config.py` |
+| `GANGOF8_PROMOTE_SHRINK_FRACTION`, `GANGOF8_PROMOTE_SHRINK_MIN_BYTES` | Warn when a promote would shrink an existing file sharply | see `config.py` |
+| `GANGOF8_ASSEMBLY_FAULT_STREAK_LIMIT`, `GANGOF8_ASSEMBLY_FAULT_ESCALATE_AT` | Deterministic-assembly fault tolerance before escalation | see `config.py` |
+| `GANGOF8_RELEASE_VERIFIER_TRANSPORT_RETRIES`, `GANGOF8_RELEASE_VERIFIER_TRANSPORT_BACKOFF` | Retry policy for a release verifier lost to transport errors | see `config.py` |
+| `GANGOF8_REVISION_SOURCE_MAX_CHARS` | Source bytes shown to a follow-up revision | see `config.py` |
+| `GANGOF8_CLI_SCRATCH_MAX_AGE_HOURS` | Age at which local CLI seat scratch is swept | see `config.py` |
+| `GANGOF8_UNGOVERNED_ORPHAN_KEEP` | Ungoverned CLI writes retained for inspection | see `config.py` |
+| `GANGOF8_OPENROUTER_ENDPOINT`, `GANGOF8_OPENROUTER_DATA` | OpenRouter endpoint / data directory overrides | provider defaults |
+| `GANGOF8_MODEL_CATALOG_URL` | Live model catalogue used by the Settings dropdowns | OpenRouter public catalogue |
 | `OPENROUTER_API_KEY` | OpenRouter key; overrides stored key | unset |
 | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | Gemini key; override stored key | unset |
 
