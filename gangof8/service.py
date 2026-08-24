@@ -7712,9 +7712,30 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         self.cancel_session(package.session_id)
                     except (KeyError, ValueError):
                         pass
+            cancelled_release_ids: set[str] = set()
             if goal.release_session_id:
                 try:
                     self.cancel_session(goal.release_session_id)
+                    cancelled_release_ids.add(goal.release_session_id)
+                except (KeyError, ValueError):
+                    pass
+            # A coordinator fault from older versions could create the release
+            # turn before persisting release_session_id. Cancellation still
+            # owns every live release turn linked by goal_id; do not leave an
+            # orphan looking active beside a cancelled parent.
+            for meta in self.store.list_sessions(limit=None):
+                release_id = str(meta.get("session_id") or "")
+                if (
+                    not release_id
+                    or release_id in cancelled_release_ids
+                    or meta.get("goal_id") != goal_id
+                    or not meta.get("goal_release")
+                    or meta.get("status") in {"done", "failed", "cancelled"}
+                ):
+                    continue
+                try:
+                    self.cancel_session(release_id)
+                    cancelled_release_ids.add(release_id)
                 except (KeyError, ValueError):
                     pass
             self._sys_log("goal_cancelled", {"goal_id": goal_id, "epoch": goal.epoch})
@@ -8709,7 +8730,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 files = self._goal_release_files(goal) if goal is not None else []
                 reusable = (
                     self._reusable_goal_release(goal, files)
-                    if goal is not None and files else None
+                    if (
+                        goal is not None
+                        and goal.status in {
+                            "planning", "running", "draining", "awaiting_release",
+                        }
+                        and files
+                    )
+                    else None
                 )
                 if reusable is not None and reusable.session_id == session.session_id:
                     # The paid reviewer phase already passed. Revoke the dead

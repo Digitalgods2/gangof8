@@ -1542,6 +1542,46 @@ def test_cancelled_goal_never_projects_running_packages_or_actionable_sessions(t
     assert view["actionable_session_id"] is None
 
 
+def test_restart_cancels_orphaned_release_turn_for_cancelled_parent(tmp_path):
+    """The old release-link race let cancellation miss its live release turn."""
+    data = tmp_path / "data"
+    service = GangOf8Service(data_dir=data)
+    goal = Goal(
+        text="cancelled release",
+        status="cancelled",
+        release_session_id=None,
+        milestones=[GoalMilestone(
+            index=0,
+            package_id="wp_1",
+            owner="codex",
+            title="report",
+            task_text="report",
+            status="done",
+            contract_declared=True,
+        )],
+    )
+    release = Session(
+        session_id="s_orphaned_release",
+        status=SessionStatus.deliberating,
+        outcome="succeeded",
+        goal_id=goal.goal_id,
+        goal_release=True,
+        task=Task(
+            task_id="t_orphaned_release",
+            session_id="s_orphaned_release",
+            text="release",
+        ),
+    )
+    service.goals.save(goal)
+    service.store.save_session(release)
+
+    restarted = GangOf8Service(data_dir=data)
+
+    reconciled = restarted.manager.load(release.session_id)
+    assert reconciled.status == SessionStatus.cancelled
+    assert reconciled.stop_reason == "interrupted by a server restart"
+
+
 def test_revoked_worker_lease_rejects_stale_session_write(svc):
     """A hot-reload's old worker cannot resurrect a cancelled session."""
     session = svc.manager.create("write a report", source="test")
