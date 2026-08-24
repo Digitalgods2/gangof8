@@ -84,11 +84,11 @@ class Settings(BaseModel):
     # The codifier may offer a validated merge after best-of-N selection. The
     # voted winner remains the default until the human explicitly chooses it.
     integration_review_enabled: bool = True
-    # How build-team goals use enabled models. ``adaptive`` convenes every
-    # enabled resource for standard/complex code packages while retaining the
-    # focused owner+verifier path for small work. ``full_council`` always runs
-    # the artifact-aware challenge wave; ``focused`` preserves the lean path.
-    participation_mode: Literal["focused", "adaptive", "full_council"] = "adaptive"
+    # How build-team goals use enabled models. Task type never controls
+    # participation: writing, research, design, media, data, and code all use
+    # the same resource logic. Full Council is the product default; ``focused``
+    # remains an explicit operator override for intentionally lean runs.
+    participation_mode: Literal["focused", "adaptive", "full_council"] = "full_council"
     # Default execution profile for tasks submitted without one. "auto" lets the
     # outcome router choose, which for any ordinary-length request scores
     # `focused` (55+8) above `council` (48+8) — and `focused` empties the panel,

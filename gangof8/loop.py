@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import (assembly, browser_acceptance, classifier, config, executor, intent,
-               rounds, skills, smoke, validation)
+               recovery, rounds, skills, smoke, validation)
 from .artifacts import (
     ARTIFACT_MARKER as _ARTIFACT_MARKER,
     BLOCK_START as _BLOCK_START,
@@ -33,10 +33,15 @@ from .artifacts import (
 )
 from .classifier import binary_format_of, classify
 from .composer import compose, fallback_final, parse_final
-from .executor import ExecutionError
+from .executor import CapabilityContractError, ExecutionError
 from .governance import ApprovalRequired, BudgetExceeded, Governance
 from .logstore import LogStore
 from .models import (
+    MAX_AGENT_CALLS,
+    MAX_WALL_SECONDS,
+    ApprovalPolicy,
+    ArtifactLineage,
+    BuildRecipe,
     Classification,
     CollaborationAssignment,
     Complexity,
@@ -46,7 +51,11 @@ from .models import (
     FinalAnswer,
     IntegrationProposal,
     InputRequest,
+    MaterializationMode,
+    MaterializationPlan,
     ProposedAction,
+    RecoveryState,
+    ReviewStatus,
     RoundSpec,
     Session,
     SessionStatus,
@@ -107,6 +116,100 @@ AgentCall = Callable[[CouncilMember, str], Contribution]
 class QualityGateFailed(Exception):
     """A required implementation or release-quality quorum was not satisfied."""
 
+
+def _record_action_execution_failure(
+    session: Session, action: ProposedAction, error: ExecutionError,
+) -> None:
+    """Keep the failing layer machine-readable before prose can erase it."""
+    action.status = "failed"
+    action.error = str(error)
+    if isinstance(error, CapabilityContractError):
+        action.failure_layer = "orchestrator"
+        session.stop_reason = (
+            f"orchestrator capability contract failed for {action.kind}: {error}"
+        )
+        recovery.record_failure(
+            session,
+            stage="orchestrator",
+            category="capability_contract",
+            summary=str(error),
+            evidence={
+                "action_id": action.action_id,
+                "action_kind": action.kind,
+                "filename": action.filename,
+            },
+            responsible_owner="coordinator",
+            recoverable=False,
+            action_id=action.action_id,
+            failure_layer="orchestrator",
+            retry_classification="nonrecoverable_contract",
+        )
+    else:
+        action.failure_layer = "author"
+        if action.kind in {"build_artifact", "run_tests", "install_deps"}:
+            category = {
+                "build_artifact": "build_command_failed",
+                "run_tests": "test_command_failed",
+                "install_deps": "dependency_install_failed",
+            }[action.kind]
+            raw_command_result = (action.args or {}).get("command_result", "")
+            try:
+                structured_command_result = (
+                    json.loads(raw_command_result)
+                    if isinstance(raw_command_result, str) and raw_command_result
+                    else dict(raw_command_result or {})
+                )
+            except (TypeError, ValueError):
+                structured_command_result = {"raw": str(raw_command_result)[:4000]}
+            structured_command_result.setdefault(
+                "command", (action.args or {}).get("command", ""))
+            structured_command_result["error"] = str(error)[:4000]
+            recovery.record_failure(
+                session,
+                stage="build" if action.kind == "build_artifact" else "execution",
+                category=category,
+                summary=str(error),
+                evidence={
+                    "action_id": action.action_id,
+                    "action_kind": action.kind,
+                    "filename": action.filename,
+                    "args": dict(action.args or {}),
+                    "error": str(error)[:4000],
+                },
+                artifact_path=action.filename,
+                responsible_owner=session.work_package_owner,
+                producer_paths=(
+                    session.materialization_plan.producing_files
+                    if session.materialization_plan else []
+                ),
+                command_result=structured_command_result,
+                recoverable=True,
+                action_id=action.action_id,
+                failure_layer="author",
+                retry_classification="repair_producer_then_replay_gate",
+            )
+        else:
+            recovery.record_failure(
+                session,
+                stage="execution",
+                category="action_execution_failed",
+                summary=str(error),
+                evidence={
+                    "action_id": action.action_id,
+                    "action_kind": action.kind,
+                    "filename": action.filename,
+                },
+                artifact_path=action.filename,
+                responsible_owner=(
+                    session.work_package_owner or action.role.value
+                ),
+                producer_paths=[action.filename] if action.filename else [],
+                recoverable=True,
+                action_id=action.action_id,
+                failure_layer="author",
+                retry_classification="changed_action_or_distinct_seat",
+            )
+
 # Guards mutable session state (budget counter, contributions, unresolved,
 # council roster, log writes) so parallel sibling consults can't race. Held only
 # for tiny bookkeeping critical sections — NEVER across an agent call.
@@ -134,8 +237,8 @@ def _effective_agent_timeout(
 ) -> int:
     """Resolve only explicit runtime policy; legacy Settings caps are ignored.
 
-    Zero is the normal policy and means the operator supervises elapsed time.
-    A positive stage/installation value is an explicit hard-deadline opt-in.
+    Zero defers to the absolute buffered/streaming ceiling at dispatch time.
+    A positive stage/installation value supplies a narrower explicit deadline.
     """
     if requested is None:
         return max(0, int(config.agent_timeout(agent)))
@@ -161,7 +264,7 @@ def _package_seconds_remaining(session: Session) -> Optional[int]:
 
 
 def _ensure_package_deadline(session: Session, store: LogStore) -> Optional[int]:
-    """Start an opted-in package deadline; unlimited authoring is the default."""
+    """Persist the absolute deadline shared by every package phase."""
     if not session.package_deadline_at and config.PACKAGE_AUTHOR_DEADLINE > 0:
         now = datetime.now(timezone.utc)
         session.package_started_at = now.isoformat()
@@ -248,11 +351,22 @@ def _steering_checkpoint(
                 except (json.JSONDecodeError, TypeError):
                     increments = {"agent_calls": command.amount}
                 with _SESSION_LOCK:
-                    session.budgets.max_agent_calls += max(
-                        0, int(increments.get("agent_calls") or command.amount or 0)
+                    # Clamp to the ceilings Budgets declares. `+=` on a model
+                    # field is a plain attribute set, which pydantic does not
+                    # re-validate, so an unclamped increase can persist a value
+                    # the model will refuse to load back — poisoning the
+                    # session permanently. Grant what the ceiling allows.
+                    session.budgets.max_agent_calls = min(
+                        MAX_AGENT_CALLS,
+                        session.budgets.max_agent_calls + max(
+                            0, int(increments.get("agent_calls") or command.amount or 0)
+                        ),
                     )
-                    session.budgets.max_wall_seconds += max(
-                        0, int(increments.get("duration_seconds") or 0)
+                    session.budgets.max_wall_seconds = min(
+                        MAX_WALL_SECONDS,
+                        session.budgets.max_wall_seconds + max(
+                            0, int(increments.get("duration_seconds") or 0)
+                        ),
                     )
                     session.consent_extra_rounds += max(
                         0, int(increments.get("rounds") or 0)
@@ -304,6 +418,14 @@ def _steering_checkpoint(
             "- FINISH: make this current step conclusive; the coordinator will "
             "compose immediately afterward"
         )
+    if session.approval_policy == ApprovalPolicy.god_mode:
+        steering_lines.append(
+            "- GOD MODE: advance consent is active. Never ask whether you may "
+            "continue, proceed, write, build, or use an in-contract action. Make "
+            "reasonable reversible assumptions and finish. Ask the human only "
+            "for essential information the coordinator cannot infer (for example "
+            "a destination, credential, or genuinely ambiguous product choice)."
+        )
     if not steering_lines:
         return prompt
     context = "\n".join(steering_lines)[:5000]
@@ -328,16 +450,30 @@ def _agent_call(
     # `reserve` calls are held back for the composer; never reserve the
     # entire budget so tiny test budgets still allow one deliberation call.
     cap = session.budgets.max_agent_calls - max(0, min(reserve, session.budgets.max_agent_calls - 1))
-    # Reserve a budget slot UP FRONT (under lock) so concurrent fan-out calls can't
-    # slip past a check-then-increment gap and oversubscribe max_agent_calls. The
-    # completed-call slot is rolled back if the call fails or pauses, preserving
-    # the budget semantics.  ``agent_call_attempts`` is separate and never rolls
-    # back, so the read-only API still exposes every timeout/error attempt.
+    # Reserve a budget slot UP FRONT (under lock) so concurrent fan-out calls
+    # cannot oversubscribe either the session or goal. A failed session-local
+    # completion slot is reusable, but the durable goal reservation is never
+    # refunded: every physical provider dispatch costs time and money.
     with _SESSION_LOCK:
         if session.agent_calls >= cap:
             raise BudgetExceeded(
                 f"max_agent_calls={session.budgets.max_agent_calls} reached"
                 + (f" (cap {cap} with {reserve} reserved for composition)" if reserve else "")
+            )
+        goal_store = getattr(store, "goal_store", None)
+        if session.goal_id and goal_store is not None:
+            reservation = goal_store.reserve_model_call(
+                session.goal_id,
+                session_id=session.session_id,
+                agent=member.agent,
+                phase=session.phase or member.role.value,
+            )
+            if reservation is None:
+                raise BudgetExceeded(
+                    "goal model-call budget exhausted before provider dispatch"
+                )
+            session.goal_model_call_reservation_ids.append(
+                reservation["reservation_id"]
             )
         session.agent_calls += 1
         session.agent_call_attempts += 1
@@ -354,6 +490,8 @@ def _agent_call(
         if stream_supervised
         else _effective_agent_timeout(session, member.agent, timeout_s)
     )
+    if not stream_supervised and timeout_s <= 0:
+        timeout_s = config.BUFFERED_CALL_HARD_TIMEOUT
     call_id = f"call_{threading.get_ident()}_{time.monotonic_ns()}"
     store.log_event(
         session.session_id, "agent_call_queued",
@@ -651,7 +789,6 @@ def _accepted_dependency_context(session: Session, data_dir) -> str:
         session.established_root,
     ]
     chunks: list[str] = []
-    remaining = config.REVISION_SOURCE_MAX_CHARS
     for raw_name in session.runtime_dependencies:
         name = str(raw_name or "").strip().replace("\\", "/")
         if not name:
@@ -675,25 +812,151 @@ def _accepted_dependency_context(session: Session, data_dir) -> str:
         if expected and digest != expected:
             continue
         body = raw.decode("utf-8", errors="replace")
-        header = f"===== ACCEPTED DEPENDENCY: {name} SHA256:{digest} =====\n"
-        if len(header) >= remaining:
-            break
-        allowance = remaining - len(header)
-        if len(body) > allowance:
-            # Keep both implementation setup and exported/registration tails,
-            # and label the omission so no model mistakes an excerpt for full bytes.
-            half = max(0, (allowance - 120) // 2)
-            body = (
-                body[:half]
-                + "\n/* DEPENDENCY MIDDLE OMITTED BY CONTEXT LIMIT */\n"
-                + body[-half:]
-            )
-        chunk = header + body
-        chunks.append(chunk)
-        remaining -= len(chunk)
-        if remaining <= 0:
-            break
+        chunks.append(f"===== ACCEPTED DEPENDENCY: {name} SHA256:{digest} =====\n{body}")
     return "\n\n".join(chunks)
+
+
+def _accepted_dependency_manifest(session: Session) -> str:
+    names = _normalized_paths(session.runtime_dependencies)
+    if not names:
+        return ""
+    return (
+        "COMPLETE ACCEPTED INPUTS ARE FILES IN YOUR ISOLATED WORKING DIRECTORY.\n"
+        "Read them directly; never reconstruct them from a prose excerpt. You may "
+        "edit only the declared package output/producer paths if your CLI supports "
+        "workspace writes; the coordinator captures those diffs and still applies "
+        "the normal contract and validation gates. Never modify accepted inputs.\n"
+        + "\n".join(
+            f"- {name} sha256={session.dependency_hashes.get(name, 'live revision input')}"
+            for name in names
+        )
+        + "\n- _gangof8_manifest.json contains the machine-readable manifest."
+    )
+
+
+def _prepare_package_working_set(
+    session: Session, store: LogStore, member: CouncilMember, wave: str,
+) -> str:
+    """Copy complete, hash-sealed package inputs into a fresh author cwd."""
+    artifacts = executor.artifacts_dir(store.data_dir, session.session_id)
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", member.agent or "author")
+    root = artifacts / "working_sets" / f"{wave}_{slug}_{time.monotonic_ns()}"
+    root.mkdir(parents=True, exist_ok=False)
+    roots = [
+        artifacts,
+        session.workspace_root,
+        session.delivery_root,
+        session.established_root,
+    ]
+    files: list[dict] = []
+    missing: list[str] = []
+    inputs = list(dict.fromkeys([
+        *_normalized_paths(session.runtime_dependencies),
+        *_normalized_paths(session.revision_targets),
+        *_normalized_paths(
+            session.materialization_plan.authoritative_inputs
+            if session.materialization_plan else []
+        ),
+        *_normalized_paths([
+            name for name in (
+                session.materialization_plan.build.inputs
+                if session.materialization_plan and session.materialization_plan.build
+                else []
+            )
+            if name not in (
+                session.materialization_plan.producing_files
+                if session.materialization_plan else []
+            )
+        ]),
+    ]))
+    for name in inputs:
+        source: Optional[Path] = None
+        for candidate_root in roots:
+            if not candidate_root:
+                continue
+            try:
+                candidate = executor.resolve_in_workspace(Path(candidate_root), name)
+            except (ExecutionError, OSError):
+                continue
+            if candidate.is_file():
+                source = candidate
+                break
+        if source is None:
+            missing.append(name)
+            continue
+        raw = source.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        expected = (session.dependency_hashes.get(name)
+                    or session.revision_base_hashes.get(name))
+        if expected and digest != expected:
+            missing.append(f"{name} (hash drift)")
+            continue
+        target = executor.resolve_in_workspace(root, name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        files.append({"path": name, "sha256": digest, "bytes": len(raw)})
+        if session.materialization_plan:
+            session.materialization_plan.input_hashes[name] = digest
+    # Existing producers and failed/current outputs are repair baselines, not
+    # mandatory upstream inputs. Include them whole when present, but do not
+    # make a first authoring attempt fail merely because it is creating them.
+    optional = list(dict.fromkeys([
+        *_normalized_paths(session.required_files),
+        *_normalized_paths(
+            session.materialization_plan.producing_files
+            if session.materialization_plan else []
+        ),
+    ]))
+    copied = {item["path"] for item in files}
+    for name in optional:
+        if name in copied:
+            continue
+        source = None
+        for candidate_root in roots:
+            if not candidate_root:
+                continue
+            try:
+                candidate = executor.resolve_in_workspace(Path(candidate_root), name)
+            except (ExecutionError, OSError):
+                continue
+            if candidate.is_file():
+                source = candidate
+                break
+        if source is None:
+            continue
+        raw = source.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        target = executor.resolve_in_workspace(root, name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        files.append({"path": name, "sha256": digest, "bytes": len(raw),
+                      "baseline": True})
+    if missing:
+        raise QualityGateFailed(
+            "could not prepare complete package working set: " + ", ".join(missing)
+        )
+    manifest = {
+        "session_id": session.session_id,
+        "package_id": session.work_package_id,
+        "author": member.agent,
+        "wave": wave,
+        "root": str(root),
+        "files": files,
+        "created_at": utcnow(),
+    }
+    (root / "_gangof8_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    history = list(session.working_set_manifest.get("history") or [])
+    history.append(manifest)
+    session.working_set_manifest = {"latest": manifest, "history": history[-24:]}
+    store.log_event(
+        session.session_id, "package_working_set_prepared",
+        {"author": member.agent, "wave": wave, "root": str(root),
+         "files": files},
+    )
+    store.save_session(session)
+    return str(root)
 
 
 def _normalized_paths(names: list[str]) -> list[str]:
@@ -718,6 +981,45 @@ def _revision_targets(session: Session) -> list[str]:
 
 def _is_in_place_revision(session: Session) -> bool:
     return bool(_revision_targets(session))
+
+
+def _ensure_session_materialization_plan(session: Session) -> None:
+    """Backfill a build contract for one-shot binary deliverables."""
+    if session.materialization_plan or not session.classification:
+        return
+    formats = list(session.classification.deliverable_formats or [])
+    if not formats:
+        return
+    contract_text = _execution_task(session)
+    named: list[str] = []
+    for fmt in formats:
+        pattern = re.compile(
+            rf"(?<![\w./\\-])([A-Za-z0-9_][A-Za-z0-9_./\\ -]*\.{re.escape(fmt)})(?!\w)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(contract_text)
+        if match:
+            named.append(match.group(1).strip().replace("\\", "/"))
+    outputs = list(dict.fromkeys(named))
+    if not outputs:
+        outputs = [f"deliverable.{fmt}" for fmt in formats]
+    producer = "_gangof8/build_output.py"
+    validators = [f"format:{fmt}" for fmt in formats]
+    session.materialization_plan = MaterializationPlan(
+        mode=MaterializationMode.build,
+        producing_files=[producer],
+        release_files=outputs,
+        validator_ids=validators,
+        contract_assertions=list(
+            (session.outcome_contract or {}).get("acceptance_criteria") or []
+        ),
+        build=BuildRecipe(
+            command=f"python {producer}", inputs=[producer], outputs=outputs,
+            validator_ids=validators,
+        ),
+    )
+    if not session.required_files:
+        session.required_files = outputs
 
 
 def _requires_file_output(session: Session) -> bool:
@@ -1757,7 +2059,34 @@ def _conversation_overview(session: Session) -> str:
 # session_id -> why the proactive web lookup failed, so the end of the run can
 # explain the gap instead of leaving it to be inferred from an empty trail.
 _WEB_FAILURES: dict[str, str] = {}
-_WEB_SKILLS = ("web_search", "web_fetch")
+_WEB_SKILLS = ("web_search", "public_web_search", "web_fetch")
+
+
+def _requires_retrieved_research(session: Session) -> bool:
+    text = _execution_task(session).lower()
+    return bool(re.search(
+        r"\b(?:research(?:ed|ing)?|cite|citations?|sources?|verify online|"
+        r"look up|web research|current information)\b", text,
+    ))
+
+
+def _requires_auditable_research(session: Session) -> bool:
+    text = _execution_task(session).lower()
+    return bool(re.search(
+        r"\b(?:research\s+heavily|cite|citations?|sources?|source-backed|"
+        r"documented research)\b", text,
+    ))
+
+
+def _has_usable_retrieved_research(session: Session) -> bool:
+    if session.research_mode != "retrieved":
+        return False
+    if not _requires_auditable_research(session):
+        return True
+    return any(
+        item.get("mode") == "retrieved" and item.get("sources")
+        for item in session.research_provenance
+    )
 
 
 def _research_provenance_note(session: Session, store: LogStore) -> None:
@@ -1779,7 +2108,11 @@ def _research_provenance_note(session: Session, store: LogStore) -> None:
         str(s).lower() for s in (cls.skills_needed or [])]
     if not wanted:
         return
-    if any(t in _WEB_SKILLS for t in (session.tools_called or [])):
+    # Repair/release sessions legitimately inherit a hash-bound retrieved
+    # corpus from the goal. They need not pay for the same web call again, and
+    # the absence of a current-session tool event does not erase provenance.
+    if _has_usable_retrieved_research(session):
+        session.research_mode = "retrieved"
         return
     reason = _WEB_FAILURES.pop(session.session_id, "")
     if not config.WEB_ENABLED:
@@ -1796,6 +2129,12 @@ def _research_provenance_note(session: Session, store: LogStore) -> None:
         why = "no seat requested a web lookup"
     note = (f"this task asked for research but NO web lookup was performed ({why}); "
             f"the content is the models' own recall and is unverified against sources")
+    session.research_mode = (
+        "capability_gap" if reason or not config.WEB_ENABLED else "recall_only"
+    )
+    session.research_provenance.append({
+        "mode": session.research_mode, "reason": why, "recorded_at": utcnow(),
+    })
     session.unresolved.append(note)
     store.log_event(session.session_id, "research_unsourced",
                     {"reason": why, "tools_called": list(session.tools_called or [])})
@@ -1807,28 +2146,106 @@ def _web_overview(session: Session, data_dir: Path) -> str:
     seat fails or no agent thinks to call web_search. (Having internet access
     available is not the same as using it; this uses it.) Best-effort; bounded."""
     cls = session.classification
-    if not config.WEB_ENABLED or session.established_root:
+    if not config.WEB_ENABLED:
+        if _requires_retrieved_research(session):
+            session.research_mode = "capability_gap"
+            _WEB_FAILURES[session.session_id] = "web research is disabled"
         return ""
     if not (cls and cls.needs_facts):
         return ""
+    if _has_usable_retrieved_research(session):
+        cached = next(
+            (str(item.get("evidence") or "")
+             for item in reversed(session.research_provenance)
+             if item.get("mode") == "retrieved" and item.get("evidence")),
+            "",
+        )
+        if cached:
+            return (
+                "VERIFIED RESEARCH REUSED FROM THE GOAL CHECKPOINT:\n" + cached
+            )
     # A from-scratch build (code/greenfield) doesn't need up-front web research —
     # skip the slow web call; the lead can still request web_search if it needs it.
     if cls.task_type == TaskType.code:
         return ""
-    try:
-        from . import web
-        result = web.web_search(session.task.text, data_dir=data_dir)
-    except Exception as e:  # noqa: BLE001 — web is best-effort context
+    from . import web
+    result = ""
+    lookup_error: Optional[Exception] = None
+    attempts = 1 + config.WEB_SEARCH_TRANSPORT_RETRIES
+    for attempt in range(attempts):
+        try:
+            result = web.web_search(session.task.text, data_dir=data_dir)
+            lookup_error = None
+            break
+        except Exception as e:  # noqa: BLE001 — classified below
+            lookup_error = e
+            message = str(e).lower()
+            transient = any(marker in message for marker in (
+                "connection", "timed out", "timeout", "getaddrinfo",
+                "temporarily unavailable", "10053", "10054",
+            ))
+            if not transient or attempt + 1 >= attempts:
+                break
+    primary_error = str(lookup_error) if lookup_error is not None else ""
+    if lookup_error is not None:
+        try:
+            result = web.public_web_search(session.task.text)
+            lookup_error = None
+            if "public_web_search" not in session.tools_called:
+                session.tools_called.append("public_web_search")
+            store_note = {
+                "mode": "provider_failover",
+                "from": "gemini_google_search",
+                "to": "bing_rss",
+                "reason": primary_error[:300],
+                "recorded_at": utcnow(),
+            }
+            session.research_provenance.append(store_note)
+        except Exception as fallback_error:  # noqa: BLE001 - both errors retained
+            lookup_error = RuntimeError(
+                f"primary web provider failed ({primary_error}); "
+                f"fallback provider failed ({fallback_error})"
+            )
+    if lookup_error is not None:
         # Best-effort must still be VISIBLE. This swallowed every failure, so a
         # run asked to "research heavily" performed zero lookups, said nothing,
         # and shipped a hundred recipes recalled from model memory. The most
         # common cause is no Gemini API key: web_search is Google Search
         # grounding through that SDK, so with no key the capability is present,
         # permitted to every seat, and inert.
-        _WEB_FAILURES[session.session_id] = str(e)
+        _WEB_FAILURES[session.session_id] = str(lookup_error)
+        session.research_mode = "capability_gap"
+        session.research_provenance.append({
+            "mode": "capability_gap", "reason": str(lookup_error)[:300],
+            "attempts": attempt + 1,
+            "recorded_at": utcnow(),
+        })
         return ""
     if not result or not result.strip():
+        session.research_mode = "capability_gap"
+        _WEB_FAILURES[session.session_id] = "web lookup returned no usable evidence"
         return ""
+    session.research_mode = "retrieved"
+    if "web_search" not in session.tools_called:
+        session.tools_called.append("web_search")
+    urls = list(dict.fromkeys(
+        item.rstrip(".,;:")
+        for item in re.findall(r"https?://[^\s)>\]]+", result)
+    ))
+    if _requires_auditable_research(session) and not urls:
+        reason = "web lookup returned no source citations"
+        session.research_mode = "capability_gap"
+        _WEB_FAILURES[session.session_id] = reason
+        session.research_provenance.append({
+            "mode": "capability_gap", "reason": reason,
+            "recorded_at": utcnow(),
+        })
+        return ""
+    session.research_provenance.append({
+        "mode": "retrieved", "query": session.task.text[:500],
+        "sources": urls[:40], "evidence": result[:config.WEB_SEARCH_MAX_CHARS],
+        "recorded_at": utcnow(),
+    })
     return ("WEB RESEARCH (current information the coordinator looked up on the live "
             "web for this task — trust and use it; you may request more with "
             "'SKILL: web_search <query>' / 'SKILL: web_fetch <url>'):\n" + result)
@@ -2253,10 +2670,15 @@ def _flush_delegate_writes(
             session.unresolved.append(f"action '{action.kind}' denied: {action.error}")
             continue
         try:
+            store.log_event(
+                session.session_id,
+                "action_execution_started",
+                {"action_id": action.action_id, "kind": action.kind,
+                 "filename": action.filename},
+            )
             result = executor.execute(session, action, store.data_dir)
         except ExecutionError as e:
-            action.status = "failed"
-            action.error = str(e)
+            _record_action_execution_failure(session, action, e)
             session.unresolved.append(f"artifact '{action.filename}' failed: {e}")
             store.log_event(session.session_id, "action_failed",
                             {"action_id": action.action_id, "error": str(e)})
@@ -2309,10 +2731,9 @@ def _is_analysis_task(session: Session) -> bool:
 
 
 def _skill_request_cap(session: Session) -> int:
-    """How many SKILL: requests one turn may resolve. Analysis tasks get more —
-    reading the material is the job; output tasks keep the tight bound."""
-    return config.MAX_SKILL_REQUESTS_ANALYSIS if _is_analysis_task(session) \
-        else config.MAX_SKILL_REQUESTS_PER_TURN
+    """Use one task-type-neutral context allowance for every council job."""
+    return max(config.MAX_SKILL_REQUESTS_ANALYSIS,
+               config.MAX_SKILL_REQUESTS_PER_TURN)
 
 
 def _skill_result_cap(session: Session) -> int:
@@ -2322,8 +2743,8 @@ def _skill_result_cap(session: Session) -> int:
     cls = session.classification
     if cls and cls.match_source:
         return config.MATCHED_SOURCE_MAX_CHARS
-    return config.SKILL_RESULT_ANALYSIS_MAX_CHARS if _is_analysis_task(session) \
-        else config.SKILL_RESULT_MAX_CHARS
+    return max(config.SKILL_RESULT_ANALYSIS_MAX_CHARS,
+               config.SKILL_RESULT_MAX_CHARS)
 
 
 def _reply_has_artifact(sid: str, content: str) -> bool:
@@ -2421,8 +2842,7 @@ def _resolve_skill_requests(
                         cap_chars = config.SKILL_RESULT_SANDBOX_MAX_CHARS
                 results.append(f"SKILL {name} '{arg}' result:\n{out[:cap_chars]}")
             except ExecutionError as e:
-                action.status = "failed"
-                action.error = str(e)
+                _record_action_execution_failure(session, action, e)
                 with _SESSION_LOCK:
                     store.log_event(sid, "skill_failed", {"skill": name, "arg": arg, "error": str(e)})
                 results.append(f"SKILL {name}: error — {e}")
@@ -2433,6 +2853,24 @@ def _resolve_skill_requests(
         contribution = (recall or call)(member, followup)
         if _reply_has_artifact(sid, contribution.content):
             authored = contribution
+    if _SKILL_REQUEST_MARKER.search(contribution.content or ""):
+        # A bounded context chain must end in a final answer request, not leak a
+        # dangling SKILL line into the caller's protocol parser. This is the
+        # exact Gemini failure seen in collaboration reviews.
+        final_prompt = (
+            f"{prompt}\n\nAccumulated skill results:\n"
+            + "\n\n".join(results)
+            + "\n\nThe bounded context-gathering phase is now complete. Do not "
+              "request another skill. Return the final response now using the "
+              "exact response contract in the original assignment."
+        )
+        contribution = (recall or call)(member, final_prompt)
+        if _SKILL_REQUEST_MARKER.search(contribution.content or ""):
+            store.log_event(
+                sid, "skill_chain_exhausted",
+                {"agent": member.agent, "role": member.role.value,
+                 "requests": len(seen)},
+            )
     return authored or contribution
 
 
@@ -2474,22 +2912,38 @@ def _synthesis_final(session: Session) -> Optional[FinalAnswer]:
 def _candidate_artifact_problem(session: Session, filename: str) -> str:
     """Return why a panel ARTIFACT name cannot be a deliverable candidate."""
     normalized = str(filename or "").strip().replace("\\", "/")
-    if (session.collaboration_mode == "build_team" and session.required_files
-            and normalized not in _normalized_paths(session.required_files)):
+    allowed_contract_paths = _normalized_paths(session.required_files)
+    if session.materialization_plan:
+        allowed_contract_paths.extend(
+            name for name in _normalized_paths(session.materialization_plan.producing_files)
+            if name not in allowed_contract_paths
+        )
+    if (session.collaboration_mode == "build_team" and allowed_contract_paths
+            and normalized not in allowed_contract_paths):
         return (
             "artifact path does not exactly match the package contract; expected one of: "
-            + ", ".join(_normalized_paths(session.required_files))
+            + ", ".join(allowed_contract_paths)
         )
     base = _basename(filename)
     if not base or base in {".", ".."}:
         return "artifact did not name a file"
     if session.delivery_root and base.casefold() == Path(session.delivery_root).name.casefold():
         return "artifact named the delivery folder instead of a file"
-    task = _execution_task(session)
-    named_suffixes = {Path(m.group(1)).suffix.lower() for m in _FILENAME_RE.finditer(task)}
-    direct_suffixes = {f".{ext.lower()}" for ext in re.findall(
-        r"(?<![\w.])\.([a-z0-9]{1,10})\b", task, re.IGNORECASE)}
-    expected_suffixes = {s for s in named_suffixes | direct_suffixes if s and s != "."}
+    # When the package declares its outputs, THOSE are the contract. Scraping
+    # the prose instead reads the package's INPUTS as if they were its output:
+    # wp_5 must consume research/*.json to author Escoffier.pdf, so the regex
+    # concluded the deliverable had to be .json and rejected the PDF three
+    # times, failing the run before the BUILD that produces it could be asked
+    # for. The heuristic stays only for tasks that never declared a filename.
+    if allowed_contract_paths:
+        expected_suffixes = {Path(p).suffix.lower() for p in allowed_contract_paths}
+    else:
+        task = _execution_task(session)
+        named_suffixes = {Path(m.group(1)).suffix.lower() for m in _FILENAME_RE.finditer(task)}
+        direct_suffixes = {f".{ext.lower()}" for ext in re.findall(
+            r"(?<![\w.])\.([a-z0-9]{1,10})\b", task, re.IGNORECASE)}
+        expected_suffixes = named_suffixes | direct_suffixes
+    expected_suffixes = {s for s in expected_suffixes if s and s != "."}
     suffix = Path(base).suffix.lower()
     if expected_suffixes and suffix not in expected_suffixes:
         return f"artifact filename does not match requested extension(s): {', '.join(sorted(expected_suffixes))}"
@@ -2607,6 +3061,41 @@ def _capture_panel_artifacts(
     the panelist role), so materialization/salvage still guard the pipeline."""
     captured = False
     for a in _parse_proposals(session.session_id, content, role=Role.panelist):
+        if a.kind in {"install_deps", "build_artifact"}:
+            plan = session.materialization_plan
+            if (session.collaboration_mode != "build_team" or not plan
+                    or str(plan.mode.value) != "build"
+                    or member.agent != session.work_package_owner):
+                continue
+            if a.kind == "build_artifact":
+                declared = {item.strip().replace("\\", "/") for item in
+                            str(a.args.get("produces") or "").split(",") if item.strip()}
+                expected = {name.replace("\\", "/") for name in
+                            (plan.build.outputs if plan.build else [])}
+                if declared != expected:
+                    store.log_event(
+                        session.session_id, "panel_build_rejected",
+                        {"agent": member.agent, "declared": sorted(declared),
+                         "expected": sorted(expected)},
+                    )
+                    continue
+            a.role = Role.implementer
+            a.args["package_author"] = member.agent or ""
+            with _SESSION_LOCK:
+                duplicate = any(
+                    existing.kind == a.kind and existing.args == a.args
+                    for existing in session.proposed_actions
+                )
+                if not duplicate:
+                    session.proposed_actions.append(a)
+                    store.log_event(
+                        session.session_id, "package_materialization_action_captured",
+                        {"agent": member.agent, "kind": a.kind,
+                         "command": a.args.get("command", ""),
+                         "produces": a.args.get("produces", "")},
+                    )
+                    store.save_session(session)
+            continue
         if a.kind != "write_file":
             continue  # edits/tests/promotes in a panel take are advice, not actions
         problem = _candidate_artifact_problem(session, a.filename)
@@ -2626,8 +3115,16 @@ def _capture_panel_artifacts(
         # files in different folders and could not safely enforce assignments.
         a.args["contract_filename"] = contract_filename
         a.args["package_author"] = member.agent
-        governance.authorize_action(session, a)
-        if a.status != "denied":
+        # Build-team owner drafts are an internal handoff, not an executable
+        # namespaced artifact.  Capture their bytes for exact-path adoption and
+        # avoid generating a fake God-mode scope denial for a scratch filename.
+        if session.collaboration_mode == "build_team":
+            a.status = "captured"
+            path = None
+            captured = True
+        else:
+            governance.authorize_action(session, a)
+        if session.collaboration_mode != "build_team" and a.status != "denied":
             try:
                 if (session.worker_lease
                         and not store.lease_is_current(session.session_id, session.worker_lease)):
@@ -2635,10 +3132,9 @@ def _capture_panel_artifacts(
                 path = executor.execute(session, a, store.data_dir)
                 a.status = "executed"
             except ExecutionError as e:
-                a.status = "failed"
-                a.error = str(e)
+                _record_action_execution_failure(session, a, e)
                 path = None
-        else:
+        elif session.collaboration_mode != "build_team":
             path = None
         with _SESSION_LOCK:
             session.proposed_actions.append(a)
@@ -2840,11 +3336,21 @@ def _pause_for_consent(
     manager: SessionManager,
     store: LogStore,
     reason: str = "",
-) -> None:
+) -> bool:
     """The automatic rotation's one checkpoint: after a block of rounds without
     DONE, ask the human whether the council should keep going."""
     n = len(session.rounds)
     block = config.ROUNDS_PER_CONSENT
+    if session.approval_policy == ApprovalPolicy.god_mode:
+        session.consent_extra_rounds += block
+        store.log_event(
+            session.session_id,
+            "round_consent_auto_resolved",
+            {"resolved_by": "god_mode", "round": session.current_round,
+             "additional_rounds": block, "reason": reason},
+        )
+        store.save_session(session)
+        return False
     req = InputRequest(
         session_id=session.session_id, agent="system", role=Role.coordinator,
         round=session.current_round, purpose="continue_rounds", resume_token="",
@@ -2860,13 +3366,22 @@ def _pause_for_consent(
     session.stop_reason = "waiting for go-ahead on more rounds"
     store.log_event(session.session_id, "input_requested", req.model_dump())
     manager.transition(session, SessionStatus.awaiting_input)
+    return True
 
 
 def _pause_for_integration_decision(
     session: Session, manager: SessionManager, store: LogStore, proposal: IntegrationProposal,
-) -> None:
+) -> bool:
     """Let the human choose an optional, validated merge over the vote winner."""
     session.integration_proposal = proposal
+    if session.approval_policy == ApprovalPolicy.god_mode:
+        proposal.status = "kept_winner"
+        store.log_event(
+            session.session_id, "integration_decision_auto_resolved",
+            {"resolved_by": "god_mode", "decision": "keep_winner"},
+        )
+        store.save_session(session)
+        return False
     req = InputRequest(
         session_id=session.session_id, agent="system", role=Role.coordinator,
         round=session.current_round, purpose="integration_decision", resume_token="",
@@ -2884,6 +3399,7 @@ def _pause_for_integration_decision(
     session.stop_reason = "waiting for human choice on council integration"
     store.log_event(session.session_id, "input_requested", req.model_dump())
     manager.transition(session, SessionStatus.awaiting_input)
+    return True
 
 
 def _revision_patch_summary(actions: list[ProposedAction]) -> str:
@@ -3024,6 +3540,15 @@ def _package_output_assignments(
     required = list(dict.fromkeys(
         name.replace("\\", "/") for name in session.required_files if name
     ))
+    if (session.materialization_plan is not None
+            and session.materialization_plan.mode == MaterializationMode.build):
+        # A model authors producer SOURCE.  The declared build owns the derived
+        # binary; calling the PDF itself "completed" before the command runs is
+        # false provenance and made failed sessions look productive.
+        required = list(dict.fromkeys(
+            name.replace("\\", "/")
+            for name in session.materialization_plan.producing_files if name
+        ))
     owner = next(
         (m for m in council.members
          if m.active and m.agent == session.work_package_owner),
@@ -3144,8 +3669,8 @@ def _package_author_timeout(session: Session, member: CouncilMember, retry: bool
         if member.agent in _frontier_seats(session) else
         config.PANEL_AUTHOR_TIMEOUT
     )
-    # A wave cap exists only when the operator explicitly configured a package
-    # deadline. The default zero passes through as no coordinator deadline.
+    # A package-wide deadline reserves time for later recovery phases; the
+    # adapter-level absolute ceiling still applies when this value is zero.
     if config.PACKAGE_AUTHOR_WAVE_TIMEOUT > 0:
         requested = (
             min(requested, config.PACKAGE_AUTHOR_WAVE_TIMEOUT)
@@ -3155,12 +3680,15 @@ def _package_author_timeout(session: Session, member: CouncilMember, retry: bool
 
 
 _COLLABORATION_ROLE_LENSES = (
+    (Role.knowledge_retriever, "sources"),
+    (Role.researcher, "research"),
     (Role.architect, "architecture"),
     (Role.critic, "correctness"),
     (Role.api_integrator, "integration"),
     (Role.red_team, "adversarial"),
     (Role.implementer, "implementation"),
     (Role.fact_validator, "verification"),
+    (Role.summarizer, "synthesis"),
 )
 _COLLABORATION_LENS_ROLES = {
     lens: role for role, lens in _COLLABORATION_ROLE_LENSES
@@ -3168,28 +3696,43 @@ _COLLABORATION_LENS_ROLES = {
 
 
 def _full_council_package(session: Session) -> bool:
-    """Whether this package earns the artifact-aware resource wave."""
-    if (session.participation_mode == "focused" or session.assembly_mode
+    """Whether this package receives the artifact-aware resource wave.
+
+    Task type is deliberately irrelevant. Gang of Eight is a resource policy,
+    not a code-only feature: a PDF, report, design, dataset, or program gets the
+    same enabled council. ``focused`` remains an explicit operator escape hatch;
+    every other Planned-build participation mode uses the whole healthy roster.
+    """
+    if (session.repair_mode or session.participation_mode == "focused" or session.assembly_mode
             or not session.required_files or len(session.resource_roster) < 2):
         return False
-    if session.participation_mode == "full_council":
-        return True
-    classification = session.classification
-    return bool(
-        session.participation_mode == "adaptive"
-        and _package_has_code_artifacts(session)
-        and classification
-        and classification.task_type == TaskType.code
-        and getattr(classification.complexity, "value", classification.complexity)
-        in {"standard", "complex"}
-    )
+    return session.participation_mode in {"adaptive", "full_council"}
+
+
+def _package_collaboration_paths(session: Session) -> set[str]:
+    """Text sources peers can inspect before deterministic materialization.
+
+    A binary output cannot exist until its producer runs. Requiring the PDF,
+    image, archive, or office document in the pre-build baseline made the full
+    council impossible for exactly those tasks. Review the authoritative
+    producer source first; the built bytes still pass their format validators
+    and independent release verification afterward.
+    """
+    plan = session.materialization_plan
+    if (plan is not None and plan.mode == MaterializationMode.build
+            and plan.producing_files):
+        return {
+            name.replace("\\", "/")
+            for name in plan.producing_files if name
+        }
+    return {
+        name.replace("\\", "/") for name in session.required_files if name
+    }
 
 
 def _package_baseline(session: Session) -> dict[str, str]:
     """Latest owner-accountable full contents for each contracted output."""
-    required = {
-        name.replace("\\", "/") for name in session.required_files if name
-    }
+    required = _package_collaboration_paths(session)
     baseline: dict[str, str] = {}
     for action in session.proposed_actions:
         name = (action.filename or "").replace("\\", "/")
@@ -3231,6 +3774,22 @@ def _ensure_collaboration_assignments(
         session.collaboration_assignments.append(
             CollaborationAssignment(seat=seat, lens=lens)
         )
+    if (session.collaboration_assignments
+            and not any(
+                item.lens == "implementation"
+                for item in session.collaboration_assignments
+            )):
+        implementer_seat = (role_agents or config.ROLE_AGENTS).get(
+            Role.implementer
+        )
+        standby = next(
+            (
+                item for item in session.collaboration_assignments
+                if item.seat == implementer_seat
+            ),
+            session.collaboration_assignments[-1],
+        )
+        standby.lens = "implementation"
     store.log_event(
         session.session_id,
         "package_collaboration_scheduled",
@@ -3253,9 +3812,75 @@ def _collaboration_patch_files(
     return list(dict.fromkeys(
         action.filename.replace("\\", "/")
         for action in _parse_proposals(session.session_id, content)
-        if (action.kind == "edit_file"
+        if (action.kind in {"edit_file", "write_file"}
             and action.filename.replace("\\", "/") in allowed)
     ))
+
+
+def _capture_collaboration_standby(
+    session: Session,
+    assignment: CollaborationAssignment,
+    member: CouncilMember,
+    content: str,
+    baseline: dict[str, str],
+    store: LogStore,
+) -> None:
+    """Persist an implementation lens's complete alternative as one unit."""
+    if assignment.lens != "implementation" or not baseline:
+        return
+    allowed = set(baseline)
+    writes = [
+        action for action in _parse_proposals(session.session_id, content)
+        if (action.kind == "write_file"
+            and action.filename.replace("\\", "/") in allowed
+            and (action.content or "").strip())
+    ]
+    by_path = {
+        action.filename.replace("\\", "/"): action for action in writes
+    }
+    if set(by_path) != allowed:
+        store.log_event(
+            session.session_id,
+            "collaboration_standby_incomplete",
+            {
+                "seat": member.agent,
+                "expected": sorted(allowed),
+                "received": sorted(by_path),
+            },
+        )
+        return
+    alternative = {
+        name: _clean_artifact_body(action.content, name)
+        for name, action in by_path.items()
+    }
+    problem = _integrated_package_problem(session, alternative)
+    if problem:
+        store.log_event(
+            session.session_id,
+            "collaboration_standby_rejected",
+            {"seat": member.agent, "reason": problem[:1000]},
+        )
+        return
+    group: list[str] = []
+    for name in sorted(alternative):
+        namespaced = f"{member.agent}__{name}"
+        candidate = by_path[name]
+        candidate.role = Role.panelist
+        candidate.filename = namespaced
+        candidate.content = alternative[name]
+        candidate.args["filename"] = namespaced
+        candidate.args["content"] = alternative[name]
+        candidate.args["package_author"] = member.agent
+        candidate.args["contract_filename"] = name
+        _append_proposals(session, store, [candidate])
+        group.append(namespaced)
+    if group not in session.candidate_fallback_groups:
+        session.candidate_fallback_groups.append(group)
+    store.log_event(
+        session.session_id,
+        "collaboration_standby_ready",
+        {"seat": member.agent, "files": sorted(allowed), "group": group},
+    )
 
 
 def _run_collaboration_assignment(
@@ -3265,29 +3890,92 @@ def _run_collaboration_assignment(
     call: AgentCall,
     store: LogStore,
     staged_context: str = "",
+    governance: Optional[Governance] = None,
+    recovery_seat: str = "",
 ) -> Optional[Contribution]:
     member = CouncilMember(
         role=_COLLABORATION_LENS_ROLES.get(assignment.lens, Role.panelist),
-        agent=assignment.seat,
+        agent=recovery_seat or assignment.seat,
         active=True,
     )
     with _SESSION_LOCK:
+        previous_error = assignment.error
+        if previous_error:
+            assignment.failure_history.append({
+                "recorded_at": utcnow(),
+                "seat": assignment.recovered_by or assignment.seat,
+                "error": previous_error,
+            })
         assignment.status = "running"
         assignment.attempts += 1
         assignment.error = ""
+        assignment.active_seat = member.agent
+        if recovery_seat and recovery_seat != assignment.seat:
+            assignment.recovered_by = recovery_seat
+            assignment.fallback_from = assignment.seat
         store.log_event(
             session.session_id, "package_collaboration_started",
             {"seat": assignment.seat, "lens": assignment.lens,
-             "attempt": assignment.attempts},
+             "agent": member.agent, "attempt": assignment.attempts,
+             "recovery": bool(recovery_seat)},
         )
         store.save_session(session)
     try:
-        contribution = call(
-            member,
-            rounds.package_collaboration_prompt(
-                session, member, assignment.lens, baseline, staged_context,
-            ),
+        prompt = rounds.package_collaboration_prompt(
+            session, member, assignment.lens, baseline, staged_context,
         )
+        if previous_error:
+            prompt += (
+                "\n\nRECOVERY FEEDBACK FROM THE PREVIOUS ATTEMPT:\n"
+                + previous_error[:1200]
+                + "\nThis attempt must change the failed behavior. Begin the "
+                  "delivered response with `VERDICT: PASS` or `VERDICT: CHANGES` "
+                  "before optional explanation, and reserve output capacity for "
+                  "the complete final protocol."
+            )
+            if "reasoning_only_output" in previous_error:
+                assignment.retry_strategy = "final_answer_only"
+                prompt += (
+                    "\nFINAL-ANSWER-ONLY RECOVERY: spend no output on private "
+                    "reasoning. Emit the required VERDICT/FINDING/EDIT protocol "
+                    "immediately."
+                )
+        contribution = call(member, prompt)
+        if (_SKILL_REQUEST_MARKER.search(contribution.content or "")
+                and governance is not None):
+            # A reviewer asking to inspect a referenced staged dependency has
+            # not failed. The ordinary council already knows how to authorize,
+            # execute, audit, and feed back safe read/web skills; collaboration
+            # accidentally skipped that resolver and mislabeled Gemini's
+            # responsible context request as a protocol failure.
+            with _SESSION_LOCK:
+                assignment.context_turns += 1
+                assignment.skill_requests.extend(
+                    request for request in (
+                        f"{name.lower()} {arg.strip()}".strip()
+                        for name, arg in _SKILL_REQUEST_MARKER.findall(
+                            contribution.content or ""
+                        )
+                    )
+                    if request and request not in assignment.skill_requests
+                )
+                assignment.status = "requesting_context"
+                store.log_event(
+                    session.session_id,
+                    "package_collaboration_context_requested",
+                    {"seat": assignment.seat, "lens": assignment.lens},
+                )
+                store.save_session(session)
+            contribution = _resolve_skill_requests(
+                session, member, prompt, contribution, call, governance, store,
+            )
+            assignment.context_results.append({
+                "recorded_at": utcnow(),
+                "tools_called": list(session.tools_called),
+                "completed": not bool(
+                    _SKILL_REQUEST_MARKER.search(contribution.content or "")
+                ),
+            })
     except SessionCancelled:
         with _SESSION_LOCK:
             assignment.status = "pending"
@@ -3304,6 +3992,10 @@ def _run_collaboration_assignment(
                 "unavailable" if state in UNAVAILABLE_STATES else "failed"
             )
             assignment.error = str(exc)[:500]
+            assignment.failure_history.append({
+                "recorded_at": utcnow(), "seat": member.agent,
+                "error": assignment.error,
+            })
             store.log_event(
                 session.session_id, "package_collaboration_failed",
                 {"seat": assignment.seat, "lens": assignment.lens,
@@ -3327,12 +4019,20 @@ def _run_collaboration_assignment(
             assignment.error = (
                 "collaboration reply did not satisfy the VERDICT/FINDING/EDIT contract"
             )
+            assignment.failure_history.append({
+                "recorded_at": utcnow(), "seat": member.agent,
+                "error": assignment.error,
+                "response_tail": (contribution.content or "")[-1000:],
+            })
             store.log_event(
                 session.session_id, "package_collaboration_protocol_miss",
                 {"seat": assignment.seat, "attempt": assignment.attempts},
             )
             store.save_session(session)
             return None
+        _capture_collaboration_standby(
+            session, assignment, member, contribution.content, baseline, store,
+        )
         assignment.status = "contributed"
         try:
             assignment.contribution_index = session.contributions.index(contribution)
@@ -3341,6 +4041,7 @@ def _run_collaboration_assignment(
         store.log_event(
             session.session_id, "package_collaboration_contributed",
             {"seat": assignment.seat, "lens": assignment.lens,
+             "agent": member.agent, "recovered_by": assignment.recovered_by,
              "findings": len(assignment.findings),
              "patch_files": assignment.patch_files},
         )
@@ -3355,6 +4056,45 @@ def _integrated_package_problem(
         if not (content or "").strip():
             return f"integrated file is empty: {filename}"
         suffix = Path(filename).suffix.lower()
+        if suffix == ".py":
+            try:
+                tree = ast.parse(content, filename=filename)
+            except SyntaxError as exc:
+                return f"integrated Python is invalid: {filename}:{exc.lineno}: {exc.msg}"
+            known = {
+                name.replace("\\", "/")
+                for name in [
+                    *integrated,
+                    *session.dependency_hashes,
+                    *((session.materialization_plan.authoritative_inputs)
+                      if session.materialization_plan else []),
+                    *((session.materialization_plan.producing_files)
+                      if session.materialization_plan else []),
+                    *((session.materialization_plan.build.inputs)
+                      if session.materialization_plan and session.materialization_plan.build
+                      else []),
+                ]
+                if name
+            }
+            known_bases = {Path(name).name.casefold() for name in known}
+            referenced = {
+                str(node.value).strip().replace("\\", "/")
+                for node in ast.walk(tree)
+                if (isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and str(node.value).strip().lower().endswith(".py")
+                    and not str(node.value).strip().lower().startswith(("http://", "https://")))
+            }
+            missing_refs = sorted(
+                ref for ref in referenced
+                if Path(ref).name.casefold() not in known_bases
+            )
+            if missing_refs:
+                return (
+                    f"integrated Python references undeclared local source(s): "
+                    + ", ".join(missing_refs[:8])
+                    + "; make the producer self-contained or declare and stage each input"
+                )
         if suffix in {".html", ".htm"}:
             low = content.lower()
             if not (("<!doctype html" in low or "<html" in low)
@@ -3371,6 +4111,121 @@ def _integrated_package_problem(
             if testable and not ran:
                 return f"integrated artifact failed runtime preflight: {detail}"
     return ""
+
+
+def _repair_package_baseline_preflight(
+    session: Session,
+    council: Council,
+    baseline: dict[str, str],
+    problem: str,
+    call: AgentCall,
+    owner_call: AgentCall,
+    store: LogStore,
+) -> Optional[dict[str, str]]:
+    """Repair an objectively invalid producer before paying for peer review."""
+    failure = recovery.record_failure(
+        session,
+        stage="producer_preflight",
+        category="dependency_closure" if "undeclared local" in problem
+        else "invalid_producer",
+        summary=problem,
+        evidence={"files": sorted(baseline), "problem": problem},
+        responsible_owner=session.work_package_owner,
+        producer_paths=sorted(baseline),
+    )
+    owner = CouncilMember(
+        role=Role.code_generator,
+        agent=session.work_package_owner,
+        active=True,
+    )
+    supervisor = council.get(Role.recovery_supervisor)
+    candidates = [owner]
+    if (supervisor and supervisor.agent
+            and supervisor.agent != session.work_package_owner):
+        candidates.append(CouncilMember(
+            role=Role.recovery_supervisor,
+            agent=supervisor.agent,
+            active=True,
+        ))
+    for seat in session.package_helpers or session.resource_roster:
+        if seat and all(item.agent != seat for item in candidates):
+            candidates.append(CouncilMember(
+                role=Role.implementer, agent=seat, active=True,
+            ))
+    source_bundle = "\n\n".join(
+        f"FILE: {name}\n-----\n{content}\n-----"
+        for name, content in baseline.items()
+    )
+    for index, member in enumerate(candidates):
+        prompt = (
+            "A deterministic producer preflight failed before council review.\n"
+            f"Failure: {problem}\n\n"
+            "Return complete corrected source for every changed file using only:\n"
+            "ARTIFACT: <exact existing path>\n<complete bytes>\nEND_ARTIFACT\n\n"
+            "Do not reference local source files that are not included in this "
+            "working set. Preserve valid work and make the producer executable "
+            "from its declared sandbox.\n\n" + source_bundle
+        )
+        try:
+            reply = (owner_call if index == 0 else call)(member, prompt)
+        except (AgentError, BudgetExceeded) as exc:
+            store.log_event(
+                session.session_id, "producer_preflight_repair_seat_failed",
+                {"agent": member.agent, "reason": str(exc)[:500]},
+            )
+            continue
+        proposals = [
+            action for action in _parse_proposals(session.session_id, reply.content)
+            if (action.kind in {"write_file", "edit_file"}
+                and action.filename.replace("\\", "/") in baseline
+                and (action.content or "").strip())
+        ]
+        if not proposals:
+            continue
+        repaired = dict(baseline)
+        for action in proposals:
+            repaired[action.filename.replace("\\", "/")] = action.content
+        remaining = _integrated_package_problem(session, repaired)
+        if remaining:
+            store.log_event(
+                session.session_id, "producer_preflight_repair_rejected",
+                {"agent": member.agent, "reason": remaining[:1000]},
+            )
+            continue
+        payload_hash = hashlib.sha256(
+            (reply.content or "").encode("utf-8")
+        ).hexdigest()[:16]
+        attempt = recovery.begin_repair(
+            session, failure, repair_owner=reply.agent or member.agent or "",
+            strategy=f"producer_preflight:{payload_hash}",
+            input_hashes={
+                name: hashlib.sha256(content.encode("utf-8")).hexdigest()
+                for name, content in baseline.items()
+            },
+        )
+        if attempt is None:
+            continue
+        _replace_package_baseline(session, repaired, store)
+        recovery.finish_repair(
+            session, attempt, verified=True, changed_files=repaired.keys(),
+        )
+        profiles = getattr(store, "seat_profiles", None)
+        if profiles is not None and attempt.owner:
+            profiles.remember_verified_recovery(
+                attempt.owner,
+                fault_signature=failure.fault_signature,
+                category=failure.category,
+                strategy=attempt.strategy,
+                changed_files=repaired.keys(),
+                session_id=session.session_id,
+            )
+        store.log_event(
+            session.session_id, "producer_preflight_recovered",
+            {"agent": attempt.owner, "files": sorted(repaired)},
+        )
+        return repaired
+    recovery.mark_exhausted(session, failure)
+    return None
 
 
 def _replace_package_baseline(
@@ -3402,6 +4257,7 @@ def _run_package_collaboration(
     store: LogStore,
     role_agents: Optional[dict[Role, str]],
     staged_context: str = "",
+    governance: Optional[Governance] = None,
 ) -> None:
     """Run the full resource council against real owner-authored bytes."""
     if not _full_council_package(session):
@@ -3409,33 +4265,120 @@ def _run_package_collaboration(
     if session.collaboration_integration_status == "integrated":
         return
     baseline = _package_baseline(session)
-    if not baseline or set(baseline) != {
-            name.replace("\\", "/") for name in session.required_files}:
+    if not baseline or set(baseline) != _package_collaboration_paths(session):
         session.collaboration_integration_status = "baseline_unavailable"
         store.save_session(session)
         return
+    baseline_problem = _integrated_package_problem(session, baseline)
+    if baseline_problem:
+        repaired = _repair_package_baseline_preflight(
+            session, council, baseline, baseline_problem,
+            call, owner_call, store,
+        )
+        if repaired is None:
+            raise QualityGateFailed(
+                "producer preflight remained invalid after independent recovery: "
+                + baseline_problem
+            )
+        baseline = repaired
+    # The implementation-lens resource supplies the hot standby in its normal
+    # council call. A separate shadow-producer call duplicated cost without
+    # adding another brain to the goal.
     if not session.collaboration_baseline:
         session.collaboration_baseline = dict(baseline)
     assignments = _ensure_collaboration_assignments(session, role_agents, store)
-    # One bounded retry recovers a malformed review envelope or transient call
-    # failure. Hard-unavailable seats remain visible and are never burned again.
-    for wave in range(2):
-        pending = [
-            assignment for assignment in assignments
-            if assignment.status in {"pending", "failed"}
-            and assignment.attempts < 2
-        ]
-        if not pending:
-            break
+    pending = [
+        assignment for assignment in assignments
+        if assignment.status == "pending" and assignment.attempts < 1
+    ]
+    if pending:
         _fan_out(
             session,
             pending,
             lambda assignment: _run_collaboration_assignment(
                 session, assignment, baseline, call, store,
-                staged_context,
+                staged_context, governance,
             ),
-            f"package-collaboration-{wave + 1}",
+            "package-collaboration",
         )
+    # Reasoning-only output has one known, changed retry variable: demand the
+    # protocol immediately with a final-answer-only prompt. Other failures go
+    # straight to a distinct-seat takeover; repeating them is not recovery.
+    reasoning_only = [
+        assignment for assignment in assignments
+        if assignment.status == "failed"
+        and "reasoning_only_output" in assignment.error
+        and assignment.attempts < 2
+    ]
+    if reasoning_only:
+        _fan_out(
+            session,
+            reasoning_only,
+            lambda assignment: _run_collaboration_assignment(
+                session, assignment, baseline, call, store,
+                staged_context, governance,
+            ),
+            "package-collaboration-final-answer-recovery",
+        )
+    # If a seat still cannot fulfill its lens, preserve that failure and assign
+    # the SAME lens once to a distinct healthy peer. This is production
+    # redundancy, not pretending the original seat succeeded.
+    failed = [
+        assignment for assignment in assignments
+        if assignment.status in {"failed", "unavailable"}
+    ]
+    if failed:
+        healthy = [
+            assignment.seat for assignment in assignments
+            if assignment.status == "contributed"
+        ]
+        healthy.extend(
+            seat for seat in session.resource_roster
+            if seat and seat != session.work_package_owner
+        )
+        healthy.append(session.work_package_owner)
+        fallback_map: dict[str, str] = {}
+        used: set[str] = set()
+        for assignment in failed:
+            replacement = next(
+                (seat for seat in dict.fromkeys(healthy)
+                 if seat and seat != assignment.seat and seat not in used),
+                "",
+            )
+            if replacement:
+                fallback_map[assignment.assignment_id] = replacement
+                used.add(replacement)
+        if fallback_map:
+            store.log_event(
+                session.session_id, "package_collaboration_recovery_scheduled",
+                {"assignments": [
+                    {"seat": item.seat, "lens": item.lens,
+                     "recovery_seat": fallback_map[item.assignment_id]}
+                    for item in failed if item.assignment_id in fallback_map
+                ]},
+            )
+            _fan_out(
+                session,
+                [item for item in failed if item.assignment_id in fallback_map],
+                lambda assignment: _run_collaboration_assignment(
+                    session, assignment, baseline, call, store,
+                    staged_context, governance,
+                    recovery_seat=fallback_map[assignment.assignment_id],
+                ),
+                "package-collaboration-recovery",
+            )
+    if all(
+            assignment.status not in {"pending", "running", "requesting_context"}
+            for assignment in assignments):
+        session.phase = "participation_complete"
+        store.log_event(
+            session.session_id, "package_participation_complete",
+            {"seats": len(assignments),
+             "contributed": sum(
+                 1 for item in assignments if item.status == "contributed"
+             )},
+        )
+        store.save_session(session)
     contributions: list[tuple[str, str]] = []
     for assignment in assignments:
         index = assignment.contribution_index
@@ -3514,6 +4457,7 @@ def _run_package_collaboration(
         return
     _replace_package_baseline(session, writes, store)
     session.collaboration_integration_status = "integrated"
+    session.phase = "integrated"
     store.log_event(
         session.session_id, "package_collaboration_integrated",
         {"owner": session.work_package_owner, "files": sorted(writes),
@@ -3532,6 +4476,10 @@ def _adopt_owned_package_artifacts(
     the accepted bytes into shared staging.
     """
     required = [name.replace("\\", "/") for name in session.required_files]
+    producing = [name.replace("\\", "/") for name in
+                 (session.materialization_plan.producing_files
+                  if session.materialization_plan else [])]
+    adoptable = list(dict.fromkeys([*required, *producing]))
     existing = {
         a.filename.replace("\\", "/") for a in session.proposed_actions
         if a.kind == "write_file" and a.role != Role.panelist
@@ -3547,15 +4495,15 @@ def _adopt_owned_package_artifacts(
             continue
         draft_agent = str(draft.args.get("package_author") or filename_agent)
         contract_filename = str(draft.args.get("contract_filename") or "").replace("\\", "/")
-        matches = [name for name in required if _basename(name) == _basename(base)]
-        if contract_filename in required:
+        matches = [name for name in adoptable if _basename(name) == _basename(base)]
+        if contract_filename in adoptable:
             filename = contract_filename
         elif len(matches) == 1:
             filename = matches[0]
-        elif not required:
+        elif not adoptable:
             filename = _basename(base)
-        elif len(required) == 1 and Path(required[0]).suffix.lower() == Path(base).suffix.lower():
-            filename = required[0]
+        elif len(adoptable) == 1 and Path(adoptable[0]).suffix.lower() == Path(base).suffix.lower():
+            filename = adoptable[0]
         else:
             continue
         expected_author = session.package_output_authors.get(filename, owner)
@@ -3612,16 +4560,51 @@ def _adopt_owned_package_artifacts(
         ))
         adopted.append(filename)
     if proposals:
-        contract_order = {filename: index for index, filename in enumerate(required)}
+        contract_order = {filename: index for index, filename in enumerate(adoptable)}
         proposals.sort(key=lambda proposal: contract_order.get(
             proposal.filename.replace("\\", "/"), len(contract_order)
         ))
         adopted = [proposal.filename.replace("\\", "/") for proposal in proposals]
         _append_proposals(session, store, proposals)
+        # The owner's reply declares BUILD beside its producer source, so the
+        # parsed build action was captured before the namespaced source was
+        # adopted into its real path. Execute source writes first, then INSTALL,
+        # then BUILD; otherwise a valid recipe fails because its script has not
+        # yet been materialized.
+        deferred = [
+            action for action in session.proposed_actions
+            if (action.kind in {"install_deps", "build_artifact"}
+                and action.status == "proposed"
+                and action.args.get("package_author"))
+        ]
+        if deferred:
+            session.proposed_actions = [
+                action for action in session.proposed_actions
+                if action not in deferred
+            ] + sorted(
+                deferred,
+                key=lambda action: 0 if action.kind == "install_deps" else 1,
+            )
+            store.save_session(session)
         store.log_event(session.session_id, "work_package_outputs_adopted",
                         {"owner": owner, "files": adopted})
     present = existing | set(adopted)
-    return adopted, [name for name in required if name not in present]
+    declared_build_outputs = {
+        item.strip().replace("\\", "/")
+        for action in session.proposed_actions
+        if action.kind == "build_artifact" and action.status in {
+            "proposed", "awaiting_approval", "approved", "executed"
+        }
+        for item in str(action.args.get("produces") or "").split(",")
+        if item.strip()
+    }
+    missing = [
+        name for name in required
+        if name not in present and name not in declared_build_outputs
+    ]
+    if declared_build_outputs and any(name not in present for name in producing):
+        missing.extend(name for name in producing if name not in present)
+    return adopted, list(dict.fromkeys(missing))
 
 
 def _assembly_sources(session: Session) -> list[str]:
@@ -3743,8 +4726,9 @@ def _run_panel_rounds(
     while not session.compose_now:
         r = len(session.rounds)
         if r > 0 and r >= config.ROUNDS_PER_CONSENT + session.consent_extra_rounds:
-            _pause_for_consent(session, manager, store)
-            return True
+            if _pause_for_consent(session, manager, store):
+                return True
+            continue
         remaining = (session.budgets.max_agent_calls - session.agent_calls
                      - config.COMPOSER_RESERVED_CALLS)
         if r > 0 and remaining < 2:
@@ -3752,15 +4736,20 @@ def _run_panel_rounds(
             break
         if r > 0 and time.monotonic() - start > session.budgets.max_wall_seconds:
             elapsed = max(1, int((time.monotonic() - start) // 60))
-            _pause_for_consent(
-                session, manager, store,
-                reason=(
-                    f"This run has been active for about {elapsed} minute"
-                    f"{'' if elapsed == 1 else 's'}. Elapsed time alone does not "
-                    "stop it; choose whether the council should continue."
-                ),
+            reason = (
+                f"This run has been active for about {elapsed} minute"
+                f"{'' if elapsed == 1 else 's'} and reached its wall-time budget."
             )
-            return True
+            if session.approval_policy == ApprovalPolicy.god_mode:
+                session.unresolved.append(
+                    reason + " God mode does not silently expand finite budgets."
+                )
+                session.stop_reason = (
+                    "manual intervention required: wall-time budget exhausted"
+                )
+                break
+            if _pause_for_consent(session, manager, store, reason=reason):
+                return True
         session.current_round = r
         build_package = bool(
             session.collaboration_mode == "build_team" and session.work_package_owner
@@ -3775,10 +4764,26 @@ def _run_panel_rounds(
                     f"package {session.work_package_id or r + 1} exhausted its shared "
                     "authoring deadline"
                 )
+            if _full_council_package(session):
+                # Schedule every peer before authoring begins so status and
+                # cancellation surfaces show the real team immediately. Calls
+                # begin after the owner's concrete baseline exists, enabling
+                # evidence-based review instead of six speculative plans.
+                _ensure_collaboration_assignments(session, role_agents, store)
             package_assignments = _package_output_assignments(session, council)
             if session.required_files and not package_assignments:
                 raise QualityGateFailed("package has required outputs but no accountable author")
-            package_jobs = _package_author_jobs(package_assignments)
+            resumable_baseline = bool(
+                session.phase in {
+                    "baseline_ready", "participation_complete", "integrated",
+                    "built", "objective_validated",
+                }
+                and _package_baseline(session)
+            )
+            package_jobs = (
+                [] if resumable_baseline
+                else _package_author_jobs(package_assignments)
+            )
             session.package_output_authors = {
                 filename: member.agent
                 for filename, member in package_assignments.items()
@@ -3797,6 +4802,7 @@ def _run_panel_rounds(
                     "seconds_remaining": remaining_deadline,
                     "wave_timeout_s": config.PACKAGE_AUTHOR_WAVE_TIMEOUT,
                     "authorship_policy": "owner_atomic",
+                    "resumed_baseline": resumable_baseline,
                     "failover_policy": (
                         "owner-atomic primary; exact missing paths fan out to untried helpers"
                     ),
@@ -3834,18 +4840,50 @@ def _run_panel_rounds(
         readable = _readable_files(session, store.data_dir)
         # the big up-front context is only worth its tokens once — round 1
         ov = established_overview if r == 0 and not assembly_package else ""
+        cwd_capable = bool(
+            build_package and package_jobs and registry
+            and all(
+                getattr(registry.get(member.agent), "supports_cwd", False)
+                for member, _files in package_jobs
+            )
+        )
         dependency_context = (
-            _accepted_dependency_context(session, store.data_dir)
+            (_accepted_dependency_manifest(session) if cwd_capable
+             else _accepted_dependency_context(session, store.data_dir))
             if build_package and not assembly_package else ""
         )
         author_context = "\n\n".join(
             item for item in (dependency_context, ov) if item
         )
 
+        def wave_calls(
+            jobs: list[tuple[CouncilMember, list[str]]], wave: str,
+        ) -> dict[str, AgentCall]:
+            bound: dict[str, AgentCall] = {}
+            for member, _files in jobs:
+                adapter = registry.get(member.agent) if registry else None
+                cwd = (
+                    _prepare_package_working_set(session, store, member, wave)
+                    if getattr(adapter, "supports_cwd", False) else None
+                )
+
+                def invoke(
+                    called_member: CouncilMember, prompt: str,
+                    timeout_s: Optional[int] = None, *, _cwd: Optional[str] = cwd,
+                ) -> Contribution:
+                    return call(
+                        called_member, prompt, timeout_s,
+                        **({"cwd": _cwd} if _cwd else {}),
+                    )
+
+                bound[member.agent] = invoke
+            return bound
+
         # (a) FAN-OUT — every panel seat answers in parallel (bounded by the
         # per-kind semaphores inside _agent_call); a failing seat is dropped.
         results: list[Contribution] = []
         if build_package and package_jobs:
+            primary_calls = wave_calls(package_jobs, "primary")
             for _member, filenames in package_jobs:
                 for filename in filenames:
                     session.package_output_attempts[filename] += 1
@@ -3859,7 +4897,7 @@ def _run_panel_rounds(
                         session, job[0], r, job[1], session.package_output_authors,
                         staged_context=author_context,
                     ),
-                    call,
+                    primary_calls[job[0].agent],
                     governance,
                     store,
                     _package_author_timeout(session, job[0]),
@@ -3908,6 +4946,7 @@ def _run_panel_rounds(
             }
             retry_jobs = _package_author_jobs(retry_assignments)
             if retry_jobs and _package_time_available(session):
+                correction_calls = wave_calls(retry_jobs, "correction")
                 for _member, filenames in retry_jobs:
                     for filename in filenames:
                         session.package_output_attempts[filename] += 1
@@ -3933,7 +4972,7 @@ def _run_panel_rounds(
                                         if "assembly template rejected" in item), "")
                             ),
                         ),
-                        call,
+                        correction_calls[job[0].agent],
                         governance,
                         store,
                         _package_author_timeout(session, job[0], retry=True),
@@ -3962,6 +5001,7 @@ def _run_panel_rounds(
             )
             failover_jobs = _package_author_jobs(failover_assignments)
             if failover_jobs and _package_time_available(session):
+                failover_calls = wave_calls(failover_jobs, "failover")
                 for filename, member in failover_assignments.items():
                     previous = session.package_output_authors.get(
                         filename, session.work_package_owner
@@ -4002,7 +5042,7 @@ def _run_panel_rounds(
                                 "files now: " + ", ".join(job[1])
                             ),
                         ),
-                        call,
+                        failover_calls[job[0].agent],
                         governance,
                         store,
                         _package_author_timeout(session, job[0], retry=True),
@@ -4036,6 +5076,7 @@ def _run_panel_rounds(
                 }
                 final_jobs = _package_author_jobs(final_assignments)
                 if final_jobs and _package_time_available(session):
+                    final_calls = wave_calls(final_jobs, "failover_correction")
                     for _member, filenames in final_jobs:
                         for filename in filenames:
                             session.package_output_attempts[filename] += 1
@@ -4059,7 +5100,7 @@ def _run_panel_rounds(
                                       "complete files now."
                                 ),
                             ),
-                            call,
+                            final_calls[job[0].agent],
                             governance,
                             store,
                             _package_author_timeout(session, job[0], retry=True),
@@ -4110,9 +5151,14 @@ def _run_panel_rounds(
             # findings into one cohesive final output set. This is distinct
             # from package ownership: peers propose code; they never silently
             # replace the accountable author's files.
+            if session.phase not in {
+                    "participation_complete", "integrated", "built",
+                    "objective_validated"}:
+                session.phase = "baseline_ready"
+            store.save_session(session)
             _run_package_collaboration(
                 session, council, call, lead_call, store, role_agents,
-                author_context,
+                author_context, governance=governance,
             )
             summary = (
                 f"Package {session.work_package_id or r + 1} was authored and staged by "
@@ -4144,8 +5190,9 @@ def _run_panel_rounds(
             )
             if bon is not None:
                 if bon.get("integration"):
-                    _pause_for_integration_decision(session, manager, store, bon["integration"])
-                    return True
+                    if _pause_for_integration_decision(
+                            session, manager, store, bon["integration"]):
+                        return True
                 chair = bon.get("chair", "")
                 authored = bon.get("authored", bon["candidates"])
                 runnable_count = bon.get("runnable", bon["candidates"])
@@ -4274,7 +5321,8 @@ def _run_panel_rounds(
                         {"round": r, "decision": decision, "why": why[:200]})
         if decision == "DONE":
             break
-    session.stop_reason = "council produced a result"
+    if not session.stop_reason:
+        session.stop_reason = "council produced a result"
     return False
 
 
@@ -4354,6 +5402,7 @@ def run_session(
     cls = _refine_classification(
         session, registry, store, cls, classification_text, role_agents)
     session.classification = cls
+    _ensure_session_materialization_plan(session)
     if not session.budgets_locked:
         session.budgets = config.budgets_for(cls.complexity)
     store.log_event(sid, "classified", cls.model_dump())
@@ -4489,9 +5538,11 @@ def _deliberate(
     if established_overview:
         store.log_event(sid, "context_overview", {"chars": len(established_overview)})
 
-    def call(member: CouncilMember, prompt: str, timeout_s: Optional[int] = None) -> Contribution:
+    def call(member: CouncilMember, prompt: str, timeout_s: Optional[int] = None,
+             cwd: Optional[str] = None) -> Contribution:
         return _agent_call(session, registry, store, member, prompt,
-                           timeout_s=timeout_s, reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+                           timeout_s=timeout_s, reserve=config.COMPOSER_RESERVED_CALLS,
+                           images=images, cwd=cwd)
 
     def compose_call(member: CouncilMember, prompt: str) -> Contribution:
         return _agent_call(session, registry, store, member, prompt, images=images)
@@ -4508,9 +5559,16 @@ def _deliberate(
         # authoring described files, finishing cut-offs, fixing tests. Heavy work,
         # so it gets the longer timeout. `member` is the codifier the caller
         # resolved via _codifier(); the lead's fast path stays on lead_call.
+        adapter = registry.get(member.agent)
+        cwd = (
+            _prepare_package_working_set(session, store, member, "codifier_repair")
+            if (session.work_package_id and getattr(adapter, "supports_cwd", False))
+            else None
+        )
         return _agent_call(session, registry, store, member, prompt,
                            timeout_s=config.CODIFIER_TIMEOUT,
-                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+                           reserve=config.COMPOSER_RESERVED_CALLS, images=images,
+                           cwd=cwd)
 
     def owner_repair_call(member: CouncilMember, prompt: str) -> Contribution:
         """A package owner repairs its own bytes under authoring policy.
@@ -4519,16 +5577,193 @@ def _deliberate(
         instead of being accidentally re-called through the summarizer/codifier
         wrapper.
         """
-        timeout = (config.FRONTIER_AUTHOR_TIMEOUT
-                   if member.agent in _frontier_seats(session)
-                   else config.PANEL_AUTHOR_TIMEOUT)
-        return _agent_call(session, registry, store, member, prompt,
+        # Repairs are executable implementation work. Reusing the owner's
+        # existing council member accidentally called Codex as `lead`, whose
+        # CLI policy is read-only; use the implementer role explicitly.
+        repair_member = CouncilMember(
+            role=Role.implementer, agent=member.agent, active=True,
+        )
+        requested = (config.FRONTIER_AUTHOR_TIMEOUT
+                     if member.agent in _frontier_seats(session)
+                     else config.PANEL_AUTHOR_TIMEOUT)
+        timeout = config.RECOVERY_CALL_TIMEOUT if requested <= 0 else min(
+            requested, config.RECOVERY_CALL_TIMEOUT
+        )
+        adapter = registry.get(repair_member.agent)
+        cwd = (
+            _prepare_package_working_set(session, store, repair_member, "owner_repair")
+            if (session.work_package_id and getattr(adapter, "supports_cwd", False))
+            else None
+        )
+        return _agent_call(session, registry, store, repair_member, prompt,
                            timeout_s=timeout,
-                           reserve=config.COMPOSER_RESERVED_CALLS, images=images)
+                           reserve=0, images=images,
+                           cwd=cwd)
+
+    def supervised_repair_call(member: CouncilMember, prompt: str) -> Contribution:
+        """Use an independent AI supervisor, then reseat a failed repair.
+
+        The supervisor is event-driven: it runs only for a concrete recoverable
+        failure. It may return the complete repair itself. If it returns only a
+        diagnosis/delegation or its call fails, another healthy seat receives
+        that evidence and the exact repair contract. No unchanged same-seat
+        repair is repeated.
+        """
+        primary = (member.agent or "").strip()
+        configured = council.get(Role.recovery_supervisor)
+        ordered: list[str] = []
+        if configured and configured.agent:
+            ordered.append(configured.agent)
+        ordered.append(primary)
+        ordered.extend(session.resource_roster or [])
+        ordered.extend(registry.names())
+        candidates = [
+            name for name in dict.fromkeys(ordered)
+            if name and name != "system" and registry.get(name) is not None
+        ]
+        causal = next(
+            (item for item in reversed(session.failure_records)
+             if item.category in {
+                 "build_command_failed", "test_command_failed",
+                 "dependency_install_failed", "deterministic_validation",
+             }),
+            session.failure_records[-1] if session.failure_records else None,
+        )
+        evidence = (
+            f"Failure ID: {causal.failure_id}\n"
+            f"Category: {causal.category}\n"
+            f"Summary:\n{causal.summary[:6000]}\n"
+            if causal else "Failure: deterministic delivery verification failed.\n"
+        )
+        failures: list[str] = []
+        diagnosis = ""
+        requested_delegate = ""
+
+        def has_payload(reply: Contribution) -> bool:
+            actions = _parse_proposals(session.session_id, reply.content or "")
+            if "BUILD:" in prompt:
+                return any(action.kind == "build_artifact" for action in actions)
+            return any(action.kind in {"write_file", "edit_file"} for action in actions)
+
+        for index, agent in enumerate(candidates):
+            if requested_delegate and agent != requested_delegate:
+                continue
+            is_supervisor = index == 0
+            repair_prompt = prompt
+            if is_supervisor:
+                repair_prompt = (
+                    "You are the run's Recovery Supervisor. Observe the fresh "
+                    "machine evidence below, identify the first causal fault, and "
+                    "perform a complete repair now if you can. Preserve valid work. "
+                    "Your response must satisfy the exact repair contract after the "
+                    "evidence. If another enabled seat should execute it, respond "
+                    "`DELEGATE: <seat> - <precise changed repair instructions>`.\n\n"
+                    + evidence + "\nEXACT REPAIR CONTRACT\n" + prompt
+                )
+            elif diagnosis:
+                repair_prompt = (
+                    f"Independent recovery diagnosis:\n{diagnosis[:5000]}\n\n"
+                    "The prior seat did not deliver an executable repair. Produce "
+                    "the exact repair payload now.\n\n" + prompt
+                )
+            role = Role.recovery_supervisor if is_supervisor else Role.implementer
+            call_member = CouncilMember(role=role, agent=agent, active=True)
+            try:
+                # Supervisor and delegates need the same complete isolated
+                # working set. Calls are finite and individually observable.
+                adapter = registry.get(agent)
+                cwd = (
+                    _prepare_package_working_set(
+                        session, store, call_member,
+                        "recovery_supervisor" if is_supervisor else "recovery_delegate",
+                    )
+                    if (session.work_package_id
+                        and getattr(adapter, "supports_cwd", False)) else None
+                )
+                reply = _agent_call(
+                    session, registry, store, call_member, repair_prompt,
+                    timeout_s=config.RECOVERY_CALL_TIMEOUT, reserve=0,
+                    images=images, cwd=cwd,
+                )
+                if (_SKILL_REQUEST_MARKER.search(reply.content or "")
+                        and not has_payload(reply)):
+                    reply = _resolve_skill_requests(
+                        session, call_member, repair_prompt, reply, call,
+                        governance, store,
+                    )
+                diagnosis = reply.content or ""
+                delegate_match = re.search(
+                    r"^\s*DELEGATE\s*:\s*([A-Za-z0-9_.-]+)\s*(?:-|—|:)\s*(.+)$",
+                    diagnosis, re.IGNORECASE | re.MULTILINE,
+                )
+                if delegate_match:
+                    named = delegate_match.group(1).strip()
+                    requested_delegate = named if named in candidates else ""
+                    diagnosis = delegate_match.group(2).strip() + "\n\n" + diagnosis
+                if has_payload(reply):
+                    event = {
+                        "recorded_at": utcnow(),
+                        "failure_id": causal.failure_id if causal else "",
+                        "supervisor": candidates[0] if candidates else "",
+                        "repair_agent": reply.agent,
+                        "status": "repair_proposed",
+                        "diagnosis": diagnosis[:2000],
+                    }
+                    session.recovery_supervisor_events.append(event)
+                    store.log_event(session.session_id, "recovery_supervisor_action", event)
+                    store.save_session(session)
+                    return reply
+            except (AgentError, BudgetExceeded) as exc:
+                failures.append(f"{agent}: {exc}")
+                store.log_event(
+                    session.session_id, "recovery_supervisor_seat_failed",
+                    {"agent": agent, "reason": str(exc)[:500]},
+                )
+                requested_delegate = ""
+                continue
+            requested_delegate = ""
+        event = {
+            "recorded_at": utcnow(),
+            "failure_id": causal.failure_id if causal else "",
+            "supervisor": candidates[0] if candidates else "",
+            "status": "exhausted",
+            "diagnosis": diagnosis[:2000],
+            "seat_failures": failures,
+        }
+        session.recovery_supervisor_events.append(event)
+        store.log_event(session.session_id, "recovery_supervisor_exhausted", event)
+        store.save_session(session)
+        raise AgentError(
+            "recovery supervisor exhausted healthy repair seats"
+            + (": " + "; ".join(failures) if failures else "")
+        )
 
     lead = council.get(Role.lead)
     lead_failed = False  # a timed-out/errored lead can't be usefully re-called
     try:
+        if (_requires_retrieved_research(session)
+                and not _has_usable_retrieved_research(session)):
+            reason = _WEB_FAILURES.get(
+                session.session_id, "no retrievable web evidence was recorded")
+            transient_research_failure = any(
+                marker in reason.lower() for marker in (
+                    "connection", "timed out", "timeout", "getaddrinfo",
+                    "temporarily unavailable", "dns", "10053", "10054",
+                    "provider failed",
+                )
+            )
+            recovery.record_failure(
+                session,
+                stage="research",
+                category="capability_gap",
+                summary="required retrieved research was unavailable",
+                evidence={"reason": reason},
+                recoverable=transient_research_failure,
+            )
+            raise QualityGateFailed(
+                "the contract requires sourced research, but retrieval did not "
+                f"succeed ({reason}); model recall is not accepted as research"
+            )
         if not _has_proposals(session) and lead and lead.active and not session.compose_now:
             if (
                 _is_in_place_revision(session)
@@ -4703,6 +5938,14 @@ def _deliberate(
     verified = True
     if _needs_file or _has_file_actions:
         verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
+        orchestrator_failure = next(
+            (
+                action for action in reversed(session.proposed_actions)
+                if action.status == "failed"
+                and action.failure_layer == "orchestrator"
+            ),
+            None,
+        )
         # Coordinator-discovered failures get their own repair state machine.
         # Do not send an author into a futile repair loop when the failure is an
         # external immutable-input conflict; changing the artifact cannot repair
@@ -4716,6 +5959,17 @@ def _deliberate(
             session.unresolved.append(
                 "artifact repair skipped: verification failure is an external dependency conflict")
             store.log_event(sid, "artifact_repair_skipped", {"reason": "external_dependency_conflict"})
+        if not verified and orchestrator_failure is not None:
+            store.log_event(
+                sid,
+                "artifact_repair_skipped",
+                {
+                    "reason": "orchestrator_capability_contract",
+                    "action_id": orchestrator_failure.action_id,
+                    "action_kind": orchestrator_failure.kind,
+                    "error": orchestrator_failure.error,
+                },
+            )
         # A missing BINARY deliverable is not an authoring defect — the bytes on
         # disk may be perfect. What is missing is the governed step that RUNS
         # them, so ask for that BEFORE the generic repair path, which can only
@@ -4723,6 +5977,7 @@ def _deliberate(
         # without ever producing the file. Terminates because every pass must add
         # a build_artifact proposal, and the helper refuses past the attempt cap.
         while (not verified and not external_conflict
+               and orchestrator_failure is None
                and _missing_deliverable_formats(session)):
             builds_before = sum(
                 1 for a in session.proposed_actions if a.kind == "build_artifact")
@@ -4730,12 +5985,18 @@ def _deliberate(
             # not the task. Spend the free retry (another seat's generator,
             # already written and already paid for) before spending a model
             # call repairing the one that just failed.
-            if any(a.kind == "build_artifact" and a.status == "failed"
-                   for a in session.proposed_actions):
-                _try_next_candidate(session, store)
+            if (any(a.kind == "build_artifact" and a.status == "failed"
+                    for a in session.proposed_actions)
+                    and _try_next_candidate(session, store)):
+                if _execute_actions(
+                        session, manager, governance, store, promotes=False):
+                    return session
+                verified = _verify_artifact_outputs(
+                    session, store, require_file=_needs_file)
+                if verified:
+                    break
             if _repair_missing_deliverable(
-                    session, manager, governance, store,
-                    owner_repair_call if package_owner else codifier_call):
+                session, manager, governance, store, supervised_repair_call):
                 return session  # paused for the build approval; resume re-enters here
             if sum(1 for a in session.proposed_actions
                    if a.kind == "build_artifact") == builds_before:
@@ -4744,12 +6005,12 @@ def _deliberate(
         # Rewriting the generator cannot conjure a deliverable that was never
         # built, so the generic author repair stays out of that case.
         while (not verified and not external_conflict
+               and orchestrator_failure is None
                and not _missing_deliverable_formats(session)
                and session.artifact_repair_attempts
                < config.MAX_ARTIFACT_REPAIR_ATTEMPTS):
             if not _repair_artifact_failure(
-                session, manager, governance, store,
-                owner_repair_call if package_owner else codifier_call):
+                session, manager, governance, store, supervised_repair_call):
                 break
             verified = _verify_artifact_outputs(session, store, require_file=_needs_file)
     if not verified:
@@ -4765,7 +6026,28 @@ def _deliberate(
         # written" here would be false and would send the user chasing the wrong
         # problem.
         missing_formats = _missing_deliverable_formats(session)
-        if missing_formats and not missing_output:
+        if orchestrator_failure is not None:
+            detail = (
+                f"orchestrator capability contract failed for "
+                f"{orchestrator_failure.kind}: {orchestrator_failure.error}"
+            )
+            if detail not in session.unresolved:
+                session.unresolved.append(detail)
+            session.quality_gate = {
+                "verdict": "FAIL",
+                "stage": "orchestrator_capability_contract",
+                "detail": detail,
+                "action_id": orchestrator_failure.action_id,
+            }
+            session.stop_reason = detail
+            store.log_event(
+                sid,
+                "orchestrator_contract_gate_failed",
+                {"action_id": orchestrator_failure.action_id,
+                 "action_kind": orchestrator_failure.kind,
+                 "detail": orchestrator_failure.error},
+            )
+        elif missing_formats and not missing_output:
             wanted = ", ".join(f".{fmt}" for fmt in missing_formats)
             detail = (
                 f"the task asked for a {wanted} deliverable and no {wanted} file was "
@@ -4798,7 +6080,17 @@ def _deliberate(
         else:
             session.stop_reason = "artifact verification failed; no file was delivered"
         manager.transition(session, SessionStatus.composing)
-        if missing_formats and not missing_output:
+        if orchestrator_failure is not None:
+            failure_answer = (
+                "The run stopped because the coordinator and its capability "
+                "catalogue disagreed. The artifact author was not retried because "
+                "rewriting user output cannot repair an orchestration contract."
+            )
+            failure_next = (
+                "Repair the named coordinator capability contract, then replay "
+                "the preserved build from the accepted inputs."
+            )
+        elif missing_formats and not missing_output:
             wanted = ", ".join(f".{fmt}" for fmt in missing_formats)
             failure_answer = (
                 f"The run failed artifact verification: this task's deliverable is a "
@@ -5382,9 +6674,43 @@ def _try_next_candidate(session: Session, store: LogStore) -> bool:
     fixed filename, so swapping the bytes lets the command the human already
     approved run again unchanged. Each candidate is offered at most once.
     """
-    if not session.candidate_fallbacks:
+    if not session.candidate_fallbacks and not session.candidate_fallback_groups:
         return False
     pool = {c.get("namespaced"): c for c in _collect_candidates(session)}
+    while session.candidate_fallback_groups:
+        group = session.candidate_fallback_groups.pop(0)
+        candidates = [pool.get(name) for name in group]
+        if not candidates or any(
+                candidate is None
+                or not (candidate.get("content") or "").strip()
+                for candidate in candidates):
+            continue
+        agents = sorted({candidate.get("agent") for candidate in candidates})
+        store.log_event(
+            session.session_id,
+            "candidate_fallback_group_shipped",
+            {
+                "agents": agents,
+                "files": [candidate["base"] for candidate in candidates],
+                "remaining_groups": len(session.candidate_fallback_groups),
+                "reason": "the primary producer build failed",
+            },
+        )
+        session.unresolved.append(
+            "primary build failed; activated the council's atomic hot standby"
+        )
+        for action in session.proposed_actions:
+            if action.kind == "build_artifact" and action.status == "failed":
+                action.status = "captured"
+                action.error = ""
+                action.failure_layer = ""
+                action.args["candidate_failover"] = ",".join(agents)
+        for candidate in candidates:
+            _ship_winner(
+                session, store, candidate["base"], candidate["content"]
+            )
+        store.save_session(session)
+        return True
     while session.candidate_fallbacks:
         nxt = session.candidate_fallbacks.pop(0)
         cand = pool.get(nxt)
@@ -5405,8 +6731,10 @@ def _try_next_candidate(session: Session, store: LogStore) -> bool:
         # install for a wrong-import crash.
         for a in session.proposed_actions:
             if a.kind == "build_artifact" and a.status == "failed":
-                a.status = "denied"
-                a.error = f"superseded: shipped {cand.get('agent')}'s candidate instead"
+                a.status = "captured"
+                a.error = ""
+                a.failure_layer = ""
+                a.args["candidate_failover"] = cand.get("agent")
         _ship_winner(session, store, base, cand["content"])
         store.save_session(session)
         return True
@@ -5426,11 +6754,43 @@ def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> 
     """
     sid = session.session_id
     filename = base
+    if (session.materialization_plan
+            and session.materialization_plan.mode == MaterializationMode.build
+            and len(session.materialization_plan.producing_files) == 1):
+        producer = session.materialization_plan.producing_files[0]
+        if Path(producer).suffix.lower() == Path(base).suffix.lower():
+            filename = producer
     if len(session.required_files) == 1:
         required = session.required_files[0]
         if Path(required).suffix.lower() == Path(base).suffix.lower():
             filename = required
     content = _clean_artifact_body(content, filename)
+    existing = next(
+        (action for action in reversed(session.proposed_actions)
+         if (action.kind == "write_file" and action.role != Role.panelist
+             and action.filename.replace("\\", "/") == filename.replace("\\", "/"))),
+        None,
+    )
+    if existing is not None:
+        # Replace the already ordered source action in place so it executes
+        # before the reset BUILD action. Appending a new write after BUILD made
+        # the supposed fallback rerun the broken producer first.
+        existing.content = content
+        existing.args["content"] = content
+        existing.status = "captured"
+        existing.error = ""
+        existing.failure_layer = ""
+        if not any(
+            action.kind == "promote" and action.filename == filename
+            for action in session.proposed_actions
+        ):
+            _append_proposals(session, store, [
+                ProposedAction(
+                    session_id=sid, kind="promote", role=Role.implementer,
+                    filename=filename, args={"filename": filename},
+                )
+            ])
+        return
     _append_proposals(session, store, [
         ProposedAction(session_id=sid, kind="write_file", role=Role.implementer,
                        filename=filename, content=content,
@@ -5612,12 +6972,7 @@ def _independent_frontier_release_gate(
     session: Session, council: Council, winner_agent: str, filename: str,
     content: str, call: AgentCall, store: LogStore,
 ) -> tuple[str, int, str]:
-    """Require an independent frontier engineer to accept (and repair) code.
-
-    This is intentionally implementation-capable verification, not a late judge
-    cameo. A FAIL must include usable edits, those edits must still run, and a
-    second clean-room pass must explicitly confirm them before release.
-    """
+    """Require read-only semantic acceptance by an independent frontier seat."""
     if not session.required_frontier_authors:
         return content, 0, "not required"
     chair = _codifier(session)
@@ -5642,7 +6997,7 @@ def _independent_frontier_release_gate(
     sid = session.session_id
     defects = list(session.quality_gate.get("judge_defects") or [])
     resolutions = dict(session.quality_gate.get("chair_resolutions") or {})
-    total_edits = 0
+    criteria = rounds.canonical_acceptance_criteria(session)
     for attempt in range(max(1, config.FRONTIER_VERIFY_ATTEMPTS)):
         prompt = rounds.frontier_release_prompt(
             session, [(filename, content)], defects, resolutions,
@@ -5654,22 +7009,40 @@ def _independent_frontier_release_gate(
             raise QualityGateFailed(
                 f"independent verifier {verifier.agent} did not complete: {e}"
             ) from e
-        verdict, checks, remaining = rounds.parse_frontier_verdict(answer.content)
-        expected = {
-            f"R{i}" for i in range(
-                1, len(rounds.acceptance_requirements(_execution_task(session))) + 1
-            )
-        }
-        checked = {item.get("id") for item in checks}
+        report = rounds.parse_frontier_review(
+            answer.content, criteria, reviewer=verifier.agent,
+            checkpoint_id=session.candidate_checkpoint_id,
+        )
+        session.review_attempts.append(report)
+        checks = [
+            {
+                "id": item.criterion_id,
+                "status": item.status.upper(),
+                "detail": item.detail,
+            }
+            for item in report.criteria
+        ]
+        expected = {item.criterion_id for item in criteria}
+        checked = {item.criterion_id for item in report.criteria}
         missing_checks = sorted(expected - checked)
-        if missing_checks:
-            verdict = "FAIL"
-            remaining.append(
-                "missing acceptance checks: " + ", ".join(missing_checks)
-            )
+        remaining = [
+            str(item.get("description") or "")
+            for item in report.defects if item.get("description")
+        ]
+        remaining.extend(
+            f"{item.criterion_id}: {item.detail}"
+            for item in report.criteria if item.status == "fail"
+        )
+        verdict = (
+            "PASS" if report.status in {
+                ReviewStatus.passed, ReviewStatus.nonblocking
+            } else "UNAVAILABLE" if report.status == ReviewStatus.protocol_invalid
+            else "FAIL"
+        )
         session.quality_gate.update({
             "verifier": verifier.agent,
             "verdict": verdict,
+            "review_status": report.status.value,
             "checks": checks,
             "remaining_defects": remaining,
             "missing_checks": missing_checks,
@@ -5682,29 +7055,16 @@ def _independent_frontier_release_gate(
              "attempt": attempt + 1},
         )
         if verdict == "PASS":
-            return content, total_edits, verifier.agent
-        if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
+            return content, 0, verifier.agent
+        if report.status == ReviewStatus.protocol_invalid:
+            if attempt + 1 < config.FRONTIER_VERIFY_ATTEMPTS:
+                continue
+            raise QualityGateFailed(
+                f"independent verifier {verifier.agent} did not complete the "
+                f"review protocol: {report.protocol_detail}"
+            )
+        else:
             break
-        patched, applied = _apply_reply_edits(content, answer.content, sid)
-        if not applied or patched == content:
-            raise QualityGateFailed(
-                f"independent verifier {verifier.agent} rejected {filename} "
-                "without a usable implementation repair"
-            )
-        ran, testable, detail, _dynamic = smoke.smoke_source(
-            patched, Path(filename).suffix or ".html",
-            prelude=_runtime_prelude(session, filename),
-        )
-        if testable and not ran:
-            raise QualityGateFailed(
-                f"frontier repair broke {filename}: {detail}"
-            )
-        content = patched
-        total_edits += applied
-        store.log_event(
-            sid, "frontier_release_repair_applied",
-            {"agent": verifier.agent, "file": filename, "edits": applied},
-        )
     raise QualityGateFailed(
         f"independent verifier {verifier.agent} rejected {filename}: "
         + "; ".join(item[:120] for item in session.quality_gate.get("remaining_defects", [])[:3])
@@ -6308,6 +7668,33 @@ def _default_delivery_root(session: Session) -> Optional[str]:
     return root
 
 
+_ACTION_PHASE = {
+    "write_file": 10,
+    "edit_file": 10,
+    "stage": 20,
+    "install_deps": 30,
+    "build_artifact": 40,
+    "run_tests": 50,
+    "promote": 60,
+    "promote_batch": 60,
+}
+
+
+def _ordered_actions(actions: list[ProposedAction]) -> list[ProposedAction]:
+    """Return a stable executable DAG order, independent of model prose order.
+
+    A model may describe BUILD before ARTIFACT even though the build consumes
+    that source.  The coordinator owns execution semantics: source mutations
+    and staging precede installs/builds, validators follow builds, and release
+    is always last.  Stable ordering within a phase preserves explicit intent.
+    """
+    indexed = list(enumerate(actions))
+    indexed.sort(key=lambda item: (
+        _ACTION_PHASE.get(item[1].kind, 35), item[0]
+    ))
+    return [action for _index, action in indexed]
+
+
 def _execute_actions(
     session: Session, manager: SessionManager, governance: Governance, store: LogStore,
     promotes: bool = True,
@@ -6370,7 +7757,19 @@ def _execute_actions(
             manager.transition(session, SessionStatus.awaiting_input)
             return True
     pending = False
-    for action in session.proposed_actions:
+    ordered_actions = _ordered_actions(session.proposed_actions)
+    if [item.action_id for item in ordered_actions] != [
+            item.action_id for item in session.proposed_actions]:
+        store.log_event(
+            sid,
+            "action_dependency_order_applied",
+            {"order": [
+                {"action_id": item.action_id, "kind": item.kind,
+                 "filename": item.filename}
+                for item in ordered_actions
+            ]},
+        )
+    for action in ordered_actions:
         if action.kind == "promote" and not promotes:
             continue
         if action.status == "proposed":
@@ -6386,7 +7785,10 @@ def _execute_actions(
                 continue
             if approval is not None:
                 action.approval_id = approval.approval_id
-                action.status = "awaiting_approval"
+                action.status = (
+                    "approved" if approval.status == "approved"
+                    else "awaiting_approval"
+                )
             else:
                 action.status = "approved"
         if action.status == "awaiting_approval":
@@ -6410,6 +7812,12 @@ def _execute_actions(
                 if (session.worker_lease
                         and not store.lease_is_current(session.session_id, session.worker_lease)):
                     raise SessionCancelled()
+                store.log_event(
+                    sid,
+                    "action_execution_started",
+                    {"action_id": action.action_id, "kind": action.kind,
+                     "filename": action.filename},
+                )
                 result = executor.execute(session, action, store.data_dir)
                 action.status = "executed"
                 action.result_path = result  # path for writes/edits/promote; output for run_tests
@@ -6429,12 +7837,12 @@ def _execute_actions(
                     {"action_id": action.action_id, "kind": action.kind, "result": result[:500]},
                 )
             except ExecutionError as e:
-                action.status = "failed"
-                action.error = str(e)
+                _record_action_execution_failure(session, action, e)
                 session.unresolved.append(f"artifact '{action.filename}' failed: {e}")
                 store.log_event(
                     sid, "action_failed",
-                    {"action_id": action.action_id, "error": str(e)},
+                    {"action_id": action.action_id, "error": str(e),
+                     "failure_layer": action.failure_layer},
                 )
     if pending:
         session.stop_reason = "human approval needed"
@@ -6597,16 +8005,25 @@ def _repair_missing_deliverable(
     missing = _missing_deliverable_formats(session)
     if not missing:
         return False
+    active_repair = next(
+        (attempt for attempt in reversed(session.repair_history)
+         if attempt.status == "started"), None,
+    )
+    if active_repair is not None:
+        recovery.finish_repair(session, active_repair, verified=False)
     # Bounded by the number of builds already attempted — no new session state,
     # and a seat that keeps proposing a build that does not produce the file
     # cannot spin here.
     attempts = sum(1 for a in session.proposed_actions if a.kind == "build_artifact")
     if attempts >= config.MAX_ARTIFACT_REPAIR_ATTEMPTS:
         return False
-    package_owner = next(
-        (member for member in session.council.members
-         if member.active and member.agent == session.work_package_owner),
-        None,
+    package_owner = (
+        CouncilMember(
+            role=Role.implementer,
+            agent=session.work_package_owner,
+            active=True,
+        )
+        if session.work_package_owner else None
     )
     who = package_owner or _codifier(session)
     if not (who and who.active):
@@ -6637,6 +8054,28 @@ def _repair_missing_deliverable(
                     {"formats": missing, "attempt": attempts + 1,
                      "agent": who.agent, "written": written[:20],
                      "previous_failure": (last_failure or "")[:500]})
+    failure_record = recovery.record_failure(
+        session, stage="materialization", category="missing_deliverable",
+        summary="required binary deliverable has not been produced",
+        evidence={"formats": missing}, responsible_owner=who.agent or "",
+        producer_paths=(session.materialization_plan.producing_files
+                        if session.materialization_plan else []),
+    )
+    producer_hashes = {
+        action.filename.replace("\\", "/"): hashlib.sha256(
+            (action.content or "").encode("utf-8")
+        ).hexdigest()
+        for action in session.proposed_actions
+        if (action.kind in {"write_file", "edit_file"}
+            and action.filename and (action.content or "").strip())
+    }
+    producer_excerpt = "\n\n".join(
+        f"CURRENT PRODUCER {action.filename}:\n{(action.content or '')[:40000]}"
+        for action in session.proposed_actions
+        if (action.kind in {"write_file", "edit_file"}
+            and action.role != Role.panelist and action.filename
+            and (action.content or "").strip())
+    )[:60000]
     prompt = (
         f"Task: {_execution_task(session)}\n\n"
         f"The deliverable of this task is a {wanted} file, and no {wanted} file "
@@ -6650,9 +8089,14 @@ def _repair_missing_deliverable(
         f"PRODUCES: <the {wanted} file that command writes>\n"
         f"PROMOTE: <the same {wanted} file>\n\n"
         "If no generator exists yet, emit it first as ONE complete ARTIFACT block, "
-        "then the lines above. The command must write its output into the sandbox "
+        "then the lines above. If the previous build crashed, repair or replace "
+        "the producer as a complete ARTIFACT before repeating the build. Never "
+        "reference a local file that is absent from the working set; make the "
+        "producer self-contained or emit every required local input. The command "
+        "must write its output into the sandbox "
         "using a relative path. Every file named on PRODUCES must really appear or "
-        "the build fails."
+        "the build fails.\n\n"
+        + producer_excerpt
     )
     try:
         reply = repair_call(who, prompt)
@@ -6660,9 +8104,22 @@ def _repair_missing_deliverable(
         store.log_event(session.session_id, "deliverable_build_failed",
                         {"reason": str(e)[:300]})
         return False
+    payload_hash = hashlib.sha256((reply.content or "").encode("utf-8")).hexdigest()[:16]
+    repair_record = recovery.begin_repair(
+        session, failure_record, repair_owner=reply.agent or who.agent or "",
+        strategy=f"repair_materialization:{payload_hash}",
+        input_hashes=producer_hashes,
+    )
+    if repair_record is None:
+        store.log_event(
+            session.session_id, "deliverable_build_failed",
+            {"reason": "unchanged repair payload was already attempted"},
+        )
+        return False
     proposals = [a for a in _parse_proposals(session.session_id, reply.content)
                  if a.kind in ("write_file", "install_deps", "build_artifact", "promote")]
     if not any(a.kind == "build_artifact" for a in proposals):
+        recovery.finish_repair(session, repair_record, verified=False)
         store.log_event(session.session_id, "deliverable_build_failed",
                         {"reason": "reply proposed no BUILD/PRODUCES"})
         return False
@@ -6683,10 +8140,13 @@ def _repair_artifact_failure(
     own test commands have finished.  Previously they went straight to a final
     answer that looked terminally successful to goals.
     """
-    package_owner = next(
-        (member for member in session.council.members
-         if member.active and member.agent == session.work_package_owner),
-        None,
+    package_owner = (
+        CouncilMember(
+            role=Role.implementer,
+            agent=session.work_package_owner,
+            active=True,
+        )
+        if session.work_package_owner else None
     )
     # A validator may diagnose an owner's file, but it must not silently become
     # the replacement author.  Package repair stays with the named owner; the
@@ -6740,6 +8200,18 @@ def _repair_artifact_failure(
         original = target.content
     else:
         return False
+    failure_record = next(
+        (record for record in reversed(session.failure_records)
+         if record.stage == "artifact_verification"), None,
+    )
+    if failure_record is None:
+        failure_record = recovery.record_failure(
+            session, stage="artifact_verification",
+            category="deterministic_validation", summary=failure,
+            artifact_path=filename, responsible_owner=who.agent or "",
+            producer_paths=(session.materialization_plan.producing_files
+                            if session.materialization_plan else []),
+        )
     while session.artifact_repair_attempts < config.MAX_ARTIFACT_REPAIR_ATTEMPTS:
         session.artifact_repair_attempts += 1
         attempt = session.artifact_repair_attempts
@@ -6760,16 +8232,31 @@ def _repair_artifact_failure(
             store.log_event(session.session_id, "artifact_repair_failed",
                             {"attempt": attempt, "file": filename, "reason": str(e)[:300]})
             continue
+        payload_hash = hashlib.sha256((reply.content or "").encode("utf-8")).hexdigest()[:16]
+        repair_record = recovery.begin_repair(
+            session, failure_record,
+            repair_owner=reply.agent or who.agent or "",
+            strategy=f"targeted_artifact_repair:{filename}:{payload_hash}",
+            input_hashes=dict(session.verified_output_hashes),
+        )
+        if repair_record is None:
+            store.log_event(
+                session.session_id, "artifact_repair_rejected",
+                {"attempt": attempt, "reason": "unchanged repair payload"},
+            )
+            break
         writes = [a for a in _parse_proposals(session.session_id, reply.content)
                   if a.kind == "write_file"
                   and a.filename.replace("\\", "/") == filename and a.content.strip()]
         if len(writes) != 1:
+            recovery.finish_repair(session, repair_record, verified=False)
             store.log_event(session.session_id, "artifact_repair_failed",
                             {"attempt": attempt, "file": filename,
                              "reason": "repair did not return one complete artifact"})
             continue
         repaired = writes[0]
         if repaired.content.strip() == (original or "").strip():
+            recovery.finish_repair(session, repair_record, verified=False)
             store.log_event(
                 session.session_id, "artifact_repair_failed",
                 {"attempt": attempt, "file": filename,
@@ -6795,6 +8282,7 @@ def _repair_artifact_failure(
                             {"attempt": attempt, "file": filename})
             original = repaired.content
             return True
+        recovery.finish_repair(session, repair_record, verified=False)
         store.log_event(session.session_id, "artifact_repair_failed",
                         {"attempt": attempt, "file": filename,
                          "reason": repaired.error or repaired.status})
@@ -7018,12 +8506,36 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
     # implementation actions form the candidate deliverable.
     file_actions = [a for a in session.proposed_actions
                     if a.kind in _FILE_OUTPUT_KINDS and a.role != Role.panelist]
-    executed = [a for a in file_actions if a.status == "executed" and a.result_path]
+    source_executed = [a for a in file_actions if a.status == "executed" and a.result_path]
+    executed = list(source_executed)
+    build_actions = [
+        action for action in session.proposed_actions
+        if action.kind == "build_artifact" and action.role != Role.panelist
+    ]
+    # Treat each declared build output as a first-class artifact.  The BUILD
+    # action's own result_path is a command report, not the PDF/archive bytes.
+    for build in build_actions:
+        if build.status != "executed":
+            continue
+        declared = [item.strip().replace("\\", "/") for item in
+                    str(build.args.get("produces") or "").split(",") if item.strip()]
+        for name, produced in zip(declared, _build_outputs(build)):
+            executed.append(ProposedAction(
+                session_id=session.session_id,
+                action_id=f"{build.action_id}:{name}",
+                kind="build_output",
+                role=Role.implementer,
+                filename=name,
+                status="executed",
+                result_path=produced,
+                args={"build_action_id": build.action_id},
+            ))
     failures: list[str] = []
+    missing_required: list[str] = []
     _smoke_checked: set[str] = set()  # smoke-test each filename once
 
     if not executed:
-        if file_actions or require_file:
+        if file_actions or build_actions or require_file:
             # files were attempted (and all failed) or were mandatory — not a success
             failures.append("no file artifact was successfully written to disk")
         else:
@@ -7038,12 +8550,14 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
                 # does not require rewriting every sibling to fix one defect.
                 continue
             if required not in written:
+                missing_required.append(required)
                 failures.append(f"required artifact missing: {required}")
 
     # The deliverable the user NAMED must exist, not a program that would create
     # it. Prose is already refused as proof for file tasks; a generator script is
     # the same claim wearing a file extension.
-    for fmt in _missing_deliverable_formats(session):
+    missing_formats = _missing_deliverable_formats(session)
+    for fmt in missing_formats:
         failures.append(
             f"the task's deliverable is a .{fmt} file and no .{fmt} was produced; "
             f"a script that would generate one is not the deliverable — it has to "
@@ -7108,6 +8622,27 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
         try:
             if not path.is_file():
                 failures.append(f"{action.filename}: result path does not exist ({path})")
+                continue
+            assertions = (
+                list(session.materialization_plan.contract_assertions)
+                if session.materialization_plan else []
+            )
+            format_result = validation.validate_artifact(path, assertions)
+            store.log_event(
+                session.session_id,
+                "artifact_format_validated",
+                {"file": action.filename, **format_result.model_dump()},
+            )
+            if not format_result.passed:
+                failures.extend(
+                    f"{action.filename}: {failure}"
+                    for failure in format_result.failures
+                )
+                continue
+            if binary_format_of(path.name):
+                # Binary semantics are handled by the format validator and the
+                # independent release reviewer. Decoding opaque bytes as UTF-8
+                # only manufactures meaningless source checks.
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             if not text.strip():
@@ -7227,12 +8762,43 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
     # Static contract checks are independent evidence. Never suppress them just
     # because runtime smoke already found something: that masking caused a
     # dependency collision to hide the actual source syntax failure.
-    failures.extend(_run_acceptance_checks(session, store, executed))
+    failures.extend(_run_acceptance_checks(session, store, source_executed))
 
     if failures:
         message = "artifact verification failed: " + "; ".join(failures)
         session.unresolved.append(message)
         store.log_event(session.session_id, "artifact_verification_failed", {"failures": failures})
+        active_repair = next(
+            (attempt for attempt in reversed(session.repair_history)
+             if attempt.status == "started"), None,
+        )
+        if active_repair is not None:
+            recovery.finish_repair(session, active_repair, verified=False)
+        failure = recovery.record_failure(
+            session,
+            stage="artifact_verification",
+            category=(
+                "missing_deliverable"
+                if missing_required or missing_formats
+                else "deterministic_validation"
+            ),
+            summary=message,
+            evidence={"failures": failures},
+            artifact_path=(
+                missing_required[0]
+                if missing_required else
+                f"deliverable.{missing_formats[0]}"
+                if missing_formats else
+                executed[0].result_path
+                if executed else ""
+            ),
+            responsible_owner=session.work_package_owner,
+            producer_paths=(
+                session.materialization_plan.producing_files
+                if session.materialization_plan else []
+            ),
+        )
+        session.recovery_state = RecoveryState.observing
         return False
 
     verified_hashes: dict[str, str] = {}
@@ -7246,6 +8812,106 @@ def _verify_artifact_outputs(session: Session, store: LogStore, require_file: bo
         except OSError:
             continue
     session.verified_output_hashes = verified_hashes
+    session.phase = "objective_validated"
+    session.artifact_lineage = [
+        ArtifactLineage(
+            path=name,
+            sha256=digest,
+            produced_by_action=next((
+                action.args.get("build_action_id", action.action_id)
+                for action in executed
+                if action.filename.replace("\\", "/") == name
+            ), ""),
+            producing_files=list(
+                session.materialization_plan.producing_files
+                if session.materialization_plan else []
+            ),
+            input_hashes=dict(
+                session.materialization_plan.input_hashes
+                if session.materialization_plan else {}
+            ),
+            validator_ids=list(
+                session.materialization_plan.validator_ids
+                if session.materialization_plan else []
+            ),
+            verified_at=utcnow(),
+        )
+        for name, digest in verified_hashes.items()
+    ]
+    if session.materialization_plan:
+        session.materialization_plan.status = "verified"
+    checkpoint_record: dict = {}
+    checkpoint_store = getattr(store, "checkpoints", None)
+    checkpoint_paths: dict[str, Path] = {}
+    for action in executed:
+        name = action.filename.replace("\\", "/")
+        path = Path(action.result_path) if action.result_path else None
+        if name in verified_hashes and path is not None and path.is_file():
+            checkpoint_paths[name] = path
+    if checkpoint_store is not None and checkpoint_paths:
+        try:
+            checkpoint_record = checkpoint_store.seal_paths(
+                goal_id=session.goal_id or session.session_id,
+                package_id=session.work_package_id or "session",
+                session_id=session.session_id,
+                paths=checkpoint_paths,
+                expected_hashes={
+                    name: verified_hashes[name] for name in checkpoint_paths
+                },
+                parent_id=session.base_checkpoint_id,
+                state="verified_candidate",
+                evidence={"validator_ids": list(
+                    session.materialization_plan.validator_ids
+                    if session.materialization_plan else []
+                )},
+            )
+            session.candidate_checkpoint_id = checkpoint_record["checkpoint_id"]
+        except (OSError, ValueError) as exc:
+            store.log_event(
+                session.session_id, "checkpoint_seal_failed",
+                {"detail": str(exc)[:500]},
+            )
+    active_repair = next(
+        (attempt for attempt in reversed(session.repair_history)
+         if attempt.status == "started"), None,
+    )
+    if active_repair is not None:
+        learned_failure = next(
+            (item for item in session.failure_records
+             if item.failure_id == active_repair.failure_id),
+            None,
+        )
+        recovery.finish_repair(
+            session, active_repair, verified=True,
+            changed_files=verified_hashes.keys(),
+            after_hashes=verified_hashes,
+            verification_evidence={"artifact_hashes": verified_hashes},
+            result_checkpoint_id=session.candidate_checkpoint_id,
+        )
+        profiles = getattr(store, "seat_profiles", None)
+        if profiles is not None and active_repair.owner:
+            try:
+                profiles.remember_verified_recovery(
+                    active_repair.owner,
+                    fault_signature=(learned_failure.fault_signature
+                                     if learned_failure else active_repair.failure_id),
+                    category=(learned_failure.category
+                              if learned_failure else "artifact_verification"),
+                    strategy=active_repair.strategy,
+                    changed_files=verified_hashes.keys(),
+                    session_id=session.session_id,
+                )
+            except OSError as exc:
+                store.log_event(
+                    session.session_id, "seat_memory_write_failed",
+                    {"seat": active_repair.owner, "reason": str(exc)[:300]},
+                )
+    recovery.seal_checkpoint(
+        session,
+        checkpoint_id=session.candidate_checkpoint_id,
+        artifact_hashes=verified_hashes,
+        action_ids=[action.action_id for action in executed],
+    )
     store.log_event(
         session.session_id,
         "artifact_verification_passed",

@@ -11,7 +11,15 @@ from pathlib import Path
 
 from .config import ALWAYS_ALLOWED_CAPABILITIES
 from .logstore import LogStore
-from .models import ApprovalRequest, ProposedAction, Risk, Session, utcnow
+from .models import (
+    ApprovalPolicy,
+    ApprovalRequest,
+    MaterializationMode,
+    ProposedAction,
+    Risk,
+    Session,
+    utcnow,
+)
 
 
 class ApprovalRequired(Exception):
@@ -67,7 +75,51 @@ class Governance:
         for a in session.approvals:
             if a.action == action and a.status == "approved":
                 return
-        raise ApprovalRequired(self.request_approval(session, action, category, risk))
+        approval = self.request_approval(session, action, category, risk)
+        if approval.status != "approved":
+            raise ApprovalRequired(approval)
+
+    @staticmethod
+    def _god_mode_action_in_scope(session: Session, action: ProposedAction) -> tuple[bool, str]:
+        """God mode is advance consent, never permission to broaden the task."""
+        required = {
+            str(name).replace("\\", "/") for name in session.required_files if name
+        }
+        plan = session.materialization_plan
+        producing = {
+            str(name).replace("\\", "/")
+            for name in (plan.producing_files if plan else []) if name
+        }
+        allowed_files = required | producing | {
+            str(name).replace("\\", "/") for name in session.revision_targets if name
+        }
+        name = str(action.args.get("filename") or action.filename or "").replace("\\", "/")
+        if required and action.kind in {"write_file", "edit_file", "stage", "promote"}:
+            if name not in allowed_files:
+                return False, f"{name!r} is outside the frozen output/producer manifest"
+        if action.kind == "build_artifact" and required:
+            outputs = {
+                item.strip().replace("\\", "/")
+                for item in str(action.args.get("produces") or "").split(",")
+                if item.strip()
+            }
+            if not outputs or not outputs.issubset(required):
+                return False, "BUILD outputs are outside the frozen required-file contract"
+        if action.kind == "promote_batch" and required:
+            import json
+            try:
+                files = {
+                    str(item).replace("\\", "/")
+                    for item in json.loads(action.args.get("files", "[]"))
+                }
+            except (TypeError, ValueError):
+                return False, "final batch manifest is invalid"
+            if files != required:
+                return False, "final batch differs from the hash-bound release manifest"
+        if action.kind == "install_deps":
+            if plan is None or plan.mode != MaterializationMode.build:
+                return False, "dependency installation is not part of a frozen build plan"
+        return True, "action is required by the frozen outcome/materialization contract"
 
     def authorize_action(
         self, session: Session, action: ProposedAction
@@ -95,6 +147,11 @@ class Governance:
                 f"role {action.role.value!r} may not use skill {skill.name!r}",
             )
             return None
+        if session.approval_policy == ApprovalPolicy.god_mode:
+            in_scope, reason = self._god_mode_action_in_scope(session, action)
+            if not in_scope:
+                self._deny_action(session, action, f"God mode scope violation: {reason}")
+                return None
         # Only parse/compile-only checks can run automatically.  A cwd is not
         # an OS sandbox, so every functional RUNTESTS command must be visible
         # to and approved by the human before the coordinator executes it.
@@ -220,12 +277,31 @@ class Governance:
         risk: Risk = Risk.medium, action_ref: str | None = None,
         details: str | None = None,
     ) -> ApprovalRequest:
+        policy = session.approval_policy
+        artifact_hashes = dict(
+            session.release_verified_hashes or session.verified_output_hashes or {}
+        )
         approval = ApprovalRequest(
             session_id=session.session_id, action=action, category=category,
             risk=risk, action_ref=action_ref, details=details,
+            execution_policy=policy,
+            scope_reason=(
+                "authorized in advance by the run-scoped God mode policy and frozen contract"
+                if policy == ApprovalPolicy.god_mode else ""
+            ),
+            artifact_hashes=artifact_hashes,
         )
         session.approvals.append(approval)
         self.store.log_event(session.session_id, "approval_requested", approval.model_dump())
+        if policy == ApprovalPolicy.god_mode:
+            approval.status = "approved"
+            approval.resolved_at = utcnow()
+            approval.resolved_by = "god_mode"
+            self.store.log_event(
+                session.session_id,
+                "approval_auto_resolved",
+                approval.model_dump(),
+            )
         return approval
 
     def resolve(

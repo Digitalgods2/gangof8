@@ -95,8 +95,8 @@ class OpenRouterAdapter:
         # request alive forever with transport-level trickles, which is exactly
         # how the live Qwen call ran for 16 minutes under a nominal 360-second
         # limit. Reads are therefore unbounded here and the watchdog below owns
-        # an opted-in hard deadline. Streaming supplies truthful progress; an
-        # installation may also opt into an automatic no-output deadline.
+        # the absolute hard deadline plus the independent no-output deadline.
+        # Streaming supplies truthful reasoning and answer progress.
         transport_timeout = httpx.Timeout(
             None,
             connect=30.0,
@@ -110,6 +110,9 @@ class OpenRouterAdapter:
         progress_lock = threading.Lock()
         last_progress = [time.monotonic()]
         output_chars = [0]
+        reasoning_chars = [0]
+        answer_chars = [0]
+        finish_reason = [""]
 
         def _abort() -> None:
             try:
@@ -119,14 +122,16 @@ class OpenRouterAdapter:
 
         tail_buf = [""]
 
-        def _model_progress(chars: int, tail_delta: str = "") -> None:
+        def _model_progress(
+            chars: int, tail_delta: str = "", detail: str = "model output streaming",
+        ) -> None:
             with progress_lock:
                 last_progress[0] = time.monotonic()
                 output_chars[0] = max(output_chars[0], chars)
                 if tail_delta:
                     tail_buf[0] = (tail_buf[0] + tail_delta)[-400:]
             cancellation.report_progress(
-                output_chars[0], "model output streaming", tail=tail_buf[0])
+                output_chars[0], detail, tail=tail_buf[0])
 
         def _watch_deadline() -> None:
             deadline_s = max(1.0, float(timeout_s)) if timeout_s > 0 else None
@@ -219,6 +224,8 @@ class OpenRouterAdapter:
                                 usage = chunk["usage"]
                             choices = chunk.get("choices") or []
                             if choices and isinstance(choices[0], dict):
+                                if choices[0].get("finish_reason"):
+                                    finish_reason[0] = str(choices[0]["finish_reason"])
                                 delta_obj = choices[0].get("delta") or {}
                                 # Reasoning models can spend minutes streaming
                                 # private reasoning before the first answer token.
@@ -227,15 +234,26 @@ class OpenRouterAdapter:
                                 reasoning = (delta_obj.get("reasoning")
                                              or delta_obj.get("reasoning_details"))
                                 if isinstance(reasoning, str) and reasoning:
-                                    _model_progress(output_chars[0] + len(reasoning))
-                                elif isinstance(reasoning, list) and reasoning:
+                                    reasoning_chars[0] += len(reasoning)
                                     _model_progress(
-                                        output_chars[0] + len(json.dumps(reasoning)))
+                                        output_chars[0] + len(reasoning),
+                                        detail="model reasoning streaming",
+                                    )
+                                elif isinstance(reasoning, list) and reasoning:
+                                    amount = len(json.dumps(reasoning))
+                                    reasoning_chars[0] += amount
+                                    _model_progress(
+                                        output_chars[0] + amount,
+                                        detail="model reasoning streaming",
+                                    )
                                 delta = delta_obj.get("content")
                                 if isinstance(delta, str) and delta:
                                     content_parts.append(delta)
+                                    answer_chars[0] += len(delta)
                                     _model_progress(
-                                        output_chars[0] + len(delta), delta)
+                                        output_chars[0] + len(delta), delta,
+                                        detail="model answer streaming",
+                                    )
             else:
                 fallback_payload = dict(payload)
                 fallback_payload.pop("stream", None)
@@ -259,9 +277,11 @@ class OpenRouterAdapter:
                         raise AgentError(f"{self.name} (OpenRouter) error: {msg}")
                     choices = body.get("choices") or []
                     if choices and isinstance(choices[0], dict):
+                        finish_reason[0] = str(choices[0].get("finish_reason") or "")
                         value = ((choices[0].get("message") or {}).get("content") or "")
                         if value:
                             content_parts.append(value)
+                            answer_chars[0] += len(value)
                             _model_progress(len(value))
                     usage = body.get("usage") or {}
                     response_model = body.get("model") or response_model
@@ -309,7 +329,16 @@ class OpenRouterAdapter:
             raise AgentError(f"{self.name} (OpenRouter) HTTP {status_code}: {detail}")
         content = "".join(content_parts).strip()
         if not content:
-            raise AgentError(f"{self.name} (OpenRouter) returned empty output")
+            if reasoning_chars[0]:
+                raise AgentError(
+                    f"{self.name} (OpenRouter) reasoning_only_output: streamed "
+                    f"{reasoning_chars[0]} reasoning characters but 0 final-answer "
+                    f"characters (finish_reason={finish_reason[0] or 'unknown'})"
+                )
+            raise AgentError(
+                f"{self.name} (OpenRouter) returned empty output "
+                f"(finish_reason={finish_reason[0] or 'unknown'})"
+            )
         tokens = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
         return AdapterResult(content=content, tokens=tokens,
                              duration_ms=int((time.monotonic() - t0) * 1000),

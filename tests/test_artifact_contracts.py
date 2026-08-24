@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from gangof8 import artifacts
+from gangof8 import artifacts, loop
+from gangof8.models import Session, Task
 
 
 def test_parse_proposals_preserves_document_order():
@@ -233,3 +234,53 @@ def test_markdown_heading_still_trims_javascript():
         source + "\n### Implementation notes\nIt logs.\n", "app.js")
     assert "Implementation notes" not in body
     assert body.endswith("}")
+
+
+def test_declared_output_extension_beats_prose_scraped_from_inputs():
+    """A package's declared output decides its extension, not its inputs.
+
+    wp_5 of the Escoffier build had required_files=['Escoffier.pdf'] but its
+    task necessarily names the research/*.json files it consumes. Deriving the
+    expected extension from that prose rejected the PDF three times and failed
+    the whole run before the BUILD that produces it could be requested.
+    """
+    session = Session(
+        session_id="s_pdf_contract",
+        task=Task(
+            task_id="t",
+            session_id="s_pdf_contract",
+            text=(
+                "[BUILD PACKAGE 5/5] Assemble the cookbook.\n"
+                "Read research/recipes_001_025.json, research/recipes_026_050.json, "
+                "research/recipes_051_075.json and research/recipes_076_100.json, "
+                "then produce the finished book."
+            ),
+        ),
+        required_files=["Escoffier.pdf"],
+    )
+
+    assert loop._candidate_artifact_problem(session, "Escoffier.pdf") == ""
+
+
+def test_input_extension_is_still_refused_when_it_is_not_the_declared_output():
+    session = Session(
+        session_id="s_pdf_contract_neg",
+        task=Task(task_id="t", session_id="s_pdf_contract_neg",
+                  text="Assemble the book from research/recipes_001_025.json"),
+        required_files=["Escoffier.pdf"],
+    )
+
+    problem = loop._candidate_artifact_problem(session, "Escoffier.json")
+    assert ".pdf" in problem
+
+
+def test_prose_heuristic_still_applies_when_nothing_was_declared():
+    """Tasks that never declared a filename keep the old inference."""
+    session = Session(
+        session_id="s_no_contract",
+        task=Task(task_id="t", session_id="s_no_contract",
+                  text="Write the summary as report.md please"),
+    )
+
+    assert loop._candidate_artifact_problem(session, "report.md") == ""
+    assert ".md" in loop._candidate_artifact_problem(session, "report.txt")

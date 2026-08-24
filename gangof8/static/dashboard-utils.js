@@ -68,6 +68,19 @@ function goalRenderSignature(goal) {
     actionable_session_id: goal.actionable_session_id,
     active_packages: goal.active_packages,
     active_agent_calls: goal.active_agent_calls,
+    // Spend belongs in the signature: without it the detail pane never
+    // re-renders on a call that only costs money, and the visible per-seat
+    // total silently goes stale while seats keep billing.
+    model_calls_used: goal.model_calls_used,
+    call_budget: goal.call_budget,
+    model_calls_by_seat: goal.model_calls_by_seat || {},
+    approval_policy: goal.approval_policy || "manual",
+    recovery_state: goal.recovery_state || "idle",
+    phase: goal.phase || "contract_frozen",
+    active_verified_checkpoint_id: goal.active_verified_checkpoint_id || "",
+    review_attempts: goal.review_attempts || [],
+    failure_records: goal.failure_records || [],
+    repair_history: goal.repair_history || [],
     milestones: (goal.milestones || []).map(m => ({
       package_id: m.package_id,
       status: m.status,
@@ -79,6 +92,9 @@ function goalRenderSignature(goal) {
       output_attempts: m.output_attempts || {},
       authoring_deadline_at: m.authoring_deadline_at,
       active_agent_calls: m.active_agent_calls || [],
+      phase: m.phase || "contract_frozen",
+      active_verified_checkpoint_id: m.active_verified_checkpoint_id || "",
+      repair_context: m.repair_context || {},
     })),
   });
 }

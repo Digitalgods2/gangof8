@@ -16,8 +16,10 @@ import ipaddress
 import re
 import socket
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.parse import quote_plus
 from typing import Optional
 
 from . import config
@@ -120,7 +122,58 @@ def web_search(query: str, data_dir: Optional[Path] = None) -> str:
                 sources.append(f"- {title}: {uri}")
     except Exception:  # noqa: BLE001 — citations are best-effort
         pass
-    out = answer or "(no answer)"
-    if sources:
-        out += "\n\nSources:\n" + "\n".join(sources[:8])
-    return out[: config.WEB_SEARCH_MAX_CHARS]
+    limit = config.WEB_SEARCH_MAX_CHARS
+    source_lines: list[str] = []
+    source_budget = max(0, limit - len("\n\nSources:\n"))
+    for line in sources[:8]:
+        addition = len(line) + (1 if source_lines else 0)
+        if addition > source_budget:
+            break
+        source_lines.append(line)
+        source_budget -= addition
+    source_block = (
+        "\n\nSources:\n" + "\n".join(source_lines)
+        if source_lines else ""
+    )
+    # Citations are acceptance evidence, not expendable tail text.  Bound the
+    # synthesized answer around them so a long response cannot truncate every
+    # URL and still be mislabeled as auditable research.
+    answer_budget = max(0, limit - len(source_block))
+    out = (answer or "(no answer)")[:answer_budget] + source_block
+    return out[:limit]
+
+
+def public_web_search(query: str) -> str:
+    """Independent no-key search fallback returning auditable result URLs.
+
+    Gemini grounding remains the richer primary provider. A transient SDK,
+    quota, key, or DNS failure must not make it the application's only path to
+    current evidence, so Bing's public RSS search is a bounded second provider.
+    """
+    query = (query or "").strip()
+    if not query:
+        raise WebError("public search requires a non-empty query")
+    url = "https://www.bing.com/search?format=rss&q=" + quote_plus(query)
+    _guard_url(url)
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "GangOf8/1.0 (council research)"})
+    try:
+        with urllib.request.urlopen(req, timeout=config.WEB_FETCH_TIMEOUT) as resp:
+            raw = resp.read(config.WEB_FETCH_MAX_BYTES)
+        root = ET.fromstring(raw)
+    except Exception as exc:  # noqa: BLE001 - normalized provider error
+        raise WebError(f"public search fallback failed: {exc}") from exc
+    results: list[tuple[str, str, str]] = []
+    for item in root.findall(".//item")[:8]:
+        title = (item.findtext("title") or "Untitled result").strip()
+        link = (item.findtext("link") or "").strip()
+        description = _html_to_text(item.findtext("description") or "")
+        if link.startswith(("http://", "https://")):
+            results.append((title, link, description[:600]))
+    if not results:
+        raise WebError("public search fallback returned no results")
+    body = "\n\n".join(
+        f"{title}\n{description}\nSource: {link}"
+        for title, link, description in results
+    )
+    return body[: config.WEB_SEARCH_MAX_CHARS]

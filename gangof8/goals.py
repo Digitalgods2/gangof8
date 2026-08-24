@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import assembly, config
-from .models import Goal, GoalMilestone, utcnow
+from .models import GOAL_SCHEMA_VERSION, Goal, GoalMilestone, utcnow
 from .roles import resolve_frontier_authors
 
 
@@ -72,7 +72,42 @@ class GoalStore:
     @staticmethod
     def _decode(raw: str) -> Optional[Goal]:
         try:
-            return Goal.model_validate(json.loads(raw))
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            # Policies are immutable run snapshots.  Persisted goals created
+            # before the policy existed must remain manual; silently turning an
+            # old run into God mode would change its authority after creation.
+            data.setdefault("approval_policy", "manual")
+            data.setdefault("failure_records", [])
+            data.setdefault("defect_ledger", [])
+            data.setdefault("repair_history", [])
+            data.setdefault("recovery_state", "idle")
+            data.setdefault("recovery_supervisor_events", [])
+            data.setdefault("recovery_attempts", {})
+            data.setdefault("last_good_checkpoint", {})
+            data.setdefault("active_verified_checkpoint_id", "")
+            data.setdefault("phase", "contract_frozen")
+            data.setdefault("criteria", [])
+            data.setdefault("review_attempts", [])
+            data.setdefault("work_items", [])
+            data.setdefault("model_call_reservations", [])
+            data.setdefault("research_mode", "not_required")
+            data.setdefault("research_provenance", [])
+            for milestone in data.get("milestones", []):
+                if isinstance(milestone, dict):
+                    milestone.setdefault("materialization_plan", None)
+                    milestone.setdefault("last_good_checkpoint", {})
+                    milestone.setdefault("recovery_source_checkpoint", {})
+                    milestone.setdefault("active_verified_checkpoint_id", "")
+                    milestone.setdefault("candidate_checkpoint_id", "")
+                    milestone.setdefault("repair_context", {})
+                    milestone.setdefault("phase", "contract_frozen")
+                    milestone.setdefault("participation_checkpoint_id", "")
+                    milestone.setdefault("participation_reports", [])
+                    milestone.setdefault("resume_session_id", "")
+            data["schema_version"] = GOAL_SCHEMA_VERSION
+            return Goal.model_validate(data)
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
@@ -83,6 +118,27 @@ class GoalStore:
             "ON CONFLICT(goal_id) DO UPDATE SET status=excluded.status, "
             "updated_at=excluded.updated_at, json=excluded.json",
             (goal.goal_id, goal.status, goal.updated_at, goal.model_dump_json()),
+        )
+
+    @staticmethod
+    def _merge_call_ledger(stored: Optional[Goal], incoming: Goal) -> None:
+        """Preserve atomic dispatch reservations across stale worker saves."""
+        if stored is None:
+            return
+        incoming.model_calls_used = max(
+            int(incoming.model_calls_used), int(stored.model_calls_used)
+        )
+        for seat, count in stored.model_calls_by_seat.items():
+            incoming.model_calls_by_seat[seat] = max(
+                int(incoming.model_calls_by_seat.get(seat, 0)), int(count)
+            )
+        known = {
+            str(item.get("reservation_id") or "")
+            for item in incoming.model_call_reservations
+        }
+        incoming.model_call_reservations.extend(
+            dict(item) for item in stored.model_call_reservations
+            if str(item.get("reservation_id") or "") not in known
         )
 
     def list(self) -> list[Goal]:
@@ -98,6 +154,12 @@ class GoalStore:
     def save(self, goal: Goal) -> Goal:
         goal.updated_at = utcnow()
         with self._conn() as conn:
+            row = conn.execute(
+                "SELECT json FROM goals WHERE goal_id = ?", (goal.goal_id,)
+            ).fetchone()
+            self._merge_call_ledger(
+                self._decode(row[0]) if row else None, goal
+            )
             self._write(conn, goal)
         return goal
 
@@ -111,9 +173,47 @@ class GoalStore:
             stored = self._decode(row[0]) if row else None
             if stored is None or stored.worker_lease != token:
                 return False
+            self._merge_call_ledger(stored, goal)
             goal.worker_lease = token
             self._write(conn, goal)
         return True
+
+    def reserve_model_call(
+        self,
+        goal_id: str,
+        *,
+        session_id: str,
+        agent: str,
+        phase: str,
+    ) -> Optional[dict]:
+        """Atomically consume one physical provider attempt before dispatch."""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT json FROM goals WHERE goal_id = ?", (goal_id,)
+            ).fetchone()
+            goal = self._decode(row[0]) if row else None
+            if goal is None or goal.status in {"completed", "failed", "cancelled"}:
+                return None
+            budget = goal.model_calls_budget or config.GOAL_MAX_MODEL_CALLS
+            if budget > 0 and goal.model_calls_used >= budget:
+                return None
+            reservation = {
+                "reservation_id": f"mc_{uuid.uuid4().hex[:16]}",
+                "goal_id": goal_id,
+                "session_id": session_id,
+                "agent": agent,
+                "phase": phase,
+                "reserved_at": utcnow(),
+            }
+            goal.model_call_reservations.append(reservation)
+            goal.model_calls_used += 1
+            goal.model_calls_by_seat[agent] = (
+                goal.model_calls_by_seat.get(agent, 0) + 1
+            )
+            goal.updated_at = utcnow()
+            self._write(conn, goal)
+        return reservation
 
     def claim_worker_lease(self, goal_id: str, allowed_statuses: set[str]) -> Optional[Goal]:
         """Atomically claim an eligible goal for a planning/advance worker."""
@@ -242,6 +342,30 @@ class GoalStore:
             # binding becomes retryable in the new epoch.
             for package in goal.milestones:
                 if package.status == "running":
+                    package.resume_session_id = package.session_id or ""
+                    if package.session_id:
+                        session_row = conn.execute(
+                            "SELECT json FROM sessions WHERE session_id = ?",
+                            (package.session_id,),
+                        ).fetchone()
+                        if session_row:
+                            try:
+                                session_data = json.loads(session_row[0])
+                            except (json.JSONDecodeError, TypeError):
+                                session_data = {}
+                            package.phase = str(
+                                session_data.get("phase") or package.phase
+                            )
+                            reports = list(
+                                session_data.get("collaboration_assignments") or []
+                            )
+                            if reports:
+                                package.participation_reports = reports
+                            candidate = str(
+                                session_data.get("candidate_checkpoint_id") or ""
+                            )
+                            if candidate:
+                                package.candidate_checkpoint_id = candidate
                     package.status = "pending"
                     package.session_id = None
             goal.updated_at = utcnow()
@@ -328,24 +452,28 @@ def plan_prompt(goal_text: str, panel: Optional[list[str]] = None,
         "NEVER to give an available model something to do.\n\n"
         "RIGHT-SIZING RULES (checked deterministically; violations are "
         "rejected):\n"
+        "- GANG OF EIGHT PARTICIPATION IS MANDATORY AND TASK-TYPE NEUTRAL. "
+        "Every healthy enabled resource contributes to each Planned goal through "
+        "a distinct research, source, architecture, correctness, integration, "
+        "adversarial, implementation, synthesis, or verification lens. This is "
+        "equally true for writing, research, design, data, media, and code. One "
+        "accountable owner controls final bytes; it never means a gang of one.\n"
         "- If the deliverable is a SINGLE artifact (one HTML file, one "
         "script, one document), EXACTLY ONE package AUTHORS it: one owner "
         "writes the complete file end to end. No template package, no "
         "staged fragments, no assembly step, no separate QA package.\n"
-        "- That cap is about AUTHORSHIP, not about the work. When the "
-        "deliverable carries a large body of content — N recipes, chapters, "
-        "entries, a glossary, a dataset — add RESEARCH packages that gather "
-        "that content in parallel. A research package outputs DATA ONLY "
+        "- That cap is about AUTHORSHIP, not about the work. The default for a "
+        "single document is ONE package: its accountable author performs the "
+        "research and builds the finished artifact. Do not split chapters, "
+        "recipes, entries, or arbitrary numeric ranges across the roster.\n"
+        "- At most ONE separate RESEARCH package is allowed for a single "
+        "artifact, and only when a retrieved source corpus genuinely needs an "
+        "independent reusable checkpoint before authoring. It outputs DATA ONLY "
         "(.json, .md, .csv, .yaml, .txt), declares RELEASE: NONE, and is named "
-        "in the authoring package's AFTER list so the author embeds it. It "
-        "never contains a fragment of the artifact itself: gathering the "
-        "Béchamel entry creates no interface anyone can disagree about, while "
-        "handing someone 'the CSS half' of one file creates several.\n"
-        "- Split research by CONTENT RANGE, one package per bounded slice "
-        "(recipes 1-25, recipes 26-50, the glossary, the technique notes), and "
-        f"assign them across the research roster: {research_roster}. These "
-        "seats cost nothing while idle and the work is genuinely parallel. "
-        "Prose-only packages with OUTPUTS: NONE remain legitimate too.\n"
+        "in the authoring package's AFTER list. Otherwise keep research inside "
+        f"the author package. Available research seats: {research_roster}. The "
+        "resource council still challenges and improves the owner's real source "
+        "in parallel; package count limits authorship seams, not participation.\n"
         "- Multi-artifact deliverables get at most one package per natural "
         "artifact boundary, and fewer whenever files are tightly coupled — "
         "files that share a runtime contract belong to ONE owner.\n"
@@ -515,7 +643,34 @@ def should_auto_route(goal_text: str, has_attachments: bool = False) -> bool:
     )
     signal_count = sum(1 for marker in signals if marker in low)
     structured_lines = sum(1 for line in text.splitlines() if line.strip())
+    # Large content artifacts need the same dependency-aware package graph as
+    # software builds.  Character-count thresholds alone classified a request
+    # for a researched, indexed 100-recipe PDF as a small focused session. That
+    # session launched research and generation concurrently, so the producer
+    # could not consume the research it depended on. Require an explicit large
+    # output, a measurable quantity, and either research or navigation before
+    # taking this route; a simple one-page PDF remains focused.
+    large_document = bool(re.search(
+        r"\b(?:pdf|book|cookbook|manual|catalog(?:ue)?|report|document)\b", low
+    ))
+    measurable_scale = bool(re.search(
+        # Natural requests often qualify the noun: "100 of his most notable
+        # and popular recipes" is the same scale signal as "100 recipes".
+        # Bound the bridge by both words and punctuation so a number in an
+        # unrelated sentence cannot attach itself to a later artifact noun.
+        r"\b(?:[2-9]\d|[1-9]\d{2,})\b"
+        r"(?:\s+[a-z][a-z'-]*){0,8}\s+"
+        r"(?:recipes?|entries|items|pages?|chapters?|sections?|records?)\b",
+        low,
+    ))
+    evidence_or_navigation = bool(re.search(
+        r"\b(?:research|sources?|citations?|bibliograph(?:y|ies)|index(?:ed)?|"
+        r"searchable|table of contents|bookmarks?)\b",
+        low,
+    ))
     return bool(
+        (large_document and measurable_scale and evidence_or_navigation)
+        or
         len(text) >= 1600
         or (len(text) >= 900 and signal_count >= 2)
         or (len(text) >= 650 and signal_count >= 4)

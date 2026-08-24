@@ -6,7 +6,7 @@ import pytest
 
 from gangof8 import loop
 from gangof8.cancellation import SessionCancelled
-from gangof8.governance import BudgetExceeded
+from gangof8.governance import BudgetExceeded, Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (
     Classification,
@@ -14,6 +14,8 @@ from gangof8.models import (
     Contribution,
     Council,
     CouncilMember,
+    MaterializationMode,
+    MaterializationPlan,
     ProposedAction,
     Risk,
     Role,
@@ -163,7 +165,50 @@ def test_full_council_challenges_real_baseline_and_owner_integrates(
     assert session.collaboration_baseline["game.html"] == BASELINE
 
 
-def test_unavailable_deepseek_stays_visible_without_blocking_other_resources(
+def test_implementation_lens_persists_and_activates_atomic_hot_standby(tmp_path):
+    """Regression: removing a duplicate shadow call must not remove the actual
+    executable fallback that provides production redundancy."""
+    session = _session()
+    session.materialization_plan = MaterializationPlan(
+        mode=MaterializationMode.build,
+        producing_files=["game.html"],
+        release_files=["game.pdf"],
+    )
+    assignment = loop._ensure_collaboration_assignments(
+        session, ROLE_AGENTS, LogStore(tmp_path),
+    )[-1]
+    assignment.lens = "implementation"
+    member = CouncilMember(role=Role.implementer, agent="kimi", active=True)
+    standby = "<html><body>independent standby</body></html>"
+
+    loop._capture_collaboration_standby(
+        session,
+        assignment,
+        member,
+        "VERDICT: PASS\nFINDING: independent producer ready\n"
+        f"ARTIFACT: game.html\n{standby}\nEND_ARTIFACT",
+        {"game.html": BASELINE},
+        LogStore(tmp_path),
+    )
+    session.proposed_actions.append(ProposedAction(
+        session_id=session.session_id,
+        kind="build_artifact",
+        role=Role.implementer,
+        status="failed",
+        error="primary build crashed",
+    ))
+
+    assert session.candidate_fallback_groups == [["kimi__game.html"]]
+    assert loop._try_next_candidate(session, LogStore(tmp_path))
+    owner_source = next(
+        action for action in session.proposed_actions
+        if action.kind == "write_file" and action.role == Role.implementer
+    )
+    assert owner_source.content == standby
+    assert session.candidate_fallback_groups == []
+
+
+def test_unavailable_deepseek_is_visible_and_recovered_by_distinct_resource(
         tmp_path, monkeypatch):
     session = _session()
     store = LogStore(tmp_path)
@@ -186,7 +231,7 @@ def test_unavailable_deepseek_stays_visible_without_blocking_other_resources(
         del prompt
         dispositions = "\n".join(
             f"DISPOSITION: {seat} | ACCEPT | review completed"
-            for seat in RESOURCES if seat not in {"codex", "deepseek"}
+            for seat in RESOURCES if seat != "codex"
         )
         return _contribution(
             session, member,
@@ -201,8 +246,10 @@ def test_unavailable_deepseek_stays_visible_without_blocking_other_resources(
         assignment for assignment in session.collaboration_assignments
         if assignment.seat == "deepseek"
     )
-    assert deepseek.status == "unavailable"
-    assert "quota" in deepseek.error
+    assert deepseek.status == "contributed"
+    assert deepseek.fallback_from == "deepseek"
+    assert deepseek.recovered_by and deepseek.recovered_by != "deepseek"
+    assert any("quota" in item["error"] for item in deepseek.failure_history)
     assert "deepseek" in session.resource_roster
     assert session.collaboration_integration_status == "integrated"
 
@@ -225,24 +272,131 @@ def test_focused_mode_does_not_schedule_resource_calls(tmp_path):
     assert session.collaboration_assignments == []
 
 
-def test_adaptive_mode_skips_prose_only_artifacts(tmp_path):
+def test_adaptive_mode_uses_all_resources_for_prose_artifacts(tmp_path):
     session = _session()
     session.participation_mode = "adaptive"
     session.required_files = ["report.md"]
-    called = []
+    session.proposed_actions[0].filename = "report.md"
+    session.proposed_actions[0].content = "baseline report"
+    session.proposed_actions[0].args = {
+        "filename": "report.md", "content": "baseline report",
+    }
+    called: list[str] = []
+
+    def peer_call(member, prompt):
+        called.append(member.agent)
+        return _contribution(
+            session, member,
+            f"VERDICT: PASS\nFINDING: {member.agent} reviewed the report",
+        )
+
+    def owner_call(member, prompt):
+        dispositions = "\n".join(
+            f"DISPOSITION: {seat} | ACCEPT | review incorporated"
+            for seat in RESOURCES if seat != "codex"
+        )
+        return _contribution(
+            session, member,
+            dispositions
+            + "\nARTIFACT: report.md\nbaseline report\nEND_ARTIFACT",
+        )
 
     loop._run_package_collaboration(
         session,
         Council(members=[]),
-        lambda *args: called.append(args),
-        lambda *args: called.append(args),
+        peer_call,
+        owner_call,
         LogStore(tmp_path),
         ROLE_AGENTS,
     )
 
-    assert called == []
-    assert session.collaboration_assignments == []
-    assert session.proposed_actions[0].content == BASELINE
+    assert set(called) == set(RESOURCES[1:])
+    assert len(session.collaboration_assignments) == len(RESOURCES) - 1
+    assert session.collaboration_integration_status == "integrated"
+
+
+def test_binary_package_council_reviews_producer_before_pdf_exists(tmp_path):
+    session = _session()
+    session.required_files = ["deliverable.pdf", "_gangof8/build_wp_1.py"]
+    session.proposed_actions[0].filename = "_gangof8/build_wp_1.py"
+    session.proposed_actions[0].content = "print('build pdf')\n"
+    session.proposed_actions[0].args = {
+        "filename": "_gangof8/build_wp_1.py",
+        "content": "print('build pdf')\n",
+    }
+    session.materialization_plan = MaterializationPlan(
+        mode=MaterializationMode.build,
+        producing_files=["_gangof8/build_wp_1.py"],
+        release_files=["deliverable.pdf"],
+    )
+    called: list[str] = []
+
+    def peer_call(member, prompt):
+        called.append(member.agent)
+        assert "ACTUAL BASELINE FILE: _gangof8/build_wp_1.py" in prompt
+        assert "deliverable.pdf" not in loop._package_baseline(session)
+        return _contribution(
+            session, member,
+            f"VERDICT: PASS\nFINDING: {member.agent} reviewed the producer",
+        )
+
+    def owner_call(member, prompt):
+        dispositions = "\n".join(
+            f"DISPOSITION: {seat} | ACCEPT | producer review incorporated"
+            for seat in RESOURCES if seat != "codex"
+        )
+        return _contribution(
+            session, member,
+            dispositions
+            + "\nARTIFACT: _gangof8/build_wp_1.py\n"
+            + "print('build pdf')\nEND_ARTIFACT",
+        )
+
+    loop._run_package_collaboration(
+        session, Council(members=[]), peer_call, owner_call,
+        LogStore(tmp_path), ROLE_AGENTS,
+    )
+
+    assert set(called) == set(RESOURCES[1:])
+    assert session.collaboration_integration_status == "integrated"
+
+
+def test_collaboration_read_request_is_resolved_before_protocol_validation(tmp_path):
+    session = _session()
+    session.workspace_root = str(tmp_path)
+    dependency = tmp_path / "evidence.md"
+    dependency.write_text("PRIMARY EVIDENCE\n", encoding="utf-8")
+    assignment = loop._ensure_collaboration_assignments(
+        session, ROLE_AGENTS, LogStore(tmp_path / "data"),
+    )[0]
+    prompts: list[str] = []
+    replies = iter([
+        "SKILL: read_file evidence.md",
+        "VERDICT: PASS\nFINDING: primary evidence was inspected",
+    ])
+
+    def reviewer_call(member, prompt):
+        prompts.append(prompt)
+        return _contribution(session, member, next(replies))
+
+    store = LogStore(tmp_path / "data")
+    result = loop._run_collaboration_assignment(
+        session,
+        assignment,
+        {"game.html": BASELINE},
+        reviewer_call,
+        store,
+        governance=Governance(store),
+    )
+
+    assert result is not None
+    assert assignment.status == "contributed"
+    assert assignment.findings == ["primary evidence was inspected"]
+    assert len(prompts) == 2
+    assert "PRIMARY EVIDENCE" in prompts[1]
+    events = store.session_log_path(session.session_id).read_text(encoding="utf-8")
+    assert "package_collaboration_context_requested" in events
+    assert "skill_resolved" in events
 
 
 def test_protocol_miss_is_retried_once_before_owner_integration(

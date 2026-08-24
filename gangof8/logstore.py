@@ -198,6 +198,10 @@ class LogStore:
             collaboration_integration_status = "not_started"
             package_started_at = None
             package_deadline_at = None
+            approval_policy = "manual"
+            recovery_state = "idle"
+            failure_records: list[dict] = []
+            repair_history: list[dict] = []
             try:
                 data = json.loads(r[4])
                 task_text = (data.get("task") or {}).get("text", "")
@@ -234,6 +238,10 @@ class LogStore:
                 )
                 package_started_at = data.get("package_started_at")
                 package_deadline_at = data.get("package_deadline_at")
+                approval_policy = data.get("approval_policy") or "manual"
+                recovery_state = data.get("recovery_state") or "idle"
+                failure_records = list(data.get("failure_records") or [])
+                repair_history = list(data.get("repair_history") or [])
                 pending_approvals = sum(
                     1 for a in data.get("approvals", []) if a.get("status") == "pending"
                 )
@@ -274,6 +282,10 @@ class LogStore:
                     "collaboration_integration_status": collaboration_integration_status,
                     "package_started_at": package_started_at,
                     "package_deadline_at": package_deadline_at,
+                    "approval_policy": approval_policy,
+                    "recovery_state": recovery_state,
+                    "failure_records": failure_records,
+                    "repair_history": repair_history,
                 }
             )
         return out
@@ -292,6 +304,37 @@ class LogStore:
         except OSError:
             pass
         return deleted
+
+    def vacuum(self) -> dict:
+        """Return freed pages to the operating system.
+
+        Deleting rows only moves their pages onto SQLite's freelist; with
+        `auto_vacuum` NONE (the default here) the file itself never shrinks,
+        so clearing history reclaimed no disk at all. Every session save
+        rewrites the whole JSON blob, which makes that freelist grow far
+        faster than the real data — 85% of a 29.8 MB store on one machine.
+
+        VACUUM cannot run inside a transaction, so this uses its own
+        autocommit connection rather than the shared `_conn` helper.
+        Best-effort: a locked database is a reason to skip, not to fail a
+        user-facing delete."""
+        try:
+            before = self.db_path.stat().st_size
+        except OSError:
+            before = 0
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return {"reclaimed_bytes": 0, "vacuumed": False}
+        try:
+            after = self.db_path.stat().st_size
+        except OSError:
+            after = before
+        return {"reclaimed_bytes": max(0, before - after), "vacuumed": True}
 
     def delete_all_sessions(self) -> int:
         """Remove every persisted session and its audit log.

@@ -12,7 +12,18 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .models import Contribution, Council, CouncilMember, Role, Session
+from .models import (
+    AcceptanceCriterion,
+    Contribution,
+    Council,
+    CouncilMember,
+    CriterionResult,
+    MaterializationMode,
+    ReviewReport,
+    ReviewStatus,
+    Role,
+    Session,
+)
 from . import assembly, config
 from .skills import capability_manifest
 from .workbench import execution_text
@@ -164,6 +175,12 @@ _ROLE_INSTRUCTIONS: dict[Role, str] = {
     Role.implementer: (
         "Seat charter: Implementer. Produce concrete deliverables and complete "
         "file artifacts when the task calls for them."
+    ),
+    Role.recovery_supervisor: (
+        "Seat charter: Recovery Supervisor. Observe exact failure evidence, "
+        "identify the first causal fault, preserve verified work, and either "
+        "produce a complete changed repair or delegate it to a healthy seat. "
+        "Run the same acceptance gate again; never label recording as recovery."
     ),
     Role.summarizer: (
         "Seat charter: Synthesizer. Resolve conflicts explicitly and separate "
@@ -413,8 +430,24 @@ def _output_contract(session: Session) -> str:
             "approval before anything lands.\n"
         )
     required = deliverable_format_requirement(session, can_build=True)
+    plan = session.materialization_plan
+    planned_build = ""
+    if plan and plan.mode == MaterializationMode.build and plan.build:
+        planned_build = (
+            "\nTHIS RUN HAS A FROZEN MATERIALIZATION PLAN. Use these exact paths "
+            "instead of inventing another generator or output name:\n"
+            + "\n".join(f"- producing source: {name}" for name in plan.producing_files)
+            + f"\nBUILD: {plan.build.command}\n"
+            + f"PRODUCES: {', '.join(plan.build.outputs)}\n"
+        )
+    approval_wording = (
+        "The build is auto-authorized under this run's audited God-mode policy"
+        if session.approval_policy.value == "god_mode" else
+        "The build runs after explicit human approval"
+    )
     return (
         required
+        + planned_build
         + "FILE-WRITING MECHANICS (these apply to WHOEVER authors a file — a talent "
         "you delegated to, or you when it is glue):\n"
         + "If the task needs files (code, docs, config), emit each file literally in "
@@ -444,7 +477,7 @@ def _output_contract(session: Session) -> str:
         "then build it, naming every file the build must produce:\n"
         "BUILD: python make_book.py --in book.md --out book.pdf\n"
         "PRODUCES: book.pdf\n"
-        "The build runs in the council space after explicit human approval; each "
+        f"{approval_wording}; each "
         "PRODUCES file must really appear or the build fails. Never claim a binary "
         "deliverable you did not produce this way — describing one does not create it.\n"
         "If the build needs third-party packages, ask for them by name on their own "
@@ -761,7 +794,13 @@ def package_output_prompt(
     staged_context: str = "",
 ) -> str:
     """Focused exact-output authoring prompt for an accountable work package."""
+    plan = session.materialization_plan
+    build_mode = bool(plan and plan.mode == MaterializationMode.build)
     assigned = [name.replace("\\", "/") for name in assigned_files]
+    if build_mode:
+        assigned = list(dict.fromkeys(
+            name.replace("\\", "/") for name in plan.producing_files
+        ))
     all_outputs = [name.replace("\\", "/") for name in session.required_files]
     owner = session.work_package_owner
     assignment_lines = "\n".join(
@@ -812,8 +851,46 @@ def package_output_prompt(
                 "directive into a complete element of that kind.\n"
             )
     exact = ", ".join(assigned)
+    if build_mode and plan and plan.build:
+        build_outputs = ", ".join(plan.build.outputs)
+        output_protocol = (
+            "For every producing source file, emit exactly one complete block:\n"
+            "ARTIFACT: <exact producing relative filename>\n"
+            "<full text source contents>\n"
+            "END_ARTIFACT\n"
+            "Then emit the replayable materialization action exactly once:\n"
+            f"BUILD: {plan.build.command}\n"
+            f"PRODUCES: {build_outputs}\n"
+            "If third-party Python packages are truly required, put one "
+            "INSTALL: package1,package2 line before BUILD. Never emit binary "
+            "bytes in ARTIFACT; the command must create the declared outputs.\n"
+        )
+        implementation_contract = (
+            implementation_contract
+            + "The required release output is derived/binary. Author the complete "
+              "producer and its deterministic build recipe; success means the "
+              "BUILD exits zero and changes every declared output. The producer "
+              "must be self-contained except for installed third-party packages "
+              "and the authoritative inputs explicitly listed in this package. "
+              "Do not probe for, import, invoke, or wrap an imagined local generator "
+              "from another run. Every referenced local source must be emitted in "
+              "this response or already appear in the accepted staging bytes.\n"
+        )
+    else:
+        output_protocol = (
+            "For every assigned output, emit exactly one complete block:\n"
+            "ARTIFACT: <exact assigned relative filename>\n"
+            "<full file contents>\n"
+            "END_ARTIFACT\n"
+        )
     return (
         f"{_GOVERNANCE_CONTEXT}"
+        "WORKING-DIRECTORY OVERRIDE: this package may be mounted in a disposable, "
+        "isolated author workspace. If your runtime offers file tools, you may read "
+        "the complete accepted inputs and write ONLY the declared output/producer "
+        "paths there. The coordinator captures those diffs and imports them through "
+        "the same governed contract. Still emit the requested ARTIFACT/BUILD envelope "
+        "in your final response when possible so API/read-only runtimes remain compatible.\n"
         f"Work package: {session.work_package_id or round_idx + 1}\n"
         f"Accountable owner: {owner}\n"
         f"Origin model for this author: {member.agent}\n"
@@ -825,10 +902,7 @@ def package_output_prompt(
         f"{assignment_lines}\n\n"
         f"YOUR ASSIGNED OUTPUTS: {exact}\n"
         f"{implementation_contract}"
-        "For every assigned output, emit exactly one complete block:\n"
-        "ARTIFACT: <exact assigned relative filename>\n"
-        "<full file contents>\n"
-        "END_ARTIFACT\n"
+        f"{output_protocol}"
         "Use raw contents without code fences. Do not emit PROMOTE, a plan, a status "
         "update, SKILL requests, or files assigned to another author.\n"
         f"{retry}"
@@ -836,6 +910,16 @@ def package_output_prompt(
 
 
 _COLLABORATION_LENS = {
+    "sources": (
+        "Audit source quality, provenance, missing primary references, and claims "
+        "that need retrieval or citation. Make exact edits that strengthen the "
+        "artifact's evidence trail."
+    ),
+    "research": (
+        "Challenge factual coverage and completeness. Identify missing, weak, or "
+        "duplicated material and provide exact corrections grounded in your "
+        "research specialty."
+    ),
     "architecture": (
         "Challenge the structure, state model, separation of responsibilities, "
         "and whether the implementation can satisfy the package contract cleanly."
@@ -857,11 +941,16 @@ _COLLABORATION_LENS = {
         "implementation of weak portions while preserving the requested behavior."
     ),
     "verification": (
-        "Independently verify stated requirements against the actual code and patch "
+        "Independently verify stated requirements against the actual artifact and patch "
         "any mismatch you can prove from the artifact."
     ),
+    "synthesis": (
+        "Challenge organization, clarity, consistency, and whether the material "
+        "forms one coherent deliverable. Provide exact edits for the highest-value "
+        "integration defects."
+    ),
     "independent": (
-        "Perform an independent code challenge without trusting the owner's design; "
+        "Perform an independent artifact challenge without trusting the owner's design; "
         "look for high-impact defects and provide exact corrective edits."
     ),
 }
@@ -886,14 +975,21 @@ def package_collaboration_prompt(
         "ACTUAL ACCEPTED DEPENDENCY CONTEXT:\n" + staged_context.strip() + "\n\n"
         if staged_context.strip() else ""
     )
+    redundancy = (
+        "For production redundancy, also emit one COMPLETE independently "
+        "authored alternative for each allowed file as ARTIFACT: <path>, the "
+        "full bytes, then END_ARTIFACT. This hot standby belongs in this "
+        "existing council call; do not return a separate plan.\n\n"
+        if lens == "implementation" else ""
+    )
     return (
         f"{_GOVERNANCE_CONTEXT}"
         f"You are resource model {member.agent} in a full-council build. The "
-        f"accountable file owner is {session.work_package_owner}; you are a code "
+        f"accountable file owner is {session.work_package_owner}; you are an artifact "
         "challenger, not a replacement owner.\n\n"
         f"PACKAGE CONTRACT:\n{_package_task_context(session)}\n\n"
         f"{dependencies}"
-        f"YOUR REVIEW LENS ({lens.upper()}):\n{focus}\n\n"
+        f"YOUR REVIEW LENS ({lens.upper()}):\n{focus}\n\n{redundancy}"
         "Review the ACTUAL baseline bytes below. Do not return a plan, ask for "
         "tools, or merely suggest that someone inspect something later. If you "
         "find a defect, provide a deterministic OLD/NEW edit against an allowed "
@@ -906,8 +1002,15 @@ def package_collaboration_prompt(
         "FINDING: <another finding, if needed>\n"
         "EDIT: <exact allowed filename>\n"
         "<<<<<<< OLD\n<text occurring exactly once>\n=======\n<replacement>\n>>>>>>> NEW\n"
-        "Repeat EDIT blocks as needed. A PASS needs no EDIT. Do not emit ARTIFACT, "
-        "PROMOTE, SKILL, CONSULT, or DELEGATE lines."
+        "Repeat EDIT blocks as needed. A PASS needs no EDIT. If and only if a "
+        "referenced staged file is essential and its contents are absent above, "
+        "you may first reply only `SKILL: read_file <relative path>`; the "
+        "coordinator will provide it and recall you for the required verdict. "
+        + (
+            "Do not emit PROMOTE, CONSULT, or DELEGATE lines."
+            if lens == "implementation" else
+            "Do not emit ARTIFACT, PROMOTE, CONSULT, or DELEGATE lines."
+        )
     )
 
 
@@ -1327,7 +1430,7 @@ _VERDICT_RE = re.compile(
 )
 _CHECK_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?CHECK(?:\s+(R\d+))?\s*:\s*"
-    r"(PASS|FAIL)\s*[-—–:]\s*(.+?)\s*$",
+    r"(PASS|FAIL)(?:\s*\*\*)?\s*[-—–:]\s*(.+?)\s*(?:\*\*)?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -1367,13 +1470,35 @@ def acceptance_requirements(task: str) -> list[str]:
     return out or [(task or "deliver the requested implementation").strip()[:500]]
 
 
+def canonical_acceptance_criteria(session: Session) -> list[AcceptanceCriterion]:
+    """Freeze one checklist for both the reviewer prompt and enforcement."""
+    if session.criteria:
+        return list(session.criteria)
+    contract_items = []
+    if isinstance(session.outcome_contract, dict):
+        contract_items = list(
+            session.outcome_contract.get("acceptance_criteria") or []
+        )
+    source = contract_items or acceptance_requirements(
+        session.task.original_text or session.task.text
+    )
+    session.criteria = [
+        AcceptanceCriterion(
+            criterion_id=f"R{index}", text=str(item).strip(),
+            gate="semantic", blocking=True,
+        )
+        for index, item in enumerate(source, 1) if str(item).strip()
+    ]
+    return list(session.criteria)
+
+
 def frontier_release_prompt(
     session: Session, files: list[tuple[str, str]],
     defect_register: Optional[list[str]] = None,
     resolutions: Optional[dict[str, dict[str, str]]] = None,
     repair_attempt: int = 0,
 ) -> str:
-    """Independent frontier release engineering: semantic acceptance + repair."""
+    """Independent read-only semantic acceptance against frozen criteria."""
     register = "\n".join(
         f"D{i}: {defect}" for i, defect in enumerate(defect_register or [], 1)
     ) or "none"
@@ -1384,31 +1509,16 @@ def frontier_release_prompt(
     bodies = "\n\n".join(
         f"===== FILE: {name} =====\n{content}" for name, content in files
     )
-    requirements = acceptance_requirements(_execution_task(session))
+    criteria = canonical_acceptance_criteria(session)
     checklist = "\n".join(
-        f"R{i}: {requirement}" for i, requirement in enumerate(requirements, 1)
+        f"{criterion.criterion_id}: {criterion.text}" for criterion in criteria
     )
-    repair = (
-        "This is the confirmation pass after your prior repair. Do not trust the "
-        "claimed fix; re-inspect the resulting files from scratch."
+    review_instruction = (
+        "The previous reviewer turn was incomplete or protocol-invalid. Perform "
+        "a fresh read-only inspection of the same checkpoint now."
         if repair_attempt else
-        "REPAIR MANDATE — you are a release ENGINEER, not a critic. For EVERY "
-        "check you FAIL where the fix is knowable from the code in front of "
-        "you, you MUST ship that fix in this same reply:\n"
-        "- surgical fixes: one block per edit, each starting with the exact "
-        "literal header 'EDIT: <exact path>' — never 'OLD/NEW EDIT' or a "
-        "numbered variant like 'EDIT 1:', every edit restates the same plain "
-        "'EDIT: <path>' header — followed by 'OLD:' and a fenced code block "
-        "with the exact existing text, then 'NEW:' and a fenced code block "
-        "with its replacement;\n"
-        "- broader fixes (structural rework, many touchpoints): a COMPLETE "
-        "replacement file as 'ARTIFACT: <exact path shown below>' followed by "
-        "the full file body and a line 'END_ARTIFACT'.\n"
-        "A FAIL without a repair is acceptable ONLY when the fix genuinely "
-        "requires its owner's rebuild (a missing subsystem, absent content you "
-        "cannot invent); say so in that DEFECT line as 'requires owner "
-        "rebuild: <why>'. Rejecting without repairing fixable defects wastes "
-        "an entire verification cycle and is treated as an incomplete review."
+        "This is a read-only release inspection. Diagnose precisely; the "
+        "coordinator will route a blocking defect to its accountable producer."
     )
     return (
         "You are the independent FRONTIER RELEASE ENGINEER. You did not select or "
@@ -1418,15 +1528,16 @@ def frontier_release_prompt(
         f"JUDGE DEFECT REGISTER:\n{register}\n\n"
         f"CHAIR CLOSURE CLAIMS:\n{closure}\n\n"
         f"REQUIRED ACCEPTANCE CHECKLIST:\n{checklist}\n\n"
-        f"{repair}\n"
+        f"{review_instruction}\n"
         "Test every explicit behavior in the task, not merely syntax/load. Verify "
         "every registered defect is demonstrably closed. Emit exactly one line "
         "for EVERY R-number: 'CHECK R1: PASS - <specific evidence>' or "
         "'CHECK R1: FAIL - <specific evidence>'. Then emit DEFECT lines for "
         "every remaining problem. End with exactly 'VERDICT: PASS' only if all "
         "explicit requirements pass and no material defect remains; otherwise end "
-        "with 'VERDICT: FAIL'. Missing R-number checks invalidate a PASS. For repairs, "
-        "use exact unique OLD/NEW EDIT blocks and the exact file paths shown.\n\n"
+        "with 'VERDICT: FAIL'. Missing R-number checks invalidate a PASS. Do not "
+        "emit EDIT, ARTIFACT, BUILD, or PROMOTE instructions: reviewer ownership "
+        "ends at diagnosis.\n\n"
         f"{bodies}"
     )
 
@@ -1444,6 +1555,79 @@ def parse_frontier_verdict(text: str) -> tuple[str, list[dict[str, str]], list[s
     if not checks or any(item["status"] == "FAIL" for item in checks) or defects:
         verdict = "FAIL"
     return verdict, checks, defects
+
+
+def parse_frontier_review(
+    text: str,
+    criteria: list[AcceptanceCriterion],
+    *,
+    checkpoint_id: str = "",
+    reviewer: str = "",
+) -> ReviewReport:
+    """Parse semantic advice without conflating protocol and artifact failure."""
+    match = _VERDICT_RE.search(text or "")
+    checks = [
+        CriterionResult(
+            criterion_id=(m.group(1) or "").upper(),
+            status=m.group(2).lower(),
+            detail=m.group(3).strip().strip("* "),
+        )
+        for m in _CHECK_RE.finditer(text or "")
+    ]
+    defects = [
+        {
+            "description": item.strip().strip("* "),
+            "severity": "error",
+            "blocks_release": True,
+        }
+        for item in _DEFECT_RE.findall(text or "")
+        if item.strip() and item.strip().lower() != "none"
+    ]
+    expected = {item.criterion_id for item in criteria}
+    observed = {item.criterion_id for item in checks if item.criterion_id}
+    missing = sorted(expected - observed)
+    unexpected = sorted(observed - expected)
+    if match is None or not checks or missing or unexpected:
+        details: list[str] = []
+        if match is None:
+            details.append("missing VERDICT")
+        if not checks:
+            details.append("no parseable CHECK lines")
+        if missing:
+            details.append("missing checks: " + ", ".join(missing))
+        if unexpected:
+            details.append("unknown checks: " + ", ".join(unexpected))
+        return ReviewReport(
+            checkpoint_id=checkpoint_id,
+            reviewer=reviewer,
+            status=ReviewStatus.protocol_invalid,
+            criteria=checks,
+            defects=defects,
+            protocol_detail="; ".join(details),
+        )
+    failed_ids = {
+        item.criterion_id for item in checks if item.status == "fail"
+    }
+    blocking_ids = {
+        item.criterion_id for item in criteria if item.blocking
+    }
+    if match.group(1).upper() == "FAIL" or failed_ids or defects:
+        status = (
+            ReviewStatus.blocking_fail
+            if failed_ids & blocking_ids or any(
+                bool(item.get("blocks_release")) for item in defects
+            )
+            else ReviewStatus.nonblocking
+        )
+    else:
+        status = ReviewStatus.passed
+    return ReviewReport(
+        checkpoint_id=checkpoint_id,
+        reviewer=reviewer,
+        status=status,
+        criteria=checks,
+        defects=defects,
+    )
 
 
 def frontier_runtime_repair_prompt(
@@ -1597,12 +1781,23 @@ def deliverable_review_prompt(session: Session, files: list[tuple[str, str]],
     to catch is categorical — a script where a PDF was wanted, an empty shell
     where content was wanted, a stub where a whole file was wanted — not style.
     """
-    listing = "\n\n".join(
-        f"--- {name} ({len(body)} chars) ---\n{body[:config.REVIEW_FILE_MAX_CHARS]}"
-        + ("\n[... truncated for review ...]"
-           if len(body) > config.REVIEW_FILE_MAX_CHARS else "")
-        for name, body in files
-    )
+    def review_excerpt(name: str, body: str) -> str:
+        limit = config.REVIEW_FILE_MAX_CHARS
+        if len(body) <= limit:
+            excerpt = body
+        else:
+            head = max(1, limit // 2)
+            tail = max(1, limit - head)
+            omitted = len(body) - head - tail
+            excerpt = (
+                body[:head]
+                + f"\n[... {omitted} characters omitted from the middle of the "
+                  "review excerpt; this is not missing file content ...]\n"
+                + body[-tail:]
+            )
+        return f"--- {name} ({len(body)} chars total) ---\n{excerpt}"
+
+    listing = "\n\n".join(review_excerpt(name, body) for name, body in files)
     return (
         f"TASK THE USER ASKED FOR:\n{_execution_task(session)}\n\n"
         f"WHAT {author} PRODUCED — these exact files are about to be delivered:\n"
@@ -1618,6 +1813,9 @@ def deliverable_review_prompt(session: Session, files: list[tuple[str, str]],
         "2. MISSING — something the request explicitly named is absent.\n"
         "3. INCOMPLETE — the file is cut off, or a section is a placeholder.\n"
         "4. FALSE CLAIM — the work claims something the bytes do not support.\n\n"
+        "A marked omission in the middle of a review excerpt is prompt-size "
+        "compression, not evidence that the underlying file is incomplete. "
+        "Use the visible beginning, ending, and total character count.\n\n"
         "Do NOT fail it for style, structure, naming, formatting, efficiency, "
         "or choices you would have made differently. Unstated details the author "
         "reasonably assumed are NOT defects.\n\n"

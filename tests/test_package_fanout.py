@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gangof8 import loop, rounds
+from gangof8 import config, loop, rounds
 from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (
@@ -141,6 +141,36 @@ def test_goal_package_preserves_healthy_sibling_seats_as_helpers(tmp_path, monke
 
     assert session is not None
     assert session.panel == ["codex"]
+    assert session.package_helpers == ["gemini", "qwen"]
+
+
+def test_full_council_package_exposes_every_resource_from_start(tmp_path, monkeypatch):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.panel = ["codex", "gemini", "qwen"]
+    goal = Goal(
+        text="write a researched report",
+        status="running",
+        epoch=1,
+        collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        staging_root=str(tmp_path / "stage"),
+        resource_roster=["codex", "gemini", "qwen"],
+        participation_mode="full_council",
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", title="report", task_text="write report",
+            owner="codex", required_files=["report.md"],
+            contract_declared=True, requires_delivery=True,
+        )],
+    )
+    service.goals.save(goal)
+    monkeypatch.setattr(
+        service, "_run_owned", lambda session, _runner, background: session,
+    )
+
+    session = service._start_milestone(goal, 0, background=False)
+
+    assert session is not None
+    assert session.panel == ["codex", "gemini", "qwen"]
     assert session.package_helpers == ["gemini", "qwen"]
 
 
@@ -326,14 +356,14 @@ def test_owner_timeout_fans_missing_outputs_out_to_enabled_helpers(tmp_path):
     } == set(session.required_files)
 
 
-def test_package_authoring_has_no_default_wall_clock_cutoff():
+def test_package_authoring_obeys_the_absolute_call_ceiling():
     session = _session()
     member = CouncilMember(role=Role.panelist, agent="codex", active=True)
 
     timeout = loop._package_author_timeout(session, member)
 
-    assert timeout == 0
-    assert loop._package_seconds_remaining(session) is None
+    assert timeout == config.BUFFERED_CALL_HARD_TIMEOUT
+    assert loop._package_seconds_remaining(session) == config.PACKAGE_AUTHOR_DEADLINE
 
 
 def test_atomic_package_never_mixes_helper_authorship(tmp_path):

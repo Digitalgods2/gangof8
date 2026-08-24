@@ -229,6 +229,7 @@ _TIMELINE = {
     "artifact_continuation_failed": ("⚠️", "Could not finish file"),
     "action_proposed": ("📝", "Action proposed"),
     "action_executed": ("⚙️", "Action executed"),
+    "action_execution_started": ("▶️", "Action started"),
     "action_denied": ("🚫", "Action denied"),
     "action_failed": ("❌", "Action failed"),
     "approval_requested": ("⏸️", "Approval requested"),

@@ -42,6 +42,11 @@ CLI_SCRATCH_MAX_AGE_HOURS = max(0, int(
     os.environ.get("GANGOF8_CLI_SCRATCH_MAX_AGE_HOURS", "6")))
 # Quarantined ungoverned writes that could not be attributed to a session are
 # kept out of the shared root but still need a bound: keep this many newest.
+# A goal's staging directory is reaped once no goal row owns it. The grace
+# window exists only so a goal whose row is mid-write cannot lose its staging;
+# it is not a retention policy. 0 disables the wait.
+GOAL_WORKSPACE_GRACE_HOURS = max(0, int(
+    os.environ.get("GANGOF8_GOAL_WORKSPACE_GRACE_HOURS", "1")))
 UNGOVERNED_ORPHAN_KEEP = max(0, int(
     os.environ.get("GANGOF8_UNGOVERNED_ORPHAN_KEEP", "10")))
 
@@ -88,12 +93,10 @@ MAX_PARALLEL_API_AGENTS = int(os.environ.get("GANGOF8_MAX_PARALLEL_API_AGENTS", 
 # where it stopped — appending, never re-drafting. Bound how many continuations.
 MAX_ARTIFACT_CONTINUATIONS = 3
 ARTIFACT_CONTINUATION_TAIL_CHARS = 1200  # how much of the file tail the lead sees to continue
-# Optional lead deadline; zero keeps the normal operator-supervised policy.
+# Optional narrower lead deadline; zero uses the global adapter ceiling.
 LEAD_TIMEOUT = max(0, int(os.environ.get("GANGOF8_LEAD_TIMEOUT", "0")))
-# Code authors are user-cancellable, so productive generation is not stopped
-# by a guessed wall clock.
-# Set either environment value above zero only when an installation explicitly
-# wants a hard authoring deadline; zero means no coordinator deadline.
+# Optional narrower author/retry deadlines. Zero uses the global buffered or
+# streaming ceiling rather than disabling the deadline.
 PANEL_AUTHOR_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_PANEL_AUTHOR_TIMEOUT", "0"))
 )
@@ -107,14 +110,15 @@ FRONTIER_AUTHOR_SEATS = tuple(
 FRONTIER_AUTHOR_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_FRONTIER_AUTHOR_TIMEOUT", "0"))
 )
-# An optional wall-clock deadline can cover a whole package. It is disabled by
-# default because a productive owner must be allowed to finish; cancellation
-# remains active. Positive values opt in.
+# One absolute package deadline covers owner authoring, council participation,
+# integration and bounded repair. Progress heartbeats remain visible, but they
+# do not permit a reasoning stream to hold the critical path indefinitely.
 PACKAGE_AUTHOR_DEADLINE = max(
-    0, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "0"))
+    0, int(os.environ.get("GANGOF8_PACKAGE_AUTHOR_DEADLINE", "2700"))
 )
-# When an operator opts into a package deadline, preserve recovery headroom by
-# dividing it across the three author/correction waves. Zero stays unlimited.
+# Preserve recovery headroom by dividing the package deadline across the three
+# author/correction waves. Zero disables only the package-wide ceiling; each
+# physical call still obeys its adapter ceiling.
 PACKAGE_AUTHOR_WAVE_TIMEOUT = (
     max(1, math.ceil(PACKAGE_AUTHOR_DEADLINE / 3))
     if PACKAGE_AUTHOR_DEADLINE > 0 else 0
@@ -129,10 +133,8 @@ FRONTIER_AUTHOR_RECOVERY_ATTEMPTS = int(
 BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS = int(
     os.environ.get("GANGOF8_BEST_OF_N_CANDIDATE_RECOVERY_ATTEMPTS", "1")
 )
-# Semantic release review is implementation work performed by a frontier model,
-# so it follows the same default policy as frontier authoring: no coordinator
-# wall-clock deadline. A positive environment value remains an explicit operator
-# opt-in; zero keeps the call user-cancellable and human-supervised.
+# Optional narrower semantic-review deadline; zero uses the global adapter
+# ceiling. Review remains user-cancellable in either case.
 FRONTIER_VERIFY_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_FRONTIER_VERIFY_TIMEOUT", "0"))
 )
@@ -150,12 +152,10 @@ FRONTIER_VERIFY_TIMEOUT = max(
 OPENROUTER_OUTPUT_STALL_TIMEOUT = max(
     0, int(os.environ.get("GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT", "180"))
 )
-# Streaming API seats are progress-supervised instead of killed by an arbitrary
-# elapsed-time guess. Zero is the normal policy: productive output may continue
-# until completion or an operator stops the individual call. Installations that
-# require a hard compliance deadline can opt in explicitly.
+# Streaming seats have both an output-stall detector and an absolute ceiling.
+# Reasoning tokens are progress for observability, not permission to run forever.
 OPENROUTER_HARD_TIMEOUT = max(
-    0, int(os.environ.get("GANGOF8_OPENROUTER_HARD_TIMEOUT", "0"))
+    0, int(os.environ.get("GANGOF8_OPENROUTER_HARD_TIMEOUT", "900"))
 )
 # A long productive call is not an error, but it should not become invisible.
 # After this interval the dashboard asks whether to keep waiting, stop only
@@ -167,7 +167,16 @@ MODEL_OPERATOR_CHECKIN_SECONDS = max(
         os.environ.get("GANGOF8_OPENROUTER_OPERATOR_CHECKIN_SECONDS", "300"),
     )),
 )
+# Buffered CLIs expose no token heartbeat. They therefore need a real terminal
+# deadline even when a productive streaming API is allowed to run indefinitely.
+# Fifteen minutes is ample for a focused frontier call and keeps one dead or
+# over-reasoning subprocess from consuming the package's entire deadline.
+BUFFERED_CALL_HARD_TIMEOUT = max(
+    60, int(os.environ.get("GANGOF8_BUFFERED_CALL_HARD_TIMEOUT", "900"))
+)
 OPENROUTER_OPERATOR_CHECKIN_SECONDS = MODEL_OPERATOR_CHECKIN_SECONDS
+# A valid PASS/FAIL is final for this checkpoint. This ceiling exists only to
+# retry an incomplete/protocol-invalid reviewer turn.
 FRONTIER_VERIFY_ATTEMPTS = int(os.environ.get("GANGOF8_FRONTIER_VERIFY_ATTEMPTS", "2"))
 # A verifier CLI that exits or reports capacity did NOT judge the batch.
 # Retry the call (rotating through eligible independent seats) before
@@ -241,6 +250,7 @@ ROLE_AGENTS_MOCK: dict[Role, str] = {
     Role.red_team: "mock",
     Role.fact_validator: "mock",
     Role.implementer: "mock",
+    Role.recovery_supervisor: "mock",
     Role.summarizer: "mock",
 }
 
@@ -260,6 +270,7 @@ ROLE_AGENTS_CLI: dict[Role, str] = {
     Role.red_team: "gemini",
     Role.fact_validator: "codex",
     Role.implementer: "claude",
+    Role.recovery_supervisor: "claude",
     Role.summarizer: "claude",
 }
 
@@ -472,6 +483,11 @@ MAX_TEST_FIX_ATTEMPTS = 3
 # supplied RUNTESTS command. The error is coordinator-generated, so it must
 # always enter this bounded loop instead of jumping straight to a false done.
 MAX_ARTIFACT_REPAIR_ATTEMPTS = 2
+# Recovery calls are surgical and must never occupy the critical path for the
+# 30-minute frontier-author window. A failed/stalled repair is reseated.
+RECOVERY_CALL_TIMEOUT = max(
+    60, int(os.environ.get("GANGOF8_RECOVERY_CALL_TIMEOUT", "600"))
+)
 RUN_TESTS_OUTPUT_MAX_CHARS = 4000
 BUILD_OUTPUT_MAX_CHARS = int(os.environ.get("GANGOF8_BUILD_OUTPUT_MAX_CHARS", "4000"))
 # Existing-file revisions are authored as compact patches, not as several
@@ -536,7 +552,7 @@ MAX_SKILL_REQUESTS_ANALYSIS = 6
 # many re-calls per turn. A live run ended a round on the bare line
 # 'SKILL: search_project …' because the single-cycle resolver handed the second
 # request back unresolved and it was accepted as the round's synthesis.
-MAX_SKILL_CHAIN_TURNS = 3
+MAX_SKILL_CHAIN_TURNS = 6
 SKILL_RESULT_MAX_CHARS = 2000
 # Analysis tasks also get DEEPER reads: 2000 chars of a 75KB file is ~3%, and a
 # live run showed the lead reasoning to a wrong conclusion from exactly that
@@ -632,6 +648,9 @@ LIST_DIR_RESULT_MAX_CHARS = 4000  # cap the formatted listing fed back to the ag
 WEB_ENABLED = os.environ.get("GANGOF8_WEB", "1") != "0"
 WEB_SEARCH_MODEL = os.environ.get("GANGOF8_WEB_MODEL", "gemini-2.5-flash")
 WEB_SEARCH_MAX_CHARS = 4000     # cap a search result fed back to the agent
+WEB_SEARCH_TRANSPORT_RETRIES = max(
+    0, int(os.environ.get("GANGOF8_WEB_SEARCH_TRANSPORT_RETRIES", "1"))
+)
 WEB_FETCH_TIMEOUT = 20          # seconds
 WEB_FETCH_MAX_BYTES = 2_000_000  # cap the download
 WEB_FETCH_MAX_CHARS = 6000      # cap the extracted text fed back to the agent

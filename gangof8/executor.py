@@ -25,6 +25,15 @@ class ExecutionError(Exception):
     pass
 
 
+class CapabilityContractError(ExecutionError):
+    """The coordinator and capability catalogue disagree.
+
+    Re-authoring user output cannot repair this class of error.  Callers keep
+    it distinct so recovery targets the orchestration layer instead of blaming
+    whichever frontier model happened to propose the action.
+    """
+
+
 def _safe_filename(raw: str) -> str:
     name = Path(raw.strip()).name  # drops any directory components
     if not name or set(name) <= {"."}:
@@ -93,6 +102,16 @@ _PERSISTED_ACTION_INPUTS: dict[str, set[str]] = {
     # metadata or handler inputs already present in saved sessions, so retaining
     # them is required for resume compatibility; no other undeclared keys pass.
     "write_file": {"contract_filename", "package_author"},
+    # Internal provenance attached by the package coordinator.  Handlers do
+    # not consume it, but dispatch must allow this exact coordinator-owned key.
+    "install_deps": {"package_author", "already_available", "installed_into"},
+    "build_artifact": {
+        "package_author",
+        "command_result",
+        "produced_paths",
+        "produced_hashes",
+        "verified_inputs",
+    },
     "promote_batch": {"source_hashes"},
 }
 
@@ -109,17 +128,17 @@ def _validated_handler(action: ProposedAction):
 
     kind = action.kind
     if not isinstance(kind, str) or not kind:
-        raise ExecutionError(f"unsupported action kind: {kind!r}")
+        raise CapabilityContractError(f"unsupported action kind: {kind!r}")
     skill = get_skill(kind)
     if skill is None or skill.name != kind:
-        raise ExecutionError(f"unsupported action kind: {kind!r}")
+        raise CapabilityContractError(f"unsupported action kind: {kind!r}")
     if action.role not in skill.allowed_roles:
         role = getattr(action.role, "value", str(action.role))
-        raise ExecutionError(
+        raise CapabilityContractError(
             f"role {role!r} is not allowed to execute capability {kind!r}"
         )
     if not isinstance(action.args, dict):
-        raise ExecutionError(f"capability {kind!r} requires an args object")
+        raise CapabilityContractError(f"capability {kind!r} requires an args object")
 
     declared = set(skill.inputs)
     compatible = set(_PERSISTED_ACTION_INPUTS.get(kind, set()))
@@ -133,7 +152,7 @@ def _validated_handler(action: ProposedAction):
         if not isinstance(key, str) or key not in declared | compatible
     )
     if unknown:
-        raise ExecutionError(
+        raise CapabilityContractError(
             f"capability {kind!r} received undeclared input(s): {', '.join(unknown)}"
         )
 
@@ -143,26 +162,26 @@ def _validated_handler(action: ProposedAction):
         target_name = str(target).strip().lower()
         legacy_name = str(legacy_space).strip().lower()
         if target_name != legacy_name:
-            raise ExecutionError(
+            raise CapabilityContractError(
                 f"capability {kind!r} received conflicting target and space inputs"
             )
     selected = target or legacy_space
     if selected:
         if not isinstance(selected, str):
-            raise ExecutionError(
+            raise CapabilityContractError(
                 f"capability {kind!r} target must be a space name"
             )
         selected_name = selected.strip().lower()
         if selected_name not in set(skill.permitted_spaces):
             allowed = ", ".join(skill.permitted_spaces) or "none"
-            raise ExecutionError(
+            raise CapabilityContractError(
                 f"capability {kind!r} cannot target {selected_name!r} "
                 f"(permitted spaces: {allowed})"
             )
 
     handler = HANDLERS.get(kind)
     if handler is None or not callable(handler):
-        raise ExecutionError(f"capability {kind!r} has no executable handler")
+        raise CapabilityContractError(f"capability {kind!r} has no executable handler")
     return handler
 
 

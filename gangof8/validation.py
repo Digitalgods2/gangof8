@@ -15,12 +15,82 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+import unicodedata
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 
 class ValidationCommandError(ValueError):
     pass
+
+
+class CommandResult(str):
+    """String-compatible command report with machine-readable truth.
+
+    Existing callers render and slice the report, so this deliberately remains
+    a ``str`` while exposing the exit status that must decide build success.
+    """
+
+    def __new__(
+        cls,
+        text: str,
+        *,
+        argv: list[str],
+        cwd: Path,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        duration_ms: int,
+    ):
+        obj = super().__new__(cls, text)
+        obj.argv = list(argv)
+        obj.cwd = str(cwd)
+        obj.returncode = int(returncode)
+        obj.stdout = stdout
+        obj.stderr = stderr
+        obj.duration_ms = int(duration_ms)
+        return obj
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+    def model_dump(self) -> dict:
+        return {
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "returncode": self.returncode,
+            "ok": self.ok,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "duration_ms": self.duration_ms,
+            "report": str(self),
+        }
+
+
+@dataclass
+class ArtifactValidationResult:
+    path: str
+    validator_ids: list[str] = field(default_factory=list)
+    passed: bool = True
+    failures: list[str] = field(default_factory=list)
+    evidence: dict = field(default_factory=dict)
+
+    def fail(self, message: str) -> None:
+        self.passed = False
+        self.failures.append(message)
+
+    def model_dump(self) -> dict:
+        return {
+            "path": self.path,
+            "validator_ids": list(self.validator_ids),
+            "passed": self.passed,
+            "failures": list(self.failures),
+            "evidence": dict(self.evidence),
+        }
 
 
 _SHELLS = {"cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
@@ -174,8 +244,9 @@ def approved_build_argv(command: str) -> list[str]:
 
 
 def run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int,
-        env: Optional[dict] = None) -> str:
+        env: Optional[dict] = None) -> CommandResult:
     """Run an already-parsed argv with bounded output; never shell-expand it."""
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             argv, shell=False, cwd=str(cwd), capture_output=True, text=True,
@@ -190,4 +261,194 @@ def run(argv: list[str], cwd: Path, timeout_s: int, output_limit: int,
         body += f"\n[stderr]\n{proc.stderr}"
     status = "passed" if proc.returncode == 0 else f"exit {proc.returncode}"
     shown = " ".join(shlex.quote(a) for a in argv)
-    return f"$ {shown}  (cwd: {cwd})\n[{status}]\n{body}"[:output_limit]
+    report = f"$ {shown}  (cwd: {cwd})\n[{status}]\n{body}"[:output_limit]
+    return CommandResult(
+        report,
+        argv=argv,
+        cwd=cwd,
+        returncode=proc.returncode,
+        stdout=(proc.stdout or "")[:output_limit],
+        stderr=(proc.stderr or "")[:output_limit],
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+
+_PLACEHOLDER_RE = re.compile(
+    r"(?:\bTBD\b|\bTODO\b|\bPLACEHOLDER\b|\[insert\s+[^\]]+\])",
+    re.IGNORECASE,
+)
+
+
+def _assertion_text(assertions: Optional[list[str]]) -> str:
+    return "\n".join(str(item) for item in (assertions or []) if item).lower()
+
+
+def _validate_pdf(path: Path, assertions: Optional[list[str]]) -> ArtifactValidationResult:
+    result = ArtifactValidationResult(
+        path=str(path),
+        validator_ids=["pdf.structure", "pdf.strict_parse", "pdf.text"],
+    )
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        result.fail(f"PDF could not be read: {exc}")
+        return result
+    result.evidence["bytes"] = len(raw)
+    if not raw.startswith(b"%PDF-"):
+        result.fail("PDF header is missing")
+    if b"%%EOF" not in raw[-2048:]:
+        result.fail("PDF EOF marker is missing from the trailer")
+    if b"startxref" not in raw[-4096:]:
+        result.fail("PDF startxref is missing from the trailer")
+    try:
+        import pypdf
+
+        reader = pypdf.PdfReader(str(path), strict=True)
+        pages = len(reader.pages)
+        result.evidence["pages"] = pages
+        if pages <= 0:
+            result.fail("PDF contains no pages")
+        extracted = "\n".join((page.extract_text() or "") for page in reader.pages)
+        result.evidence["extractable_text_chars"] = len(extracted.strip())
+        if not extracted.strip():
+            result.fail("PDF contains no extractable text")
+        requested = _assertion_text(assertions)
+        metadata = reader.metadata or {}
+        result.evidence["metadata"] = {
+            str(key): str(value)[:300] for key, value in dict(metadata).items()
+        }
+        if any(word in requested for word in ("metadata", "document title", "pdf title")):
+            result.validator_ids.append("pdf.metadata")
+            if not str(metadata.get("/Title") or "").strip():
+                result.fail("PDF title metadata is required but absent")
+        if "bookmark" in requested or "pdf outline" in requested:
+            result.validator_ids.append("pdf.outline")
+            try:
+                outline = reader.outline
+            except Exception as exc:  # strict evidence, not a best-effort read
+                result.fail(f"PDF outline could not be read: {exc}")
+            else:
+                result.evidence["outline_items"] = len(outline or [])
+                if not outline:
+                    result.fail("PDF bookmarks/outline were requested but absent")
+        if ("no placeholder" in requested or "without placeholder" in requested
+                or "placeholder rejection" in requested):
+            result.validator_ids.append("contract.no_placeholders")
+            match = _PLACEHOLDER_RE.search(extracted)
+            if match:
+                result.fail(f"forbidden placeholder text found: {match.group(0)}")
+        # A common document contract names the classical mother sauces and asks
+        # for their order. Verify their observable text order deterministically.
+        fold = lambda value: unicodedata.normalize("NFKD", value).encode(
+            "ascii", "ignore").decode("ascii").lower()
+        sauces = ["bechamel", "veloute", "espagnole", "hollandaise", "tomato"]
+        requested_folded = fold(requested)
+        if ("mother sauce" in requested_folded
+                and all(name in requested_folded for name in sauces)):
+            result.validator_ids.append("contract.mother_sauce_order")
+            normalized = fold(extracted)
+            positions = [normalized.find(name) for name in sauces]
+            result.evidence["mother_sauce_positions"] = dict(zip(sauces, positions))
+            if any(position < 0 for position in positions) or positions != sorted(positions):
+                result.fail("mother sauces are absent or out of the required order")
+
+        # Quantified document contracts need machine-countable identifiers.
+        # This is intentionally opt-in: ordinary prose numbers are not treated
+        # as record counts. Contracts that ask for unique IDs make the expected
+        # cardinality and index coverage objectively testable before an LLM sees
+        # the document.
+        count_match = re.search(
+            r"\b(\d{1,5})\s+(?:unique\s+)?(?:recipes?|entries|records|items)\b",
+            requested,
+        )
+        unique_id_contract = bool(re.search(
+            r"\bunique\s+(?:recipe\s+)?(?:ids?|identifiers?)\b",
+            requested,
+        ))
+        if count_match and unique_id_contract:
+            expected_count = int(count_match.group(1))
+            result.validator_ids.append("contract.unique_ids")
+            label_ids = re.findall(
+                r"(?im)\b(?:recipe\s+)?(?:id|identifier)\s*[:#-]\s*"
+                r"([A-Za-z][A-Za-z0-9]{0,15}(?:[-_]\d{2,6})|\d{2,8})\b",
+                extracted,
+            )
+            token_ids = re.findall(
+                r"\b[A-Za-z][A-Za-z0-9]{1,15}[-_]\d{2,6}\b",
+                extracted,
+            )
+            observed_ids = list(dict.fromkeys(
+                item.casefold() for item in [*label_ids, *token_ids]
+            ))
+            result.evidence["expected_unique_ids"] = expected_count
+            result.evidence["observed_unique_ids"] = len(observed_ids)
+            if len(observed_ids) != expected_count:
+                result.fail(
+                    f"contract requires exactly {expected_count} unique IDs; "
+                    f"observed {len(observed_ids)}"
+                )
+            if re.search(r"\bindex\s+(?:coverage|contains|includes|lists)\b", requested):
+                result.validator_ids.append("contract.index_coverage")
+                index_positions = [
+                    match.start() for match in re.finditer(
+                        r"(?im)^\s*(?:recipe\s+)?index\s*$", extracted
+                    )
+                ]
+                if not index_positions:
+                    result.fail("an ID index was required but no index heading was found")
+                else:
+                    index_text = extracted[index_positions[-1]:].casefold()
+                    indexed = sum(1 for item in observed_ids if item in index_text)
+                    result.evidence["indexed_unique_ids"] = indexed
+                    if indexed != expected_count:
+                        result.fail(
+                            f"ID index covers {indexed} of {expected_count} required IDs"
+                        )
+    except Exception as exc:  # pypdf strict parse includes xref/trailer consistency
+        result.fail(f"strict PDF parse failed: {exc}")
+    return result
+
+
+def _validate_zip(path: Path) -> ArtifactValidationResult:
+    result = ArtifactValidationResult(path=str(path), validator_ids=["zip.integrity"])
+    try:
+        with zipfile.ZipFile(path) as archive:
+            bad = archive.testzip()
+            result.evidence["members"] = len(archive.infolist())
+            if bad:
+                result.fail(f"archive member failed CRC validation: {bad}")
+            if not archive.infolist():
+                result.fail("archive contains no files")
+    except (OSError, zipfile.BadZipFile) as exc:
+        result.fail(f"archive integrity failed: {exc}")
+    return result
+
+
+def validate_artifact(
+    path: Path,
+    assertions: Optional[list[str]] = None,
+) -> ArtifactValidationResult:
+    """Dispatch deterministic format checks before any semantic reviewer."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _validate_pdf(path, assertions)
+    if suffix in {".zip", ".docx", ".xlsx", ".pptx"}:
+        return _validate_zip(path)
+    result = ArtifactValidationResult(path=str(path), validator_ids=["file.nonempty"])
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        result.fail(f"artifact could not be read: {exc}")
+        return result
+    result.evidence["bytes"] = len(raw)
+    if not raw:
+        result.fail("artifact is empty")
+    if suffix == ".json" and raw:
+        import json
+        result.validator_ids.append("json.strict_parse")
+        try:
+            json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            result.fail(f"JSON parse failed: {exc}")
+    return result

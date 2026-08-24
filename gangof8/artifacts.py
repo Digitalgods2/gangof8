@@ -12,6 +12,13 @@ import re
 from .models import ProposedAction, Role
 
 
+_BINARY_ARTIFACT_SUFFIXES = {
+    ".7z", ".avi", ".docx", ".gif", ".gz", ".ico", ".jpeg", ".jpg",
+    ".mov", ".mp3", ".mp4", ".pdf", ".png", ".pptx", ".tar", ".webp",
+    ".xlsx", ".zip",
+}
+
+
 # 'ARTIFACT: <filename>' followed by raw file contents.
 ARTIFACT_MARKER = re.compile(
     r"^\s*(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*(?:\*\*)?\s*$",
@@ -172,6 +179,13 @@ def parse_proposals(sid: str, text: str, role: Role = Role.implementer) -> list[
     for m in ARTIFACT_MARKER.finditer(text):
         fn = canonical_protocol_filename(m.group(1))
         if not fn:
+            continue
+        # ARTIFACT is a Unicode text envelope. Treating an opaque/binary path
+        # as if the model could type its bytes created corrupt PDFs that later
+        # reviewers were asked to reason about. Binary outputs must arrive via
+        # BUILD/PRODUCES (or a coordinator transform) instead.
+        from pathlib import Path
+        if Path(fn).suffix.lower() in _BINARY_ARTIFACT_SUFFIXES:
             continue
         body = clean_artifact_body(text[m.end():content_end(m.end())], fn)
         found.append((m.start(), ProposedAction(

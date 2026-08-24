@@ -18,12 +18,13 @@
     <span class="brand"><img src="/gangof8-text.png" class="brand-lockup" alt="Gang of 8"></span>
     <span class="bpill"><span class="dot"></span><span id="backend">backend: …</span></span>
     <span class="bpill"><span class="dot dot-brand"></span><span id="workspace">workspace: …</span></span>
-    <span class="bpill tagline">🔒 nothing executes without your approval</span>
+    <span class="bpill tagline">🔒 audited execution · manual or God mode</span>
     <span id="seatHealth" class="seat-health" title="live seat health"></span>
     <div class="hgroup">
       <button class="hbtn" title="Hard refresh — reload the page, bypassing cache (like Ctrl/Cmd+F5)" onclick="hardRefresh()">⟳</button>
       <button class="hbtn" title="Save this session (task, summary, risks, files, contributions, timeline) as a Markdown file" onclick="savePage()">💾</button>
       <button class="hbtn" title="Settings" onclick="openSettings()">⚙</button>
+      <button class="hbtn" title="How Gang of Eight executes and recovers" onclick="openHelp()">Help</button>
       <button class="hbtn" title="Diagnostics" onclick="window.open('/diagnostics','_blank')">Diag</button>
     </div>
   </div>
@@ -54,6 +55,27 @@
       <button class="ghost" onclick="applyLocalCliOnly()"
               title="Turn the local CLI seats back on and disable all OpenRouter models, then save — the council runs entirely on the local CLIs.">Local-CLIs-only</button>
       <span id="savedNote"></span>
+    </div>
+  </div>
+</div>
+
+<div id="helpOverlay" role="dialog" aria-modal="true" aria-labelledby="helpTitle"
+     onclick="if(event.target===this)closeHelp()">
+  <div id="helpPanel">
+    <div class="shead">
+      <div><div class="eyebrow">Execution guide</div><h2 id="helpTitle">How a planned build works</h2></div>
+      <button class="ghost x" type="button" onclick="closeHelp()">Close</button>
+    </div>
+    <div class="help-body">
+      <p><b>Full Council means every enabled seat participates once against the real owner baseline.</b> One accountable owner controls final bytes; the other seats research, challenge, improve, provide a standby, or verify.</p>
+      <p>The normal path is: freeze the contract, author one baseline, complete council participation, integrate once, build, run objective validators, run one independent semantic review, then release.</p>
+      <div class="help-grid">
+        <section><h3>Objective verification</h3><p>Commands, hashes, file formats, searchable text, PDF structure, runtime checks, and release-byte equality. These gates can block release.</p></section>
+        <section><h3>AI review</h3><p>Semantic evidence against the frozen R-number checklist. A malformed, timed-out, or unavailable reviewer never invalidates an objectively verified artifact; only the reviewer is retried.</p></section>
+        <section><h3>Recovery</h3><p>Repairs branch from an immutable verified checkpoint. The affected producer and downstream validators rerun; completed council reports and unrelated artifacts are reused.</p></section>
+        <section><h3>Limits</h3><p>Every physical provider dispatch consumes the goal budget before it starts, including timeouts. Calls and packages also have absolute deadlines, and unchanged repair strategies stop.</p></section>
+      </div>
+      <p><b>God mode</b> auto-approves in-contract actions with an audit trail. It does not disable scope boundaries, objective gates, cancellation, call budgets, deadlines, or no-progress stops.</p>
     </div>
   </div>
 </div>
@@ -182,7 +204,9 @@
     <label id="advWrap" title="Show the comparison routes: every seat answers (Council) or every seat writes a complete solution and all but one is discarded (Best-of-all)">
       <input type="checkbox" id="advancedRoutes"> Advanced
     </label>
-    <span id="profileHint">Gang of 8 will explain its routing choice before starting.</span>
+    <label id="godWrap" class="god-toggle" title="Advance-consent to in-contract actions for this run. Scope, hashes, and every automatic approval remain audited. The run still stops on missing information, cancellation, finite budget exhaustion, or exhausted recovery.">
+      <input type="checkbox" id="godMode"> God mode
+    </label>
   </div>
   <div class="crow">
     <div class="plusw">

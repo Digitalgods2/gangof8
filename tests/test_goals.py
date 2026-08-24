@@ -8,6 +8,7 @@ in-flight goals as paused (their workers died with the process).
 
 import hashlib
 import json
+import re
 import threading
 from pathlib import Path
 
@@ -89,6 +90,14 @@ class _PlannerSeat:
         from gangof8.models import Role
         if "MILESTONE 1:" in prompt and "GOAL:" in prompt:
             return AdapterResult(content=self._plan, duration_ms=1)
+        if "FRONTIER RELEASE ENGINEER" in prompt:
+            checks = "\n".join(
+                f"CHECK {criterion}: PASS - verified by test seat"
+                for criterion in re.findall(r"^(R\d+):", prompt, re.MULTILINE)
+            )
+            return AdapterResult(
+                content=checks + "\nVERDICT: PASS", duration_ms=1,
+            )
         if self._promoting and role in (Role.lead, Role.panelist) and "delivered into" in prompt:
             return AdapterResult(content=PROMOTE_DRAFT, duration_ms=1)
         return self._inner.call(role, prompt, timeout_s)
@@ -277,7 +286,10 @@ def test_invalid_assembly_plan_is_repaired_with_exact_validator_feedback(
     assert goal.planned_by == "gemini"
     assert len(planner.prompts) == 2
     assert planner.roles == [Role.architect, Role.architect]
-    assert planner.timeouts == [config.GOAL_PLAN_TIMEOUT, config.GOAL_PLAN_TIMEOUT]
+    assert planner.timeouts == [
+        config.BUFFERED_CALL_HARD_TIMEOUT,
+        config.BUFFERED_CALL_HARD_TIMEOUT,
+    ]
     assert template_error in planner.prompts[1]
     assert integration_error in planner.prompts[1]
     assert INVALID_ASSEMBLY_PLAN.strip() in planner.prompts[1]
@@ -325,7 +337,10 @@ def test_invalid_plan_repair_is_bounded_and_never_starts_packages(tmp_path, monk
     assert goal.milestones == []
     assert started == []
     assert len(planner.prompts) == 1 + config.GOAL_PLAN_REPAIR_ATTEMPTS
-    assert all(timeout == config.GOAL_PLAN_TIMEOUT for timeout in planner.timeouts)
+    assert all(
+        timeout == config.BUFFERED_CALL_HARD_TIMEOUT
+        for timeout in planner.timeouts
+    )
     assert "TEMPLATE must be OWNER or one of REQUIRES" in goal.last_error
     assert "without a hard-after non-assembly integration/QA package" in goal.plan_rationale
     assert service.store.list_sessions() == []
@@ -876,8 +891,8 @@ def test_stale_session_from_retried_milestone_cannot_advance(svc):
     assert svc.goals.get(goal.goal_id).status == "running"  # untouched
 
 
-def test_failed_verification_is_terminal_and_never_reported_as_done(svc):
-    """Regression for the live run: validation failure is not success."""
+def test_failed_verification_schedules_bounded_repair_and_never_reports_done(svc):
+    """A validation failure opens a bounded repair branch, never success."""
     goal = Goal(text="g", status="running", milestones=[
         GoalMilestone(index=0, title="core", task_text="build core", status="running",
                       session_id="s_failed", required_files=["core.js"],
@@ -892,13 +907,14 @@ def test_failed_verification_is_terminal_and_never_reported_as_done(svc):
     )
     svc._maybe_advance_goal(failed)
     parked = svc.goals.get(goal.goal_id)
-    assert parked.status == "paused"
+    assert parked.status == "running"
     assert parked.current_index == 0
-    assert parked.milestones[0].status == "failed"
-    assert "failed" in parked.last_error
+    assert parked.milestones[0].status == "pending"
+    assert parked.milestones[0].repair_context
+    assert "automatic recovery" in parked.last_error
 
 
-def test_parallel_failure_drains_live_sibling_before_parent_pauses(svc):
+def test_parallel_failure_schedules_repair_without_cancelling_live_sibling(svc):
     goal = Goal(text="parallel", status="running", milestones=[
         GoalMilestone(index=0, package_id="wp_1", owner="claude", title="failed",
                       task_text="one", status="running", session_id="s_failed",
@@ -914,19 +930,10 @@ def test_parallel_failure_drains_live_sibling_before_parent_pauses(svc):
         task=Task(task_id="t1", session_id="s_failed", text="one"),
     )
     svc._maybe_advance_goal(failed)
-    draining = svc.goals.get(goal.goal_id)
-    assert draining.status == "draining"
-    assert [m.status for m in draining.milestones] == ["failed", "running"]
-
-    healthy = Session(
-        session_id="s_healthy", status=SessionStatus.done, outcome="succeeded",
-        goal_id=goal.goal_id, goal_milestone=1,
-        task=Task(task_id="t2", session_id="s_healthy", text="two"),
-    )
-    svc._maybe_advance_goal(healthy)
-    parked = svc.goals.get(goal.goal_id)
-    assert parked.status == "paused"
-    assert [m.status for m in parked.milestones] == ["failed", "done"]
+    repairing = svc.goals.get(goal.goal_id)
+    assert repairing.status == "running"
+    assert [m.status for m in repairing.milestones] == ["pending", "running"]
+    assert repairing.milestones[0].repair_context
 
 
 def test_goal_context_uses_only_promoted_accepted_files(svc, tmp_path):
@@ -1167,8 +1174,9 @@ def test_assembly_template_failure_reopens_only_its_upstream_owner(tmp_path, mon
     assert repairing.status == "running"
     assert [package.status for package in repairing.milestones] == ["pending", "pending"]
     provider = repairing.milestones[0]
-    assert provider.invalidated_session_ids == ["s_bad_template"]
-    assert provider.accepted_hashes == {}
+    assert provider.invalidated_session_ids == []
+    assert provider.accepted_hashes == {"index.template.html": "bad"}
+    assert provider.repair_context["failed_session_id"] == "s_assembly"
     assert repairing.current_index == 0
     assert scheduled == [0]
 
@@ -1179,7 +1187,7 @@ def test_assembly_template_failure_reopens_only_its_upstream_owner(tmp_path, mon
 
     reopened = service.goals.resume(goal.goal_id)
     assert [package.status for package in reopened.milestones] == ["pending", "pending"]
-    assert reopened.milestones[0].invalidated_session_ids == ["s_bad_template"]
+    assert reopened.milestones[0].invalidated_session_ids == []
 
 
 def test_resume_reopens_legacy_non_self_contained_stylesheet_owner(
@@ -1245,8 +1253,9 @@ def test_resume_reopens_legacy_non_self_contained_stylesheet_owner(
     provider = service.goals.get(goal.goal_id).milestones[0]
     assert provider.status == "pending"
     assert provider.session_id is None
-    assert provider.invalidated_session_ids == ["s_bad_styles"]
-    assert provider.accepted_hashes == {}
+    assert provider.invalidated_session_ids == []
+    assert provider.accepted_hashes == {"css/theme.css": stylesheet_hash}
+    assert provider.repair_context["failed_session_id"] == "s_assembly"
 
 
 def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeypatch):
@@ -1324,8 +1333,12 @@ def test_resume_reopens_provider_that_breaks_assembled_runtime(tmp_path, monkeyp
     provider = repaired.milestones[0]
     assert provider.status == "pending"
     assert provider.session_id is None
-    assert provider.invalidated_session_ids == ["s_bad_core"]
-    assert provider.accepted_hashes == {}
+    assert provider.invalidated_session_ids == []
+    assert provider.accepted_hashes == {
+        "js/input.js": hashlib.sha256(input_source.encode()).hexdigest(),
+        "js/portal.js": hashlib.sha256(portal_source.encode()).hexdigest(),
+    }
+    assert provider.repair_context["failed_session_id"] == "s_assembly_runtime"
     # Stack-based attribution blames js/input.js, not js/portal.js: the throw
     # (`.actions.fire = true`) is a line inside input.js's own keydown
     # callback. Bisection alone would blame portal.js merely because ITS
@@ -1848,7 +1861,10 @@ def test_resume_reopens_culprit_package_after_failed_release_verification(tmp_pa
     provider = repaired.milestones[0]
     assert provider.status == "pending"
     assert provider.session_id is None
-    assert provider.invalidated_session_ids == ["s_painter"]
+    assert provider.invalidated_session_ids == []
+    assert provider.accepted_hashes["js/painter.js"] == hashlib.sha256(
+        painter_source.encode()
+    ).hexdigest()
     assert "js/painter.js" in provider.acceptance_detail
     assert "AFTER" in provider.acceptance_detail
     assert repaired.milestones[2].status == "pending"
@@ -1916,7 +1932,10 @@ def test_resume_reopens_direct_owner_after_failed_verification_single_package(tm
     assert provider.status == "pending"
     assert provider.session_id is None
     assert provider.owner == "claude"
-    assert provider.invalidated_session_ids == ["s_game"]
+    assert provider.invalidated_session_ids == []
+    assert provider.accepted_hashes["donkey-kong.html"] == hashlib.sha256(
+        game_source.encode()
+    ).hexdigest()
     assert "horizontal velocity" in provider.acceptance_detail
     assert repaired.release_status == "not_started"
     assert repaired.release_session_id is None
@@ -2441,6 +2460,72 @@ def test_single_package_plan_for_single_artifact_is_accepted(tmp_path):
     assert errors == []
 
 
+def test_named_format_without_filename_skips_planner_and_uses_one_package(
+    tmp_path, monkeypatch,
+):
+    """A content-heavy PDF is still one artifact.  The August 23 regression
+    spent a planner call and created a five-package swarm because intake had a
+    format but used a descriptive deliverable instead of an explicit path."""
+    service = GangOf8Service(
+        data_dir=tmp_path / "data",
+        role_agents={Role.code_generator: "codex"},
+        panel=["codex", "claude", "gemini"],
+    )
+    started: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_start_ready_packages",
+        lambda current, background: started.append(current.goal_id),
+    )
+
+    goal = service.create_goal(
+        "Research heavily and create a searchable indexed PDF cookbook with "
+        "100 recipes, modernized for home use."
+    )
+
+    assert goal.status == "running"
+    assert goal.planned_by == "coordinator:deterministic-single-artifact"
+    assert goal.model_calls_used == 0
+    assert len(goal.milestones) == 1
+    package = goal.milestones[0]
+    assert package.owner == "codex"
+    assert package.release_files == ["deliverable.pdf"]
+    assert package.required_files == [
+        "deliverable.pdf", "_gangof8/build_wp_1.py"
+    ]
+    assert started == [goal.goal_id]
+
+
+def test_single_artifact_rejects_research_fanout(tmp_path):
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    milestones = [
+        GoalMilestone(
+            index=0, package_id="wp_1", owner="claude", title="first half",
+            task_text="research recipes 1-50", contract_declared=True,
+            requires_delivery=True, required_files=["research/first.json"],
+        ),
+        GoalMilestone(
+            index=1, package_id="wp_2", owner="gemini", title="second half",
+            task_text="research recipes 51-100", contract_declared=True,
+            requires_delivery=True, required_files=["research/second.json"],
+        ),
+        GoalMilestone(
+            index=2, package_id="wp_3", owner="codex", title="book",
+            task_text="author the book", contract_declared=True,
+            requires_delivery=True, required_files=["deliverable.pdf"],
+            release_files=["deliverable.pdf"], depends_on=[0, 1],
+            dependencies=["research/first.json", "research/second.json"],
+        ),
+    ]
+
+    _normalized, errors = service._normalize_work_packages(
+        milestones, "create one PDF", roster=["claude", "gemini", "codex"]
+    )
+
+    assert any("at most one independently checkpointed research package" in e
+               for e in errors)
+
+
 def test_multi_artifact_plans_are_not_capped_to_one_package(tmp_path):
     service = GangOf8Service(data_dir=tmp_path / "data")
     milestones = [
@@ -2844,7 +2929,9 @@ def test_goal_session_spend_is_counted_exactly_once(tmp_path):
 
     # attempts (5) dominate completed contributions (3): failures cost too
     assert goal.model_calls_used == 5
-    assert goal.model_calls_by_seat == {"claude": 2, "codex": 1}
+    assert goal.model_calls_by_seat == {
+        "claude": 2, "codex": 1, "unattributed_attempts": 2,
+    }
     assert goal.counted_session_ids == ["s_spend"]
 
 

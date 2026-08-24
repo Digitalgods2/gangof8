@@ -9,7 +9,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
-SESSION_SCHEMA_VERSION = 3
+SESSION_SCHEMA_VERSION = 6
+GOAL_SCHEMA_VERSION = 4
 
 # Intake contracts are user-editable, so their execution budget needs a
 # generous but finite safety envelope. Runtime steering remains the explicit,
@@ -69,6 +70,40 @@ class SessionStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class ApprovalPolicy(str, Enum):
+    """How approval-bearing actions are resolved for one immutable run."""
+
+    manual = "manual"
+    god_mode = "god_mode"
+
+
+class MaterializationMode(str, Enum):
+    text = "text"
+    build = "build"
+    transform = "transform"
+    revision = "revision"
+
+
+class RecoveryState(str, Enum):
+    idle = "idle"
+    observing = "observing"
+    repairing = "repairing"
+    verifying = "verifying"
+    recovered = "recovered"
+    exhausted = "exhausted"
+    manual_intervention_required = "manual_intervention_required"
+
+
+class ReviewStatus(str, Enum):
+    """A semantic reviewer result, kept separate from artifact validity."""
+
+    passed = "pass"
+    blocking_fail = "blocking_fail"
+    nonblocking = "nonblocking"
+    protocol_invalid = "protocol_invalid"
+    unavailable = "unavailable"
+
+
 class Role(str, Enum):
     coordinator = "coordinator"
     lead = "lead"  # the single driver of a task; pulls in the talents below on demand
@@ -82,6 +117,7 @@ class Role(str, Enum):
     red_team = "red_team"
     fact_validator = "fact_validator"
     implementer = "implementer"
+    recovery_supervisor = "recovery_supervisor"
     governance = "governance"
     summarizer = "summarizer"
 
@@ -227,6 +263,11 @@ class ApprovalRequest(BaseModel):
     requested_at: str = Field(default_factory=utcnow)
     resolved_at: Optional[str] = None
     resolved_by: Optional[str] = None
+    # Audit context is populated even when God mode resolves the request in the
+    # same transaction in which it was created.
+    execution_policy: ApprovalPolicy = ApprovalPolicy.manual
+    scope_reason: str = ""
+    artifact_hashes: dict[str, str] = {}
 
 
 class ProposedAction(BaseModel):
@@ -251,7 +292,143 @@ class ProposedAction(BaseModel):
     approval_id: Optional[str] = None
     result_path: Optional[str] = None
     error: Optional[str] = None
+    # Failure ownership is structural, not prose inferred later.  In
+    # particular, a capability-contract defect belongs to the coordinator and
+    # must never trigger another expensive artifact-author call.
+    failure_layer: str = ""  # "" | author | environment | orchestrator
     proposed_at: str = Field(default_factory=utcnow)
+
+
+class BuildRecipe(BaseModel):
+    """The exact, replayable command that produces derived output bytes."""
+
+    command: str = ""
+    working_directory: str = "."
+    environment: dict[str, str] = {}
+    inputs: list[str] = []
+    outputs: list[str] = []
+    validator_ids: list[str] = []
+
+
+class MaterializationPlan(BaseModel):
+    """Persisted source-to-output contract for one output-producing unit."""
+
+    mode: MaterializationMode = MaterializationMode.text
+    authoritative_inputs: list[str] = []
+    input_hashes: dict[str, str] = {}
+    producing_files: list[str] = []
+    release_files: list[str] = []
+    build: Optional[BuildRecipe] = None
+    validator_ids: list[str] = []
+    contract_assertions: list[str] = []
+    status: str = "planned"  # planned | materialized | verified | failed
+
+
+class ArtifactLineage(BaseModel):
+    path: str
+    sha256: str = ""
+    produced_by_action: str = ""
+    producing_files: list[str] = []
+    input_hashes: dict[str, str] = {}
+    validator_ids: list[str] = []
+    verified_at: Optional[str] = None
+
+
+class AcceptanceCriterion(BaseModel):
+    """One frozen definition-of-done item shared by prompt and enforcement."""
+
+    criterion_id: str
+    text: str
+    gate: str = "semantic"  # objective | semantic | human
+    blocking: bool = True
+    validator_id: str = ""
+
+
+class CriterionResult(BaseModel):
+    criterion_id: str
+    status: str  # pass | fail | not_checked
+    detail: str = ""
+
+
+class ReviewReport(BaseModel):
+    """Hash-bound review evidence; protocol errors never invalidate bytes."""
+
+    review_id: str = Field(default_factory=lambda: f"rv_{short_id()}")
+    checkpoint_id: str = ""
+    reviewer: str = ""
+    status: ReviewStatus = ReviewStatus.protocol_invalid
+    criteria: list[CriterionResult] = []
+    defects: list[dict] = []
+    protocol_detail: str = ""
+    created_at: str = Field(default_factory=utcnow)
+
+
+class FailureRecord(BaseModel):
+    failure_id: str = Field(default_factory=lambda: f"f_{short_id()}")
+    stage: str
+    category: str
+    summary: str
+    evidence: dict = {}
+    evidence_history: list[dict] = []
+    artifact_path: str = ""
+    artifact_hash: str = ""
+    expected_hash: str = ""
+    validator_id: str = ""
+    command_result: dict = {}
+    owner: str = ""
+    fault_signature: str = ""
+    recoverable: bool = True
+    severity: str = "error"
+    blocks_release: bool = True
+    repair_scope: list[str] = []
+    action_id: str = ""
+    failure_layer: str = ""
+    caused_by_failure_id: str = ""
+    retry_classification: str = ""
+    resolution_state: str = "open"  # open | resolved | exhausted
+    occurrences: int = 1
+    created_at: str = Field(default_factory=utcnow)
+    updated_at: str = Field(default_factory=utcnow)
+
+
+class DefectRecord(BaseModel):
+    defect_id: str = Field(default_factory=lambda: f"d_{short_id()}")
+    failure_id: str = ""
+    validator_id: str = ""
+    artifact_path: str = ""
+    artifact_hash: str = ""
+    producer_paths: list[str] = []
+    description: str
+    criterion_id: str = ""
+    severity: str = "error"
+    blocks_release: bool = True
+    observed_checkpoint_id: str = ""
+    target_producer_paths: list[str] = []
+    status: str = "open"  # open | repairing | resolved | exhausted
+    created_at: str = Field(default_factory=utcnow)
+    resolved_at: Optional[str] = None
+
+
+class RepairAttempt(BaseModel):
+    repair_id: str = Field(default_factory=lambda: f"r_{short_id()}")
+    failure_id: str = ""
+    defect_ids: list[str] = []
+    owner: str = ""
+    strategy: str = ""
+    input_hashes: dict[str, str] = {}
+    changed_files: list[str] = []
+    fault_signature: str = ""
+    diagnosed_by: str = ""
+    diagnosis: str = ""
+    before_hashes: dict[str, str] = {}
+    after_hashes: dict[str, str] = {}
+    verification_evidence: dict = {}
+    attempt_fingerprint: str = ""
+    base_checkpoint_id: str = ""
+    result_checkpoint_id: str = ""
+    status: str = "started"  # started | verified | failed | superseded
+    started_at: str = Field(default_factory=utcnow)
+    completed_at: Optional[str] = None
 
 
 class Workspace(BaseModel):
@@ -356,12 +533,29 @@ class GoalMilestone(BaseModel):
     # Accepted-byte provenance by relative output path. Deterministic transforms
     # identify source hashes and never falsely credit a zero-call owner as author.
     output_provenance: dict[str, dict] = {}
-    # Downstream deterministic validation can prove that an otherwise completed
-    # upstream attempt violated its template contract. Resume must not silently
-    # recover that exact session as verified work again.
+    # Retained only for migrations from pre-checkpoint sessions. New recovery
+    # branches never invalidate a verified checkpoint in place.
     invalidated_session_ids: list[str] = []
     acceptance_detail: str = ""
     summary: str = ""                 # snippet of its final answer, for context
+    materialization_plan: Optional[MaterializationPlan] = None
+    last_good_checkpoint: dict = {}
+    # A failed producer is still valuable diagnostic input. Goal recovery seals
+    # its exact bytes separately and records their hashes here so a replacement
+    # owner repairs the observed failure instead of starting over from a prose-
+    # only error summary. This is deliberately separate from
+    # ``last_good_checkpoint`` because these bytes have not passed validation.
+    recovery_source_checkpoint: dict = {}
+    # Checkpoints are immutable content-addressed manifests. A repair branches
+    # from this verified candidate and cannot replace it until verification.
+    active_verified_checkpoint_id: str = ""
+    candidate_checkpoint_id: str = ""
+    repair_context: dict = {}
+    phase: str = "contract_frozen"
+    # Full-council reports belong to the baseline, not the disposable Session.
+    participation_checkpoint_id: str = ""
+    participation_reports: list[dict] = []
+    resume_session_id: str = ""
 
 
 class CollaborationAssignment(BaseModel):
@@ -383,6 +577,14 @@ class CollaborationAssignment(BaseModel):
     disposition: str = ""
     contribution_index: Optional[int] = None
     error: str = ""
+    recovered_by: str = ""
+    failure_history: list[dict] = []
+    context_turns: int = 0
+    skill_requests: list[str] = []
+    context_results: list[dict] = []
+    retry_strategy: str = ""
+    active_seat: str = ""
+    fallback_from: str = ""
 
 
 class Goal(BaseModel):
@@ -393,12 +595,14 @@ class Goal(BaseModel):
     their sequential tournament/milestone behavior.
     """
 
+    schema_version: int = GOAL_SCHEMA_VERSION
     goal_id: str = Field(default_factory=lambda: f"g_{short_id()}")
     text: str
     # Product-level intent that remains stable while package prompts evolve.
     # Stored as a versioned JSON object so older Goal records remain valid.
     outcome_contract: dict = Field(default_factory=dict)
     execution_profile: str = "auto"
+    approval_policy: ApprovalPolicy = ApprovalPolicy.manual
     routing_decision: dict = Field(default_factory=dict)
     playbook_id: Optional[str] = None
     parent_goal_id: Optional[str] = None
@@ -431,8 +635,8 @@ class Goal(BaseModel):
     release_session_id: Optional[str] = None
     release_status: str = "not_started"  # not_started | awaiting_target | awaiting_approval | released | denied | failed
     release_files: list[str] = []
-    # Semantic defects and unapplied frontier repairs survive a release retry;
-    # otherwise an inconsistent second reading can silently forget a known bug.
+    # Semantic defects survive a release retry; otherwise an inconsistent
+    # second reading can silently forget a known bug.
     release_defects: list[str] = []
     # A goal-level epoch invalidates a planner/milestone worker that belonged to
     # an earlier cancelled or retried run.  The short-lived lease is persisted
@@ -456,6 +660,26 @@ class Goal(BaseModel):
     model_calls_budget: int = 0
     # Sessions already folded into the ledger — spend is counted exactly once.
     counted_session_ids: list[str] = []
+    failure_records: list[FailureRecord] = []
+    defect_ledger: list[DefectRecord] = []
+    repair_history: list[RepairAttempt] = []
+    recovery_state: RecoveryState = RecoveryState.idle
+    recovery_supervisor_events: list[dict] = []
+    recovery_attempts: dict[str, int] = {}
+    last_good_checkpoint: dict = {}
+    active_verified_checkpoint_id: str = ""
+    phase: str = "contract_frozen"
+    criteria: list[AcceptanceCriterion] = []
+    review_attempts: list[ReviewReport] = []
+    work_items: list[dict] = []
+    # Each physical provider dispatch is reserved before it starts. These IDs
+    # are never refunded merely because the provider failed or timed out.
+    model_call_reservations: list[dict] = []
+    # Goal-level aggregation of the evidence gathered by its package sessions.
+    # Without this, a run could call itself "heavily researched" while the goal
+    # API exposed no auditable sources at all.
+    research_mode: str = "not_required"
+    research_provenance: list[dict] = []
     created_at: str = Field(default_factory=utcnow)
     updated_at: str = Field(default_factory=utcnow)
 
@@ -476,6 +700,7 @@ class Session(BaseModel):
     # receives the same explicit deliverables and success criteria.
     outcome_contract: dict = Field(default_factory=dict)
     execution_profile: str = "auto"
+    approval_policy: ApprovalPolicy = ApprovalPolicy.manual
     routing_decision: dict = Field(default_factory=dict)
     playbook_id: Optional[str] = None
     parent_session_id: Optional[str] = None
@@ -553,7 +778,30 @@ class Session(BaseModel):
     # instead of repairing the same one until the attempt cap. A run once died
     # holding five generators having executed exactly one of them.
     candidate_fallbacks: list[str] = []
+    # Full-council implementation lenses may provide a complete multi-file hot
+    # standby. Groups are atomic: a failed build swaps every producer in the
+    # group together so recovery never creates a mixed-generation package.
+    candidate_fallback_groups: list[list[str]] = []
     quality_gate: dict = {}
+    criteria: list[AcceptanceCriterion] = []
+    review_attempts: list[ReviewReport] = []
+    phase: str = "contract_frozen"
+    repair_mode: bool = False
+    base_checkpoint_id: str = ""
+    candidate_checkpoint_id: str = ""
+    reused_participation_reports: list[dict] = []
+    goal_model_call_reservation_ids: list[str] = []
+    materialization_plan: Optional[MaterializationPlan] = None
+    artifact_lineage: list[ArtifactLineage] = []
+    failure_records: list[FailureRecord] = []
+    defect_ledger: list[DefectRecord] = []
+    repair_history: list[RepairAttempt] = []
+    recovery_state: RecoveryState = RecoveryState.idle
+    recovery_supervisor_events: list[dict] = []
+    last_good_checkpoint: dict = {}
+    working_set_manifest: dict = {}
+    research_mode: str = "not_required"  # not_required | retrieved | recall_only | capability_gap
+    research_provenance: list[dict] = []
     # Package artifact hashes captured by the deterministic verifier. Recovery
     # may adopt a completed attempt only when its current result paths still
     # match this seal.

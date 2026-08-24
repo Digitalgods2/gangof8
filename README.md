@@ -2,12 +2,14 @@
 
 ![Gang of 8](gangof8/static/gangof8-text.png)
 
-Gang of 8 is a local, human-governed coordinator for multiple LLMs. It can
+Gang of 8 is a local, auditable coordinator for multiple LLMs. It can
 convene the whole configured council to compare independent solutions, or turn
 the same council into a build team whose members own different parts of a
 larger job. The application runs the models, captures their work as real
-artifacts, verifies it, keeps an audit trail, and requires approval before
-moving finished work into a real project.
+artifacts, verifies it, and keeps an audit trail. Manual mode requires approval
+before moving finished work into a real project; per-run **God mode** provides
+advance consent for in-contract actions without disabling validation, budgets,
+deadlines, cancellation, or scope boundaries.
 
 The name describes the intended full roster: one coordinator plus seven model
 seats. The bundled roster can combine three local CLI seats (Claude, Codex, and
@@ -26,10 +28,44 @@ never contain API keys, workspaces, sandbox paths, or session data.
 Gang of 8 is currently version `0.1.0` and under active development. It is a
 single-user desktop service, not a hosted multi-tenant system.
 
-## The two collaboration modes
+## Execution and recovery invariants
 
-Gang of 8 deliberately uses different logic for a normal request and a large
-build goal.
+The same task-neutral controller rules apply to programs, documents, research,
+PDFs, data, designs, and every other deliverable:
+
+1. The Outcome Contract and stable R-number acceptance criteria are frozen once
+   and shared by authors, validators, reviewers, and enforcement.
+2. In Full Council mode, every healthy enabled seat participates once against
+   the real owner baseline. One accountable owner integrates final bytes. A
+   repair reuses completed participation instead of replaying all seven seats.
+3. Source writes, staging, installs, builds, validators, and release run in a
+   coordinator-owned dependency order even when a model lists them differently.
+4. Objective gates and AI review are separate. Hashes, commands, strict format
+   parsing, searchable text, PDF structure, runtime behavior, and release-byte
+   equality can block release. A malformed or unavailable reviewer cannot
+   invalidate bytes that passed those gates.
+5. Verified artifacts are immutable content-addressed checkpoints under
+   `data/blobs/sha256/`. Repairs branch from the active checkpoint and replace
+   it only after a new candidate passes objective validation.
+6. Every physical provider dispatch reserves one goal-budget slot before it
+   starts. Timeouts, transport failures, and reasoning-only responses still
+   consume that slot. Parallel fan-out therefore cannot overshoot the cap.
+7. Recovery observes the first causal failure, chooses a changed bounded
+   action, repairs the narrowest producer, reruns downstream gates, records the
+   evidence, and stops on success, exhaustion, cancellation, budget, deadline,
+   or no progress.
+8. Restart resumes durable package phase evidence and completed council reports.
+   It does not deliberately turn a reviewer error into a fresh full-council
+   production run.
+
+The dashboard shows two explicit lanes—**Objective verification** and **AI
+review**—plus the active checkpoint, controller phase, defect evidence, repair
+state, and model attempts by seat.
+
+## The two collaboration shapes
+
+Ordinary requests and planned builds use the same contract, budget, checkpoint,
+verification, and recovery logic. They differ only in collaboration shape.
 
 | | Ordinary task | Build-team goal |
 |---|---|---|
@@ -160,22 +196,22 @@ governance ledger rather than pretending to be file deliverables.
 Claude and Codex are treated as implementation capacity first and evaluation
 capacity second when they are enabled:
 
-- each must author a substantive source-producing package in a broad build-team
-  goal; the coordinator repairs planner assignments that put them only on
-  review or documentation;
+- a planned build gives one accountable owner the cohesive package baseline;
+  every other enabled frontier/resource seat receives a distinct useful lens
+  against those real bytes rather than an artificial extra package;
 - an ordinary code tournament requires a candidate from every enabled frontier
   author, and each required candidate must pass the runtime gate;
 - a failed frontier candidate goes back to the same model for implementation
   repair before judging; returning later only as a judge does not satisfy the
   author quorum;
-- frontier authoring and release verification have no coordinator hard deadline
-  by default and remain immediately cancellable by the user;
+- frontier authoring and release verification obey absolute call/package
+  deadlines and remain immediately cancellable by the user;
 - a selected implementation is checked against an explicit requirement list
   and judge-defect register by a different frontier release engineer; and
 - a build team's assembled final batch receives the same independent frontier
-  inspection before the single approval card is created. A failed inspection
-  can apply surgical code repairs, but the repaired result must pass a second
-  confirmation inspection.
+  inspection before the single approval card is created. Review is read-only:
+  a typed blocking defect returns to the accountable producer and every
+  downstream objective/semantic gate reruns on the replacement checkpoint.
 
 Disabling Claude or Codex in the header or Settings intentionally removes that
 seat from the required quorum. This is the supported way to request a smaller
@@ -238,9 +274,10 @@ flowchart TD
 7. A strong codifier/chair ratifies or overrides the vote using evidence,
    closes every numbered judge defect, applies bounded surgical fixes, and can offer a separately validated
    integration candidate when Council integration review is enabled.
-8. An independent frontier release engineer checks every extracted acceptance
-   requirement, repairs failures when possible, and confirms repaired code in a
-   second pass. Candidate counts report authored and runnable totals separately.
+8. An independent frontier release engineer checks every frozen acceptance
+   requirement without rewriting owner-controlled bytes. A blocking defect is
+   routed to its producer; a malformed reviewer response retries only review.
+   Candidate counts report authored and runnable totals separately.
 9. The chosen output remains in a council-controlled space until its governed
    delivery action is approved.
 
@@ -490,18 +527,23 @@ to keep the final batch in staging instead of delivering it.
 
 ## Council roster and model configuration
 
-**Right-sizing defaults** (see `ARCHITECTURE-REVIEW.md`): the roster serves
-the task. By default the panel runs in **duo** mode — a lead author plus one
-independent frontier reviewer — and goals are planned against a
-frontier-only build roster with the fewest packages the deliverable's real
-structure allows (a single-file deliverable is exactly one authoring
-package). Build collaboration has a separate resource roster containing every
-enabled registered model, including DeepSeek when no named specialist role
-maps to it. Settings provides three participation modes:
+The packaged profile uses **Full Council** for planned builds. Package count is
+right-sized to the artifact, but participation is task-type neutral: one owner
+authors a cohesive artifact while every healthy enabled seat is scheduled once
+to research, challenge, improve, provide redundancy, synthesize, or verify the
+real baseline. Targeted repairs reuse those completed reports instead of
+replaying the council.
+
+**Right-sizing defaults** (see `ARCHITECTURE-REVIEW.md`): package count follows
+the deliverable's real structure (a single-file deliverable is exactly one
+authoring package), while resource participation is independent of task type.
+Planned builds have a resource roster containing every enabled registered
+model, including DeepSeek when no named specialist role maps to it. Settings
+provides three participation modes:
 
 - **Focused** — package owner plus independent release verification.
-- **Adaptive** (default) — Full Council for standard/complex code builds and
-  Focused behavior for small work.
+- **Adaptive** (default) — use the enabled council for planned builds while
+  keeping the package graph proportional to the artifact.
 - **Full Council** — every enabled resource is scheduled against the real
   baseline; failures remain visible rather than silently shrinking the roster.
 
@@ -600,8 +642,8 @@ status pills (see `NEXT-LEVEL.md` for the design rationale):
   reached".
 - **Goal story (📜)** — one click renders the goal's complete ordered
   timeline merged from all of its sessions, topped by a postmortem: model
-  calls per seat against the budget, packages with owners and invalidated
-  attempts, and attempts split honestly into completed / lost to seat
+  calls per seat against the budget, packages with owners and checkpointed
+  repair branches, and attempts split honestly into completed / lost to seat
   outages / interrupted / failed.
 - **Output tail** — while a streaming seat is authoring, the session view
   shows the last few hundred characters the model is literally writing.
@@ -636,15 +678,20 @@ rejected as authorship.
 
 ## Timeouts, failures, and recovery
 
-Model calls have no coordinator wall-clock deadline by default: elapsed time is
-not evidence of failure. This covers planning, local CLI seats, OpenRouter,
-authors, reviewers, judges, summarizers, repair passes, and release verification.
-At the configurable check-in interval, the dashboard offers **Keep waiting**,
-**Stop this model**, or **Cancel run/goal**. Keeping waiting snoozes the next
-check-in without restarting the call; stopping one model leaves healthy sibling
-calls alone. Installations that require compliance deadlines can opt in with
-the environment variables below. Registered HTTP connections and CLI processes
-still stop immediately when the operator asks.
+Every provider call now has an absolute ceiling as well as live progress and
+operator cancellation. Buffered CLI and streaming OpenRouter calls default to
+15 minutes; a complete package—owner, council, integration, and recovery—has a
+45-minute deadline. OpenRouter additionally stops after three minutes without
+model output. Reasoning tokens remain visible progress, but they do not extend
+the absolute deadline. The dashboard still offers **Keep waiting**, **Stop this
+model**, and **Cancel run/goal** at the check-in interval; Keep waiting never
+restarts the call or overrides its ceiling.
+
+Release handling distinguishes five semantic-review results: `pass`,
+`blocking_fail`, `nonblocking`, `protocol_invalid`, and `unavailable`. Only a
+typed blocking defect mapped to a frozen criterion and producing source can
+open a repair branch. Protocol and transport failures retry the verifier only.
+The objectively verified checkpoint remains active throughout.
 
 Gang of 8 handles failures as follows:
 
@@ -656,9 +703,8 @@ Gang of 8 handles failures as follows:
   transient error is re-called as the same implementation owner; a missing or
   non-runnable required frontier candidate stops delivery instead of degrading
   silently;
-- package authoring is not cut off by elapsed wall time unless an operator opts
-  into `GANGOF8_PACKAGE_AUTHOR_DEADLINE`; an opted-in deadline includes queue
-  time and is divided across author/recovery waves;
+- package authoring, queueing, council review, integration, and repair share one
+  absolute package deadline; a deployment may override or disable it explicitly;
 - a timeout/error is never retried against the same author. Only its unresolved
   exact paths may be reassigned once to a healthy sibling, which must author new
   artifacts during the recovery wave. Completed sibling outputs are
@@ -666,8 +712,8 @@ Gang of 8 handles failures as follows:
 - a completed protocol/path miss can receive one focused exact-path correction;
   no assignment or timeout decision uses guessed file byte or token counts;
 - deterministic assembly spends only its one compact-template call;
-- streaming calls persist output-backed progress timestamps and distinguish
-  productive generation from a call still waiting for output;
+- streaming calls persist separate reasoning/answer progress, enforce an
+  output-stall cutoff, and also obey the absolute call deadline;
 - bounded artifact and test repair loops re-run verification after changes,
   stay on the exact path, and return package code to its owner;
 - an OpenRouter call that produces **no token** for `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT`
@@ -697,10 +743,12 @@ scheduled—not just the first package index. The goal epoch is preserved on
 resume so a healthy sibling cannot be invalidated merely because another
 package failed.
 
-Restart recovery does not resume an interrupted model subprocess in place. It
-parks every running package, not only the first one shown in the goal. Inspect
-the recorded error and explicitly resume the paused goal; completed verified
-work is then recovered as described above.
+Restart recovery cannot resume an operating-system subprocess in place, but it
+does persist the package phase, owner baseline actions, completed council
+assignments, candidate checkpoint, and build recipe. Resume creates a clean
+worker, reuses that durable evidence, completes only unfinished participation,
+and deterministically replays the downstream build/gates. A fully verified
+session is adopted directly without another model call.
 
 The dashboard groups retry sessions under their parent goal. Each package row
 shows its accountable owner, exact-output author count, effective session
@@ -1135,27 +1183,28 @@ Common environment variables:
 | `GANGOF8_MAX_PARALLEL_AGENTS` | Concurrent local CLI subprocesses | `4` |
 | `GANGOF8_MAX_PARALLEL_API_AGENTS` | Concurrent API-backed calls | `8` |
 | `GANGOF8_MODEL_OPERATOR_CHECKIN_SECONDS` | Ask whether to keep waiting, stop one model, or cancel | `300` |
-| `GANGOF8_LEAD_TIMEOUT` | Optional lead-call hard deadline; `0` disables | `0` |
-| `GANGOF8_GOAL_PLAN_TIMEOUT` | Optional goal-planning hard deadline; `0` disables | `0` |
-| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Optional package/panel authoring hard deadline; `0` disables | `0` |
-| `GANGOF8_PANEL_RETRY_TIMEOUT` | Optional focused recovery hard deadline; `0` disables | `0` |
+| `GANGOF8_LEAD_TIMEOUT` | Optional narrower lead-call deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_GOAL_PLAN_TIMEOUT` | Optional narrower goal-planning deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_PANEL_AUTHOR_TIMEOUT` | Optional narrower package/panel authoring deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_PANEL_RETRY_TIMEOUT` | Optional narrower focused recovery deadline; `0` uses the global call ceiling | `0` |
 | `GANGOF8_FRONTIER_AUTHOR_SEATS` | Comma-separated required implementation seats | `claude,codex` |
-| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Optional frontier-author hard deadline; `0` disables | `0` |
-| `GANGOF8_PACKAGE_AUTHOR_DEADLINE` | Optional shared package deadline; `0` disables, positive values are split across author/recovery waves | `0` |
+| `GANGOF8_FRONTIER_AUTHOR_TIMEOUT` | Optional narrower frontier-author deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_PACKAGE_AUTHOR_DEADLINE` | Absolute shared package deadline covering author/council/integration/recovery; `0` disables | `2700` |
 | `GANGOF8_FRONTIER_AUTHOR_RECOVERY_ATTEMPTS` | Same-owner recovery calls for non-build-team frontier tournament authors | `1` |
-| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Optional independent frontier release deadline; `0` disables | `0` |
-| `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Initial inspection plus repair-confirmation ceiling | `2` |
+| `GANGOF8_FRONTIER_VERIFY_TIMEOUT` | Optional narrower independent release-review deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_FRONTIER_VERIFY_ATTEMPTS` | Reviewer protocol-attempt ceiling; a valid PASS/FAIL is never repeated unchanged | `2` |
 | `GANGOF8_OPENROUTER_OUTPUT_STALL_TIMEOUT` | Cut off an OpenRouter call that has produced no token for this long. Measures silence, not duration, so a productive stream is never interrupted; `0` disables | `180` |
-| `GANGOF8_OPENROUTER_HARD_TIMEOUT` | Optional hard deadline for streaming OpenRouter calls; `0` disables | `0` |
+| `GANGOF8_OPENROUTER_HARD_TIMEOUT` | Absolute hard deadline for streaming OpenRouter calls; `0` disables | `900` |
+| `GANGOF8_BUFFERED_CALL_HARD_TIMEOUT` | Absolute hard deadline for buffered CLI calls | `900` |
 | `GANGOF8_OPENROUTER_OPERATOR_CHECKIN_SECONDS` | Legacy alias for the model check-in interval | `300` |
-| `GANGOF8_CODIFIER_TIMEOUT` | Optional finishing-pass hard deadline; `0` disables | `0` |
-| `GANGOF8_JUDGE_TIMEOUT` | Optional candidate-judge hard deadline; `0` disables | `0` |
+| `GANGOF8_CODIFIER_TIMEOUT` | Optional narrower finishing-pass deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_JUDGE_TIMEOUT` | Optional narrower candidate-judge deadline; `0` uses the global call ceiling | `0` |
 | `GANGOF8_MAX_JUDGES` | Maximum blind judges | `3` |
 | `GANGOF8_JUDGE_FIRST_WAVE` | Judges called before early-stop evaluation | `2` |
 | `GANGOF8_BATCH_PROMOTE_DIFF_MAX_CHARS` | Aggregate final-batch diff display cap | `60000` |
 | `GANGOF8_ALLOW_REMOTE` | Explicitly allow non-loopback serving | unset |
-| `GANGOF8_AGENT_TIMEOUT_DEFAULT` | Fallback per-call deadline when no role-specific one applies; `0` disables | `0` |
-| `GANGOF8_CLAUDE_TIMEOUT`, `GANGOF8_CODEX_TIMEOUT`, `GANGOF8_GEMINI_TIMEOUT` | Per-CLI-seat deadline override; `0` disables | `0` |
+| `GANGOF8_AGENT_TIMEOUT_DEFAULT` | Optional narrower generic deadline; `0` uses the global call ceiling | `0` |
+| `GANGOF8_CLAUDE_TIMEOUT`, `GANGOF8_CODEX_TIMEOUT`, `GANGOF8_GEMINI_TIMEOUT` | Optional narrower per-CLI-seat deadline; `0` uses the global call ceiling | `0` |
 | `GANGOF8_DUO_PANEL_SIZE` | Seats a `duo` panel convenes (lead + reviewers) | `2` |
 | `GANGOF8_REVIEW` | Independent pre-delivery review of every result | `1` |
 | `GANGOF8_REVIEW_BLOCKS` | A confirmed FAIL refuses delivery | `1` |
@@ -1340,6 +1389,8 @@ change.
 cli.py                         Command-line entry point
 gangof8/main.py                FastAPI service and dashboard routes
 gangof8/service.py             Service wiring, background work, goals, recovery
+gangof8/checkpoints.py         Immutable SHA-256 blob/checkpoint manifests
+gangof8/recovery.py            Causal faults, bounded repairs, no-progress stops
 gangof8/workbench.py           Outcome contracts, playbooks, evaluations, steering, artifact manifests
 gangof8/loop.py                Deliberation, delegation, selection, repair
 gangof8/goals.py               Goal planning, persistence, package contracts

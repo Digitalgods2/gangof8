@@ -543,7 +543,7 @@ def test_stubbing_panel_seat_is_dropped_from_synthesis(tmp_path):
 # --- task-aware skill-request cap --------------------------------------------------
 
 
-def test_analysis_tasks_get_a_higher_skill_cap(tmp_path):
+def test_context_skill_cap_is_task_type_neutral(tmp_path):
     from gangof8 import loop
     from gangof8.classifier import classify
     from gangof8.logstore import LogStore
@@ -557,7 +557,7 @@ def test_analysis_tasks_get_a_higher_skill_cap(tmp_path):
 
     s.classification = classify("implement a parser module in parser.py")
     assert s.classification.task_type.value == "code"
-    assert loop._skill_request_cap(s) == config.MAX_SKILL_REQUESTS_PER_TURN
+    assert loop._skill_request_cap(s) == config.MAX_SKILL_REQUESTS_ANALYSIS
 
 
 def test_research_lead_gets_more_than_two_skill_results(tmp_path):
@@ -737,8 +737,8 @@ def test_lead_recall_after_skill_results_keeps_the_lead_timeout(tmp_path):
     session = svc.run(TASK, source="test")
     assert session.status == SessionStatus.done
     assert len(probe.lead_timeouts) == 2, "initial call + skill-results re-call"
-    assert all(t == config.LEAD_TIMEOUT for t in probe.lead_timeouts), \
-        f"every lead call gets the lead timeout, got {probe.lead_timeouts}"
+    assert all(t == config.BUFFERED_CALL_HARD_TIMEOUT for t in probe.lead_timeouts), \
+        f"every lead call gets the absolute buffered timeout, got {probe.lead_timeouts}"
 
 
 # --- delegated RESULT block survives folding ----------------------------------------
@@ -964,22 +964,18 @@ def test_legacy_establish_target_input_still_answerable(tmp_path):
     assert resumed.established_asked is True
 
 
-def test_release_prompt_mandates_repairs_including_whole_file_rewrites():
-    """Phase 2 repair mandate: the release engineer must ship fixes for every
-    fixable FAIL — surgical EDITs or complete ARTIFACT rewrites — and may only
-    leave a defect unrepaired by stating it requires the owner's rebuild."""
+def test_release_prompt_keeps_review_read_only_and_routes_repairs_to_owner():
     from gangof8.models import Session, Task
     session = Session(
         session_id="s_prompt", task=Task(
             task_id="t", session_id="s_prompt", text="build a game"))
     prompt = rounds.frontier_release_prompt(
         session, [("game.html", "<html></html>")], defect_register=[])
-    assert "REPAIR MANDATE" in prompt
-    assert "ARTIFACT:" in prompt
-    assert "END_ARTIFACT" in prompt
-    assert "requires owner rebuild" in prompt
-    # the confirmation pass stays a clean-room re-inspection, not a repair pass
+    assert "read-only release inspection" in prompt
+    assert "Do not emit EDIT, ARTIFACT, BUILD, or PROMOTE" in prompt
+    assert "accountable producer" in prompt
+    # a protocol retry remains a fresh inspection of the same checkpoint
     confirm = rounds.frontier_release_prompt(
         session, [("game.html", "<html></html>")], repair_attempt=1)
-    assert "REPAIR MANDATE" not in confirm
-    assert "re-inspect the resulting files from scratch" in confirm
+    assert "protocol-invalid" in confirm
+    assert "same checkpoint" in confirm

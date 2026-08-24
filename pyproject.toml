@@ -28,7 +28,7 @@ packages = ["gangof8", "gangof8.adapters"]
 py-modules = ["cli"]
 
 [tool.setuptools.package-data]
-gangof8 = ["static/*", "default-settings.json"]
+gangof8 = ["static/*", "default-settings.json", "seat_profiles/*/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

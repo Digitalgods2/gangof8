@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__, reporting, security, skills
-from .models import Role
+from .models import ApprovalPolicy, Role
 from .service import GangOf8Service
 from .settings import SettingsProfile
 
@@ -58,6 +58,7 @@ class TaskIn(BaseModel):
     execution_profile: str = "auto"
     playbook_id: str | None = None
     parent_session_id: str | None = None
+    approval_policy: ApprovalPolicy = ApprovalPolicy.manual
 
 
 class TaskPreviewIn(BaseModel):
@@ -66,6 +67,7 @@ class TaskPreviewIn(BaseModel):
     attachments: list[str] = Field(default_factory=list)
     outcome_contract: dict | None = None
     execution_profile: str = "auto"
+    approval_policy: ApprovalPolicy = ApprovalPolicy.manual
 
 
 class UploadIn(BaseModel):
@@ -96,6 +98,7 @@ def _summary(session) -> dict:
         "original_text": session.task.original_text or session.task.text,
         "outcome_contract": session.outcome_contract,
         "execution_profile": session.execution_profile,
+        "approval_policy": session.approval_policy.value,
         "routing_decision": session.routing_decision,
         "playbook_id": session.playbook_id,
         "parent_session_id": session.parent_session_id,
@@ -209,6 +212,7 @@ def submit_task(body: TaskIn) -> dict:
             execution_profile=body.execution_profile,
             playbook_id=body.playbook_id,
             parent_session_id=body.parent_session_id,
+            approval_policy=body.approval_policy,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -233,6 +237,7 @@ def preview_task(body: TaskPreviewIn) -> dict:
     try:
         return service.preview_task(
             body.text,
+            approval_policy=body.approval_policy,
             source=body.source,
             attachments=body.attachments,
             outcome_contract=body.outcome_contract,
@@ -642,6 +647,12 @@ class GoalIn(BaseModel):
     execution_profile: str = "build_team"
     playbook_id: str | None = None
     parent_goal_id: str | None = None
+    approval_policy: ApprovalPolicy = ApprovalPolicy.manual
+
+
+class GoalRecoveryIn(BaseModel):
+    strategy: str
+    background: bool = True
 
 
 @app.post("/goals")
@@ -657,6 +668,7 @@ def create_goal(body: GoalIn) -> dict:
             execution_profile=body.execution_profile,
             playbook_id=body.playbook_id,
             parent_goal_id=body.parent_goal_id,
+            approval_policy=body.approval_policy,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -707,6 +719,17 @@ def stop_goal_agent_call(goal_id: str, call_id: str) -> dict:
 def resume_goal(goal_id: str) -> dict:
     try:
         return service.resume_goal(goal_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="goal not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/goals/{goal_id}/recover")
+def recover_goal(goal_id: str, body: GoalRecoveryIn) -> dict:
+    try:
+        return service.recover_goal(
+            goal_id, body.strategy, background=body.background)
     except KeyError:
         raise HTTPException(status_code=404, detail="goal not found")
     except ValueError as e:

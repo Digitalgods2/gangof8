@@ -14,6 +14,7 @@ import hashlib
 import re
 import shutil
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +32,9 @@ from . import (
     intent,
     reporting,
     rounds,
+    recovery,
     smoke,
+    validation,
 )
 from .artifacts import parse_proposals
 from .adapters.cli import CliAdapter
@@ -40,6 +43,7 @@ from .adapters.openrouter import OpenRouterAdapter
 from .secrets import SecretStore
 from .roles import resolve_frontier_authors, separate_authoring_from_lead
 from .composer import fallback_final
+from .checkpoints import CheckpointStore
 from .governance import Governance
 from .logstore import LogStore
 from .loop import (
@@ -51,6 +55,8 @@ from .loop import (
     run_session,
 )
 from .models import (
+    ApprovalPolicy,
+    BuildRecipe,
     Budgets,
     Complexity,
     CouncilMember,
@@ -58,7 +64,11 @@ from .models import (
     Goal,
     GoalMilestone,
     InputRequest,
+    MaterializationMode,
+    MaterializationPlan,
     ProposedAction,
+    RecoveryState,
+    ReviewStatus,
     Risk,
     Role,
     Session,
@@ -82,6 +92,7 @@ from .settings import (
     make_settings_profile,
     save_settings,
 )
+from .seat_profiles import PRODUCTION_SEATS, SeatProfileStore
 from .uploads import UploadStore, attachment_context
 from .workbench import (
     OutcomeContract,
@@ -163,6 +174,58 @@ def _dir_mtime(p: Path) -> float:
         return 0.0
 
 
+def _prune_empty_dirs(root: Path, *, protect: Optional[set] = None,
+                      min_age_s: float = 0.0) -> int:
+    """Remove empty directories under `root`, deepest first. Returns the count.
+
+    Deleting files leaves their folders behind, so scratch space slowly fills
+    with hollow trees that no size-based or age-based sweep notices: they hold
+    no bytes and their mtime keeps changing as children are removed. Walking
+    bottom-up matters — emptying a leaf is what makes its parent empty, and a
+    single top-down pass would miss every parent it had already visited.
+
+    `root` itself is never removed (a live writer expects it to exist), and
+    nothing in `protect` is touched.
+
+    `min_age_s` is not a retention policy — it is a safety guard. An empty
+    directory is ambiguous: it may be debris, or it may be a folder created
+    seconds ago by a writer that has not saved its first file yet. Deleting
+    the second kind pulls the ground out from under a running call, so a
+    freshly-touched directory is always left alone. Best-effort — never
+    raises."""
+    import os
+    import time as _time
+
+    protect = protect or set()
+    cutoff = _time.time() - min_age_s if min_age_s else None
+    # Removing a child updates the parent's mtime, which would make the parent
+    # look freshly-touched and protect it until the next sweep — so a deep
+    # hollow tree would peel only one layer per run. Our own deletions are not
+    # evidence that someone is writing here, so they never confer protection.
+    emptied_by_us: set = set()
+    removed = 0
+    try:
+        if not root.is_dir():
+            return 0
+        for dirpath, _dirnames, _files in os.walk(root, topdown=False):
+            d = Path(dirpath)
+            if d == root or str(d) in protect or d.name in protect:
+                continue
+            try:
+                if (cutoff is not None and _dir_mtime(d) > cutoff
+                        and d not in emptied_by_us):
+                    continue  # too fresh — a writer may be about to use it
+                if next(d.iterdir(), None) is None:
+                    d.rmdir()
+                    removed += 1
+                    emptied_by_us.add(d.parent)
+            except OSError:
+                continue  # vanished, in use, or not actually empty — leave it
+    except OSError:
+        pass
+    return removed
+
+
 def _strip_fence(s: str) -> str:
     """Drop a wrapping ``` code fence if the model added one, so the textarea
     gets the clean prompt."""
@@ -185,6 +248,8 @@ class GangOf8Service:
         panel: Optional[list[str]] = None,
     ):
         self._data_dir = Path(data_dir) if data_dir else config.DATA_DIR
+        self.seat_profiles = SeatProfileStore(self._data_dir)
+        self.seat_profiles.ensure_many(PRODUCTION_SEATS)
         # A normal application start (no injected data_dir) uses the bundled,
         # versioned non-secret profile when settings.json does not exist. Tests
         # and embedders with an explicit data directory retain config defaults
@@ -199,12 +264,16 @@ class GangOf8Service:
         self._explicit_panel = panel
 
         self.store = LogStore(self._data_dir)
+        self.store.seat_profiles = self.seat_profiles
         self.manager = SessionManager(self.store)
         self.governance = Governance(self.store)
         self.workspaces = WorkspaceStore(self._data_dir)
         self.uploads = UploadStore(self._data_dir)
         self.secrets = SecretStore(self._data_dir)
         self.goals = goals.GoalStore(self._data_dir)
+        self.checkpoints = CheckpointStore(self._data_dir)
+        self.store.goal_store = self.goals
+        self.store.checkpoints = self.checkpoints
         self.workbench = WorkbenchStore(self._data_dir)
         # The execution loop receives the LogStore rather than this service.
         # Attach the durable workbench so every agent-call checkpoint can see
@@ -238,6 +307,14 @@ class GangOf8Service:
         if data_dir is not None or not self._another_instance_is_live():
             self._reconcile_orphans()
             self._reconcile_goal_orphans()
+            # Sweep at startup too, not only on submit. Cleanup used to be a
+            # side effect of starting new work, so an idle instance never
+            # reclaimed anything: the longer it sat, the longer debris stayed.
+            # Guarded exactly like the reconcilers, so a throwaway Service or a
+            # second launcher can never sweep a live owner's data.
+            self._pool.submit(self._gc_sandboxes)
+            self._pool.submit(self._gc_cli_scratch)
+            self._pool.submit(self._gc_goal_workspaces)
 
     def _another_instance_is_live(self) -> bool:
         """True if something is already listening on the dashboard port —
@@ -302,6 +379,7 @@ class GangOf8Service:
             self.role_agents = self._apply_seat_disables(self.role_agents)
 
         self.registry = AgentRegistry()
+        self.registry.seat_profiles = self.seat_profiles
         # Shared per-seat health: fed by every registry call outcome and
         # consulted by scheduling so hard-unavailable seats (quota, auth,
         # offline) are routed around instead of retried into the ground.
@@ -728,6 +806,7 @@ class GangOf8Service:
         "accept",
         "accepted",
         "acknowledged",
+        "agree",
         "all good",
         "approve",
         "approved",
@@ -750,6 +829,59 @@ class GangOf8Service:
         "yes thank you",
         "yes thanks",
     }
+    _PENDING_ACKNOWLEDGEMENTS = {
+        "accept", "agree", "approve", "continue", "go ahead", "ok", "okay",
+        "proceed", "resume", "yes",
+    }
+
+    def _resolve_pending_acknowledgement(
+        self, text: str, *, background: bool, attachments: Optional[list[str]],
+    ) -> Optional[tuple[str, Session | Goal]]:
+        """Route a bare acknowledgment to one unambiguous pending state."""
+        if attachments:
+            return None
+        normalized = re.sub(r"[\s.!?,;:]+", " ", (text or "").casefold()).strip()
+        if normalized not in self._PENDING_ACKNOWLEDGEMENTS:
+            return None
+        approvals = self.pending_approvals()
+        inputs = [item for item in self.pending_inputs()
+                  if item.get("purpose") in {"continue_rounds", "integration_decision"}]
+        if len(approvals) + len(inputs) == 1:
+            if approvals:
+                pending = approvals[0]
+                session = self.approve(
+                    pending["session_id"], pending["approval_id"], True,
+                    by="chat_acknowledgement", background=background,
+                )
+                self.store.log_event(
+                    session.session_id, "pending_state_acknowledged",
+                    {"kind": "approval", "text": normalized},
+                )
+                return "session", session
+            pending = inputs[0]
+            session = self.answer(
+                pending["session_id"], pending["input_id"], "yes",
+                by="chat_acknowledgement", background=background,
+            )
+            self.store.log_event(
+                session.session_id, "pending_state_acknowledged",
+                {"kind": pending.get("purpose"), "text": normalized},
+            )
+            return "session", session
+        if normalized in {"continue", "proceed", "resume", "go ahead"}:
+            paused = [goal for goal in self.goals.list() if goal.status == "paused"]
+            if len(paused) == 1:
+                self.resume_goal(paused[0].goal_id, background=background)
+                goal = self.goals.get(paused[0].goal_id) or paused[0]
+                self._sys_log("pending_state_acknowledged",
+                    {"goal_id": goal.goal_id, "kind": "resume",
+                     "text": normalized},
+                )
+                return "goal", goal
+        raise ValueError(
+            "that acknowledgment does not identify exactly one pending action; "
+            "open the goal/session you mean or add a concrete instruction"
+        )
 
     def _sys_log(self, event: str, payload: Optional[dict] = None) -> None:
         """Log an event that belongs to no single session.
@@ -1045,6 +1177,7 @@ class GangOf8Service:
         attachments: Optional[list[str]] = None,
         outcome_contract: Optional[dict] = None,
         execution_profile: str = "auto",
+        approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual,
     ) -> dict:
         """Return the editable contract and explainable route without model calls."""
         raw = (text or "").strip()
@@ -1079,6 +1212,7 @@ class GangOf8Service:
             "source": source,
             "outcome_contract": contract.model_dump(),
             "execution_profile": profile,
+            "approval_policy": ApprovalPolicy(approval_policy).value,
             "recommended_profile": routing["selected_route"],
             "routing_decision": routing,
             "classification": {
@@ -1099,14 +1233,20 @@ class GangOf8Service:
         execution_profile: str = "auto",
         playbook_id: Optional[str] = None,
         parent_session_id: Optional[str] = None,
+        approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual,
     ) -> tuple[str, Session | Goal]:
         """Central intake router used by the API, clones, and playbooks."""
+        resolved = self._resolve_pending_acknowledgement(
+            text, background=background, attachments=attachments)
+        if resolved is not None:
+            return resolved
         preview = self.preview_task(
             text,
             source=source,
             attachments=attachments,
             outcome_contract=outcome_contract,
             execution_profile=execution_profile,
+            approval_policy=approval_policy,
         )
         route = preview["routing_decision"]["selected_route"]
         contract = preview["outcome_contract"]
@@ -1118,6 +1258,7 @@ class GangOf8Service:
                 execution_profile=execution_profile,
                 playbook_id=playbook_id,
                 routing_decision=preview["routing_decision"],
+                approval_policy=approval_policy,
             )
             return "goal", goal
         runner = self.submit_background if background else self.run
@@ -1130,6 +1271,7 @@ class GangOf8Service:
             routing_decision=preview["routing_decision"],
             playbook_id=playbook_id,
             parent_session_id=parent_session_id,
+            approval_policy=approval_policy,
         )
         return "session", session
 
@@ -1139,7 +1281,8 @@ class GangOf8Service:
               execution_profile: str = "auto",
               routing_decision: Optional[dict] = None,
               playbook_id: Optional[str] = None,
-              parent_session_id: Optional[str] = None) -> Session:
+              parent_session_id: Optional[str] = None,
+              approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual) -> Session:
         """Create a session, stamping the backend, the active workspace root
         (so file skills operate in that project; None ⇒ per-session sandbox),
         and folding any attachment text into the task the council reads."""
@@ -1177,6 +1320,7 @@ class GangOf8Service:
             }
         ).model_dump()
         session.execution_profile = profile
+        session.approval_policy = ApprovalPolicy(approval_policy)
         session.routing_decision = dict(routing)
         session.playbook_id = playbook_id
         session.parent_session_id = parent_session_id
@@ -1260,6 +1404,7 @@ class GangOf8Service:
         # therefore protected.
         self._pool.submit(self._gc_sandboxes)
         self._pool.submit(self._gc_cli_scratch)
+        self._pool.submit(self._gc_goal_workspaces)
         return session
 
     def _gc_sandboxes(self, keep: Optional[int] = None) -> dict:
@@ -1290,6 +1435,10 @@ class GangOf8Service:
                     continue  # in use — never GC (and doesn't count toward `keep`)
                 kept += 1
                 if kept <= keep:
+                    # Retained for inspection — but the tree inside it still
+                    # collects empty folders that no size or age rule notices.
+                    # The session is finished, so nothing is writing here.
+                    removed += _prune_empty_dirs(d)
                     continue
                 shutil.rmtree(d, ignore_errors=True)
                 removed += 1
@@ -1297,6 +1446,57 @@ class GangOf8Service:
             pass
         if removed:
             self._sys_log("sandboxes_gc", {"removed": removed, "kept": keep})
+        return {"removed": removed}
+
+    def _gc_goal_workspaces(self, grace_hours: Optional[float] = None) -> dict:
+        """Delete per-goal staging directories whose goal no longer exists.
+
+        Every other scratch space here has a bound — sandboxes keep the newest
+        SANDBOX_KEEP, CLI scratch expires by age. Goal staging had none, and
+        clearing history removes the goal ROW while leaving its directory on
+        disk, so orphans accumulated permanently (21 dirs / 4.5 MB observed).
+
+        A directory is removed only when no goal row owns it. Live goals are
+        never touched whatever their age or size, and a grace window protects
+        a goal whose row is being written right now, so this can never delete
+        staging out from under a starting run. Best-effort — never raises.
+
+        `grace_hours=0` skips that wait, for the one caller that has already
+        deleted every goal row on purpose: after "clear history" there is no
+        row left to settle, and honouring the window there would strand the
+        staging of the run the user just cleared."""
+        import shutil
+        import time as _time
+
+        root = self._data_dir / "goal-workspaces"
+        removed = 0
+        try:
+            if not root.is_dir():
+                return {"removed": 0}
+            live = {g.goal_id for g in self.goals.list()}
+            grace = (config.GOAL_WORKSPACE_GRACE_HOURS
+                     if grace_hours is None else grace_hours)
+            cutoff = _time.time() - grace * 3600
+            for entry in root.iterdir():
+                if not entry.is_dir() or entry.name in live:
+                    continue
+                if grace and _dir_mtime(entry) > cutoff:
+                    continue  # too fresh to be sure its goal row is settled
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+            # A live goal keeps its directory, but the tree under it still
+            # collects empty folders as packages are staged and promoted.
+            # Its own dir and its `stage` root are protected — a running
+            # package expects both to exist.
+            for goal_id in live:
+                goal_dir = root / goal_id
+                if goal_dir.is_dir():
+                    removed += _prune_empty_dirs(
+                        goal_dir, protect={"stage"}, min_age_s=grace * 3600)
+        except OSError:
+            pass
+        if removed:
+            self._sys_log("goal_workspaces_gc", {"removed": removed})
         return {"removed": removed}
 
     def _gc_cli_scratch(self) -> dict:
@@ -1347,6 +1547,12 @@ class GangOf8Service:
                 else:
                     entry.unlink(missing_ok=True)
                 removed += 1
+            # No empty-directory sweep belongs here. Every entry under this
+            # root is already governed: stale ones are deleted above whether
+            # or not they hold files, recent ones must survive because a call
+            # may be about to write into them, and `_ungoverned` children are
+            # bounded by UNGOVERNED_ORPHAN_KEEP rather than by emptiness.
+            # A blanket prune would override all three.
         except OSError:
             pass
         if removed:
@@ -1394,7 +1600,8 @@ class GangOf8Service:
             execution_profile: str = "auto",
             routing_decision: Optional[dict] = None,
             playbook_id: Optional[str] = None,
-            parent_session_id: Optional[str] = None) -> Session:
+            parent_session_id: Optional[str] = None,
+            approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual) -> Session:
         session = self._open(
             text, source, budgets, attachments,
             outcome_contract=outcome_contract,
@@ -1402,6 +1609,7 @@ class GangOf8Service:
             routing_decision=routing_decision,
             playbook_id=playbook_id,
             parent_session_id=parent_session_id,
+            approval_policy=approval_policy,
         )
         return self._run_owned(session, self._run_full, background=False)
 
@@ -1412,7 +1620,8 @@ class GangOf8Service:
                           execution_profile: str = "auto",
                           routing_decision: Optional[dict] = None,
                           playbook_id: Optional[str] = None,
-                          parent_session_id: Optional[str] = None) -> Session:
+                          parent_session_id: Optional[str] = None,
+                          approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual) -> Session:
         """Create the session and run it on a worker thread; the caller polls
         GET /sessions/{id} for progress."""
         session = self._open(
@@ -1422,6 +1631,7 @@ class GangOf8Service:
             routing_decision=routing_decision,
             playbook_id=playbook_id,
             parent_session_id=parent_session_id,
+            approval_policy=approval_policy,
         )
         self._run_owned(session, self._run_full, background=True)
         return session
@@ -1646,7 +1856,37 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         except Exception as e:  # noqa: BLE001 — last-resort containment
             if not self._lease_current(session):
                 return session
-            self.store.log_event(session.session_id, "internal_error", {"detail": str(e)})
+            detail = f"{type(e).__name__}: {e}"
+            session.stop_reason = f"orchestrator internal error: {detail}"
+            session.quality_gate = {
+                "verdict": "FAIL",
+                "stage": "orchestrator_internal_error",
+                "detail": detail,
+            }
+            try:
+                recovery.record_failure(
+                    session,
+                    stage="orchestrator",
+                    category="internal_error",
+                    summary=detail,
+                    evidence={"traceback": traceback.format_exc(limit=12)[-6000:]},
+                    responsible_owner="coordinator",
+                    recoverable=False,
+                )
+            except Exception as ledger_error:  # noqa: BLE001 - preserve root cause
+                session.unresolved.append(
+                    f"failure ledger also failed: {type(ledger_error).__name__}: "
+                    f"{ledger_error}"
+                )
+            self.store.log_event(
+                session.session_id,
+                "internal_error",
+                {
+                    "detail": detail,
+                    "traceback": traceback.format_exc(limit=12)[-6000:],
+                    "failure_layer": "orchestrator",
+                },
+            )
             session.outcome = "failed"
             try:
                 self.manager.transition(session, SessionStatus.failed)
@@ -2426,8 +2666,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         }
         for record in session_records:
             session_id = record["session_id"]
-            session = self.manager.load(session_id)
-            if session is not None and session.status not in terminal:
+            # A row that will not deserialize must not block the delete. This
+            # operation is precisely what a user reaches for when stored data
+            # has gone bad, so a single unreadable session cannot be allowed to
+            # fail the whole sweep — fall back to the status column, which is
+            # all this loop actually needs to decide whether to cancel.
+            try:
+                session = self.manager.load(session_id)
+                status = session.status if session is not None else None
+            except Exception:  # noqa: BLE001 — unreadable is still deletable
+                session = None
+                status = record.get("status")
+                self._sys_log("history_clear_unreadable_session",
+                              {"session_id": session_id, "status": str(status)})
+            if status is not None and status not in terminal:
                 cancellation.request(session_id)
                 self.store.revoke_worker_lease(session_id)
             self.workbench.revoke_session_steering(session_id)
@@ -2438,9 +2690,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
 
         goals_deleted = self.goals.remove_all()
         sessions_deleted = self.store.delete_all_sessions()
+        # Deleting rows and goal rows frees nothing the user can see: the DB
+        # keeps the pages on its freelist and the staging directories are not
+        # DB rows at all. Reclaim both, so "clear history" actually clears.
+        workspaces_deleted = self._gc_goal_workspaces(grace_hours=0).get("removed", 0)
+        reclaimed = self.store.vacuum().get("reclaimed_bytes", 0)
+        self._sys_log("history_cleared", {
+            "sessions_deleted": sessions_deleted,
+            "goals_deleted": goals_deleted,
+            "workspaces_deleted": workspaces_deleted,
+            "reclaimed_bytes": reclaimed,
+        })
         return {
             "sessions_deleted": sessions_deleted,
             "goals_deleted": goals_deleted,
+            "workspaces_deleted": workspaces_deleted,
+            "reclaimed_bytes": reclaimed,
         }
 
     _CORRECTIVE_FOLLOWUP_RE = re.compile(
@@ -2802,6 +3067,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             routing_decision=routing,
             playbook_id=parent.playbook_id,
             parent_session_id=parent.session_id,
+            approval_policy=parent.approval_policy,
         )
         history = list(parent.turns)
         if not history:
@@ -2973,6 +3239,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         playbook_id: Optional[str] = None,
         parent_goal_id: Optional[str] = None,
         routing_decision: Optional[dict] = None,
+        approval_policy: ApprovalPolicy | str = ApprovalPolicy.manual,
     ) -> Goal:
         """Open a goal: the architect decomposes it into milestone-sized
         deliverables, repairing a rejected contract when necessary, then the
@@ -3011,6 +3278,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             text=raw,
             outcome_contract=contract.model_dump(),
             execution_profile=profile,
+            approval_policy=ApprovalPolicy(approval_policy),
             routing_decision=routing,
             playbook_id=playbook_id,
             parent_goal_id=parent_goal_id,
@@ -3086,6 +3354,82 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 return agent, role
         return None, Role.architect
 
+    def _obvious_single_artifact_plan(
+        self, goal: Goal, goal_contract_text: str,
+    ) -> tuple[list[GoalMilestone], str]:
+        """Skip the planning model when intake already proves one file exists.
+
+        Only an explicit, safe relative filename from the deterministic outcome
+        contract qualifies. Descriptions such as "a polished report" are not
+        guessed into paths, and multiple named files still require a dependency
+        plan. One named artifact has no package graph to discover: its complete
+        authorship and materialization belong to one accountable owner.
+        """
+        raw = list((goal.outcome_contract or {}).get("deliverables") or [])
+        if len(raw) != 1:
+            return [], ""
+        name = str(raw[0] or "").strip().strip("`\"'").replace("\\", "/")
+        supported = {
+            ".7z", ".c", ".cc", ".cpp", ".cs", ".css", ".csv",
+            ".docx", ".gif", ".go", ".h", ".hpp", ".html", ".htm",
+            ".java", ".jpeg", ".jpg", ".js", ".json", ".jsx", ".md",
+            ".mjs", ".mp3", ".mp4", ".pdf", ".php", ".png", ".pptx",
+            ".py", ".rb", ".rs", ".rst", ".svelte", ".svg", ".swift",
+            ".tar", ".ts", ".tsv", ".tsx", ".txt", ".vue", ".webp",
+            ".xlsx", ".xml", ".yaml", ".yml", ".zip",
+        }
+        # Intake intentionally uses a human-readable fallback when the user
+        # names a format but not a filename ("create a PDF" becomes "The
+        # requested polished content artifact").  Treating that description as
+        # if no artifact were known sent an obvious one-file job to an LLM
+        # planner, which then split 100 recipes into four research packages and
+        # an integrator.  The format is already deterministic; give it one safe
+        # canonical path and skip the planning call altogether.
+        if Path(name).suffix.lower() not in supported:
+            inferred = classifier.classify(goal.text, self.role_agents)
+            formats = list(dict.fromkeys(
+                f".{str(fmt).strip().lower().lstrip('.')}"
+                for fmt in inferred.deliverable_formats
+                if f".{str(fmt).strip().lower().lstrip('.')}" in supported
+            ))
+            if inferred.produces_output and len(formats) == 1:
+                name = f"deliverable{formats[0]}"
+        if (not name or name.startswith(("/", "//"))
+                or re.match(r"^[A-Za-z]:", name)
+                or any(part in {"", ".", ".."} for part in name.split("/"))):
+            return [], ""
+        if Path(name).suffix.lower() not in supported:
+            return [], ""
+        roster = list(dict.fromkeys(goal.build_roster or self.panel))
+        preferred = self.role_agents.get(Role.code_generator)
+        owner = preferred if preferred in roster else ""
+        if not owner:
+            owner = next(
+                (seat for seat in self._frontier_seats() if seat in roster),
+                roster[0] if roster else "",
+            )
+        package = GoalMilestone(
+            index=0,
+            title=f"Create {Path(name).name}",
+            task_text=goal_contract_text,
+            package_id="wp_1",
+            owner=owner,
+            contract_declared=True,
+            requires_delivery=True,
+            required_files=[name],
+            release_files=[name],
+            release_declared=True,
+        )
+        normalized, errors = self._normalize_work_packages(
+            [package], goal_contract_text, roster=roster,
+        )
+        if errors:
+            return [], ""
+        return normalized, (
+            "deterministic one-artifact plan: intake identifies one safe "
+            "release file, so no planning model call was necessary"
+        )
+
     _GOAL_STAGE_SKIP = {
         ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "env",
         "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "build",
@@ -3133,6 +3477,68 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     # authoring part of the artifact, and the single-author rule applies again.
     _RESEARCH_SUFFIXES = (".json", ".md", ".markdown", ".yaml", ".yml",
                           ".csv", ".tsv", ".txt", ".rst")
+    _DERIVED_SUFFIXES = {
+        ".7z", ".docx", ".gif", ".gz", ".ico", ".jpeg", ".jpg",
+        ".mp3", ".mp4", ".pdf", ".png", ".pptx", ".tar", ".webp",
+        ".xlsx", ".zip",
+    }
+
+    @classmethod
+    def _materialization_plan(
+        cls, package: GoalMilestone, outcome_contract: Optional[dict] = None,
+    ) -> MaterializationPlan:
+        """Turn a planner file list into an executable output contract."""
+        required = [name.replace("\\", "/") for name in package.required_files]
+        dependencies = [name.replace("\\", "/") for name in package.dependencies]
+        released = [name.replace("\\", "/") for name in package.release_files]
+        assertions = list((outcome_contract or {}).get("acceptance_criteria") or [])
+        derived = [name for name in required
+                   if Path(name).suffix.lower() in cls._DERIVED_SUFFIXES]
+        if derived:
+            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", package.package_id or "output")
+            producing_files = [name for name in required if name not in derived]
+            runner = next(
+                (name for name in producing_files
+                 if (Path(name).suffix.lower() in {".py", ".js", ".mjs"}
+                     and " " not in name)),
+                "",
+            )
+            if not runner:
+                runner = f"_gangof8/build_{safe_id}.py"
+                producing_files.append(runner)
+            command = (
+                f"node {runner}" if Path(runner).suffix.lower() in {".js", ".mjs"}
+                else f"python {runner}"
+            )
+            validators = list(dict.fromkeys(
+                f"format:{Path(name).suffix.lower().lstrip('.')}" for name in derived
+            ))
+            return MaterializationPlan(
+                mode=MaterializationMode.build,
+                authoritative_inputs=dependencies,
+                producing_files=producing_files,
+                release_files=released,
+                validator_ids=validators,
+                contract_assertions=assertions,
+                build=BuildRecipe(
+                    command=command,
+                    inputs=[*dependencies, *producing_files],
+                    outputs=derived,
+                    validator_ids=validators,
+                ),
+            )
+        mode = MaterializationMode.text
+        if package.assembly_mode:
+            mode = MaterializationMode.transform
+        elif set(required) & set(dependencies):
+            mode = MaterializationMode.revision
+        return MaterializationPlan(
+            mode=mode,
+            authoritative_inputs=dependencies,
+            producing_files=(required if mode != MaterializationMode.transform else []),
+            release_files=released,
+            contract_assertions=assertions,
+        )
 
     @staticmethod
     def _is_research_package(package, release_paths: set) -> bool:
@@ -3320,6 +3726,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if package.required_files
             and not self._is_research_package(package, release_paths)
         ]
+        research_packages = [
+            package for package in milestones
+            if self._is_research_package(package, release_paths)
+        ]
         if (not config.GOAL_FULL_ROSTER
                 and len(release_paths) == 1 and len(file_packages) > 1):
             errors.append(
@@ -3329,6 +3739,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "packages. A single-artifact deliverable is EXACTLY ONE "
                 "file-authoring package whose owner writes the complete file "
                 "— no template package, no staged fragments, no assembly step"
+            )
+        if (not config.GOAL_FULL_ROSTER
+                and len(release_paths) == 1 and len(research_packages) > 1):
+            errors.append(
+                "right-sizing violation: a single-artifact build may have at "
+                "most one independently checkpointed research package, but "
+                f"the plan created {len(research_packages)}. Do not divide a "
+                "document into arbitrary content ranges merely to occupy more "
+                "models; keep research with the accountable author unless one "
+                "reusable source corpus genuinely needs its own package"
             )
 
         providers: dict[str, int] = {}
@@ -3532,10 +3952,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         timeout_s: int = 0,
     ):
         """Run and persist a supervised planning call before a Session exists."""
+        reservation = self.goals.reserve_model_call(
+            goal.goal_id,
+            session_id="",
+            agent=agent,
+            phase="planning",
+        )
+        if reservation is None:
+            raise AgentError(
+                "goal model-call budget exhausted before planning dispatch"
+            )
+        refreshed = self.goals.get(goal.goal_id)
+        if refreshed is not None:
+            goal.model_calls_used = refreshed.model_calls_used
+            goal.model_calls_by_seat = dict(refreshed.model_calls_by_seat)
+            goal.model_call_reservations = list(
+                refreshed.model_call_reservations
+            )
         adapter = self.registry.get(agent)
         streaming = bool(getattr(adapter, "streams_progress", False))
         hard_timeout = (
-            config.OPENROUTER_HARD_TIMEOUT if streaming else max(0, int(timeout_s))
+            config.OPENROUTER_HARD_TIMEOUT if streaming else
+            (int(timeout_s) if int(timeout_s or 0) > 0
+             else config.BUFFERED_CALL_HARD_TIMEOUT)
         )
         call_id = f"goalcall_{goal.goal_id}_{time.monotonic_ns()}"
         started_at = utcnow()
@@ -3655,7 +4094,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             validation_errors: list[str] = []
             call_error = ""
             repair_count = 0
-            if agent:
+            milestones, rationale = self._obvious_single_artifact_plan(
+                goal, goal_contract_text,
+            )
+            if milestones:
+                goal.planned_by = "coordinator:deterministic-single-artifact"
+                self._sys_log(
+                    "goal_plan_derived",
+                    {
+                        "goal_id": goal.goal_id,
+                        "reason": "one explicit or deterministically inferred artifact",
+                        "release_files": list(milestones[0].release_files),
+                    },
+                )
+            elif agent:
                 prompt = goals.plan_prompt(
                     goal_contract_text, goal.build_roster or self.panel,
                     # Code authorship stays frontier-only; content gathering may
@@ -3672,9 +4124,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             or persisted.worker_lease != token
                             or persisted.epoch != goal.epoch):
                         return persisted or goal
-                    goal.model_calls_used += 1
-                    goal.model_calls_by_seat[agent] = (
-                        goal.model_calls_by_seat.get(agent, 0) + 1)
                     try:
                         result = self._goal_agent_call(
                             goal,
@@ -3792,6 +4241,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     contract_declared=True, requires_delivery=False,
                 )]
                 rationale = (rationale or "plan was not parseable") + " - analysis-only milestone"
+            for package in milestones:
+                package.materialization_plan = self._materialization_plan(
+                    package, goal.outcome_contract)
+                if package.materialization_plan.mode == MaterializationMode.build:
+                    for producer in package.materialization_plan.producing_files:
+                        if producer not in package.required_files:
+                            package.required_files.append(producer)
             goal.milestones = milestones
             self._seed_goal_stage(goal)
             goal.plan_rationale = rationale
@@ -3833,6 +4289,335 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 )
         return ""
 
+    @staticmethod
+    def _session_orchestrator_failure(session: Session) -> Optional[ProposedAction]:
+        return next(
+            (
+                action for action in reversed(session.proposed_actions)
+                if action.status == "failed"
+                and action.failure_layer == "orchestrator"
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _milestone_input_hashes(
+        goal: Goal, milestone: GoalMilestone,
+    ) -> dict[str, str]:
+        """Seal every accepted byte the package actually consumes."""
+        wanted = {
+            name.replace("\\", "/")
+            for name in [
+                *milestone.dependencies,
+                *((milestone.materialization_plan.authoritative_inputs)
+                  if milestone.materialization_plan else []),
+            ]
+            if name
+        }
+        hashes: dict[str, str] = {}
+        for package in goal.milestones:
+            if package.status != "done":
+                continue
+            for name, digest in package.accepted_hashes.items():
+                normalized = name.replace("\\", "/")
+                if not wanted or normalized in wanted:
+                    hashes[normalized] = digest
+        return hashes
+
+    @staticmethod
+    def _merge_goal_research_provenance(
+        goal: Goal, milestone: GoalMilestone, session: Session,
+    ) -> None:
+        existing = {
+            (str(item.get("session_id") or ""), str(item.get("recorded_at") or ""))
+            for item in goal.research_provenance
+        }
+        for raw in session.research_provenance:
+            item = dict(raw)
+            item["session_id"] = session.session_id
+            item["package_id"] = milestone.package_id
+            key = (session.session_id, str(item.get("recorded_at") or ""))
+            if key not in existing:
+                goal.research_provenance.append(item)
+                existing.add(key)
+        modes = {str(item.get("mode") or "") for item in goal.research_provenance}
+        if "retrieved" in modes:
+            goal.research_mode = "retrieved"
+        elif "capability_gap" in modes or "recall_only" in modes:
+            goal.research_mode = "capability_gap"
+
+    def _recover_failed_milestone(
+        self, goal: Goal, milestone: GoalMilestone, session: Session,
+        category: str, detail: str,
+    ) -> bool:
+        """Apply bounded recovery; approval policy governs actions, not diagnosis."""
+        prior_repair = next(
+            (attempt for attempt in reversed(goal.repair_history)
+             if attempt.status == "started" and attempt.owner == milestone.owner),
+            None,
+        )
+        if prior_repair is not None:
+            recovery.finish_repair(goal, prior_repair, verified=False)
+        orchestrator_action = self._session_orchestrator_failure(session)
+        if orchestrator_action is not None:
+            exact = (
+                f"{orchestrator_action.kind}: "
+                f"{orchestrator_action.error or detail}"
+            )
+            failure = recovery.record_failure(
+                goal,
+                stage="orchestrator",
+                category="capability_contract",
+                summary=exact,
+                evidence={
+                    "package_id": milestone.package_id,
+                    "milestone": milestone.index,
+                    "session_id": session.session_id,
+                    "action_id": orchestrator_action.action_id,
+                    "diagnostic": exact,
+                },
+                responsible_owner="coordinator",
+                recoverable=False,
+                producer_paths=(
+                    list(milestone.materialization_plan.producing_files)
+                    if milestone.materialization_plan else []
+                ),
+            )
+            recovery.mark_exhausted(goal, failure)
+            milestone.status = "failed"
+            goal.status = "failed"
+            goal.last_error = (
+                "manual intervention required: orchestrator capability contract "
+                f"failed; {exact}"
+            )[:300]
+            self._sys_log(
+                "goal_orchestrator_failure",
+                {"goal_id": goal.goal_id, "package": milestone.package_id,
+                 "session_id": session.session_id,
+                 "action_id": orchestrator_action.action_id,
+                 "fault_signature": failure.fault_signature,
+                 "error": orchestrator_action.error},
+            )
+            return False
+        unresolved_failures = [
+            item for item in session.failure_records
+            if item.resolution_state != "resolved"
+        ]
+        # Missing-output verification is commonly the final symptom of an
+        # earlier build/test/dependency failure.  Recovery must diagnose and
+        # fingerprint the causal execution failure, not repeatedly retry the
+        # most recent secondary symptom.
+        causal_categories = {
+            "build_command_failed",
+            "test_command_failed",
+            "dependency_install_failed",
+            "invalid_producer",
+            "dependency_closure",
+        }
+        source_failure = next(
+            (
+                item for item in reversed(unresolved_failures)
+                if item.category in causal_categories
+            ),
+            unresolved_failures[-1] if unresolved_failures else None,
+        )
+        self._preserve_failed_producer(goal, milestone, session, source_failure)
+        failure_stage = source_failure.stage if source_failure else "milestone"
+        failure_category = source_failure.category if source_failure else category
+        failure_summary = (
+            source_failure.summary if source_failure else category
+        )
+        failure = recovery.record_failure(
+            goal,
+            stage=failure_stage,
+            category=failure_category,
+            summary=f"{milestone.package_id or milestone.index}: {failure_summary}",
+            evidence={"package_id": milestone.package_id,
+                      "milestone": milestone.index,
+                      "diagnostic": detail[:1000],
+                      "session_failure_id": (
+                          source_failure.failure_id if source_failure else ""
+                      )},
+            responsible_owner=milestone.owner,
+            recoverable=(source_failure.recoverable if source_failure else True),
+            validator_id=(source_failure.validator_id if source_failure else ""),
+            producer_paths=(
+                list(source_failure.repair_scope)
+                if source_failure else
+                list(milestone.materialization_plan.producing_files)
+                if milestone.materialization_plan else []
+            ),
+            expected_hash=(source_failure.expected_hash if source_failure else ""),
+            command_result=(source_failure.command_result if source_failure else {}),
+        )
+        # Preserve the rich changing diagnostic without letting incidental
+        # wording create an unbounded series of distinct fault signatures.
+        failure.evidence["diagnostic"] = detail[:1000]
+        if not failure.recoverable:
+            recovery.mark_exhausted(goal, failure)
+            milestone.status = "failed"
+            goal.status = "failed"
+            goal.last_error = (
+                f"manual intervention required: {failure.stage} / "
+                f"{failure.category}; {detail}"
+            )[:300]
+            self._sys_log(
+                "goal_nonrecoverable_failure",
+                {"goal_id": goal.goal_id, "package": milestone.package_id,
+                 "stage": failure.stage, "category": failure.category,
+                 "fault_signature": failure.fault_signature,
+                 "reason": detail[:500]},
+            )
+            return False
+        frontier = [
+            seat for seat in self._frontier_seats()
+            if seat in self.panel and not self.seat_health.is_unavailable(seat)
+        ]
+        decision = recovery.choose_goal_recovery(
+            goal, failure, milestone.owner, frontier)
+        if decision.action == "exhausted":
+            recovery.mark_exhausted(goal, failure)
+            milestone.status = "failed"
+            goal.status = "failed"
+            goal.last_error = (
+                f"manual intervention required: {milestone.package_id or milestone.title} "
+                f"exhausted bounded recovery for {category}; {detail}"
+            )[:300]
+            self._sys_log("goal_recovery_exhausted",
+                {"goal_id": goal.goal_id, "package": milestone.package_id,
+                 "fault_signature": failure.fault_signature,
+                 "attempt": decision.attempt},
+            )
+            return False
+        attempt = recovery.begin_repair(
+            goal, failure,
+            repair_owner=decision.owner,
+            strategy=decision.action,
+            input_hashes=self._milestone_input_hashes(goal, milestone),
+        )
+        if attempt is None:
+            recovery.mark_exhausted(goal, failure)
+            milestone.status = "failed"
+            goal.status = "failed"
+            goal.last_error = "manual intervention required: unchanged retry rejected"
+            return False
+        previous_owner = milestone.owner
+        milestone.owner = decision.owner
+        milestone.status = "pending"
+        milestone.resume_session_id = milestone.session_id or session.session_id
+        milestone.session_id = None
+        milestone.acceptance_detail = (
+            f"{category}: {detail}\nFault signature: {failure.fault_signature}. "
+            "Change the producing source or relevant implementation; do not "
+            "repeat unchanged bytes."
+        )[:1600]
+        # Never demote or erase the last verified candidate merely because a
+        # repair branch is starting. The branch becomes authoritative only
+        # after it passes objective verification and seals a new checkpoint.
+        milestone.repair_context = {
+            "failure_id": failure.failure_id,
+            "fault_signature": failure.fault_signature,
+            "category": failure.category,
+            "detail": detail[:1600],
+            "base_checkpoint_id": milestone.active_verified_checkpoint_id,
+            "target_paths": list(failure.repair_scope),
+            "repair_owner": decision.owner,
+        }
+        milestone.phase = "repairing"
+        goal.phase = "repairing"
+        goal.status = "running"
+        goal.current_index = milestone.index
+        goal.release_status = "not_started"
+        goal.release_session_id = None
+        goal.last_error = (
+            f"automatic recovery {decision.attempt}: {decision.action} "
+            f"for {milestone.package_id or milestone.title}"
+        )
+        self._record_work_item(
+            goal,
+            milestone.package_id,
+            "repairing",
+            "ready",
+            checkpoint_id=milestone.active_verified_checkpoint_id,
+        )
+        self._sys_log("goal_recovery_scheduled",
+            {"goal_id": goal.goal_id, "package": milestone.package_id,
+             "from_owner": previous_owner, "to_owner": decision.owner,
+             "strategy": decision.action, "attempt": decision.attempt,
+             "fault_signature": failure.fault_signature},
+        )
+        return True
+
+    def _preserve_failed_producer(
+        self,
+        goal: Goal,
+        milestone: GoalMilestone,
+        session: Session,
+        source_failure,
+    ) -> None:
+        """Checkpoint failed source bytes for the next bounded repair attempt."""
+        if not goal.staging_root:
+            return
+        planned = list(
+            milestone.materialization_plan.producing_files
+            if milestone.materialization_plan else []
+        )
+        scoped = list(source_failure.repair_scope) if source_failure else []
+        producer_paths = {
+            name.replace("\\", "/") for name in [*scoped, *planned] if name
+        }
+        if not producer_paths:
+            return
+        latest = {}
+        for action in session.proposed_actions:
+            name = str(action.filename or action.args.get("filename") or "").replace(
+                "\\", "/"
+            )
+            if (
+                name in producer_paths
+                and action.kind in {"write_file", "edit_file"}
+                and action.status == "executed"
+                and (action.content or action.args.get("content"))
+            ):
+                latest[name] = action
+        if not latest:
+            return
+        candidate_paths: dict[str, Path] = {}
+        for name, action in latest.items():
+            path = Path(action.result_path) if action.result_path else None
+            if path is not None and path.is_file():
+                candidate_paths[name] = path
+        if not candidate_paths:
+            return
+        try:
+            record = self.checkpoints.seal_paths(
+                goal_id=goal.goal_id,
+                package_id=milestone.package_id,
+                session_id=session.session_id,
+                paths=candidate_paths,
+                parent_id=milestone.active_verified_checkpoint_id,
+                state="failed_candidate",
+                evidence={
+                    "causal_failure_id": (
+                        source_failure.failure_id if source_failure else ""
+                    )
+                },
+            )
+        except (OSError, ValueError):
+            return
+        milestone.candidate_checkpoint_id = record["checkpoint_id"]
+        milestone.recovery_source_checkpoint = record
+        self._sys_log(
+            "goal_failed_producer_preserved",
+            {
+                "goal_id": goal.goal_id,
+                "package": milestone.package_id,
+                "session_id": session.session_id,
+                "checkpoint_id": record["checkpoint_id"],
+                "producer_paths": list(record["manifest"]),
+            },
+        )
+
     def _route_around_unavailable_owners(self, goal: Goal) -> None:
         """Reassign pending packages away from seats that cannot answer.
 
@@ -3869,6 +4654,43 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if changed:
             self.goals.save(goal)
 
+    @staticmethod
+    def _record_work_item(
+        goal: Goal,
+        package_id: str,
+        phase: str,
+        status: str,
+        *,
+        session_id: str = "",
+        checkpoint_id: str = "",
+    ) -> dict:
+        """Upsert one idempotent durable phase cursor."""
+        identity = hashlib.sha256(
+            f"{goal.goal_id}|{package_id}|{phase}|{checkpoint_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        key = f"wi_{identity}"
+        item = next(
+            (entry for entry in goal.work_items
+             if entry.get("work_item_id") == key),
+            None,
+        )
+        if item is None:
+            item = {
+                "work_item_id": key,
+                "package_id": package_id,
+                "phase": phase,
+                "checkpoint_id": checkpoint_id,
+                "created_at": utcnow(),
+            }
+            goal.work_items.append(item)
+        item.update({
+            "status": status,
+            "session_id": session_id,
+            "updated_at": utcnow(),
+        })
+        goal.phase = phase
+        return item
+
     def _start_milestone(self, goal: Goal, index: int, background: bool) -> Optional[Session]:
         """Create a session, then atomically bind it to one live goal epoch."""
         current = self.goals.get(goal.goal_id)
@@ -3880,6 +4702,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if (current.delivery_mode != "final_batch"
                 and (current.current_index != index or current.current is None)):
             return None
+        if current.milestones[index].materialization_plan is None:
+            current.milestones[index].materialization_plan = self._materialization_plan(
+                current.milestones[index], current.outcome_contract)
+            if (current.milestones[index].materialization_plan.mode
+                    == MaterializationMode.build):
+                for producer in current.milestones[index].materialization_plan.producing_files:
+                    if producer not in current.milestones[index].required_files:
+                        current.milestones[index].required_files.append(producer)
+            self.goals.save(current)
         session = self._open(
             goals.compose_milestone_task(current, index),
             "goal",
@@ -3889,6 +4720,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             execution_profile=current.execution_profile,
             routing_decision=current.routing_decision,
             playbook_id=current.playbook_id,
+            approval_policy=current.approval_policy,
         )
         bound = self.goals.bind_milestone(
             current.goal_id, index, current.epoch, session.session_id)
@@ -3896,6 +4728,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.store.delete_session(session.session_id)
             return None
         milestone = bound.milestones[index]
+        self._record_work_item(
+            bound,
+            milestone.package_id,
+            "repairing" if milestone.repair_context else "baseline_ready",
+            "running",
+            session_id=session.session_id,
+            checkpoint_id=milestone.active_verified_checkpoint_id,
+        )
+        self.goals.save(bound)
         prior_hashes: dict[str, str] = {}
         for prior in bound.milestones:
             if prior.status == "done":
@@ -3908,7 +4749,94 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.delivery_mode = bound.delivery_mode
         session.work_package_id = milestone.package_id
         session.work_package_owner = milestone.owner
+        session.materialization_plan = milestone.materialization_plan
+        session.repair_mode = bool(milestone.repair_context)
+        session.base_checkpoint_id = milestone.active_verified_checkpoint_id
+        session.candidate_checkpoint_id = milestone.candidate_checkpoint_id
+        session.reused_participation_reports = list(
+            milestone.participation_reports
+        ) if session.repair_mode else []
+        session.phase = "repairing" if session.repair_mode else "baseline_ready"
+        if milestone.resume_session_id and not session.repair_mode:
+            previous = self.manager.load(milestone.resume_session_id)
+            if previous is not None and previous.work_package_id == milestone.package_id:
+                session.candidate_fallbacks = list(
+                    previous.candidate_fallbacks
+                )
+                session.candidate_fallback_groups = [
+                    list(group) for group in previous.candidate_fallback_groups
+                ]
+                standby_names = {
+                    name
+                    for group in session.candidate_fallback_groups
+                    for name in group
+                } | set(session.candidate_fallbacks)
+                resumable_kinds = {
+                    "write_file", "edit_file", "install_deps",
+                    "build_artifact", "run_tests",
+                }
+                session.proposed_actions = []
+                for prior_action in previous.proposed_actions:
+                    if prior_action.kind not in resumable_kinds:
+                        continue
+                    if (prior_action.role == Role.panelist
+                            and prior_action.filename not in standby_names):
+                        continue
+                    restored = prior_action.model_copy(deep=True)
+                    restored.session_id = session.session_id
+                    restored.status = "proposed"
+                    restored.approval_id = None
+                    restored.result_path = None
+                    restored.error = None
+                    session.proposed_actions.append(restored)
+                session.contributions = [
+                    item.model_copy(deep=True) for item in previous.contributions
+                ]
+                session.collaboration_assignments = [
+                    item.model_copy(deep=True)
+                    for item in previous.collaboration_assignments
+                ]
+                for assignment in session.collaboration_assignments:
+                    if assignment.status in {"running", "requesting_context"}:
+                        assignment.status = "pending"
+                session.collaboration_baseline = dict(
+                    previous.collaboration_baseline
+                )
+                session.collaboration_integrated_files = list(
+                    previous.collaboration_integrated_files
+                )
+                session.collaboration_integration_status = (
+                    previous.collaboration_integration_status
+                )
+                session.package_output_authors = dict(
+                    previous.package_output_authors
+                )
+                session.package_output_history = dict(
+                    previous.package_output_history
+                )
+                session.phase = previous.phase or "baseline_ready"
+                self.store.log_event(
+                    session.session_id,
+                    "package_phase_resumed",
+                    {
+                        "from_session_id": previous.session_id,
+                        "phase": session.phase,
+                        "reused_actions": len(session.proposed_actions),
+                        "reused_contributions": sum(
+                            1 for item in session.collaboration_assignments
+                            if item.status == "contributed"
+                        ),
+                    },
+                )
         session.resource_roster = list(bound.resource_roster or session.panel)
+        if bound.research_mode == "retrieved":
+            reusable = [
+                dict(item) for item in bound.research_provenance
+                if item.get("mode") == "retrieved" and item.get("evidence")
+            ]
+            if reusable:
+                session.research_mode = "retrieved"
+                session.research_provenance = reusable
         session.participation_mode = bound.participation_mode
         session.package_helpers = [
             seat for seat in session.resource_roster
@@ -3926,7 +4854,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             session.workspace_root = bound.staging_root
             session.established_root = bound.established_root
             session.delivery_root = bound.delivery_root
-            if milestone.owner:
+            if (session.participation_mode != "focused"
+                    and session.resource_roster):
+                # The owner controls final bytes, but every enabled resource is
+                # part of the Planned team from package start. Keeping only the
+                # owner here made the live council announce a gang of one even
+                # though peers were scheduled to challenge the baseline later.
+                session.panel = list(dict.fromkeys(session.resource_roster))
+            elif milestone.owner:
                 session.panel = [milestone.owner]
         session.required_files = list(milestone.required_files)
         ready_contract_files: list[str] = []
@@ -3940,7 +4875,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if Path(name).suffix.lower() in (".js", ".mjs")
             )
         session.runtime_dependencies = list(dict.fromkeys(
-            list(milestone.dependencies) + ready_contract_files
+            list(milestone.dependencies)
+            + list(
+                milestone.materialization_plan.authoritative_inputs
+                if milestone.materialization_plan else []
+            )
+            + ready_contract_files
         ))
         session.deferred_runtime_dependencies = list(dict.fromkeys(pending_contract_files))
         # A same-path dependency is an in-place revision target, not an
@@ -3955,6 +4895,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             name: prior_hashes[name] for name in session.runtime_dependencies
             if name in prior_hashes and name.replace("\\", "/") not in mutable
         }
+        if session.materialization_plan is not None:
+            session.materialization_plan.input_hashes = dict(session.dependency_hashes)
+            if session.materialization_plan.build is not None:
+                session.materialization_plan.build.inputs = list(dict.fromkeys([
+                    *session.materialization_plan.build.inputs,
+                    *session.materialization_plan.authoritative_inputs,
+                    *session.materialization_plan.producing_files,
+                ]))
         session.revision_base_hashes = {
             name: prior_hashes[name] for name in session.revision_targets if name in prior_hashes
         }
@@ -4002,6 +4950,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             if (action.role != Role.panelist and action.kind in ("write_file", "edit_file")
                     and action.status == "executed" and action.result_path):
                 latest[name] = Path(action.result_path)
+            if (action.role != Role.panelist and action.kind == "build_artifact"
+                    and action.status == "executed"):
+                declared = [item.strip().replace("\\", "/") for item in
+                            str(action.args.get("produces") or "").split(",")
+                            if item.strip()]
+                try:
+                    produced = [Path(item) for item in json.loads(
+                        action.args.get("produced_paths") or "[]")]
+                except (json.JSONDecodeError, TypeError):
+                    produced = []
+                for output_name, output_path in zip(declared, produced):
+                    latest[output_name] = output_path
         missing: list[str] = []
         accepted: list[str] = []
         hashes: dict[str, str] = {}
@@ -4040,7 +5000,30 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                  if entry.get("status") == "completed" and entry.get("agent")),
                 None,
             )
-            if deterministic:
+            build_action = next((
+                action for action in reversed(session.proposed_actions)
+                if action.kind == "build_artifact" and action.status == "executed"
+                and name in {part.strip().replace("\\", "/") for part in
+                             str(action.args.get("produces") or "").split(",")}
+            ), None)
+            if build_action is not None:
+                record = {
+                    "sha256": hashes.get(name, ""),
+                    "session_id": session.session_id,
+                    "method": "deterministic_build",
+                    "agent": session.work_package_owner or None,
+                    "build_action_id": build_action.action_id,
+                    "command": build_action.args.get("command", ""),
+                    "producer_files": list(
+                        session.materialization_plan.producing_files
+                        if session.materialization_plan else []
+                    ),
+                    "input_hashes": dict(
+                        session.materialization_plan.input_hashes
+                        if session.materialization_plan else {}
+                    ),
+                }
+            elif deterministic:
                 record = {
                     "sha256": hashes.get(name, ""),
                     "session_id": session.session_id,
@@ -4153,6 +5136,15 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if approval is None:
             raise RuntimeError("final batch unexpectedly bypassed its approval gate")
         action.approval_id = approval.approval_id
+        if approval.status == "approved":
+            action.status = "approved"
+            self.store.save_session(session)
+            self.store.log_event(
+                session.session_id, "final_batch_approval_auto_resolved",
+                {"approval_id": approval.approval_id,
+                 "policy": session.approval_policy.value},
+            )
+            return self._finish_goal_release(session, True)
         action.status = "awaiting_approval"
         if session.status == SessionStatus.awaiting_input:
             self.manager.transition(session, SessionStatus.deliberating)
@@ -4171,6 +5163,56 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             for package in release_packages
         )
         deterministic_preflight: dict = {}
+        expected_hashes = {
+            name.replace("\\", "/"): package.accepted_hashes.get(
+                name.replace("\\", "/"), "")
+            for package in release_packages for name in package.release_files
+        }
+        format_failures: list[str] = []
+        format_evidence: list[dict] = []
+        assertions = list(
+            (goal.outcome_contract or {}).get("acceptance_criteria") or []
+        )
+        for name in session.required_files:
+            try:
+                path = executor.resolve_in_workspace(stage, name)
+                raw = path.read_bytes()
+            except (OSError, executor.ExecutionError) as exc:
+                format_failures.append(f"{name}: release file is unavailable ({exc})")
+                continue
+            digest = hashlib.sha256(raw).hexdigest()
+            if expected_hashes.get(name) != digest:
+                format_failures.append(
+                    f"{name}: staged bytes do not match the package's accepted hash"
+                )
+                continue
+            result = validation.validate_artifact(path, assertions)
+            format_evidence.append({"file": name, **result.model_dump()})
+            format_failures.extend(
+                f"{name}: {failure}" for failure in result.failures
+            )
+        self.store.log_event(
+            session.session_id, "release_format_validated",
+            {"verdict": "FAIL" if format_failures else "PASS",
+             "files": format_evidence, "failures": format_failures},
+        )
+        if format_failures:
+            session.quality_gate = {
+                "verdict": "FAIL", "stage": "release_format_validation",
+                "files": format_evidence, "remaining_defects": format_failures,
+            }
+            session.unresolved.extend(format_failures)
+            session.stop_reason = "strict final-artifact validation failed"
+            session.outcome = "failed_verification"
+            self.manager.transition(session, SessionStatus.composing)
+            session.final = FinalAnswer(
+                answer="The final artifact failed deterministic format or hash validation and was not released.",
+                confidence="low", risks_unresolved=list(session.unresolved),
+                next_action="Repair the producing source identified by the validation evidence.",
+            )
+            self.manager.transition(session, SessionStatus.failed)
+            self.store.save_session(session)
+            return False
         if deterministic_release:
             failures: list[str] = []
             verified_hashes: dict[str, str] = {}
@@ -4264,15 +5306,80 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             },
         )
 
+        if not browser_failures:
+            objective_paths: dict[str, Path] = {}
+            objective_hashes: dict[str, str] = {}
+            for name in session.required_files:
+                path = executor.resolve_in_workspace(stage, name)
+                objective_paths[name] = path
+                objective_hashes[name] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+            objective_checkpoint = self.checkpoints.seal_paths(
+                goal_id=goal.goal_id,
+                package_id="__release__",
+                session_id=session.session_id,
+                paths=objective_paths,
+                expected_hashes=objective_hashes,
+                parent_id=goal.active_verified_checkpoint_id,
+                state="objective_validated",
+                evidence={
+                    "format_validation": format_evidence,
+                    "deterministic_preflight": deterministic_preflight,
+                    "browser_acceptance": browser_evidence,
+                },
+            )
+            session.base_checkpoint_id = objective_checkpoint["checkpoint_id"]
+            goal.active_verified_checkpoint_id = objective_checkpoint[
+                "checkpoint_id"
+            ]
+            goal.phase = "objective_validated"
+            session.phase = "objective_validated"
+            self._record_work_item(
+                goal, "__release__", "objective_validated", "completed",
+                session_id=session.session_id,
+                checkpoint_id=objective_checkpoint["checkpoint_id"],
+            )
+
         def seal_verified_hashes() -> dict[str, str]:
             sealed: dict[str, str] = {}
+            checkpoint_paths: dict[str, Path] = {}
             for name in session.required_files:
                 path = executor.resolve_in_workspace(stage, name)
                 if not path.is_file():
                     raise OSError(f"verified release file disappeared: {name}")
                 sealed[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+                checkpoint_paths[name] = path
+            checkpoint = self.checkpoints.seal_paths(
+                goal_id=goal.goal_id,
+                package_id="__release__",
+                session_id=session.session_id,
+                paths=checkpoint_paths,
+                expected_hashes=sealed,
+                parent_id=goal.active_verified_checkpoint_id,
+                state="release_verified",
+                evidence={
+                    "criteria": [
+                        item.model_dump() for item in session.criteria
+                    ],
+                    "quality_gate": dict(session.quality_gate),
+                },
+            )
             session.release_verified_hashes = sealed
+            session.candidate_checkpoint_id = checkpoint["checkpoint_id"]
+            goal.active_verified_checkpoint_id = checkpoint["checkpoint_id"]
+            goal.phase = "release_ready"
+            session.phase = "release_ready"
+            self._record_work_item(
+                goal,
+                "__release__",
+                "release_ready",
+                "completed",
+                session_id=session.session_id,
+                checkpoint_id=checkpoint["checkpoint_id"],
+            )
             session.quality_gate["verified_hashes"] = dict(sealed)
+            session.quality_gate["checkpoint_id"] = checkpoint["checkpoint_id"]
             return sealed
 
         enabled_frontier = [
@@ -4353,7 +5460,31 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             loaded: list[tuple[str, str]] = []
             for name in session.required_files:
                 path = executor.resolve_in_workspace(stage, name)
-                loaded.append((name, path.read_text(encoding="utf-8", errors="replace")))
+                suffix = path.suffix.lower()
+                if suffix == ".pdf":
+                    try:
+                        from pypdf import PdfReader
+                        reader = PdfReader(str(path), strict=True)
+                        body = "\n\n".join(
+                            f"--- PAGE {index + 1} ---\n{page.extract_text() or ''}"
+                            for index, page in enumerate(reader.pages)
+                        )
+                        metadata = dict(reader.metadata or {})
+                        body = (
+                            "[STRICTLY PARSED PDF TEXT FOR SEMANTIC REVIEW]\n"
+                            f"Metadata: {metadata}\nPages: {len(reader.pages)}\n\n{body}"
+                        )
+                    except Exception as exc:
+                        body = f"[PDF text extraction failed after format validation: {exc}]"
+                elif suffix in self._DERIVED_SUFFIXES:
+                    body = (
+                        f"[BINARY ARTIFACT: {path.stat().st_size} bytes. The exact "
+                        "file is available in the verifier working directory and "
+                        "passed deterministic format validation.]"
+                    )
+                else:
+                    body = path.read_text(encoding="utf-8", errors="replace")
+                loaded.append((name, body))
             return loaded
 
         review_root = Path(config.SANDBOX_ROOT) / f"release-review-{session.session_id}"
@@ -4471,8 +5602,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self.manager.transition(session, SessionStatus.failed)
                 self.store.save_session(session)
                 return False
+            criteria = rounds.canonical_acceptance_criteria(session)
+            report = rounds.parse_frontier_review(
+                answer.content,
+                criteria,
+                checkpoint_id=(goal.active_verified_checkpoint_id
+                               or session.base_checkpoint_id),
+                reviewer=verifier_name,
+            )
+            session.review_attempts.append(report)
+            goal.review_attempts.append(report)
             verdict, checks, defects = rounds.parse_frontier_verdict(answer.content)
-            if not checks and not defects and "VERDICT:" not in (answer.content or "").upper():
+            if report.status == ReviewStatus.protocol_invalid:
                 # No CHECK lines, no DEFECT lines, no VERDICT at all — the
                 # turn produced real output (this is not a transport
                 # failure) but never performed an actual review. A real
@@ -4485,9 +5626,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 # "missing acceptance checks: ALL" placeholder. Retry with
                 # a fresh call before ever attributing this to the code.
                 self.store.log_event(
-                    session.session_id, "release_verifier_incomplete_turn",
+                    session.session_id, "release_verifier_protocol_invalid",
                     {"agent": verifier_name, "attempt": attempt + 1,
-                     "response_chars": len(answer.content or "")},
+                     "response_chars": len(answer.content or ""),
+                     "detail": report.protocol_detail},
                 )
                 if attempt + 1 < config.FRONTIER_VERIFY_ATTEMPTS:
                     continue
@@ -4497,6 +5639,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         "release verifier did not complete a review (incomplete "
                         "turn, no checks or defects emitted)"
                     ),
+                    "review_status": report.status.value,
+                    "checkpoint_id": report.checkpoint_id,
                     "browser_acceptance": browser_evidence,
                 }
                 session.unresolved.append(
@@ -4518,42 +5662,77 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 self.manager.transition(session, SessionStatus.failed)
                 self.store.save_session(session)
                 return False
-            # Repair mandate (ARCHITECTURE-REVIEW.md Phase 2): whole-file
-            # ARTIFACT rewrites are first-class repairs alongside surgical
-            # EDITs — a verifier that saw the fix but could only patch
-            # old/new pairs used to reject whole batches over structural
-            # defects it could have rewritten in place.
-            edits = [action for action in parse_proposals(
+            checks = [
+                {
+                    "id": item.criterion_id,
+                    "status": item.status.upper(),
+                    "detail": item.detail,
+                }
+                for item in report.criteria
+            ]
+            defects = [
+                str(item.get("description") or "")
+                for item in report.defects if item.get("description")
+            ]
+            verdict = (
+                "PASS" if report.status in {
+                    ReviewStatus.passed, ReviewStatus.nonblocking
+                } else "FAIL"
+            )
+            # Reviewers diagnose immutable checkpoint bytes; they never become
+            # an untracked second author. Any attempted rewrite is evidence of
+            # a protocol/ownership violation and routes back to the producer.
+            proposed_repairs = [action for action in parse_proposals(
                 session.session_id, answer.content, Role.implementer)
                 if action.kind in ("edit_file", "write_file")
                 and action.filename in session.required_files
             ]
-            # A verifier cannot truthfully PASS the current bytes while also
-            # supplying edits they require. Apply those edits first, then demand
-            # the normal clean-room confirmation pass.
-            if verdict == "PASS" and edits:
+            if proposed_repairs:
                 verdict = "FAIL"
                 defects.append(
-                    "frontier verifier supplied implementation repairs that must "
-                    "be applied and confirmed before PASS"
+                    "release reviewer attempted to rewrite owner-controlled bytes; "
+                    "route the diagnosed issue to the accountable producer"
                 )
             if browser_failures:
                 verdict = "FAIL"
                 defects = list(dict.fromkeys(browser_failures + defects))
-            expected = {
-                f"R{i}" for i in range(
-                    1, len(rounds.acceptance_requirements(session.task.text)) + 1)
-            }
-            checked = {item.get("id") for item in checks}
-            missing_checks = sorted(expected - checked)
-            if missing_checks:
-                verdict = "FAIL"
-                defects.append("missing acceptance checks: " + ", ".join(missing_checks))
+            missing_checks: list[str] = []
+            default_targets = list(dict.fromkeys(
+                path
+                for package in release_packages
+                for path in (
+                    package.materialization_plan.producing_files
+                    if package.materialization_plan else package.required_files
+                )
+            )) if len(release_packages) == 1 else []
+            blocking_defects = [
+                {
+                    "criterion_id": str(check.get("id") or ""),
+                    "description": str(check.get("detail") or ""),
+                    "severity": "error",
+                    "blocks_release": True,
+                    "observed_checkpoint_id": report.checkpoint_id,
+                    "target_producer_paths": default_targets,
+                }
+                for check in checks
+                if str(check.get("status") or "").upper() == "FAIL"
+            ]
+            blocking_defects.extend({
+                "criterion_id": "",
+                "description": defect,
+                "severity": "error",
+                "blocks_release": True,
+                "observed_checkpoint_id": report.checkpoint_id,
+                "target_producer_paths": default_targets,
+            } for defect in defects)
             session.quality_gate = {
                 "verifier": verifier_name,
                 "verdict": verdict,
+                "review_status": report.status.value,
+                "checkpoint_id": report.checkpoint_id,
                 "checks": checks,
                 "remaining_defects": defects,
+                "blocking_defects": blocking_defects,
                 "missing_checks": missing_checks,
                 "attempt": attempt + 1,
                 "repairs_applied": total_edits,
@@ -4568,28 +5747,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                  "attempt": attempt + 1},
             )
             if verdict == "PASS":
-                if deterministic_release and total_edits:
-                    # A frontier repair changes the assembled bytes. Persist the
-                    # new accepted hash explicitly so release provenance remains
-                    # truthful instead of silently relying on the pre-repair hash.
-                    for package in release_packages:
-                        for name in package.release_files:
-                            try:
-                                path = executor.resolve_in_workspace(stage, name)
-                                package.accepted_hashes[name] = hashlib.sha256(
-                                    path.read_bytes()
-                                ).hexdigest()
-                                package.output_provenance[name] = {
-                                    "sha256": package.accepted_hashes[name],
-                                    "session_id": session.session_id,
-                                    "method": "frontier_release_repair",
-                                    "agent": verifier_name,
-                                    "source_hashes": dict(
-                                        deterministic_preflight.get("hashes") or {}
-                                    ),
-                                }
-                            except (OSError, executor.ExecutionError):
-                                pass
                 try:
                     seal_verified_hashes()
                 except (OSError, executor.ExecutionError) as exc:
@@ -4606,43 +5763,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 goal.assembly_fault_streak = {}
                 self.store.save_session(session)
                 return True
-            if attempt + 1 >= config.FRONTIER_VERIFY_ATTEMPTS:
-                break
-            applied = 0
-            for action in edits:
-                action.args["target"] = "workspace"
-                try:
-                    path = executor.execute(session, action, self._data_dir)
-                except executor.ExecutionError as e:
-                    action.status = "failed"
-                    action.error = str(e)
-                else:
-                    action.status = "executed"
-                    action.result_path = path
-                    applied += 1
-                session.proposed_actions.append(action)
-            if not applied:
-                session.quality_gate["detail"] = (
-                    "verifier rejected the batch without a usable implementation repair"
-                )
-                break
-            files = read_files()
-            runtime_failures = []
-            for name, content in files:
-                ran, testable, detail, _dynamic = smoke.smoke_source(
-                    content, Path(name).suffix or ".txt")
-                if (testable and not ran
-                        and browser_acceptance.confirms_runtime_failure(
-                            content, Path(name).suffix)):
-                    runtime_failures.append(f"{name}: {detail}")
-            if runtime_failures:
-                session.quality_gate["detail"] = "frontier repair failed runtime: " + "; ".join(runtime_failures)
-                break
-            total_edits += applied
-            self.store.log_event(
-                session.session_id, "frontier_final_batch_repair_applied",
-                {"agent": verifier_name, "edits": applied},
-            )
+            # A valid semantic FAIL ends this reviewer pass immediately. The
+            # typed defect below opens a producer-owned repair branch; only a
+            # protocol-invalid turn is retried against the unchanged checkpoint.
+            break
 
         detail = session.quality_gate.get("detail") or (
             "; ".join(session.quality_gate.get("remaining_defects") or [])
@@ -4671,7 +5795,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         session.final = FinalAnswer(
             answer="The assembled final batch failed independent frontier verification and was not offered for approval.",
             confidence="low", risks_unresolved=list(session.unresolved),
-            next_action="Resume the goal so the frontier release engineer can repair and re-check it.",
+            next_action="Repair the accountable producer, then rerun objective and semantic verification.",
         )
         self.manager.transition(session, SessionStatus.failed)
         self.store.save_session(session)
@@ -4691,6 +5815,52 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         ) or "no completed calls"
         return f"{goal.model_calls_used} model calls ({by_seat})"
 
+    def _successful_session_calls(self, session: Session) -> dict[str, int]:
+        """Return exact successful calls, with a legacy-session fallback.
+
+        Current sessions increment ``successful_agent_calls`` at the same
+        transaction boundary as ``agent_call_finished``. Older saved sessions
+        predate that field, so recover the authoritative events from their log.
+        Only fixtures/very old sessions without either signal fall back to
+        contributions; those are capped at attempted calls so deterministic
+        coordinator summaries cannot inflate the total.
+        """
+        explicit = {
+            str(seat): int(count)
+            for seat, count in (session.successful_agent_calls or {}).items()
+            if int(count) > 0
+        }
+        if explicit:
+            return explicit
+
+        from_events: dict[str, int] = {}
+        path = self.store.session_log_path(session.session_id)
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    record = json.loads(line)
+                    if record.get("event") != "agent_call_finished":
+                        continue
+                    seat = str((record.get("payload") or {}).get("agent") or "")
+                    if seat:
+                        from_events[seat] = from_events.get(seat, 0) + 1
+            except (OSError, json.JSONDecodeError):
+                from_events = {}
+        if from_events:
+            return from_events
+
+        remaining = max(0, int(session.agent_call_attempts))
+        legacy: dict[str, int] = {}
+        for contribution in session.contributions:
+            if remaining <= 0:
+                break
+            seat = str(contribution.agent or "")
+            if not seat or seat == "system":
+                continue
+            legacy[seat] = legacy.get(seat, 0) + 1
+            remaining -= 1
+        return legacy
+
     def _count_goal_session(self, goal: Goal, session: Session) -> None:
         """Fold a session's spend into the goal ledger exactly once.
 
@@ -4701,12 +5871,29 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if session.session_id in goal.counted_session_ids:
             return
         goal.counted_session_ids.append(session.session_id)
-        goal.model_calls_used += max(
-            session.agent_call_attempts, len(session.contributions))
-        for contribution in session.contributions:
-            seat = contribution.agent or "?"
-            goal.model_calls_by_seat[seat] = (
-                goal.model_calls_by_seat.get(seat, 0) + 1)
+        attempts = int(session.agent_call_attempts)
+        reserved = [
+            item for item in goal.model_call_reservations
+            if item.get("session_id") == session.session_id
+        ]
+        unreserved_attempts = max(0, attempts - len(reserved))
+        goal.model_calls_used += unreserved_attempts
+        successful = self._successful_session_calls(session)
+        # New calls were attributed to their dispatched seat at reservation
+        # time. Only legacy/unreserved attempts need the old terminal fold.
+        if not reserved:
+            for seat, count in successful.items():
+                goal.model_calls_by_seat[seat] = (
+                    goal.model_calls_by_seat.get(seat, 0) + int(count))
+        unattributed = (
+            max(0, attempts - sum(int(n) for n in successful.values()))
+            if not reserved else unreserved_attempts
+        )
+        if unattributed:
+            goal.model_calls_by_seat["unattributed_attempts"] = (
+                goal.model_calls_by_seat.get("unattributed_attempts", 0)
+                + unattributed
+            )
 
     def _pause_goal_over_budget(self, goal: Goal) -> bool:
         """Phase 3 cap: a goal at/over budget pauses with a cost report
@@ -4715,6 +5902,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         budget = self._goal_call_budget(goal)
         if budget <= 0 or goal.model_calls_used < budget:
             return False
+        if goal.approval_policy == ApprovalPolicy.god_mode:
+            goal.status = "failed"
+            goal.recovery_state = RecoveryState.manual_intervention_required
+            goal.last_error = (
+                f"goal call budget exhausted after {self._goal_cost_report(goal)} "
+                f"against {budget}; God mode will not wait for an approval or "
+                "silently buy more attempts"
+            )[:300]
+            self._sys_log("goal_budget_exhausted",
+                {"goal_id": goal.goal_id, "used": goal.model_calls_used,
+                 "budget": budget, "policy": "god_mode"},
+            )
+            return True
         goal.status = "paused"
         goal.last_error = (
             f"goal call budget reached: {self._goal_cost_report(goal)} against "
@@ -4833,6 +6033,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             execution_profile=goal.execution_profile,
             routing_decision=goal.routing_decision,
             playbook_id=goal.playbook_id,
+            approval_policy=goal.approval_policy,
         )
         session.goal_id = goal.goal_id
         session.goal_epoch = goal.epoch
@@ -4841,6 +6042,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         # coordinator wrapper used to create this release session.
         session.task.text = goal.text
         session.task.original_text = goal.text
+        if goal.criteria:
+            session.criteria = list(goal.criteria)
+        else:
+            goal.criteria = rounds.canonical_acceptance_criteria(session)
+        session.base_checkpoint_id = goal.active_verified_checkpoint_id
+        session.phase = "objective_validated"
         session.collaboration_mode = "build_team"
         session.delivery_mode = "final_batch"
         session.workspace_root = goal.staging_root
@@ -4855,7 +6062,73 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         verified = self._verify_goal_release(goal, session)
         self._count_goal_session(goal, session)
         if not verified:
-            goal.status = "paused"
+            gate = dict(session.quality_gate or {})
+            defects = list(gate.get("remaining_defects") or [])
+            blocking_defects = list(gate.get("blocking_defects") or [])
+            release_packages = [
+                package for package in goal.milestones if package.release_files
+            ]
+            diagnostic = session.stop_reason or "frontier final-batch verification failed"
+            target_package = next(
+                (
+                    package for package in release_packages
+                    if set(
+                        name.replace("\\", "/")
+                        for item in blocking_defects
+                        for name in (
+                            item.get("target_producer_paths") or []
+                        )
+                    ) & set(
+                        name.replace("\\", "/") for name in [
+                            *package.required_files,
+                            *package.release_files,
+                            *(
+                                package.materialization_plan.producing_files
+                                if package.materialization_plan else []
+                            ),
+                        ]
+                    )
+                ),
+                release_packages[0] if len(release_packages) == 1 else None,
+            )
+            auto_recover = bool(
+                target_package is not None
+                and gate.get("verdict") == "FAIL"
+                and (
+                    (
+                        blocking_defects
+                        and any(
+                            item.get("target_producer_paths")
+                            for item in blocking_defects
+                        )
+                    )
+                    or gate.get("stage") in {
+                    "release_format_validation", "deterministic_assembly_release"
+                    }
+                )
+                and self._recover_failed_milestone(
+                    goal, target_package, session,
+                    "release_verification_rejected", diagnostic,
+                )
+            )
+            if auto_recover:
+                goal.release_status = "not_started"
+                goal.release_session_id = None
+                return
+            failure = recovery.record_failure(
+                goal,
+                stage="release_verification",
+                category="verification_failed",
+                summary=session.stop_reason or "frontier final-batch verification failed",
+                evidence={"session_id": session.session_id,
+                          "quality_gate": gate},
+                responsible_owner=str((session.quality_gate or {}).get("verifier") or ""),
+            )
+            goal.status = (
+                "failed" if goal.approval_policy == ApprovalPolicy.god_mode else "paused"
+            )
+            if goal.approval_policy == ApprovalPolicy.god_mode:
+                recovery.mark_exhausted(goal, failure)
             goal.release_status = "failed_verification"
             goal.last_error = session.stop_reason or "frontier final-batch verification failed"
             return
@@ -4878,6 +6151,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         else:
             goal.release_status = "awaiting_approval"
             self._authorize_goal_release(session)
+            # God mode can authorize and complete the release synchronously.
+            # Reflect that durable result in the leased object the caller is
+            # about to save, instead of overwriting it with awaiting_release.
+            if goal.approval_policy == ApprovalPolicy.god_mode:
+                persisted = self.goals.get(goal.goal_id)
+                if persisted is not None:
+                    goal.status = persisted.status
+                    goal.release_status = persisted.release_status
+                    goal.last_error = persisted.last_error
+                    goal.recovery_state = persisted.recovery_state
 
     @staticmethod
     def _assembly_runtime_interface_hint(
@@ -5413,8 +6696,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 },
             )
             return None
-        if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
-            provider.invalidated_session_ids.append(provider.session_id)
         # Escalation ladder (ARCHITECTURE-REVIEW.md Phase 2): after the owner
         # has had its constrained retry, the package transfers to the
         # strongest frontier seat rather than going back to the same seat
@@ -5443,9 +6724,16 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     },
                 )
         provider.status = "failed"
-        provider.files = []
-        provider.accepted_files = []
-        provider.accepted_hashes = {}
+        # Open a repair branch without destroying the accepted manifest. The
+        # replacement may inspect these bytes, but cannot supersede them until
+        # its own candidate passes the objective gates and is sealed.
+        provider.repair_context = {
+            "reason": "deterministic_assembly_failure",
+            "fault_scope": scope,
+            "fault_path": invalid_input,
+            "base_checkpoint_id": provider.active_verified_checkpoint_id,
+            "failed_session_id": session.session_id,
+        }
         guidance = ""
         if "@import" in detail and "DELETE the @import" not in detail:
             # Sessions saved before the assembler's message became
@@ -5524,21 +6812,35 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 # Fold this terminal session's spend into the goal ledger
                 # before any branch saves; idempotent per session.
                 self._count_goal_session(goal, session)
+                self._merge_goal_research_provenance(
+                    goal, milestone, session
+                )
                 if session.status == SessionStatus.done:
                     accepted, files, detail = self._goal_acceptance(session, milestone)
                     milestone.acceptance_detail = detail
                     if not accepted:
                         milestone.status = "failed"
+                        auto_recover = self._recover_failed_milestone(
+                            goal, milestone, session,
+                            "acceptance_rejected", detail,
+                        )
                         sibling_running = any(
                             item.status == "running" and item.index != idx
                             for item in goal.milestones
                         )
-                        goal.status = "draining" if sibling_running else "paused"
-                        goal.last_error = detail[:300]
+                        if not auto_recover and goal.status != "failed":
+                            goal.status = "draining" if sibling_running else "paused"
+                            goal.last_error = detail[:300]
                         self.goals.save_owned(goal, token)
                         self.store.log_event(session.session_id, "goal_milestone_rejected",
                                              {"goal_id": goal.goal_id, "milestone": idx + 1,
-                                              "reason": detail})
+                                              "reason": detail,
+                                              "auto_recovery": auto_recover})
+                        if auto_recover:
+                            self._pool.submit(
+                                self._start_ready_packages,
+                                goal.model_copy(deep=True), background,
+                            )
                         return
                     if goal.delivery_mode == "final_batch":
                         _, _, hashes = self._goal_stage_manifest(
@@ -5559,6 +6861,105 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     milestone.accepted_hashes = {
                         name: hashes[name] for name in milestone.required_files if name in hashes
                     }
+                    checkpoint_paths: dict[str, Path] = {}
+                    if goal.delivery_mode == "final_batch":
+                        for name in milestone.accepted_hashes:
+                            try:
+                                checkpoint_paths[name] = executor.resolve_in_workspace(
+                                    Path(goal.staging_root), name
+                                )
+                            except executor.ExecutionError:
+                                continue
+                    else:
+                        checkpoint_paths = {
+                            name: Path(path) for name, path in zip(
+                                milestone.required_files, files
+                            ) if Path(path).is_file()
+                        }
+                    if checkpoint_paths:
+                        checkpoint = self.checkpoints.seal_paths(
+                            goal_id=goal.goal_id,
+                            package_id=milestone.package_id,
+                            session_id=session.session_id,
+                            paths=checkpoint_paths,
+                            expected_hashes=milestone.accepted_hashes,
+                            parent_id=milestone.active_verified_checkpoint_id,
+                            state="verified",
+                            evidence={
+                                "phase": "objective_validated",
+                                "repair_mode": session.repair_mode,
+                            },
+                        )
+                        milestone.active_verified_checkpoint_id = checkpoint[
+                            "checkpoint_id"
+                        ]
+                        milestone.candidate_checkpoint_id = ""
+                        session.candidate_checkpoint_id = checkpoint["checkpoint_id"]
+                        goal.active_verified_checkpoint_id = checkpoint[
+                            "checkpoint_id"
+                        ]
+                    if session.materialization_plan is not None:
+                        milestone.materialization_plan = session.materialization_plan
+                    milestone.last_good_checkpoint = dict(
+                        session.last_good_checkpoint or {}
+                    )
+                    accepted_goal_hashes: dict[str, str] = {}
+                    for completed_package in goal.milestones:
+                        if completed_package.status == "done":
+                            accepted_goal_hashes.update(
+                                completed_package.accepted_hashes
+                            )
+                    recovery.seal_checkpoint(
+                        goal,
+                        checkpoint_id=milestone.active_verified_checkpoint_id,
+                        package_id=milestone.package_id,
+                        session_id=session.session_id,
+                        artifact_hashes=accepted_goal_hashes,
+                    )
+                    active_repair = next(
+                        (attempt for attempt in reversed(goal.repair_history)
+                         if attempt.status == "started"
+                         and attempt.owner == milestone.owner),
+                        None,
+                    )
+                    if active_repair is not None:
+                        recovery.finish_repair(
+                            goal, active_repair, verified=True,
+                            changed_files=milestone.accepted_files,
+                            after_hashes=milestone.accepted_hashes,
+                            verification_evidence={
+                                "acceptance_detail": milestone.acceptance_detail,
+                            },
+                            result_checkpoint_id=(
+                                milestone.active_verified_checkpoint_id
+                            ),
+                        )
+                    if session.collaboration_assignments:
+                        milestone.participation_reports = [
+                            item.model_dump()
+                            for item in session.collaboration_assignments
+                        ]
+                        baseline_identity = hashlib.sha256(
+                            json.dumps(
+                                session.collaboration_baseline,
+                                sort_keys=True,
+                            ).encode("utf-8")
+                        ).hexdigest()[:24]
+                        milestone.participation_checkpoint_id = (
+                            "baseline_" + baseline_identity
+                        )
+                    milestone.repair_context = {}
+                    milestone.resume_session_id = ""
+                    milestone.phase = "objective_validated"
+                    goal.phase = "objective_validated"
+                    self._record_work_item(
+                        goal,
+                        milestone.package_id,
+                        "objective_validated",
+                        "completed",
+                        session_id=session.session_id,
+                        checkpoint_id=milestone.active_verified_checkpoint_id,
+                    )
                     milestone.output_provenance = self._accepted_output_provenance(
                         session, milestone.required_files, milestone.accepted_hashes
                     )
@@ -5640,28 +7041,48 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         # goal.status/last_error were already set by the streak
                         # breaker inside _invalidate_assembly_input_provider —
                         # preserve that diagnostic instead of the generic one.
+                        if goal.approval_policy == ApprovalPolicy.god_mode:
+                            goal.status = "failed"
+                            goal.recovery_state = RecoveryState.manual_intervention_required
+                            goal.last_error = (
+                                "manual intervention required: " + goal.last_error
+                            )[:300]
                         self.goals.save_owned(goal, token)
                         self._sys_log("goal_paused",
                             {"goal_id": goal.goal_id, "reason": goal.last_error},
                         )
                     else:
+                        failure_detail = (
+                            self._session_seat_outage(session)
+                            or session.stop_reason
+                            or f"milestone {idx + 1} failed"
+                        )
+                        auto_recover = self._recover_failed_milestone(
+                            goal, milestone, session,
+                            "execution_failed", failure_detail,
+                        )
                         sibling_running = any(
                             item.status == "running" and item.index != idx
                             for item in goal.milestones
                         )
-                        goal.status = "draining" if sibling_running else "paused"
+                        if not auto_recover and goal.status != "failed":
+                            goal.status = "draining" if sibling_running else "paused"
                         # Name the SEAT truth when that is the real story: a
                         # quota-capped claude once surfaced as "no file was
                         # delivered" and read as a fatal app error.
-                        outage = self._session_seat_outage(session)
-                        goal.last_error = (
-                            outage or session.stop_reason
-                            or f"milestone {idx + 1} failed"
-                        )[:300]
+                            goal.last_error = failure_detail[:300]
                         self.goals.save_owned(goal, token)
-                        self._sys_log("goal_draining" if sibling_running else "goal_paused",
-                            {"goal_id": goal.goal_id, "reason": goal.last_error},
-                        )
+                        if auto_recover:
+                            self._pool.submit(
+                                self._start_ready_packages,
+                                goal.model_copy(deep=True), background,
+                            )
+                        else:
+                            self._sys_log(
+                                "goal_draining" if sibling_running else
+                                "goal_failed" if goal.status == "failed" else "goal_paused",
+                                {"goal_id": goal.goal_id, "reason": goal.last_error},
+                            )
                 elif session.status == SessionStatus.cancelled:
                     milestone.status = "pending"
                     sibling_running = any(
@@ -5853,12 +7274,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     ),
                     "collaboration_assignments": current.get(
                         "collaboration_assignments", []
-                    ),
+                    ) or list(package.participation_reports),
                     "collaboration_integrated_files": current.get(
                         "collaboration_integrated_files", []
                     ),
-                    "collaboration_integration_status": current.get(
-                        "collaboration_integration_status", "not_started"
+                    "collaboration_integration_status": (
+                        "reused_for_targeted_repair"
+                        if (package.participation_reports
+                            and package.repair_context
+                            and not current.get("collaboration_assignments"))
+                        else current.get(
+                            "collaboration_integration_status", "not_started"
+                        )
                     ),
                     "authoring_started_at": current.get("package_started_at"),
                     "authoring_deadline_at": current.get("package_deadline_at"),
@@ -6361,8 +7788,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             )
             self.goals.save_owned(goal, token)
             return "breaker"
-        if provider.session_id and provider.session_id not in provider.invalidated_session_ids:
-            provider.invalidated_session_ids.append(provider.session_id)
         escalated_from = ""
         if streak >= config.ASSEMBLY_FAULT_ESCALATE_AT:
             replacement = next(
@@ -6380,15 +7805,25 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                      "streak": streak},
                 )
         provider.status = "pending"
+        provider.resume_session_id = provider.session_id or ""
         provider.session_id = None
-        provider.files = []
-        provider.accepted_files = []
-        provider.accepted_hashes = {}
         provider.acceptance_detail = (
             "The independent release verifier rejected this package's output on "
             "final review. Fix every item below; do not change files you do not "
             "own:\n- " + "\n- ".join(defects)
         )[:4000]
+        provider.repair_context = {
+            "category": "semantic_release_defect",
+            "detail": "\n".join(defects)[:3000],
+            "base_checkpoint_id": provider.active_verified_checkpoint_id,
+            "target_paths": list(
+                provider.materialization_plan.producing_files
+                if provider.materialization_plan else provider.required_files
+            ),
+            "repair_owner": provider.owner,
+        }
+        provider.phase = "repairing"
+        goal.phase = "repairing"
         goal.current_index = provider.index
         goal.release_status = "not_started"
         goal.release_session_id = None
@@ -6406,7 +7841,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         )
         return "reopened"
 
-    def _recover_verified_goal_packages(self, goal_id: str) -> list[str]:
+    def _recover_verified_goal_packages(
+        self, goal_id: str, allowed_statuses: Optional[set[str]] = None,
+    ) -> list[str]:
         """Adopt completed package attempts that lost their goal commit.
 
         Session verification and goal staging are separate durable transactions.
@@ -6414,7 +7851,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         resume, recover exact owner/package outputs from any completed successful
         attempt before spending another model call.
         """
-        goal = self.goals.claim_worker_lease(goal_id, {"paused"})
+        goal = self.goals.claim_worker_lease(
+            goal_id, allowed_statuses or {"paused"}
+        )
         if goal is None:
             return []
         token = goal.worker_lease
@@ -6450,7 +7889,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 match = None
                 for candidate in candidates.get(package.package_id, []):
                     if (candidate.work_package_owner != package.owner
-                            or candidate.session_id in package.invalidated_session_ids
                             or not set(package.required_files).issubset(
                                 set(candidate.required_files))):
                         continue
@@ -6470,6 +7908,27 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                             and action.kind in ("write_file", "edit_file")
                             and action.status == "executed" and action.result_path)
                     }
+                    for action in candidate.proposed_actions:
+                        if (action.role == Role.panelist
+                                or action.kind != "build_artifact"
+                                or action.status != "executed"):
+                            continue
+                        declared = [
+                            item.strip().replace("\\", "/")
+                            for item in str(
+                                action.args.get("produces") or ""
+                            ).split(",") if item.strip()
+                        ]
+                        try:
+                            produced = [
+                                Path(item) for item in json.loads(
+                                    action.args.get("produced_paths") or "[]"
+                                )
+                            ]
+                        except (json.JSONDecodeError, TypeError):
+                            produced = []
+                        for name, path in zip(declared, produced):
+                            latest[name] = path
                     try:
                         intact = all(
                             sealed.get(name)
@@ -6502,6 +7961,37 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     match, package.required_files, package.accepted_hashes
                 )
                 package.acceptance_detail = "recovered verified output from completed attempt"
+                checkpoint_paths = {
+                    name: executor.resolve_in_workspace(
+                        Path(goal.staging_root), name
+                    )
+                    for name in package.accepted_hashes
+                }
+                checkpoint = self.checkpoints.seal_paths(
+                    goal_id=goal.goal_id,
+                    package_id=package.package_id,
+                    session_id=match.session_id,
+                    paths=checkpoint_paths,
+                    expected_hashes=package.accepted_hashes,
+                    parent_id=package.active_verified_checkpoint_id,
+                    state="recovered_verified",
+                    evidence={"migration": "verified_session_recovery"},
+                )
+                package.active_verified_checkpoint_id = checkpoint[
+                    "checkpoint_id"
+                ]
+                package.invalidated_session_ids = [
+                    item for item in package.invalidated_session_ids
+                    if item != match.session_id
+                ]
+                package.phase = "objective_validated"
+                goal.active_verified_checkpoint_id = checkpoint["checkpoint_id"]
+                goal.phase = "objective_validated"
+                if match.collaboration_assignments:
+                    package.participation_reports = [
+                        item.model_dump()
+                        for item in match.collaboration_assignments
+                    ]
                 package.summary = (match.final.answer if match.final else "")[
                     : config.GOAL_SUMMARY_MAX_CHARS]
                 recovered.append(package.package_id)
@@ -6618,6 +8108,135 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self._start_ready_packages(goal, background=background)
         return self.get_goal(goal_id) or goal.model_dump()
 
+    def recover_goal(
+        self, goal_id: str, strategy: str, background: bool = True,
+    ) -> dict:
+        """Apply an explicit operator recovery command to persisted state."""
+        strategy = (strategy or "").strip().lower()
+        if strategy not in {"retry_verifier", "repair_owner", "frontier_takeover"}:
+            raise ValueError(
+                "strategy must be retry_verifier, repair_owner, or frontier_takeover"
+            )
+        if strategy == "retry_verifier":
+            self._recover_verified_goal_packages(
+                goal_id, {"paused", "failed"}
+            )
+        goal = self.goals.claim_worker_lease(goal_id, {"paused", "failed"})
+        if goal is None:
+            if self.goals.get(goal_id) is None:
+                raise KeyError(f"goal {goal_id} not found")
+            raise ValueError("goal is not in a recoverable terminal state")
+        token = goal.worker_lease
+        prepare_release = False
+        schedule = False
+        try:
+            if strategy == "retry_verifier":
+                if not goal.milestones or not (
+                        goal.active_verified_checkpoint_id
+                        or all(
+                            package.status == "done"
+                            for package in goal.milestones
+                        )):
+                    raise ValueError("release verification is not the current failure")
+                if goal.active_verified_checkpoint_id and goal.staging_root:
+                    self.checkpoints.materialize(
+                        goal.active_verified_checkpoint_id,
+                        Path(goal.staging_root),
+                        names=goal.release_files or None,
+                    )
+                goal.status = "running"
+                goal.release_session_id = None
+                goal.release_status = "not_started"
+                goal.last_error = "operator requested a fresh independent verifier"
+                prepare_release = True
+            else:
+                latest_failure = next(iter(reversed(goal.failure_records)), None)
+                if (latest_failure is not None
+                        and latest_failure.stage == "orchestrator"):
+                    raise ValueError(
+                        "this is an orchestrator capability-contract failure; "
+                        "another artifact author cannot repair it"
+                    )
+                target = next(
+                    (package for package in goal.milestones
+                     if package.status == "failed"),
+                    None,
+                )
+                if target is None and goal.release_status not in {
+                        "not_started", "released"}:
+                    release_packages = [
+                        package for package in goal.milestones if package.release_files
+                    ]
+                    target = release_packages[0] if len(release_packages) == 1 else None
+                if target is None:
+                    target = goal.current
+                if target is None:
+                    raise ValueError("no package can be attributed for recovery")
+                prior_owner = target.owner
+                if strategy == "frontier_takeover":
+                    replacement = next(
+                        (seat for seat in self._frontier_seats()
+                         if seat in self.panel and seat != target.owner
+                         and not self.seat_health.is_unavailable(seat)),
+                        None,
+                    )
+                    if replacement is None:
+                        raise ValueError("no healthy independent frontier seat is available")
+                    target.owner = replacement
+                target.status = "pending"
+                target.resume_session_id = target.session_id or ""
+                target.session_id = None
+                target.acceptance_detail = (
+                    f"Operator selected {strategy}; preserve the last-good inputs, "
+                    "change the producing source, and rerun every gate."
+                )
+                target.repair_context = {
+                    "category": "operator_recovery",
+                    "detail": target.acceptance_detail,
+                    "base_checkpoint_id": target.active_verified_checkpoint_id,
+                    "target_paths": list(
+                        target.materialization_plan.producing_files
+                        if target.materialization_plan else target.required_files
+                    ),
+                    "repair_owner": target.owner,
+                }
+                target.phase = "repairing"
+                goal.phase = "repairing"
+                goal.status = "running"
+                goal.current_index = target.index
+                goal.release_session_id = None
+                goal.release_status = "not_started"
+                goal.last_error = f"operator selected {strategy} for {target.package_id}"
+                failure = next(iter(reversed(goal.failure_records)), None)
+                if failure is None:
+                    failure = recovery.record_failure(
+                        goal, stage="operator", category="manual_recovery",
+                        summary=f"operator recovery for {target.package_id}",
+                        evidence={"package_id": target.package_id},
+                        responsible_owner=prior_owner,
+                    )
+                recovery.begin_repair(
+                    goal, failure, repair_owner=target.owner,
+                    strategy=f"operator_{strategy}",
+                    input_hashes=self._milestone_input_hashes(goal, target),
+                )
+                schedule = True
+            goal.recovery_state = RecoveryState.repairing
+            if not self.goals.save_owned(goal, token):
+                raise ValueError("goal changed while applying recovery")
+        finally:
+            self.goals.release_worker_lease(goal_id, token)
+        current = self.goals.get(goal_id) or goal
+        self._sys_log("operator_recovery_selected",
+            {"goal_id": goal_id, "strategy": strategy},
+        )
+        if prepare_release:
+            self._prepare_goal_release(current)
+            self.goals.save(current)
+        elif schedule:
+            self._start_ready_packages(current, background=background)
+        return self.get_goal(goal_id) or current.model_dump()
+
     def delete_goal(self, goal_id: str) -> bool:
         """Remove the goal record. Its milestone sessions remain in the store."""
         return self.goals.remove(goal_id)
@@ -6716,16 +8335,24 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         completed = 0
         outage_attempts = 0
         interrupted = 0
+        session_verification_signatures: set[str] = set()
         from .seat_health import UNAVAILABLE_STATES, classify_failure
         for meta in related:
             session = self.manager.load(meta["session_id"])
             if session is None:
                 continue
             attempts += session.agent_call_attempts
-            completed += len(session.contributions)
+            successful = sum(self._successful_session_calls(session).values())
+            completed += successful
             if session.status == SessionStatus.cancelled:
                 interrupted += max(
-                    0, session.agent_call_attempts - len(session.contributions))
+                    0, session.agent_call_attempts - successful)
+            for failure in session.failure_records:
+                if ("verification" in failure.stage
+                        or "validation" in failure.category):
+                    session_verification_signatures.add(
+                        failure.fault_signature or failure.failure_id
+                    )
             for note in (session.unresolved or []):
                 if ("dropped" in str(note)
                         and classify_failure(str(note)) in UNAVAILABLE_STATES):
@@ -6747,6 +8374,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "interrupted": interrupted,
                 "other_failures": failed_other,
             },
+            "economics": {
+                "useful_completed_calls": completed,
+                "repair_attempts": len(goal.repair_history),
+                "verification_failures": len({
+                    failure.fault_signature or failure.failure_id
+                    for failure in goal.failure_records
+                    if ("verification" in failure.stage
+                        or "validation" in failure.category)
+                } | session_verification_signatures),
+                "transport_or_seat_failures": outage_attempts,
+                "orchestration_calls": max(0, goal.model_calls_used - attempts),
+            },
+            "recovery_state": goal.recovery_state,
+            "failure_records": [item.model_dump() for item in goal.failure_records],
+            "repair_history": [item.model_dump() for item in goal.repair_history],
+            "last_good_checkpoint": dict(goal.last_good_checkpoint),
             "packages": [
                 {
                     "package": package.index + 1,
@@ -6920,6 +8563,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                   "destination": destination})
             goal.status = "completed"
             goal.release_status = "released"
+            goal.phase = "released"
+            session.phase = "released"
+            self._record_work_item(
+                goal, "__release__", "released", "completed",
+                session_id=session.session_id,
+                checkpoint_id=goal.active_verified_checkpoint_id,
+            )
             goal.last_error = ""
             self.goals.save(goal)
         except Exception as e:  # noqa: BLE001
@@ -6932,9 +8582,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 confidence="low", assumptions=[], risks_unresolved=[str(e)],
                 next_action="Review the conflict, then resume the goal to generate a fresh final diff.")
             self.manager.transition(session, SessionStatus.failed)
-            goal.status = "paused"
+            goal.status = (
+                "failed" if goal.approval_policy == ApprovalPolicy.god_mode else "paused"
+            )
             goal.release_status = "failed"
             goal.last_error = session.stop_reason[:300]
+            failure = recovery.record_failure(
+                goal, stage="release", category="promotion_failed",
+                summary=goal.last_error,
+                evidence={"action_id": action.action_id, "error": str(e)},
+            )
+            if goal.approval_policy == ApprovalPolicy.god_mode:
+                recovery.mark_exhausted(goal, failure)
             self.goals.save(goal)
         self.store.save_session(session)
         return session
@@ -7187,6 +8846,20 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             )
         resume_started = time.monotonic()
         try:
+            if session.goal_id:
+                reservation = self.goals.reserve_model_call(
+                    session.goal_id,
+                    session_id=session.session_id,
+                    agent=req.agent,
+                    phase=session.phase or "resume_after_input",
+                )
+                if reservation is None:
+                    raise AgentError(
+                        "goal model-call budget exhausted before provider resume"
+                    )
+                session.goal_model_call_reservation_ids.append(
+                    reservation["reservation_id"]
+                )
             result = self.registry.resume(req.agent, req.resume_token, req.answer)
         except AgentError as e:
             elapsed_ms = int((time.monotonic() - resume_started) * 1000)

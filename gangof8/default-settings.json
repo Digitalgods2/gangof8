@@ -15,6 +15,7 @@
       "red_team": "qwen",
       "fact_validator": "codex",
       "implementer": "kimi",
+      "recovery_supervisor": "claude",
       "summarizer": "gemini"
     },
     "role_models": {
@@ -26,6 +27,7 @@
       "code_generator": "gpt-5.5",
       "red_team": "qwen/qwen3.7-plus",
       "fact_validator": "gpt-5.4",
+      "recovery_supervisor": "claude-opus-4.8",
       "summarizer": "gemini-3.5-flash"
     },
     "panel_seats": [],
@@ -62,7 +64,7 @@
     "rounds_per_consent": 3,
     "integration_review_enabled": true,
     "default_execution_profile": "auto",
-    "participation_mode": "adaptive",
+    "participation_mode": "full_council",
     "ui": {
       "poll_interval_ms": 5000,
       "collapse_finished": true

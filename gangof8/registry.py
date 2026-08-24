@@ -64,9 +64,15 @@ class AgentRegistry:
         # outcome updates per-seat health so scheduling can route around
         # seats that cannot answer instead of burning attempts against them.
         self.health = None
+        # Optional durable profile store (injected by the service). Keeping the
+        # hook here guarantees every call path receives AGENT.md + MEMORY.md,
+        # including goal planning and prompt enhancement outside loop.py.
+        self.seat_profiles = None
 
     def register(self, adapter: Adapter) -> None:
         self._adapters[adapter.name] = adapter
+        if self.seat_profiles is not None:
+            self.seat_profiles.ensure(adapter.name)
 
     def names(self) -> list[str]:
         return sorted(self._adapters)
@@ -82,6 +88,9 @@ class AgentRegistry:
             raise KeyError(f"no adapter registered for agent '{agent}'")
         t0 = time.perf_counter()
         adapter = self._adapters[agent]
+        if self.seat_profiles is not None:
+            seat_context = self.seat_profiles.prompt_context(agent)
+            prompt = f"{seat_context}\n\nCURRENT ASSIGNMENT\n{prompt}"
         # Only pass optional kwargs when present/supported, so adapters that
         # don't take them (simple/text-only doubles) keep working unchanged.
         kwargs: dict = {}

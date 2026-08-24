@@ -362,8 +362,8 @@ function clearComposer() {
   const box = document.getElementById("task");
   box.value = ""; autoGrow(box);
   attachments = []; renderAttachments();
-  const profile = document.getElementById("executionProfile");
-  if (profile) profile.value = "auto";
+  const godMode = document.getElementById("godMode");
+  if (godMode) godMode.checked = false;
   document.getElementById("submitNote").textContent = "";
   resetEnhance();
 }
@@ -415,22 +415,12 @@ function bindComposerControls() {
     });
   }
   const profile = document.getElementById("executionProfile");
-  const profileHint = document.getElementById("profileHint");
-  const hints = {
-    auto: "Gang of 8 will explain its routing choice before starting.",
-    focused: "Uses the smallest capable group for a fast, direct result. Cheapest route, and the right default for building one thing.",
-    council: "Invites broad critique and synthesis across the council.",
-    best_of_n: "MOST EXPENSIVE ROUTE. Every enabled seat writes a COMPLETE solution and all but one are discarded, so cost scales with the number of seats and the run is the slowest of any route. Candidates are compared anonymously and the strongest ships. Worth it when you want competing whole answers to choose between — not when you want one thing built.",
-    build_team: "Creates owned packages. Independent packages run in parallel; an atomic deliverable may use one owner plus council review.",
-  };
-  const updateHint = () => {
-    if (profileHint && profile) profileHint.textContent = hints[profile.value] || hints.auto;
-  };
   // Council and Best-of-all compare whole answers across seats, which costs a
   // multiple of the other routes and discards all but one result. They stay
   // available, but behind a deliberate opt-in rather than sitting in the list
   // as peers of the route you almost always want.
   const ADV_KEY = "gangof8.advancedRoutes";
+  const PROFILE_KEY = "gangof8.executionProfile";
   const advBox = document.getElementById("advancedRoutes");
   const advOpts = profile ? [...profile.querySelectorAll("option[data-advanced]")] : [];
   const applyAdvanced = () => {
@@ -438,7 +428,6 @@ function bindComposerControls() {
     advOpts.forEach(o => { o.hidden = !on; o.disabled = !on; });
     if (!on && profile && advOpts.some(o => o.value === profile.value)) {
       profile.value = "auto";   // never leave a hidden route selected
-      updateHint();
     }
   };
   if (advBox) {
@@ -448,9 +437,18 @@ function bindComposerControls() {
       applyAdvanced();
     });
   }
+  if (profile) {
+    try {
+      const saved = localStorage.getItem(PROFILE_KEY);
+      if (saved && [...profile.options].some(option => option.value === saved)) {
+        profile.value = saved;
+      }
+    } catch (e) { /* private mode / older browser */ }
+    profile.addEventListener("change", () => {
+      try { localStorage.setItem(PROFILE_KEY, profile.value); } catch (e) { /* ignore */ }
+    });
+  }
   applyAdvanced();
-  profile?.addEventListener("change", updateHint);
-  updateHint();
 }
 
 // ---- floatable composer: drag it by the terminal bar out of the way of
@@ -685,9 +683,10 @@ async function submitTaskLegacy() {
       note.textContent = "usage: /goal <a big objective — the council gets owned build packages and one final release>";
       return;
     }
+    const approvalPolicy = document.getElementById("godMode")?.checked ? "god_mode" : "manual";
     const g = await api("/goals", {method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({text: goalText, background: true})});
+      body: JSON.stringify({text: goalText, background: true, approval_policy: approvalPolicy})});
     note.style.color = ""; note.textContent = "goal " + g.goal_id + " opened — assigning build packages…";
     _followGoal = g.goal_id; _planShownFor = "";  // main pane tracks this goal
     current = null;
@@ -699,7 +698,8 @@ async function submitTaskLegacy() {
   const r = await api("/tasks", {method:"POST",
     headers:{"Content-Type":"application/json"},
     body: JSON.stringify({text, source:"dashboard", background:true,
-                          attachments: attachments.map(a => a.id)})});
+                          attachments: attachments.map(a => a.id),
+                          approval_policy: document.getElementById("godMode")?.checked ? "god_mode" : "manual"})});
   if (r.goal_id) {
     note.style.color = "";
     note.textContent = "substantial build auto-routed to goal " + r.goal_id
@@ -816,7 +816,9 @@ function openContractReview(preview) {
     _routeReview(preview, pendingSubmission.execution_profile);
   const note = document.getElementById("contractNote");
   note.style.color = "";
-  note.textContent = "This becomes the shared definition of done for every agent.";
+  note.textContent = pendingSubmission.approval_policy === "god_mode"
+    ? "God mode: in-contract approvals auto-resolve with an audit trail; scope expansion and exhausted recovery still stop."
+    : "This becomes the shared definition of done for every agent.";
   document.getElementById("contractRunBtn").disabled = false;
   document.getElementById("contractOverlay").classList.add("open");
   document.getElementById("contractOutcome").focus();
@@ -910,6 +912,8 @@ async function submitTask() {
     text, source: "dashboard",
     attachments: attachments.map(item => item.id),
     execution_profile: executionProfile,
+    // Deliberate per-run snapshot: never persisted and reset after submit.
+    approval_policy: document.getElementById("godMode")?.checked ? "god_mode" : "manual",
   };
   pendingSubmission = payload;
   submissionBusy = true;
@@ -1189,6 +1193,40 @@ function humanStatus(st) {
   return STATUS_WORDS[st] || String(st || "").replaceAll("_", " ");
 }
 
+function openHelp() {
+  document.getElementById("helpOverlay")?.classList.add("open");
+}
+
+function closeHelp() {
+  document.getElementById("helpOverlay")?.classList.remove("open");
+}
+
+// Model spend is disclosed VISIBLY, never hover-only. A run routinely pulls in
+// seats far beyond the build roster — an architect to plan, a critic and a
+// confirming reviewer to check — and every one of them bills real tokens. The
+// user cannot choose to abort what the UI never showed them, so this row states
+// the running total, the cap (or its absence), and the per-seat breakdown.
+function seatSpendRow(g) {
+  const seats = Object.entries((g && g.model_calls_by_seat) || {})
+    .sort((a, b) => b[1] - a[1]);
+  if (!seats.length) return "";
+  const used = Number(g.model_calls_used || 0);
+  const cap = Number(g.call_budget || 0);
+  const build = new Set(g.build_roster || []);
+  const chips = seats.map(([seat, n]) => {
+    // A seat that is spending WITHOUT owning a package is the surprising case:
+    // mark it so an unexpected consumer is obvious at a glance.
+    const extra = !build.has(seat);
+    return `<span class="spend-chip${extra ? " extra" : ""}"` +
+      ` title="${esc(extra ? seat + " is not a package owner — it is spending as a helper seat (architect, critic or reviewer)" : seat + " owns packages in this build")}">` +
+      `<b>${esc(seat)}</b> ${n}</span>`;
+  }).join("");
+  return `<div class="seat-spend" aria-label="Model calls by seat">
+    <span class="spend-total${!cap ? " uncapped" : ""}">${used}${cap ? "/" + cap : ""} model call${used === 1 ? "" : "s"}${cap ? "" : " · no cap"}</span>
+    ${chips}
+  </div>`;
+}
+
 function goalCard(g) {
   const ms = g.milestones || [];
   const done = ms.filter(m => m.status === "done").length;
@@ -1198,6 +1236,20 @@ function goalCard(g) {
   const expectedContributors = g.expected_artifact_contributor_count
     ?? g.expected_contributor_count ?? 0;
   const displayStatus = g.display_status || g.status;
+  const godMode = g.approval_policy === "god_mode";
+  const recoveryState = g.recovery_state || "idle";
+  const failures = g.failure_records || [];
+  const latestFailure = failures.length ? failures[failures.length - 1] : null;
+  const reviews = g.review_attempts || [];
+  const latestReview = reviews.length ? reviews[reviews.length - 1] : null;
+  const milestoneCheckpoint = ms.find(m => m.active_verified_checkpoint_id)
+    ?.active_verified_checkpoint_id || "";
+  const checkpointId = g.active_verified_checkpoint_id || milestoneCheckpoint || "";
+  const hasVerifiedEvidence = Boolean(
+    checkpointId
+    || Object.keys(g.last_good_checkpoint?.artifact_hashes || {}).length
+    || ms.some(m => Object.keys(m.last_good_checkpoint?.artifact_hashes || {}).length)
+  );
   const icons = {done: "✓", running: "▶", pending: "○", failed: "×",
     awaiting_approval: "!", awaiting_input: "?", cancelled: "×", draining: "◌"};
   const rows = ms.map(m => {
@@ -1217,7 +1269,7 @@ function goalCard(g) {
     const working = (m.active_agent_calls || []).length
       ? ` · ${m.active_agent_calls.map(c => {
           const chars = c.progress_chars || 0;
-          return `${c.agent} ${chars ? `streaming ${chars.toLocaleString()} chars` : "waiting for output"}`;
+          return `${c.agent} ${chars ? `streaming ${chars.toLocaleString()} chars` : "no observable output yet"}`;
         }).join(", ")}` : "";
     const title = `${m.title}${m.owner ? ` — accountable owner ${m.owner}` : ""}${edge}${attempts}${fanout}${callAttempts}${working}`;
     return `
@@ -1231,6 +1283,15 @@ function goalCard(g) {
   const followupLive = GOAL_FOLLOWUP_LIVE.has(displayStatus);
   let btns =
     (g.status === "paused" ? `<button class="gbtn" onclick="resumeGoal('${esc(g.goal_id)}', event)">Resume</button>` : "") +
+    (["paused", "failed"].includes(g.status) && failures.length
+      ? `<button class="gbtn recovery-action" title="Retry the affected package with its accountable owner" onclick="recoverGoal('${escAttr(g.goal_id)}', 'repair_owner', event)">Repair with owner</button>`
+      : "") +
+    (["paused", "failed"].includes(g.status) && failures.length
+      ? `<button class="gbtn recovery-action" title="Assign the affected package to a different healthy frontier model" onclick="recoverGoal('${escAttr(g.goal_id)}', 'frontier_takeover', event)">Frontier takeover</button>`
+      : "") +
+    (["paused", "failed"].includes(g.status) && ms.length && (done === ms.length || hasVerifiedEvidence) && g.release_status !== "released"
+      ? `<button class="gbtn recovery-action" title="Rerun deterministic release checks with a fresh independent verifier" onclick="recoverGoal('${escAttr(g.goal_id)}', 'retry_verifier', event)">Retry verifier</button>`
+      : "") +
     (live || g.status === "paused" ? `<button class="gbtn ghost" onclick="cancelGoal('${esc(g.goal_id)}', event)">Cancel</button>` : "") +
     (followupLive && g.actionable_session_id
       ? `<button class="gbtn ghost" onclick="cancelSession('${esc(g.actionable_session_id)}', event)">Cancel repair</button>`
@@ -1239,7 +1300,7 @@ function goalCard(g) {
     `<button class="gbtn ghost" title="Full story: timeline + postmortem" onclick="toggleGoalStory('${esc(g.goal_id)}', event)">📜</button>`;
   btns += `<button class="gbtn ghost" title="Copy this goal into the composer" onclick="cloneGoal('${esc(g.goal_id)}', event)">Copy</button>`;
   const aggregate = g.delivery_mode === "final_batch"
-    ? `<div class="sub">${g.participation_mode === "full_council" ? "Full Council" : g.participation_mode === "adaptive" ? "Adaptive council" : "Focused build"} · ${contributors}/${expectedContributors || "?"} artifact contributors` +
+    ? `<div class="sub">${g.participation_mode === "full_council" ? "Full Council" : g.participation_mode === "adaptive" ? "Adaptive council" : "Focused build"} · ${contributors}/${expectedContributors || "?"} resource participants` +
       ` · ${owners} planned owner${owners === 1 ? "" : "s"} · ${running} active` +
       `${g.active_agent_calls ? ` · ${g.active_agent_calls} model call${g.active_agent_calls === 1 ? "" : "s"}` : ""}` +
       `${g.pending_approvals ? ` · ${g.pending_approvals} approval blocked` : ""}` +
@@ -1278,7 +1339,7 @@ function goalCard(g) {
           <div>
             <b>${esc(call.agent || "model")}</b> has been planning for ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"}.
             ${chars ? `It is still producing output (${chars.toLocaleString()} characters so far).` : "It has not produced output yet."}
-            There is no automatic wall-clock cutoff.
+            ${call.timeout_s ? `A hard deadline is active at ${Math.round(call.timeout_s / 60)} minutes.` : "There is no automatic wall-clock cutoff."}
           </div>
           <div class="slow-call-actions">
             <button class="ghost mini" type="button"
@@ -1291,16 +1352,28 @@ function goalCard(g) {
         </div>`;
       }).join("")}
     </div>` : "";
-  const spentSeats = Object.entries(g.model_calls_by_seat || {})
-    .sort((a, b) => b[1] - a[1]).map(([seat, n]) => `${seat} ${n}`).join(", ");
   const cost = g.model_calls_used
-    ? `<span class="gprog" title="model calls spent${spentSeats ? `: ${esc(spentSeats)}` : ""}">` +
+    ? `<span class="gprog">` +
       `${g.model_calls_used}${g.call_budget ? `/${g.call_budget}` : ""} calls</span>`
     : "";
+  const verificationLanes = checkpointId || latestReview ? `
+    <div class="verification-lanes">
+      <div class="verification-lane objective">
+        <b>Objective verification</b>
+        <span>${checkpointId ? `verified checkpoint <code>${esc(checkpointId.slice(0, 15))}</code>` : "no verified checkpoint yet"}</span>
+      </div>
+      <div class="verification-lane semantic">
+        <b>AI review</b>
+        <span>${latestReview ? `${esc(humanStatus(latestReview.status))} by ${esc(latestReview.reviewer || "reviewer")}` : "not run yet"}</span>
+      </div>
+      <div class="verification-phase">phase: ${esc(humanStatus(g.phase || "contract_frozen"))}</div>
+    </div>` : "";
   return `
     <div class="goal ${esc(g.status)}">
       <div class="ghead">
         <span class="pill g-${esc(displayStatus)}">${esc(humanStatus(displayStatus))}</span>
+        ${godMode ? `<span class="pill god-pill" title="In-contract approvals auto-resolve and remain audited">God mode</span>` : ""}
+        ${recoveryState !== "idle" ? `<span class="pill recovery-pill">${esc(humanStatus(recoveryState))}</span>` : ""}
         <span class="gprog">${done}/${ms.length || "…"}</span>
         ${cost}
         ${btns}
@@ -1309,8 +1382,11 @@ function goalCard(g) {
            onclick="this.classList.toggle('open')">${esc(g.text)}</div>
       ${g.now ? `<div class="gnow">▸ ${esc(g.now)}</div>` : ""}
       ${g.last_error ? `<div class="gerr">${esc(g.last_error)}</div>` : ""}
+      ${latestFailure ? `<div class="recovery-summary"><b>Latest diagnosed failure</b> · ${esc(latestFailure.stage || "run")} · ${esc(latestFailure.summary || "")}${latestFailure.fault_signature ? ` <code>${esc(latestFailure.fault_signature.slice(0, 10))}</code>` : ""}</div>` : ""}
+      ${verificationLanes}
       ${aggregate}
       ${resources}
+      ${seatSpendRow(g)}
       ${planningCheckin}
       ${rows}
       <div class="gstory" id="gstory-${esc(g.goal_id)}" style="display:none"></div>
@@ -1338,6 +1414,23 @@ async function toggleGoalStory(goalId, ev) {
   const pkgs = (s.packages || []).map(p =>
     `P${p.package} ${esc(p.title)} — ${esc(p.owner)} (${esc(p.status)}${p.invalidated_attempts ? `, ${p.invalidated_attempts} invalidated attempt${p.invalidated_attempts === 1 ? "" : "s"}` : ""})`
   ).join("<br>");
+  const econ = s.economics || {};
+  const econBits = [
+    `${econ.useful_completed_calls || 0} useful`,
+    `${econ.repair_attempts || 0} repair`,
+    `${econ.verification_failures || 0} verification failure`,
+    `${econ.transport_or_seat_failures || 0} transport/seat failure`,
+    `${econ.orchestration_calls || 0} orchestration`,
+  ].join(" · ");
+  const failures = (s.failure_records || []).slice(-5).map(failure =>
+    `<div class="recovery-ledger-row"><code>${esc(String(failure.fault_signature || "").slice(0, 10))}</code> ` +
+    `<b>${esc(failure.stage || "run")}</b> — ${esc(failure.summary || "")}</div>`
+  ).join("");
+  const repairs = (s.repair_history || []).slice(-5).map(repair =>
+    `<div class="recovery-ledger-row"><b>${esc(repair.strategy || "repair")}</b> by ${esc(repair.owner || "coordinator")} ` +
+    `— ${esc(repair.status || "unknown")}</div>`
+  ).join("");
+  const checkpoint = s.last_good_checkpoint || {};
   const rows = (d.events || []).slice(-120).map(e =>
     `<div class="tlrow"><span class="tlts">${esc((e.ts || "").slice(11, 19))}</span> ${esc(e.icon || "•")} <b>${esc(e.label || e.event)}</b>${e.detail ? ` — ${esc(e.detail)}` : ""}</div>`
   ).join("");
@@ -1346,8 +1439,12 @@ async function toggleGoalStory(goalId, ev) {
       <b>${esc(s.status || "")}${s.release_status ? " · " + esc(s.release_status) : ""}</b>
       · ${s.calls_used ?? 0}/${s.call_budget ?? "∞"} calls${seats ? ` (${esc(seats)})` : ""}
       ${attemptBits ? `<br>attempts: ${esc(attemptBits)}` : ""}
+      <br>model-call economics: ${esc(econBits)}
+      ${s.recovery_state ? `<br>recovery: ${esc(humanStatus(s.recovery_state))}` : ""}
+      ${checkpoint.sealed_at ? `<br>last good checkpoint: ${esc(checkpoint.sealed_at)}` : ""}
       ${pkgs ? `<br>${pkgs}` : ""}
     </div>
+    ${(failures || repairs) ? `<div class="recovery-ledger">${failures}${repairs}</div>` : ""}
     <div class="gtimeline">${rows || '<div class="hint">no events recorded</div>'}</div>`;
 }
 
@@ -1392,6 +1489,39 @@ async function resumeGoal(id, ev) {
   // it immediately instead of leaving the failed attempt in the main pane.
   if (resumed.actionable_session_id) {
     current = resumed.actionable_session_id;
+    history.replaceState(null, "", "#" + current);
+  }
+  pollLoop();
+}
+
+async function recoverGoal(id, strategy, ev) {
+  if (ev) ev.stopPropagation();
+  const labels = {
+    retry_verifier: "retry release verification",
+    repair_owner: "repair the affected package with its current owner",
+    frontier_takeover: "move the affected package to an independent frontier model",
+  };
+  if (strategy === "frontier_takeover" &&
+      !confirm("Use a different frontier model for this package? The prior attempt remains in the audit trail.")) {
+    return;
+  }
+  const response = await fetch(`/goals/${encodeURIComponent(id)}/recover`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({strategy, background: true}),
+  });
+  const recovered = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    alert(`Could not ${labels[strategy] || "recover"}: ${recovered.detail || response.status}`);
+    return;
+  }
+  _followGoal = id;
+  _planShownFor = "";
+  detailRefreshGate.invalidate();
+  _lastDetailSig = "";
+  _lastGoalsSig = "";
+  if (recovered.actionable_session_id) {
+    current = recovered.actionable_session_id;
     history.replaceState(null, "", "#" + current);
   }
   pollLoop();
@@ -1738,6 +1868,7 @@ function outcomeContractCard(s) {
     <div class="card-heading-row">
       <h3>Outcome contract</h3>
       ${profile ? `<span class="pill profile-pill">${esc(executionProfileLabel(profile))}</span>` : ""}
+      ${s.approval_policy === "god_mode" ? `<span class="pill god-pill">God mode · audited auto-approval</span>` : ""}
     </div>
     ${outcome ? `<div class="contract-outcome">${esc(outcome)}</div>` : ""}
     <div class="contract-detail-grid">
@@ -1750,6 +1881,7 @@ function outcomeContractCard(s) {
       <span>Route</span> <b>${esc(executionProfileLabel(routeName || "auto"))}</b>
       ${reason ? `<span>· ${esc(reason)}</span>` : ""}
     </div>` : ""}
+    ${s.recovery_state && s.recovery_state !== "idle" ? `<div class="recovery-summary"><b>Recovery</b> · ${esc(humanStatus(s.recovery_state))} · ${(s.failure_records || []).length} diagnosed failure${(s.failure_records || []).length === 1 ? "" : "s"} · ${(s.repair_history || []).length} repair attempt${(s.repair_history || []).length === 1 ? "" : "s"}</div>` : ""}
   </div>`;
 }
 
@@ -2346,7 +2478,7 @@ function renderDetail(s) {
           <div>
             <b>${esc(call.agent || "model")}</b> has been working for ${elapsedMinutes} minute${elapsedMinutes === 1 ? "" : "s"}.
             ${chars ? `It is still producing output (${chars.toLocaleString()} characters so far).` : "It has not produced output yet."}
-            There is no automatic wall-clock cutoff.
+            ${call.timeout_s ? `A hard deadline is active at ${Math.round(call.timeout_s / 60)} minutes.` : "There is no automatic wall-clock cutoff."}
           </div>
           <div class="slow-call-actions">
             <button class="ghost mini" type="button"
@@ -2370,7 +2502,7 @@ function renderDetail(s) {
     const chars = activeCall.progress_chars || 0;
     const progress = chars
       ? `streamed ${chars.toLocaleString()} chars`
-      : "waiting for first model output";
+      : "no observable model output yet";
     const workers = packageMode && activeCalls.length > 1
       ? `${activeCalls.length} package authors working`
       : `${packageMode ? "package author" : "model"} working`;
@@ -2473,6 +2605,49 @@ function renderDetail(s) {
   const showSummary = !!final || contribs.length || disagreements.length;
   // finished sessions collapse by default; live ones expand so progress shows
   const collapseDefault = working || uiPreferences.collapse_finished === false;
+  const packageAssignments = packageMode
+    ? ((s.collaboration_assignments || []).length
+      ? s.collaboration_assignments
+      : (currentPackage?.collaboration_assignments || []))
+    : [];
+  const packageAssignmentBySeat = new Map(
+    packageAssignments.map(assignment => [assignment.seat, assignment])
+  );
+  const activePackageAgents = new Set(
+    activeCalls.map(call => call.agent).filter(Boolean)
+  );
+  const lensRoles = {
+    sources: "knowledge_retriever",
+    research: "researcher",
+    architecture: "architect",
+    correctness: "critic",
+    integration: "api_integrator",
+    adversarial: "red_team",
+    implementation: "implementer",
+    verification: "fact_validator",
+    synthesis: "summarizer",
+    independent: "panelist",
+  };
+  const packageResourceSeats = packageMode && parentGoal
+    ? (parentGoal.resource_roster || s.resource_roster || [])
+      .filter(seat => seat && seat !== s.work_package_owner)
+      .map(seat => {
+        const assignment = packageAssignmentBySeat.get(seat);
+        const lens = assignment?.lens || "independent";
+        const rawStatus = activePackageAgents.has(seat)
+          ? "running" : (assignment?.status || "scheduled");
+        const stateClass = rawStatus === "contributed" ? "spoke"
+          : ["running", "requesting_context"].includes(rawStatus) ? "working"
+            : ["failed", "unavailable", "stopped"].includes(rawStatus) ? "missing"
+              : "on";
+        const stateLabel = rawStatus === "requesting_context"
+          ? "requesting context" : rawStatus.replaceAll("_", " ");
+        const recovered = assignment?.recovered_by
+          ? ` (recovered by ${assignment.recovered_by})` : "";
+        return `<span class="seat role-${esc(lensRoles[lens] || "panelist")} ${stateClass}"
+          title="resource assignment · ${esc(lens)} · ${esc(stateLabel)}${esc(recovered)}">${esc(seat)} · ${esc(lens)} · ${esc(stateLabel)}${esc(recovered)}</span>`;
+      }).join("")
+    : "";
 
   right.innerHTML = `
     <div class="card">
@@ -2567,6 +2742,11 @@ function renderDetail(s) {
           </div>`).join("")}</div>` : ""}
       </div>` : ""}
 
+    ${sessionGoal ? `<div class="card spend-card">
+      <h3>Model spend · whole build <span class="sub">· every seat this goal has paid for, not just this package</span></h3>
+      ${seatSpendRow(sessionGoal)}
+    </div>` : ""}
+
     ${steeringCard(s, working)}
 
     ${(roster.length || (parentGoal && (parentGoal.milestones || []).length)) ? `
@@ -2575,7 +2755,7 @@ function renderDetail(s) {
           candidateMode
             ? ` <span class="sub">· every enabled AI attempts the complete artifact; runnable candidates are judged anonymously</span>`
             : packageMode
-              ? ` <span class="sub">· this package has one accountable owner; peers review and can propose edits</span>`
+              ? ` <span class="sub">· one accountable owner integrates final bytes; every enabled peer is scheduled to research, challenge, improve, or verify</span>`
               : ""
         }</h3>
         <div class="roster">
@@ -2588,8 +2768,10 @@ function renderDetail(s) {
               : m.status === "running" && (m.contract_depends_on || []).length
                 ? "running from declared interfaces; no artifact wait"
                 : `${m.status}; no upstream blocker`;
-            return `<span class="seat role-panelist ${active ? "spoke" : "on"}" title="${esc(title)}">P${i + 1} · ${esc(m.owner || "unassigned")} · ${esc(m.status)}</span>`;
-          }).join("") : roster.map(m => {
+            const ownerState = active && m.status === "running"
+              ? "working" : m.status === "done" ? "spoke" : "on";
+            return `<span class="seat role-panelist ${ownerState}" title="${esc(title)}">P${i + 1} · ${esc(m.owner || "unassigned")} · ${esc(m.status)}</span>`;
+          }).join("") + packageResourceSeats : roster.map(m => {
             const talent = !DRIVE_ROLES.has(m.role);
             // the model this member's role+agent actually ran; else the one it
             // WILL run (resolved server-side: role pin › seat pin › CLI default).
@@ -2825,7 +3007,7 @@ async function declineInput(iid) {
 // ============================ Settings panel ============================
 // Self-contained: its own open/close + render, sharing only esc/api helpers.
 // Opening overlays the dashboard; closing returns to it untouched.
-const ROLES = ["lead", "researcher", "architect", "critic", "implementer", "summarizer"];
+const ROLES = ["lead", "researcher", "architect", "critic", "implementer", "recovery_supervisor", "summarizer"];
 const roleList = s => (s.role_catalog && s.role_catalog.length) ? s.role_catalog : ROLES;
 const roleLabel = r => r.split("_").map(w => w ? w[0].toUpperCase() + w.slice(1) : w).join(" ");
 let settingsCache = null, seatsCache = [], wsCache = {workspaces: [], active: null};
@@ -2848,6 +3030,7 @@ const TIPS = {
   red_team: "Agent that tries to break the proposal with adversarial cases and wrong assumptions.",
   fact_validator: "Agent that independently confirms, refutes, or marks claims as unverifiable.",
   implementer: "Talent that drafts complete written deliverables (docs, reports, prose) when the lead assigns them.",
+  recovery_supervisor: "Agent that monitors failures, diagnoses the first causal fault, directs a changed repair, and re-runs verification.",
   summarizer: "Agent that composes the final, reconciled answer.",
   risk: "Tasks classified above this risk level pause for your approval before any deliberation runs.",
   prose: "If an agent returns unlabeled prose at least this many characters long, it's accepted as the answer (at medium confidence) instead of being retried.",

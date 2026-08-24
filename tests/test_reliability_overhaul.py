@@ -9,16 +9,93 @@ import threading
 import pytest
 
 from gangof8 import config, executor, loop, skills
+from gangof8.checkpoints import CheckpointStore
+from gangof8.goals import GoalStore
 from gangof8.governance import Governance
 from gangof8.logstore import LogStore
 from gangof8.models import (
-    ApprovalRequest, Contribution, Council, CouncilMember, Goal, GoalMilestone, ProposedAction,
-    Role, Session, SessionStatus, Task,
+    ApprovalRequest, Classification, Complexity, Contribution, Council,
+    CouncilMember, Goal, GoalMilestone, ProposedAction, Risk, Role, Session,
+    SessionStatus, Task, TaskType,
 )
 from gangof8.registry import AdapterResult
 from gangof8.service import GangOf8Service
 from gangof8.sessions import SessionManager
 from gangof8 import validation
+
+
+def test_model_response_actions_execute_in_dependency_order():
+    session_id = "s_action_order"
+    actions = [
+        ProposedAction(
+            session_id=session_id, kind="build_artifact",
+            role=Role.implementer,
+        ),
+        ProposedAction(
+            session_id=session_id, kind="write_file",
+            role=Role.implementer, filename="make_pdf.py", content="pass",
+        ),
+        ProposedAction(
+            session_id=session_id, kind="install_deps",
+            role=Role.implementer,
+        ),
+    ]
+
+    assert [action.kind for action in loop._ordered_actions(actions)] == [
+        "write_file", "install_deps", "build_artifact",
+    ]
+
+
+def test_checkpoint_materializes_original_bytes_after_working_copy_changes(tmp_path):
+    source = tmp_path / "deliverable.pdf"
+    source.write_bytes(b"%PDF-1.7 verified generation")
+    store = CheckpointStore(tmp_path / "data")
+    checkpoint = store.seal_paths(
+        goal_id="g_checkpoint",
+        package_id="wp_1",
+        session_id="s_verified",
+        paths={"deliverable.pdf": source},
+    )
+    source.write_bytes(b"failed replacement generation")
+
+    restored = tmp_path / "restored"
+    store.materialize(checkpoint["checkpoint_id"], restored)
+
+    assert (restored / "deliverable.pdf").read_bytes() == (
+        b"%PDF-1.7 verified generation"
+    )
+
+
+def test_parallel_goal_dispatch_reservations_cannot_overshoot_budget(tmp_path):
+    goals = GoalStore(tmp_path / "data")
+    goal = Goal(text="bounded", status="running", model_calls_budget=2)
+    goals.save(goal)
+    barrier = threading.Barrier(6)
+    results: list[dict | None] = []
+    lock = threading.Lock()
+
+    def reserve(index: int) -> None:
+        barrier.wait()
+        result = goals.reserve_model_call(
+            goal.goal_id,
+            session_id=f"s_{index}",
+            agent="codex",
+            phase="participation",
+        )
+        with lock:
+            results.append(result)
+
+    workers = [threading.Thread(target=reserve, args=(index,)) for index in range(6)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+
+    persisted = goals.get(goal.goal_id)
+    assert sum(result is not None for result in results) == 2
+    assert persisted is not None
+    assert persisted.model_calls_used == 2
+    assert len(persisted.model_call_reservations) == 2
 
 
 def test_legacy_settings_timeout_is_ignored_but_explicit_policy_is_honored():
@@ -482,6 +559,34 @@ def test_hand_typed_binary_file_does_not_satisfy_the_deliverable_format():
         status="executed", result_path="/tmp/Book.pdf"))
     assert loop._produced_deliverable_formats(session) == {"pdf"}
     assert loop._missing_deliverable_formats(session) == []
+
+
+def test_missing_binary_records_the_output_defect_without_crashing_recovery(tmp_path):
+    store = LogStore(tmp_path / "data")
+    session = Session(
+        session_id="s_missing_pdf",
+        work_package_owner="codex",
+        required_files=["deliverable.pdf"],
+        task=Task(
+            task_id="t_missing_pdf",
+            session_id="s_missing_pdf",
+            text="create a searchable PDF",
+        ),
+    )
+    session.classification = Classification(
+        task_type=TaskType.content,
+        complexity=Complexity.standard,
+        risk=Risk.none,
+        produces_output=True,
+        deliverable_formats=["pdf"],
+    )
+
+    assert not loop._verify_artifact_outputs(session, store, require_file=True)
+    assert len(session.failure_records) == 1
+    failure = session.failure_records[0]
+    assert failure.category == "missing_deliverable"
+    assert failure.artifact_path == "deliverable.pdf"
+    assert failure.owner == "codex"
 
 
 def test_corrective_followup_reads_its_base_from_the_parent_sandbox(tmp_path):

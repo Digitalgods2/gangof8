@@ -4,9 +4,11 @@ Each call invokes the local CLI in plain non-interactive generation mode and
 returns its raw text output. That is what lets the implementer emit real file
 bodies instead of descriptions — Gang of 8 is fully self-contained.
 
-Tools are disabled / read-only so the agent cannot perform side effects itself;
-every write stays governed by Gang of 8 (executor + approval kernel). Print
-mode is one-shot, so there is no awaiting_user_input/resume path here.
+Reviewer calls are read-only. Codex author calls may edit only a fresh,
+hash-sealed disposable package directory; changed text files are converted back
+into the normal ARTIFACT protocol and still pass Gang of 8's path, contract,
+validation, executor, and approval gates. Print mode is one-shot, so there is
+no awaiting_user_input/resume path here.
 
 Supported agents: claude (fully exercised), codex, gemini.
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +33,53 @@ from .. import cancellation, config
 from ..cancellation import SessionCancelled
 from ..models import Role
 from ..registry import AdapterResult, AgentCallStopped, AgentError
+
+
+_OPAQUE_SUFFIXES = {
+    ".7z", ".avi", ".docx", ".gif", ".gz", ".ico", ".jpeg", ".jpg",
+    ".mov", ".mp3", ".mp4", ".pdf", ".png", ".pptx", ".tar", ".webp",
+    ".xlsx", ".zip",
+}
+
+
+def _workspace_snapshot(root: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    try:
+        paths = list(root.rglob("*"))
+    except OSError:
+        return snapshot
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            name = path.relative_to(root).as_posix()
+            snapshot[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return snapshot
+
+
+def _workspace_change_envelopes(root: Path, before: dict[str, str]) -> tuple[str, list[str]]:
+    """Import native CLI edits through the same governed ARTIFACT protocol."""
+    after = _workspace_snapshot(root)
+    changed = [name for name, digest in after.items()
+               if before.get(name) != digest and name != "_gangof8_manifest.json"]
+    blocks: list[str] = []
+    accepted: list[str] = []
+    for name in changed:
+        path = root / name
+        if path.suffix.lower() in _OPAQUE_SUFFIXES:
+            continue
+        try:
+            raw = path.read_bytes()
+            if len(raw) > 4_000_000 or b"\x00" in raw:
+                continue
+            body = raw.decode("utf-8")
+        except (OSError, UnicodeError):
+            continue
+        blocks.append(f"ARTIFACT: {name}\n{body}\nEND_ARTIFACT")
+        accepted.append(name)
+    return "\n\n".join(blocks), accepted
 
 
 def _err_tail(text: str, limit: int = 300) -> str:
@@ -226,10 +276,21 @@ class CliAdapter:
             clone.model = pinned
             clone.role_models = {}
             return clone.call(role, prompt, timeout_s, images)
-        # An explicit cwd is a caller-owned disposable review copy — it is meant
-        # to be inspected, and the caller cleans it up.
+        # An explicit cwd is a caller-owned disposable copy. Author roles may
+        # edit only that copy; changed text is converted back into ARTIFACT
+        # envelopes so the normal contract filter and executor govern import.
         if self._cwd_override:
-            return self._dispatch(role, prompt, timeout_s, images)
+            root = Path(self._cwd_override)
+            before = _workspace_snapshot(root)
+            result = self._dispatch(role, prompt, timeout_s, images)
+            envelopes, _changed = _workspace_change_envelopes(root, before)
+            if envelopes:
+                result.content = (
+                    result.content.rstrip()
+                    + "\n\nNATIVE WORKSPACE CHANGES CAPTURED BY COORDINATOR:\n"
+                    + envelopes
+                )
+            return result
         sid = cancellation.current_session()
         d = _call_dir()
         previous = getattr(_CALL_DIR, "path", None)
@@ -258,7 +319,7 @@ class CliAdapter:
                 content, used = self._run_claude(prompt, timeout_s)
                 model = model or used  # the CLI reports what it actually ran
         elif self.agent == "codex":
-            content = self._run_codex(prompt, timeout_s, images)  # --image=<path>
+            content = self._run_codex(role, prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
             # Prefer the google-genai SDK for ALL gemini calls (text AND images)
             # when an API key is present — from the env OR stored via Settings →
@@ -465,7 +526,8 @@ class CliAdapter:
             raise AgentCallStopped("gemini SDK call stopped by operator")
         return resp.text or ""
 
-    def _run_codex(self, prompt: str, timeout_s: int, images: list[dict] | None = None) -> str:
+    def _run_codex(self, role: Role, prompt: str, timeout_s: int,
+                   images: list[dict] | None = None) -> str:
         # codex exec writes its final message cleanly to --output-last-message.
         # Images attach with --image=<path> (verified: reads text in images).
         fd, outfile = tempfile.mkstemp(suffix=".txt")
@@ -475,8 +537,12 @@ class CliAdapter:
             # (git) directory, and we deliberately run every CLI from a neutral
             # EMPTY dir (see _neutral_cwd) — codex has no tools enabled here, so
             # the trust check protects nothing and only kills the seat.
+            writable = bool(
+                self._cwd_override
+                and role in {Role.code_generator, Role.implementer}
+            )
             cmd = ["codex", "exec", "--color", "never", "--skip-git-repo-check",
-                   "--sandbox", "read-only",
+                   "--sandbox", "workspace-write" if writable else "read-only",
                    "--output-last-message", outfile]
             if self.model:
                 cmd += ["-m", self.model]

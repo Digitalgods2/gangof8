@@ -125,6 +125,11 @@ def build_council(
     ]
     # implementer is kept listed (UI/back-compat) but the LEAD authors files now.
     members.append(CouncilMember(role=Role.implementer, agent=agent_for(Role.implementer), active=False))
+    members.append(CouncilMember(
+        role=Role.recovery_supervisor,
+        agent=agent_for(Role.recovery_supervisor),
+        active=True,
+    ))
     members.append(CouncilMember(role=Role.governance, agent="system", active=cls.needs_governance))
     members.append(CouncilMember(role=Role.summarizer, agent=agent_for(Role.summarizer), active=True))
     return Council(members=members)

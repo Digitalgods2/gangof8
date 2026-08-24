@@ -565,6 +565,121 @@ def _build_wrote(before: dict[str, tuple[int, int]], after: dict[str, tuple[int,
     return f"the build actually wrote: {listing}"
 
 
+def _seed_verified_build_inputs(
+    session: Session, data_dir: Path, cwd: Path, target_space: str,
+) -> list[str]:
+    """Put the exact accepted package inputs where the build actually runs.
+
+    Package authors receive immutable dependencies in an isolated authoring
+    working set. The generated producer, however, executes in the session
+    sandbox. Only hash-sealed dependencies cross that boundary: a missing or
+    drifting input is an orchestration failure, not permission to recreate it
+    from prompt text.
+    """
+    expected_inputs = dict(session.dependency_hashes or {})
+    plan = session.materialization_plan
+    expected_inputs.update(dict(plan.input_hashes or {}) if plan else {})
+    producers = {
+        name.replace("\\", "/") for name in (plan.producing_files if plan else [])
+    }
+    declared = {
+        name.replace("\\", "/")
+        for name in (
+            plan.build.inputs if plan and plan.build else []
+        )
+        if name and name.replace("\\", "/") not in producers
+    }
+
+    source_roots: list[Path] = []
+    for raw_root in (
+        session.workspace_root,
+        session.delivery_root,
+        session.established_root,
+    ):
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        if root.resolve() != cwd.resolve() and root not in source_roots:
+            source_roots.append(root)
+
+    seeded: list[str] = []
+    # A declared local input without a prior hash is still mandatory. Resolve it
+    # once from the accepted roots, seal its hash, then use the same copy path as
+    # every other immutable input. Missing dependency closure fails before the
+    # command starts instead of becoming a misleading missing-deliverable error.
+    for name in sorted(declared - set(expected_inputs)):
+        destination = resolve_in_workspace(cwd, name)
+        if destination.is_file():
+            digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+            expected_inputs[name] = digest
+            if plan:
+                plan.input_hashes[name] = digest
+            continue
+        source = None
+        for root in source_roots:
+            try:
+                candidate = resolve_in_workspace(root, name)
+            except (ExecutionError, OSError):
+                continue
+            if candidate.is_file():
+                source = candidate
+                break
+        if source is None:
+            raise ExecutionError(
+                f"declared build input is unavailable before execution: {name}"
+            )
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        expected_inputs[name] = digest
+        if plan:
+            plan.input_hashes[name] = digest
+    for name, expected in expected_inputs.items():
+        if name.replace("\\", "/") in producers:
+            continue
+        destination = resolve_in_workspace(cwd, name)
+        if destination.is_file():
+            actual = hashlib.sha256(destination.read_bytes()).hexdigest()
+            if actual == expected:
+                seeded.append(name)
+                continue
+            if target_space != SANDBOX:
+                raise ExecutionError(
+                    f"accepted build input drifted before execution: {name} "
+                    f"(expected {expected}, found {actual})"
+                )
+
+        source: Optional[Path] = None
+        observed: list[str] = []
+        for root in source_roots:
+            try:
+                candidate = resolve_in_workspace(root, name)
+            except (ExecutionError, OSError):
+                continue
+            if not candidate.is_file():
+                continue
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            if digest == expected:
+                source = candidate
+                break
+            observed.append(digest)
+        if source is None:
+            detail = f"; observed hashes: {', '.join(observed)}" if observed else ""
+            raise ExecutionError(
+                f"accepted build input is unavailable: {name} "
+                f"(expected sha256={expected}{detail})"
+            )
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        copied = hashlib.sha256(destination.read_bytes()).hexdigest()
+        if copied != expected:
+            raise ExecutionError(
+                f"accepted build input changed while copying: {name} "
+                f"(expected {expected}, found {copied})"
+            )
+        seeded.append(name)
+    return seeded
+
+
 def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) -> str:
     """Run an approved build in a council space and capture the files it PRODUCES.
 
@@ -588,11 +703,21 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
     cwd = space_root(session, data_dir, target)
     _assert_outside_established(session, cwd)
     cwd.mkdir(parents=True, exist_ok=True)
+    seeded_inputs = _seed_verified_build_inputs(session, data_dir, cwd, target)
+    if seeded_inputs:
+        action.args["verified_inputs"] = json.dumps(seeded_inputs)
     # Resolve every declared output inside the space FIRST: a build must not be
     # able to name its way out of the council's own area.
     outputs = {name: resolve_in_workspace(cwd, name) for name in produces}
     for path in outputs.values():
         _assert_outside_established(session, path)
+    before_hashes: dict[str, str] = {}
+    for name, path in outputs.items():
+        try:
+            if path.is_file():
+                before_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
     # Snapshot BEFORE the command runs: when a declared output is missing, the
     # only useful thing to say is what appeared instead.
     before = _build_snapshot(cwd)
@@ -602,6 +727,15 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
                                 env=build_env(session, data_dir))
     except validation.ValidationCommandError as e:
         raise ExecutionError(str(e)) from e
+
+    action.args["command_result"] = json.dumps(report.model_dump())
+    if not report.ok:
+        # A stale output from an earlier attempt is never evidence that THIS
+        # command worked. Exit status is the first build gate, unconditionally.
+        raise ExecutionError(
+            f"build command failed with exit {report.returncode}; declared outputs "
+            "were not accepted\n" + str(report)
+        )
 
     missing = [n for n, path in outputs.items() if not path.is_file()]
     if missing:
@@ -618,6 +752,17 @@ def _build_artifact(session: Session, action: ProposedAction, data_dir: Path) ->
     digests = {}
     for name, path in outputs.items():
         digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    unchanged = [
+        name for name, digest in digests.items()
+        if before_hashes.get(name) == digest
+    ]
+    if unchanged:
+        raise ExecutionError(
+            "build exited zero but did not create or change declared output(s): "
+            + ", ".join(unchanged)
+            + "\n" + _build_wrote(before, _build_snapshot(cwd), unchanged)
+            + "\n" + str(report)
+        )
     # The loop reads these back to register the outputs as real deliverables.
     action.args["produced_paths"] = json.dumps([str(p) for p in outputs.values()])
     action.args["produced_hashes"] = json.dumps(digests)

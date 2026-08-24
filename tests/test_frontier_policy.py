@@ -10,8 +10,9 @@ from gangof8 import config, goals, loop, rounds
 from gangof8.artifacts import canonical_protocol_filename, parse_proposals
 from gangof8.logstore import LogStore
 from gangof8.models import (
-    Classification, Complexity, Council, CouncilMember, Contribution,
+    AcceptanceCriterion, Classification, Complexity, Council, CouncilMember, Contribution,
     GoalMilestone, ProposedAction, Risk, Role, Session, Task, TaskType,
+    ReviewStatus,
 )
 from gangof8.service import GangOf8Service
 
@@ -43,13 +44,13 @@ def test_protocol_filenames_strip_all_outer_presentation_quotes():
     assert canonical_protocol_filename("'assets/Benny\'s-theme.css'") == "assets/Benny's-theme.css"
 
 
-def test_frontier_implementation_has_no_default_coordinator_deadline():
+def test_frontier_implementation_has_bounded_package_deadline():
     session = _code_session()
     session.cli_timeouts = {"claude": 30}
     assert loop._effective_agent_timeout(
         session, "claude", config.FRONTIER_AUTHOR_TIMEOUT) == config.FRONTIER_AUTHOR_TIMEOUT
     assert config.FRONTIER_AUTHOR_TIMEOUT == 0
-    assert config.PACKAGE_AUTHOR_DEADLINE == 0
+    assert config.PACKAGE_AUTHOR_DEADLINE == 2700
     assert config.FRONTIER_VERIFY_TIMEOUT == 0
 
 
@@ -70,6 +71,14 @@ def test_substantial_build_auto_routes_but_small_fix_does_not():
         "and a complete acceptance checklist. " * 6
     )
     assert goals.should_auto_route(brief)
+    assert goals.should_auto_route(
+        "Research heavily and create a searchable indexed PDF cookbook with "
+        "100 recipes, citations, and a bibliography."
+    )
+    assert goals.should_auto_route(
+        "research heavily and create a searchable indexed PDF with 100 of his "
+        "most notable and popular recipes still used today"
+    )
     assert not goals.should_auto_route("Fix the typo in README.md")
     assert not goals.should_auto_route(brief, has_attachments=True)
 
@@ -193,3 +202,19 @@ def test_frontier_verdict_without_checks_is_never_a_pass():
     assert verdict == "FAIL"
     assert checks == []
     assert defects == []
+
+
+def test_markdown_wrapped_pass_is_a_valid_semantic_review():
+    """Regression: the verified PDF was discarded because closing Markdown
+    emphasis after PASS made a successful reviewer response unparsable."""
+    criteria = [AcceptanceCriterion(criterion_id="R1", text="searchable title")]
+    report = rounds.parse_frontier_review(
+        "**CHECK R1: PASS** - title found in extracted text\n**VERDICT: PASS**",
+        criteria,
+        checkpoint_id="cp_good",
+        reviewer="claude",
+    )
+
+    assert report.status == ReviewStatus.passed
+    assert report.checkpoint_id == "cp_good"
+    assert report.criteria[0].detail == "title found in extracted text"
