@@ -135,11 +135,43 @@ function packageAttemptState(session, goal, sessions = []) {
   };
 }
 
+// A terminal model/council session is not a delivery verdict. Goal builds have
+// a second lifecycle (materialize, verify, release), so status copy must be
+// derived from the parent goal before it uses the word "success".
+function goalOutcomeContext(session, goal) {
+  const isGoalSession = !!(session?.goal_id && goal?.goal_id === session.goal_id);
+  const milestone = isGoalSession
+    ? (goal.milestones || []).find(item =>
+        item.session_id === session.session_id ||
+        item.package_id === session.work_package_id)
+    : null;
+  const goalSucceeded = !!(isGoalSession && goal.status === "completed" &&
+    goal.release_status === "released");
+  const goalFailed = !!(isGoalSession && ["failed", "cancelled"].includes(goal.status));
+  const goalPaused = !!(isGoalSession && goal.status === "paused");
+  const modelSessionSucceeded = session?.status === "done" &&
+    session?.outcome === "succeeded";
+  const active = Number(goal?.active_agent_calls || 0) +
+    Number(goal?.planning_agent_calls?.length || 0) +
+    Number(milestone?.active_agent_calls?.length || 0);
+  const terminalPackageSession = ["done", "failed", "cancelled"].includes(
+    String(milestone?.session_status || "")
+  );
+  const recoveryStalled = !!(isGoalSession &&
+    ["planning", "running", "draining", "awaiting_release"].includes(goal.status) &&
+    milestone?.status === "running" && terminalPackageSession && active === 0 &&
+    !Number(goal.pending_approvals || 0) && !Number(goal.pending_inputs || 0));
+  return {
+    isGoalSession, milestone, goalSucceeded, goalFailed, goalPaused,
+    modelSessionSucceeded, recoveryStalled,
+  };
+}
+
 // Export the pure helper for the Node regression test. Browsers load this file
 // as a normal script and never enter this branch.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    createLatestRequestGate, goalSessionIds, goalRenderSignature, packageAttemptState,
-    seatSettingsPatch,
+    createLatestRequestGate, goalOutcomeContext, goalSessionIds,
+    goalRenderSignature, packageAttemptState, seatSettingsPatch,
   };
 }

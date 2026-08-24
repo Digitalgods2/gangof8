@@ -1,5 +1,29 @@
 # Gang of Eight — Confirmed Defects
 
+## August 24 goal-release reconciliation incident
+
+- **GO8-014 - A completed council session is labeled as a successful goal**
+  - Status: fixed on 2026-08-24.
+  - Session `s_20260824_479b9eaf` completed its model work while parent goal
+    `g_f333455f` had not completed its release transaction. The detail panel
+    nevertheless said “This run finished successfully.”
+  - Resolution: dashboard status is derived from both lifecycles. A goal-linked
+    turn is called successful only when the parent goal is `completed` and its
+    verified release is `released`; council completion and delivery are shown
+    separately.
+
+- **GO8-015 - God mode releases before its durable goal link exists**
+  - Status: fixed on 2026-08-24.
+  - The package build and release review passed, but synchronous God-mode
+    approval called final promotion before `release_session_id` was persisted.
+    Reloading the stale goal raised `final-batch release state is incomplete`,
+    and the exception handler left the goal falsely running with no worker.
+  - Resolution: release linkage and phase are persisted before verification and
+    authorization; auto-release operates on the linked leased goal. A verified
+    interrupted release resumes its deterministic promotion without another
+    reviewer call. Coordinator transition exceptions receive one bounded replay
+    and then become an explicit paused/failed state.
+
 ## August 24 verified-PDF incident
 
 - **GO8-009 - Markdown PASS is parsed as artifact failure**

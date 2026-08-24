@@ -62,6 +62,12 @@ The dashboard shows two explicit lanes—**Objective verification** and **AI
 review**—plus the active checkpoint, controller phase, defect evidence, repair
 state, and model attempts by seat.
 
+Session completion and goal delivery are deliberately separate. A council turn
+may finish successfully while its package is still building, validating, or
+recovering. The dashboard uses “goal finished successfully” only after the
+verified release transaction completes; otherwise it names the parent goal's
+live, paused, failed, or reconciliation state.
+
 ## The two collaboration shapes
 
 Ordinary requests and planned builds use the same contract, budget, checkpoint,
@@ -731,8 +737,13 @@ Gang of 8 handles failures as follows:
 - cancellation immediately closes registered HTTP/CLI work, revokes the worker
   lease, clears persisted active calls, and records the session terminal, so a
   late background worker cannot overwrite newer authoritative state; and
-- after a server restart, orphaned live sessions are cancelled and active goals
-  are parked as paused rather than left permanently `running` with no worker.
+- after a server restart, terminal package transitions are replayed without a
+  model call, already-passed release reviews resume at the deterministic
+  promotion step, dependency-ready work is rescheduled, and only an operating-
+  system subprocess that cannot be reconstructed is parked as paused;
+- a coordinator transition exception receives one bounded deterministic replay;
+  if the same fault repeats, the goal becomes explicitly paused/failed with the
+  causal error instead of remaining permanently `running` with no worker.
 
 Resume is available after draining completes. It first scans the audit store for a successful, already-verified attempt
 from the same package owner. If its complete required manifest still exists,
@@ -1342,10 +1353,12 @@ batched.
 
 ### A goal is paused after a restart
 
-This is intentional recovery behavior. The old model subprocess no longer
-exists, so the service parks the goal rather than pretending it is still
-running. Read `last_error`, inspect completed package/staging state, and use
-Resume.
+This now means the interrupted work depended on an operating-system model
+subprocess that cannot be reconstructed. Terminal package results, verified
+release reviews, and dependency-ready work resume automatically without paying
+for completed model work again. If no durable transition exists, the service
+parks the goal rather than pretending it is still running. Read `last_error`,
+inspect completed package/staging state, and use Resume.
 
 ### A final batch fails because the target changed
 

@@ -2,6 +2,29 @@
 
 Status: Implemented and superseded by the August 24 checkpoint/controller cutover
 
+## August 24 release-state follow-up
+
+The later Escoffier run exposed two controller defects after its PDF had already
+passed objective validation and independent release review. First, the dashboard
+reported a successful council session as if the parent goal and artifact release
+had succeeded. Second, God-mode approval reloaded the goal before the new release
+session link had been persisted, raised `final-batch release state is incomplete`,
+and left the goal falsely running without an active worker.
+
+The repaired path now:
+
+- reports council-session completion separately from parent-goal delivery and
+  only labels the goal successful after a verified release is committed;
+- persists the release-session link before synchronous God-mode authorization;
+- continues the final release against the same leased goal object instead of a
+  stale store reload;
+- recognizes a prior passing release review only when every staged SHA-256 hash
+  still matches, then resumes promotion without another model call;
+- replays a failed terminal coordinator transition once without a model call and
+  converts a repeated identical fault into an explicit paused/failed state; and
+- reconciles terminal package sessions and dependency-ready packages after a
+  restart instead of leaving a live goal with no worker.
+
 ## August 24 controller cutover
 
 The 52-attempt Escoffier run proved that the August 23 recovery work was not

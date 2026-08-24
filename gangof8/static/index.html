@@ -72,9 +72,10 @@
       <div class="help-grid">
         <section><h3>Objective verification</h3><p>Commands, hashes, file formats, searchable text, PDF structure, runtime checks, and release-byte equality. These gates can block release.</p></section>
         <section><h3>AI review</h3><p>Semantic evidence against the frozen R-number checklist. A malformed, timed-out, or unavailable reviewer never invalidates an objectively verified artifact; only the reviewer is retried.</p></section>
-        <section><h3>Recovery</h3><p>Repairs branch from an immutable verified checkpoint. The affected producer and downstream validators rerun; completed council reports and unrelated artifacts are reused.</p></section>
+        <section><h3>Recovery</h3><p>Repairs branch from an immutable verified checkpoint. Terminal package transitions and already-passed release reviews resume without another model call. A repeated coordinator failure becomes an explicit stop, never an empty “running” state.</p></section>
         <section><h3>Limits</h3><p>Every physical provider dispatch consumes the goal budget before it starts, including timeouts. Calls and packages also have absolute deadlines, and unchanged repair strategies stop.</p></section>
       </div>
+      <p><b>Status language is goal-aware.</b> “Council session completed” means the models returned; it is not called successful delivery until the artifact is built, verified, and released. The session and parent-goal states are shown separately.</p>
       <p><b>God mode</b> auto-approves in-contract actions with an audit trail. It does not disable scope boundaries, objective gates, cancellation, call budgets, deadlines, or no-progress stops.</p>
     </div>
   </div>

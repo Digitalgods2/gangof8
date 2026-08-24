@@ -200,7 +200,7 @@ def test_dashboard_tracks_historical_and_current_goal_attempts(client):
         pytest.skip("node not on PATH")
     script = r"""
 const {
-  goalSessionIds, goalRenderSignature, packageAttemptState,
+  goalOutcomeContext, goalSessionIds, goalRenderSignature, packageAttemptState,
 } = require('./gangof8/static/dashboard-utils.js');
 const attempts = [
   {number:1, session_id:'s_old', status:'failed', created_at:'2026-01-01T00:00:00Z'},
@@ -217,6 +217,21 @@ if (!state.isHistorical || state.selectedNumber !== 1 || state.currentNumber !==
 const before = goalRenderSignature(goal);
 goal.milestones[0].status = 'done';
 if (before === goalRenderSignature(goal)) throw new Error('parent transition did not invalidate detail');
+goal.milestones[0].status = 'running';
+goal.milestones[0].session_status = 'done';
+goal.active_agent_calls = 0;
+goal.pending_approvals = 0;
+goal.pending_inputs = 0;
+const completedTurn = {session_id:'s_new', status:'done', outcome:'succeeded',
+  goal_id:'g_1', work_package_id:'wp_1'};
+const incomplete = goalOutcomeContext(completedTurn, goal);
+if (incomplete.goalSucceeded || !incomplete.recoveryStalled)
+  throw new Error('a terminal council turn was mislabeled as goal success');
+goal.status = 'completed';
+goal.release_status = 'released';
+const delivered = goalOutcomeContext(completedTurn, goal);
+if (!delivered.goalSucceeded || delivered.recoveryStalled)
+  throw new Error('verified goal delivery was not recognized');
 """
     completed = subprocess.run(
         ["node", "-e", script], cwd=os.getcwd(), capture_output=True, text=True, check=False
@@ -226,6 +241,7 @@ if (before === goalRenderSignature(goal)) throw new Error('parent transition did
     assert "Retry attempt" in app_js
     assert "Package briefs are captured when an attempt starts" in app_js
     assert "goalRenderSignature(parentGoal)" in app_js
+    assert "This run finished successfully." not in app_js
 
 
 def test_health_reports_backend(client):

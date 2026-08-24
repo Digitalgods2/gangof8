@@ -17,7 +17,15 @@ from fastapi.testclient import TestClient
 
 from gangof8 import assembly, config, goals as goals_mod
 from gangof8.adapters.mock import MockAdapter
-from gangof8.models import Goal, GoalMilestone, Role, Session, SessionStatus, Task
+from gangof8.models import (
+    ApprovalPolicy,
+    Goal,
+    GoalMilestone,
+    Role,
+    Session,
+    SessionStatus,
+    Task,
+)
 from gangof8.registry import AdapterResult
 from gangof8.service import GangOf8Service
 
@@ -985,6 +993,59 @@ def test_restart_parks_inflight_goals_as_paused(tmp_path):
     assert [m.session_id for m in parked.milestones] == [None, None]
 
 
+def test_restart_resumes_terminal_package_transition_without_another_model_call(tmp_path):
+    """A completed package can be stranded behind a coordinator exception.
+    Restart must advance its durable result instead of falsely parking it."""
+    import time
+
+    data = tmp_path / "data"
+    service = GangOf8Service(data_dir=data)
+    goal = Goal(
+        text="summarize the result",
+        status="running",
+        collaboration_mode="build_team",
+        delivery_mode="final_batch",
+        epoch=1,
+        milestones=[GoalMilestone(
+            index=0,
+            package_id="wp_1",
+            owner="mock",
+            title="summary",
+            task_text="summarize",
+            status="running",
+            session_id="s_terminal",
+            contract_declared=True,
+            requires_delivery=False,
+        )],
+    )
+    terminal = Session(
+        session_id="s_terminal",
+        status=SessionStatus.done,
+        outcome="succeeded",
+        goal_id=goal.goal_id,
+        goal_milestone=0,
+        goal_epoch=1,
+        task=Task(
+            task_id="t_terminal",
+            session_id="s_terminal",
+            text="summarize",
+        ),
+    )
+    service.store.save_session(terminal)
+    service.goals.save(goal)
+
+    restarted = GangOf8Service(data_dir=data)
+    deadline = time.monotonic() + 3
+    recovered = restarted.goals.get(goal.goal_id)
+    while recovered.status != "completed" and time.monotonic() < deadline:
+        time.sleep(0.02)
+        recovered = restarted.goals.get(goal.goal_id)
+
+    assert recovered.status == "completed"
+    assert recovered.milestones[0].status == "done"
+    assert recovered.model_calls_used == 0
+
+
 def test_second_instance_does_not_park_goal_while_first_is_live(tmp_path, monkeypatch):
     """A second launch (double-clicked launcher, an accidental duplicate
     `serve`) constructs its own Service object BEFORE it ever tries to bind
@@ -1542,6 +1603,89 @@ def test_goal_stages_every_package_then_uses_one_final_batch_approval(tmp_path):
     assert provenance["sha256"] == verified_hashes["report.md"]
     assert provenance["agent"] == "mock"
     assert provenance["method"] == "model_authored"
+
+
+def test_god_mode_persists_release_link_before_synchronous_delivery(tmp_path):
+    """Regression: verification passed, then auto-release reloaded a goal whose
+    release_session_id had not been saved and left it falsely running."""
+    established = tmp_path / "established"
+    established.mkdir()
+    plan = (
+        "MILESTONE 1: Ship the report\n"
+        f"TASK: Write a short report recommending SQLite, delivered into {established}\n"
+        "OUTPUTS: report.md\n"
+        "RELEASE: report.md\n"
+    )
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    service.registry.register(_PlannerSeat(plan=plan, promoting=True))
+
+    goal = service.create_goal(
+        f"Ship a storage report into {established}",
+        approval_policy="god_mode",
+    )
+
+    persisted = service.goals.get(goal.goal_id)
+    assert persisted.status == "completed"
+    assert persisted.release_status == "released"
+    assert persisted.release_session_id
+    assert persisted.milestones[0].status == "done"
+    release = service.manager.load(persisted.release_session_id)
+    assert release.status == SessionStatus.done
+    assert release.outcome == "succeeded"
+    assert (established / "report.md").exists()
+
+
+def test_restart_reuses_passed_release_review_and_promotes_without_model_call(tmp_path):
+    """Regression: a passed final review survived a coordinator crash, but the
+    app neither re-linked it nor resumed promotion after restart."""
+    import time
+
+    established = tmp_path / "established"
+    established.mkdir()
+    plan = (
+        "MILESTONE 1: Ship the report\n"
+        f"TASK: Write a short report recommending SQLite, delivered into {established}\n"
+        "OUTPUTS: report.md\n"
+        "RELEASE: report.md\n"
+    )
+    data = tmp_path / "data"
+    service = GangOf8Service(data_dir=data)
+    service.registry.register(_PlannerSeat(plan=plan, promoting=True))
+    goal = service.create_goal(f"Ship a storage report into {established}")
+    release = service.manager.load(goal.release_session_id)
+    calls_before = goal.model_calls_used
+    assert release.status == SessionStatus.awaiting_approval
+    assert not (established / "report.md").exists()
+
+    # Reproduce the durable state left by the old ordering bug: the artifact
+    # and passing release review exist, but the parent lost its release link.
+    goal.status = "awaiting_release"
+    goal.release_status = "not_started"
+    goal.release_session_id = None
+    goal.approval_policy = ApprovalPolicy.god_mode
+    service.goals.save(goal)
+    release.approval_policy = ApprovalPolicy.god_mode
+    # This is the state captured in the real incident after its paid release
+    # reviewer had completed, before promotion advanced the parent goal.
+    release.outcome = "succeeded"
+    release.quality_gate = {"verdict": "PASS"}
+    service.store.save_session(release)
+
+    restarted = GangOf8Service(data_dir=data)
+    deadline = time.monotonic() + 3
+    recovered = restarted.goals.get(goal.goal_id)
+    while recovered.status != "completed" and time.monotonic() < deadline:
+        time.sleep(0.02)
+        recovered = restarted.goals.get(goal.goal_id)
+
+    assert recovered.status == "completed"
+    assert recovered.release_status == "released"
+    assert recovered.release_session_id == release.session_id
+    assert recovered.model_calls_used == calls_before
+    assert (established / "report.md").exists()
+    resumed = restarted.manager.load(release.session_id)
+    assert resumed.status == SessionStatus.done
+    assert not [approval for approval in resumed.approvals if approval.status == "pending"]
 
 
 def test_final_batch_detects_destination_drift_before_writing(tmp_path):

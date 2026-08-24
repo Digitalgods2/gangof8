@@ -5093,7 +5093,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 out[name] = None
         return out
 
-    def _authorize_goal_release(self, session: Session) -> Session:
+    def _authorize_goal_release(
+        self, session: Session, *, linked_goal: Optional[Goal] = None,
+    ) -> Session:
         """Create exactly one approval-bearing action for the complete manifest."""
         destination = session.delivery_root or session.established_root
         if not destination:
@@ -5144,7 +5146,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 {"approval_id": approval.approval_id,
                  "policy": session.approval_policy.value},
             )
-            return self._finish_goal_release(session, True)
+            return self._finish_goal_release(
+                session, True, linked_goal=linked_goal,
+            )
         action.status = "awaiting_approval"
         if session.status == SessionStatus.awaiting_input:
             self.manager.transition(session, SessionStatus.deliberating)
@@ -6000,6 +6004,103 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             reopened = True
         return reopened
 
+    def _reusable_goal_release(
+        self, goal: Goal, files: list[str],
+    ) -> Optional[Session]:
+        """Return a previously verified release turn whose bytes still match.
+
+        A server/process fault can happen after semantic verification but before
+        the final promotion transaction.  Repeating the frontier review spends
+        money without adding evidence.  Reuse is therefore allowed only when
+        every sealed release hash still matches the current staging bytes.
+        """
+        candidates: list[Session] = []
+        for meta in self.store.list_sessions(limit=None):
+            if meta.get("goal_id") != goal.goal_id:
+                continue
+            session_id = str(meta.get("session_id") or "")
+            session = self.manager.load(session_id) if session_id else None
+            if session is None or not session.goal_release:
+                continue
+            if session.status not in {
+                SessionStatus.deliberating, SessionStatus.awaiting_approval,
+            }:
+                continue
+            if session.outcome != "succeeded":
+                continue
+            if str((session.quality_gate or {}).get("verdict") or "").upper() != "PASS":
+                continue
+            hashes = dict(session.release_verified_hashes or {})
+            if any(not hashes.get(name) for name in files):
+                continue
+            stage = Path(goal.staging_root)
+            valid = True
+            for name in files:
+                try:
+                    path = executor.resolve_in_workspace(stage, name)
+                    valid = bool(
+                        path.is_file()
+                        and hashlib.sha256(path.read_bytes()).hexdigest()
+                        == hashes[name]
+                    )
+                except (OSError, executor.ExecutionError):
+                    valid = False
+                if not valid:
+                    break
+            if valid:
+                candidates.append(session)
+        return max(candidates, key=lambda item: item.updated_at) if candidates else None
+
+    def _resume_reusable_goal_release(
+        self, goal: Goal, session: Session,
+    ) -> None:
+        """Resume the deterministic promotion step without another model call."""
+        goal.release_session_id = session.session_id
+        goal.status = "awaiting_release"
+        goal.release_status = "awaiting_approval"
+        goal.phase = "semantic_review_passed"
+        self.goals.save(goal)
+
+        pending = next(
+            (approval for approval in session.approvals
+             if approval.status == "pending"),
+            None,
+        )
+        if pending is not None and goal.approval_policy != ApprovalPolicy.god_mode:
+            if session.status == SessionStatus.deliberating:
+                self.manager.transition(session, SessionStatus.awaiting_approval)
+            self.store.save_session(session)
+            return
+
+        # A promotion authorization captures destination baselines. Re-create
+        # it after an interrupted transaction so a file changed while the app
+        # was down is detected against a fresh, explicit audit record. God mode
+        # resolves the new in-contract action immediately; manual mode asks once.
+        if session.status == SessionStatus.awaiting_approval:
+            self.manager.transition(session, SessionStatus.deliberating)
+        for approval in session.approvals:
+            if approval.status == "pending":
+                approval.status = "denied"
+                approval.resolved_at = utcnow()
+                approval.resolved_by = "release_reconciliation_superseded"
+                self.store.log_event(
+                    session.session_id,
+                    "approval_superseded",
+                    {"approval_id": approval.approval_id,
+                     "reason": "fresh destination baseline required"},
+                )
+        session.proposed_actions = [
+            action for action in session.proposed_actions
+            if action.kind != "promote_batch"
+        ]
+        self.store.save_session(session)
+        self.store.log_event(
+            session.session_id,
+            "verified_release_resumed",
+            {"goal_id": goal.goal_id, "model_calls_added": 0},
+        )
+        self._authorize_goal_release(session, linked_goal=goal)
+
     def _prepare_goal_release(self, goal: Goal) -> None:
         """Create the final review session after every package has staged cleanly."""
         if self._mark_stale_assembly_packages(goal):
@@ -6025,6 +6126,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             goal.status = "completed"
             goal.release_status = "released"
             self._sys_log("goal_completed", {"goal_id": goal.goal_id})
+            return
+        reusable = self._reusable_goal_release(goal, files)
+        if reusable is not None:
+            self._resume_reusable_goal_release(goal, reusable)
             return
         session = self._open(
             f"[FINAL BATCH RELEASE] {goal.text}\nReview and release all staged package outputs together.",
@@ -6059,6 +6164,14 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self.manager.transition(session, SessionStatus.classified)
         self.manager.transition(session, SessionStatus.deliberating)
         goal.release_session_id = session.session_id
+        goal.status = "awaiting_release"
+        goal.release_status = "verifying"
+        goal.phase = "semantic_review"
+        # The release session link is a prerequisite of God mode's synchronous
+        # promotion. Persist it before verification/authorization so the final
+        # transaction can never reload a stale goal and report an incomplete
+        # release state after all artifact gates passed.
+        self.goals.save(goal)
         verified = self._verify_goal_release(goal, session)
         self._count_goal_session(goal, session)
         if not verified:
@@ -6150,7 +6263,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             self.manager.transition(session, SessionStatus.awaiting_input)
         else:
             goal.release_status = "awaiting_approval"
-            self._authorize_goal_release(session)
+            goal.phase = "semantic_review_passed"
+            self.goals.save(goal)
+            self._authorize_goal_release(session, linked_goal=goal)
             # God mode can authorize and complete the release synchronously.
             # Reflect that durable result in the leased object the caller is
             # about to save, instead of overwriting it with awaiting_release.
@@ -6161,6 +6276,8 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     goal.release_status = persisted.release_status
                     goal.last_error = persisted.last_error
                     goal.recovery_state = persisted.recovery_state
+                    goal.phase = persisted.phase
+                    goal.work_items = list(persisted.work_items)
 
     @staticmethod
     def _assembly_runtime_interface_hint(
@@ -7102,8 +7219,109 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 if current and current.status == "running" and current.epoch == session.goal_epoch:
                     self._start_ready_packages(current, background=background)
         except Exception as e:  # noqa: BLE001
-            self._sys_log("goal_advance_error",
-                                 {"goal_id": session.goal_id, "detail": str(e)})
+            self._sys_log(
+                "goal_advance_error",
+                {"goal_id": session.goal_id, "detail": str(e)},
+            )
+            self._recover_goal_advance_error(session, e, background)
+
+    def _recover_goal_advance_error(
+        self, session: Session, error: Exception, background: bool,
+    ) -> None:
+        """Bound a coordinator-state failure and guarantee a truthful outcome.
+
+        This path does not spend another model call. One deterministic replay is
+        allowed because the artifact/session bytes are unchanged; a repeated
+        identical coordinator failure becomes an explicit paused/failed state
+        instead of an immortal ``running`` goal with no worker.
+        """
+        if not session.goal_id:
+            return
+        goal = self.goals.claim_worker_lease(
+            session.goal_id,
+            {"running", "draining", "paused", "awaiting_release"},
+        )
+        if goal is None:
+            return
+        token = goal.worker_lease
+        retry = False
+        try:
+            detail = " ".join(str(error).split())[:1000]
+            failure = recovery.record_failure(
+                goal,
+                stage="coordinator",
+                category="goal_advance_error",
+                summary=detail or error.__class__.__name__,
+                evidence={
+                    "session_id": session.session_id,
+                    "package_index": session.goal_milestone,
+                    "exception_type": error.__class__.__name__,
+                },
+                responsible_owner="coordinator",
+                recoverable=True,
+            )
+            key = "goal_advance:" + failure.fault_signature
+            attempt = int(goal.recovery_attempts.get(key, 0)) + 1
+            goal.recovery_attempts[key] = attempt
+            terminal_session = session.status in self._TERMINAL
+            retry = attempt == 1 and terminal_session
+            if retry:
+                goal.status = "running"
+                goal.recovery_state = RecoveryState.repairing
+                goal.last_error = (
+                    "automatic coordinator recovery: replaying the terminal "
+                    f"goal transition after {detail}"
+                )[:300]
+                self._record_work_item(
+                    goal,
+                    "__coordinator__",
+                    "reconciling_goal_state",
+                    "ready",
+                    session_id=session.session_id,
+                )
+            else:
+                milestone = goal.current
+                if milestone is not None and milestone.status == "running":
+                    milestone.status = "failed"
+                    milestone.phase = "recovery_exhausted"
+                goal.status = (
+                    "failed"
+                    if goal.approval_policy == ApprovalPolicy.god_mode
+                    else "paused"
+                )
+                goal.recovery_state = RecoveryState.manual_intervention_required
+                goal.phase = "recovery_exhausted"
+                goal.last_error = (
+                    "coordinator recovery stopped after the same goal-state "
+                    f"transition failed {attempt} times: {detail}"
+                )[:300]
+                self._record_work_item(
+                    goal,
+                    "__coordinator__",
+                    "reconciling_goal_state",
+                    "failed",
+                    session_id=session.session_id,
+                )
+            self.goals.save_owned(goal, token)
+            self._sys_log(
+                "goal_advance_recovery_scheduled" if retry
+                else "goal_advance_recovery_exhausted",
+                {
+                    "goal_id": goal.goal_id,
+                    "session_id": session.session_id,
+                    "attempt": attempt,
+                    "fault_signature": failure.fault_signature,
+                    "detail": detail,
+                },
+            )
+        finally:
+            self.goals.release_worker_lease(goal.goal_id, token)
+        if retry:
+            self._pool.submit(
+                self._maybe_advance_goal,
+                session.model_copy(deep=True),
+                background,
+            )
 
     @staticmethod
     def _goal_now_line(goal: Goal, related: list[dict]) -> str:
@@ -8242,9 +8460,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         return self.goals.remove(goal_id)
 
     def _reconcile_goal_orphans(self) -> None:
-        """After a restart there is no worker driving any goal: running
-        milestone sessions were just cancelled by _reconcile_orphans, so park
-        planning/running goals as paused — resume retries the current milestone."""
+        """Resume durable work after restart or park it with a truthful reason.
+
+        Terminal package sessions can advance without another author call, and
+        dependency-ready packages can be scheduled directly. Only work with no
+        resumable transition is parked for operator attention.
+        """
         try:
             for goal in self.goals.list():
                 if goal.status == "cancelled":
@@ -8259,7 +8480,56 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     if changed:
                         self.goals.save(goal)
                     continue
-                if goal.status not in ("planning", "running", "draining"):
+                if goal.status not in (
+                    "planning", "running", "draining", "awaiting_release",
+                ):
+                    continue
+                if (
+                    goal.milestones
+                    and all(package.status == "done" for package in goal.milestones)
+                ):
+                    # The crash may have happened after the last package was
+                    # accepted but before (or during) final promotion. Re-enter
+                    # release preparation directly; it reuses a hash-matching
+                    # passed review and otherwise creates only the missing
+                    # review step.
+                    self._sys_log(
+                        "goal_release_transition_resumed",
+                        {"goal_id": goal.goal_id,
+                         "release_session_id": goal.release_session_id},
+                    )
+                    self._pool.submit(self._prepare_goal_release, goal)
+                    continue
+                # A terminal package turn has already spent its model calls and
+                # contains durable output/failure evidence. Resume the goal
+                # transition itself instead of throwing that work away and
+                # forcing another author attempt after every restart.
+                terminal = next(
+                    (
+                        session
+                        for package in goal.milestones
+                        if package.status == "running" and package.session_id
+                        if (session := self.manager.load(package.session_id)) is not None
+                        and session.status in self._TERMINAL
+                    ),
+                    None,
+                )
+                if terminal is not None:
+                    self._sys_log(
+                        "goal_terminal_transition_resumed",
+                        {"goal_id": goal.goal_id,
+                         "session_id": terminal.session_id},
+                    )
+                    self._pool.submit(self._maybe_advance_goal, terminal, True)
+                    continue
+                if any(
+                    self._package_ready(goal, index)
+                    for index in range(len(goal.milestones))
+                ):
+                    self._sys_log(
+                        "goal_ready_work_resumed", {"goal_id": goal.goal_id},
+                    )
+                    self._pool.submit(self._start_ready_packages, goal, True)
                     continue
                 parked = self.goals.park_active(goal.goal_id, "interrupted by a server restart")
                 if parked is not None:
@@ -8434,6 +8704,27 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             session = self.manager.load(sid) if sid else None
             if session is None:
                 continue
+            if session.goal_release and session.goal_id:
+                goal = self.goals.get(session.goal_id)
+                files = self._goal_release_files(goal) if goal is not None else []
+                reusable = (
+                    self._reusable_goal_release(goal, files)
+                    if goal is not None and files else None
+                )
+                if reusable is not None and reusable.session_id == session.session_id:
+                    # The paid reviewer phase already passed. Revoke the dead
+                    # process lease but preserve this deterministic promotion
+                    # cursor for the goal reconciler instead of cancelling it.
+                    session.active_agent_calls = []
+                    self.store.revoke_worker_lease(sid)
+                    session.worker_lease = ""
+                    self.store.save_session(session)
+                    self.store.log_event(
+                        sid,
+                        "verified_release_parked_for_resume",
+                        {"goal_id": session.goal_id},
+                    )
+                    continue
             session.stop_reason = "interrupted by a server restart"
             session.outcome = "cancelled"
             session.active_agent_calls = []
@@ -8524,10 +8815,18 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
     def list(self) -> list[dict]:
         return self.store.list_sessions()
 
-    def _finish_goal_release(self, session: Session, approved: bool) -> Session:
+    def _finish_goal_release(
+        self,
+        session: Session,
+        approved: bool,
+        *,
+        linked_goal: Optional[Goal] = None,
+    ) -> Session:
         """Resolve the special one-action release session without another LLM run."""
         action = next((a for a in session.proposed_actions if a.kind == "promote_batch"), None)
-        goal = self.goals.get(session.goal_id) if session.goal_id else None
+        goal = linked_goal or (
+            self.goals.get(session.goal_id) if session.goal_id else None
+        )
         if action is None or goal is None or goal.release_session_id != session.session_id:
             raise ValueError("final-batch release state is incomplete")
         if not approved:

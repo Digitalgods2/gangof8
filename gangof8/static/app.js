@@ -2220,6 +2220,7 @@ function statusAgentName(name) {
 function runStatusBrief(s, goal, events) {
   const activeCalls = s.active_agent_calls || [];
   const activeCall = activeCalls[0] || null;
+  const outcomeContext = goalOutcomeContext(s, goal);
   const gate = s.quality_gate || s.run_summary?.quality_gate || {};
   const timeline = events || [];
   const hasEvent = name => timeline.some(item => item.event === name);
@@ -2240,9 +2241,21 @@ function runStatusBrief(s, goal, events) {
   } else if (s.status === "awaiting_input") {
     headline = "The run is paused for an answer from you.";
   } else if (s.status === "done") {
-    headline = s.outcome === "succeeded"
-      ? "This run finished successfully."
-      : "This run finished, but its recorded outcome was not successful.";
+    if (outcomeContext.goalSucceeded) {
+      headline = "The goal finished successfully and its verified output was released.";
+    } else if (outcomeContext.recoveryStalled) {
+      headline = "The council session finished, but goal recovery has no active worker and is not successful.";
+    } else if (outcomeContext.goalFailed) {
+      headline = "The council session finished, but the goal failed and was not delivered as a success.";
+    } else if (outcomeContext.goalPaused) {
+      headline = "The council session finished, but the goal is paused and has not been delivered.";
+    } else if (outcomeContext.isGoalSession) {
+      headline = "The council session finished, but the goal has not completed or delivered its artifact yet.";
+    } else {
+      headline = s.outcome === "succeeded"
+        ? "This standalone run finished successfully."
+        : "This run finished, but its recorded outcome was not successful.";
+    }
   } else if (s.status === "failed") {
     headline = "This run stopped after failing verification; it was not delivered as a success.";
   } else if (s.status === "cancelled") {
@@ -2250,6 +2263,16 @@ function runStatusBrief(s, goal, events) {
   }
 
   const bullets = [];
+  if (outcomeContext.isGoalSession && outcomeContext.modelSessionSucceeded &&
+      !outcomeContext.goalSucceeded) {
+    bullets.push("The model/council turn completed; that is not the same as artifact delivery succeeding.");
+  }
+  if (outcomeContext.recoveryStalled) {
+    bullets.push("The parent goal is marked live, but no package or model worker is active; recovery reconciliation is required.");
+  }
+  if (outcomeContext.isGoalSession && goal?.last_error) {
+    bullets.push(`Goal state: ${goal.last_error}`);
+  }
   const completedPackages = (goal?.milestones || []).filter(item =>
     item.status === "done" && item.owner
   );
@@ -2326,9 +2349,11 @@ function runStatusBrief(s, goal, events) {
     ["promote", "promote_batch"].includes(action.kind) && action.status === "executed"
   );
   const established = String(s.established_root || "").toLowerCase();
-  const delivered = promoted || (s.files_changed || []).some(path =>
-    established && String(path).toLowerCase().startsWith(established)
-  );
+  const delivered = outcomeContext.isGoalSession
+    ? outcomeContext.goalSucceeded
+    : promoted || (s.files_changed || []).some(path =>
+        established && String(path).toLowerCase().startsWith(established)
+      );
   bullets.push(delivered
     ? "Verified output has been delivered to the established folder."
     : "Nothing has been delivered yet.");
@@ -2340,7 +2365,14 @@ function runStatusBrief(s, goal, events) {
       bullets.push(`This call has a ${activeCall.timeout_s}-second hard timeout.`);
     }
   }
-  return {headline, bullets, live: working || s.status === "awaiting_approval"};
+  const goalLive = outcomeContext.isGoalSession &&
+    ["planning", "running", "draining", "awaiting_release"].includes(goal?.status) &&
+    !outcomeContext.recoveryStalled;
+  return {
+    headline,
+    bullets,
+    live: working || s.status === "awaiting_approval" || goalLive,
+  };
 }
 
 function toggleRunStatus() {
@@ -2682,7 +2714,9 @@ function renderDetail(s) {
       <div class="run-status-headline" role="status" aria-live="polite">${esc(statusBrief.headline)}</div>
       <div class="run-status-details">
         <ul>${statusBrief.bullets.map(item => `<li>${esc(item)}</li>`).join("")}</ul>
-        <div class="sub">${statusBrief.live
+        <div class="sub">${sessionGoal
+          ? "Council-session completion and goal delivery are reported separately."
+          : statusBrief.live
           ? "Updated automatically while this session is active."
           : "Final recorded status for this session."}</div>
       </div>
