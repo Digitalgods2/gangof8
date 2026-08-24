@@ -257,6 +257,7 @@ class GoalStore:
                 return None
             if goal.status not in ("completed", "cancelled", "failed"):
                 goal.status = "cancelled"
+                goal.last_error = "cancelled by user"
                 goal.epoch += 1
                 goal.worker_lease = ""
                 goal.active_agent_calls = []

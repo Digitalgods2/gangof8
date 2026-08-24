@@ -8494,6 +8494,9 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                     # left package rows as "running", which kept the dashboard
                     # visually alive forever. Normalize those records once.
                     changed = False
+                    if goal.last_error != "cancelled by user":
+                        goal.last_error = "cancelled by user"
+                        changed = True
                     for package in goal.milestones:
                         if package.status == "running":
                             package.status = "cancelled"

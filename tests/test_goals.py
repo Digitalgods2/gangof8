@@ -1577,7 +1577,9 @@ def test_restart_cancels_orphaned_release_turn_for_cancelled_parent(tmp_path):
 
     restarted = GangOf8Service(data_dir=data)
 
+    cancelled = restarted.goals.get(goal.goal_id)
     reconciled = restarted.manager.load(release.session_id)
+    assert cancelled.last_error == "cancelled by user"
     assert reconciled.status == SessionStatus.cancelled
     assert reconciled.stop_reason == "interrupted by a server restart"
 
