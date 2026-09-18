@@ -2104,8 +2104,8 @@ def _research_provenance_note(session: Session, store: LogStore) -> None:
     cls = session.classification
     if not cls:
         return
-    wanted = bool(cls.needs_facts) or "research" in [
-        str(s).lower() for s in (cls.skills_needed or [])]
+    wanted = _requires_retrieved_research(session) or (
+        bool(cls.needs_facts) and cls.task_type != TaskType.code)
     if not wanted:
         return
     # Repair/release sessions legitimately inherit a hash-bound retrieved
