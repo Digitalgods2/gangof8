@@ -70,13 +70,14 @@
       <p><b>Full Council means every enabled seat participates once against the real owner baseline.</b> One accountable owner controls final bytes; the other seats research, challenge, improve, provide a standby, or verify.</p>
       <p>The normal path is: freeze the contract, author one baseline, complete council participation, integrate once, build, run objective validators, run one independent semantic review, then release.</p>
       <div class="help-grid">
-        <section><h3>Objective verification</h3><p>Commands, hashes, file formats, searchable text, PDF structure, runtime checks, and release-byte equality. These gates can block release.</p></section>
-        <section><h3>AI review</h3><p>Semantic evidence against the frozen R-number checklist. A malformed, timed-out, or unavailable reviewer never invalidates an objectively verified artifact; only the reviewer is retried.</p></section>
-        <section><h3>Recovery</h3><p>Repairs branch from an immutable verified checkpoint. Terminal package transitions and already-passed release reviews resume without another model call. A repeated coordinator failure becomes an explicit stop, never an empty “running” state.</p></section>
+        <section><h3>Objective verification</h3><p>Commands, hashes, file formats, searchable text, PDF structure, alphabetical index order, runtime checks, and release-byte equality. These gates can block release, and anything code can check is not left to a reviewer.</p></section>
+        <section><h3>AI review</h3><p>Semantic evidence against the frozen R-number checklist. A malformed, timed-out, or unavailable reviewer never invalidates an objectively verified artifact; only the reviewer is retried. An out-of-quota reviewer hands the review to another seat that did not author the work; if none can answer, the goal pauses for <i>Retry verifier</i>. Findings labelled NON-BLOCKING never send a release back.</p></section>
+        <section><h3>Recovery</h3><p>Repairs branch from an immutable verified checkpoint. The owner gets the causal error and its failed file as a starting point, not a blank page. Terminal package transitions and already-passed release reviews resume without another model call, and a God-mode goal interrupted by a restart resumes on its own. A repeated coordinator failure becomes an explicit stop, never an empty “running” state.</p></section>
         <section><h3>Limits</h3><p>Every physical provider dispatch consumes the goal budget before it starts, including timeouts. Calls and packages also have absolute deadlines, and unchanged repair strategies stop.</p></section>
       </div>
       <p><b>Status language is goal-aware.</b> “Council session completed” means the models returned; it is not called successful delivery until the artifact is built, verified, and released. The session and parent-goal states are shown separately.</p>
       <p><b>God mode</b> auto-approves in-contract actions with an audit trail. It does not disable scope boundaries, objective gates, cancellation, call budgets, deadlines, or no-progress stops.</p>
+      <p><b>Gemini runs on the Antigravity CLI first</b> (your Google subscription), then on the Gemini API key, which is billed per call. Every contribution's model label names the route that ran, e.g. “Antigravity default” or “… (API key fallback)”. Antigravity's own tools are blocked on every call.</p>
     </div>
   </div>
 </div>

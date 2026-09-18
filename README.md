@@ -13,7 +13,8 @@ deadlines, cancellation, or scope boundaries.
 
 The name describes the intended full roster: one coordinator plus seven model
 seats. The bundled roster can combine three local CLI seats (Claude, Codex, and
-Gemini) with four optional OpenRouter seats (DeepSeek, GLM, Qwen, and Kimi).
+Gemini, which runs on Google's Antigravity CLI) with four optional OpenRouter
+seats (DeepSeek, GLM, Qwen, and Kimi).
 Seats can be enabled, disabled, remapped, and model-pinned in Settings. The
 dashboard header also exposes all seven brands as immediate checkboxes, so the
 working roster can be changed without opening Settings. New runs snapshot the
@@ -43,7 +44,10 @@ PDFs, data, designs, and every other deliverable:
 4. Objective gates and AI review are separate. Hashes, commands, strict format
    parsing, searchable text, PDF structure, runtime behavior, and release-byte
    equality can block release. A malformed or unavailable reviewer cannot
-   invalidate bytes that passed those gates.
+   invalidate bytes that passed those gates. Checks that code can decide are
+   not left to a reviewer's eye: a PDF's alphabetical index must be in order,
+   and when a contract names the five mother sauces, they must appear in the
+   order the contract names them.
 5. Verified artifacts are immutable content-addressed checkpoints under
    `data/blobs/sha256/`. Repairs branch from the active checkpoint and replace
    it only after a new candidate passes objective validation.
@@ -53,7 +57,9 @@ PDFs, data, designs, and every other deliverable:
 7. Recovery observes the first causal failure, chooses a changed bounded
    action, repairs the narrowest producer, reruns downstream gates, records the
    evidence, and stops on success, exhaustion, cancellation, budget, deadline,
-   or no progress.
+   or no progress. The repairing owner receives the causal error (not just the
+   downstream symptom) and the exact failed producer as an unverified repair
+   baseline, so it fixes the cause instead of rewriting from scratch.
 8. Restart resumes durable package phase evidence and completed council reports.
    It does not deliberately turn a reviewer error into a fresh full-council
    production run.
@@ -170,6 +176,12 @@ under human control:
 | `Council` | Convenes the complete configured panel for independent takes and synthesis |
 | `Best-of-all` | Every enabled model attempts one complete single-artifact candidate; runnable candidates are validated, judged blindly, and the strongest is selected |
 | `Planned build` | Plans owned packages, runs independent packages in parallel when decomposition permits, then verifies one final-batch release |
+
+A substantial brief is auto-routed to Planned build when it names an action
+(build, write, create, compile, produce, generate, assemble, ...), a delivered
+file (software, or a document such as PDF, DOCX, XLSX, PPTX, EPUB), and a
+measurable quantity. "Compile a searchable PDF of 100 recipes" routes; "make me
+a PDF about sauces" stays focused.
 
 An explicit profile is never overridden by adaptive routing. Auto-routing
 stores its candidate scores, filters, reason, policy version, and historical
@@ -573,7 +585,25 @@ installed and authenticated:
 
 - `claude`
 - `codex`
-- `gemini`
+- `gemini` — see below
+
+Google retired the `gemini` CLI for personal accounts on June 18, 2026 and
+moved them to the **Antigravity CLI** (`agy`). The Gemini seat therefore tries,
+in order:
+
+1. `agy`, on your Google subscription (no per-call charge);
+2. the Gemini API key (`GEMINI_API_KEY` or Settings → API keys), billed per
+   call, used when `agy` fails or is at its limit, and for image inputs;
+3. the old `gemini` CLI, still served to Code Assist Standard/Enterprise.
+
+The model label on every contribution names the route that ran:
+`Antigravity default`, `gemini-3.1-pro-high (Antigravity)`, or
+`… (API key fallback)`. Antigravity has no switch that turns its tools off, so
+each call loads a hook that denies every tool before it runs; a reply produced
+after a tool did run anyway is discarded. Antigravity rejects model ids it does
+not list, so pick the Gemini model from its ids in Settings (they carry an
+effort suffix such as `-high`); a pin it does not list runs on its default.
+Each Antigravity call spends about 35 seconds starting up.
 
 Settings can additionally enable these OpenRouter seats when an OpenRouter API
 key is present:
@@ -703,6 +733,16 @@ Gang of 8 handles failures as follows:
 
 - an unavailable local Claude or Codex login is detected before a CLI-backed
   ordinary run and recorded as degraded council health;
+- a failed primary build falls over to the council's hot-standby candidate,
+  which is executed, not merely recorded;
+- a release reviewer that is out of quota (for example "You've hit your session
+  limit") is tried once, then the review moves to another enabled seat that did
+  not author the release; if no seat can review it, the goal pauses for a
+  retry instead of failing;
+- a release reviewer's findings are split into blocking and advisory. Defects
+  labelled `NON-BLOCKING`, cosmetic, or listed under a passing verdict never
+  send a verified release back, and blocking findings reach the owner's retry
+  instructions word for word;
 - an explicitly configured hard deadline is reported as installation policy,
   never inferred merely from elapsed time;
 - outside build-team packages, a frontier tournament author returning a stub or
@@ -739,8 +779,10 @@ Gang of 8 handles failures as follows:
   late background worker cannot overwrite newer authoritative state; and
 - after a server restart, terminal package transitions are replayed without a
   model call, already-passed release reviews resume at the deterministic
-  promotion step, dependency-ready work is rescheduled, and only an operating-
-  system subprocess that cannot be reconstructed is parked as paused;
+  promotion step, dependency-ready work is rescheduled, and the interrupted
+  attempt keeps its failed producer and latest failure. A God-mode goal
+  interrupted mid-package resumes on its own; a manual goal is parked as
+  paused for Resume;
 - a coordinator transition exception receives one bounded deterministic replay;
   if the same fault repeats, the goal becomes explicitly paused/failed with the
   causal error instead of remaining permanently `running` with no worker.
@@ -939,7 +981,8 @@ explicitly select `cli`.
 
 1. Open Settings and select the `cli` backend.
 2. Confirm Claude, Codex, and Gemini availability. Install/authenticate any
-   missing local CLI you intend to use.
+   missing local CLI you intend to use. For Gemini install the Antigravity CLI
+   (`agy`) and sign in once; `agy models` lists what your account can run.
 3. Add an OpenRouter key and enable the four optional API seats if you want the
    full seven-model council.
 4. Review model pins and role assignments.
@@ -949,8 +992,8 @@ explicitly select `cli`.
    work that should be decomposed into owned packages.
 
 The Settings page shows the effective seat/model catalog. Its model list is
-refreshed from the public OpenRouter catalog with an offline fallback; Gemini's
-catalog can also use its configured API key.
+refreshed from the public OpenRouter catalog with an offline fallback. Gemini's
+list shows the Antigravity CLI's model ids first, then the API key's.
 
 ## Attachments and conversation follow-ups
 
@@ -1356,9 +1399,24 @@ batched.
 This now means the interrupted work depended on an operating-system model
 subprocess that cannot be reconstructed. Terminal package results, verified
 release reviews, and dependency-ready work resume automatically without paying
-for completed model work again. If no durable transition exists, the service
-parks the goal rather than pretending it is still running. Read `last_error`,
-inspect completed package/staging state, and use Resume.
+for completed model work again. A God-mode goal interrupted mid-package is
+rescheduled on its own (`last_error` says "resumed automatically"). If no durable
+transition exists, the service parks the goal rather than pretending it is still
+running. Read `last_error`, inspect completed package/staging state, and use
+Resume.
+
+### A goal is paused with "frontier release verifier unavailable"
+
+Every seat that could review the release was out of quota or offline, so the
+batch was not judged. Nothing was rejected. When a seat is back, choose
+**Retry verifier** (or `POST /goals/{id}/recover` with
+`{"strategy": "retry_verifier"}`).
+
+### The Gemini seat cannot log in
+
+The old `gemini` CLI no longer serves personal accounts. Install the
+Antigravity CLI, sign in, and check `agy models`. Until then the seat uses the
+Gemini API key if one is set, and each such call is billed.
 
 ### A final batch fails because the target changed
 
