@@ -749,3 +749,20 @@ def test_alphabetical_index_order_is_checked_by_code():
         "letter heading B follows L")
 
     assert validation._alphabetical_index_problem(["Contents\nRecipes"]) is None
+
+
+def test_source_code_is_not_a_request_for_sourced_research():
+    """Live: a read-only review of local apps ("read enough of the source to
+    explain what the app does") was stopped as unsourced research, because
+    the bare word "source" demanded web citations the task never wanted."""
+    def asks(text):
+        session = Session(session_id="s_src", task=Task(
+            task_id="t", session_id="s_src", text=text))
+        return loop._requires_retrieved_research(session)
+
+    assert not asks("Read enough of the source to explain what the app does.")
+    assert not asks("Review the source code; is it open source?")
+    assert asks("research heavily the works of Auguste Escoffier")
+    assert asks("Write an essay using reputable sources")
+    assert asks("Summarize the findings with sources cited")
+    assert asks("Give a source-backed overview")

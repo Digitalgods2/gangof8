@@ -150,6 +150,17 @@ that needed it.
     identify exactly one pending action", as if one had to be picked.
   - Resolution: separate messages for nothing waiting and several waiting.
 
+- **GO8-034 - "Source" code triggers the sourced-research gate**
+  - Status: fixed on 2026-09-18.
+  - Session `s_20260918_dd7ff479`, a read-only review of local apps, said
+    "read enough of the source to explain what the app does". The bare word
+    matched the research trigger, the web lookup found no citations, and the
+    run stopped before any model wrote the report. The stop was reported as
+    "a required frontier implementation did not complete".
+  - Resolution: only the citation sense of "source" counts (sources cited,
+    reputable/external sources, source-backed); a research stop is reported
+    as such, with its own next step.
+
 ## August 24 goal-release reconciliation incident
 
 - **GO8-014 - A completed council session is labeled as a successful goal**

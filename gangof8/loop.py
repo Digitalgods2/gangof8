@@ -117,6 +117,10 @@ class QualityGateFailed(Exception):
     """A required implementation or release-quality quorum was not satisfied."""
 
 
+class ResearchUnavailable(QualityGateFailed):
+    """The task asked for sourced research and no sourced retrieval succeeded."""
+
+
 def _record_action_execution_failure(
     session: Session, action: ProposedAction, error: ExecutionError,
 ) -> None:
@@ -2062,19 +2066,33 @@ _WEB_FAILURES: dict[str, str] = {}
 _WEB_SKILLS = ("web_search", "public_web_search", "web_fetch")
 
 
+# "Source" alone is usually source CODE: a live read-only review of local apps
+# ("read enough of the source to explain what the app does") was stopped as
+# unsourced research because a web lookup found no citations. Only the
+# citation sense counts: sources that are cited, listed, external, credible...
+_CITED_SOURCES = (
+    r"(?:cite|cited|citing|with|include|including|list|listing|provide|add|"
+    r"reputable|credible|primary|secondary|external|online|web|published|"
+    r"authoritative|academic|reliable|trusted)\s+(?:the\s+|your\s+|its\s+|their\s+)?"
+    r"sources|sources?\s+(?:cited|for\s+(?:each|every|all)|and\s+citations)|"
+    r"source-backed"
+)
+
+
 def _requires_retrieved_research(session: Session) -> bool:
     text = _execution_task(session).lower()
     return bool(re.search(
-        r"\b(?:research(?:ed|ing)?|cite|citations?|sources?|verify online|"
-        r"look up|web research|current information)\b", text,
+        r"\b(?:research(?:ed|ing)?|cite|citations?|verify online|"
+        r"look up|web research|current information|" + _CITED_SOURCES + r")\b",
+        text,
     ))
 
 
 def _requires_auditable_research(session: Session) -> bool:
     text = _execution_task(session).lower()
     return bool(re.search(
-        r"\b(?:research\s+heavily|cite|citations?|sources?|source-backed|"
-        r"documented research)\b", text,
+        r"\b(?:research\s+heavily|cite|citations?|documented research|"
+        + _CITED_SOURCES + r")\b", text,
     ))
 
 
@@ -5778,7 +5796,7 @@ def _deliberate(
                 evidence={"reason": reason},
                 recoverable=transient_research_failure,
             )
-            raise QualityGateFailed(
+            raise ResearchUnavailable(
                 "the contract requires sourced research, but retrieval did not "
                 f"succeed ({reason}); model recall is not accepted as research"
             )
@@ -5822,7 +5840,11 @@ def _deliberate(
             session.execution_profile == "best_of_n"
             or (session.routing_decision or {}).get("selected_route") == "best_of_n"
         )
+        # A research stop happens before anyone authors anything; reporting it
+        # as a failed implementation hid the real reason from the user.
+        research_failure = isinstance(e, ResearchUnavailable)
         stage = (
+            "research" if research_failure else
             "deterministic_assembly" if assembly_failure else
             "package_implementation" if package_failure else
             "candidate_comparison" if candidate_failure else
@@ -5836,6 +5858,7 @@ def _deliberate(
             "detail": str(e),
         }
         event = (
+            "research_gate_failed" if research_failure else
             "assembly_failed" if assembly_failure else
             "package_implementation_gate_failed" if package_failure else
             "candidate_comparison_failed" if candidate_failure else
@@ -5845,6 +5868,11 @@ def _deliberate(
         manager.transition(session, SessionStatus.composing)
         session.final = FinalAnswer(
             answer=(
+                "The run was stopped before any model wrote the deliverable: the "
+                f"task asks for sourced research and none could be retrieved ({e}). "
+                "Answers from model memory are not passed off as research. No file "
+                "was delivered."
+                if research_failure else
                 "The run was stopped because the compact assembly template did not "
                 "satisfy its explicit manifest contract. No file was delivered."
                 if assembly_failure else
@@ -5867,6 +5895,9 @@ def _deliberate(
             assumptions=[],
             risks_unresolved=list(session.unresolved),
             next_action=(
+                "Check that web search is enabled and reachable and rerun, "
+                "or reword the task if it does not need outside sources."
+                if research_failure else
                 "Resume or rerun so the owner can emit one compact manifest template."
                 if assembly_failure else
                 "Retry the failed package; missing outputs will be assigned independently "
