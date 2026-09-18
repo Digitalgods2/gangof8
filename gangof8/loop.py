@@ -3866,6 +3866,7 @@ def _capture_collaboration_standby(
         namespaced = f"{member.agent}__{name}"
         candidate = by_path[name]
         candidate.role = Role.panelist
+        candidate.status = "captured"
         candidate.filename = namespaced
         candidate.content = alternative[name]
         candidate.args["filename"] = namespaced
