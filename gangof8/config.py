@@ -546,7 +546,10 @@ COMPOSER_CONTEXT_CHARS = 1400
 # get more headroom — reading the material IS the job there; the tight cap
 # starved "examine this codebase" runs (a lead asked for 11 reads, got 2).
 MAX_SKILL_REQUESTS_PER_TURN = 2
-MAX_SKILL_REQUESTS_ANALYSIS = 6
+# Reads ride along in the SAME model call, so raising this costs prompt size,
+# not extra calls (unlike MAX_SKILL_CHAIN_TURNS, where each turn is a call). A
+# live review of 48 app folders needed ~150 reads and got ~36 at 6 per turn.
+MAX_SKILL_REQUESTS_ANALYSIS = int(os.environ.get("GANGOF8_MAX_SKILL_REQUESTS", "16"))
 # The re-called reply may itself open with NEW skill requests (read one file →
 # the next read depends on what it said). Resolve those too, chained, up to this
 # many re-calls per turn. A live run ended a round on the bare line
@@ -641,10 +644,16 @@ SEARCH_MAX_FILE_BYTES = 500_000  # skip files larger than this
 SEARCH_RESULT_MAX_CHARS = 4000  # cap the formatted result fed back to the agent
 
 # list_dir skill bounds: a bounded directory listing so agents can DISCOVER what
-# exists in the workspace before reading/writing. Kept cheap and small.
-LIST_DIR_MAX_ENTRIES = 300      # files/folders listed before truncating
+# exists in the workspace before reading/writing. 300 entries / 4000 chars
+# showed a 48-app folder only its top level and a sliver of the next.
+LIST_DIR_MAX_ENTRIES = int(os.environ.get("GANGOF8_LIST_DIR_MAX_ENTRIES", "1000"))
 LIST_DIR_MAX_DEPTH = 6          # nesting depth walked
-LIST_DIR_RESULT_MAX_CHARS = 4000  # cap the formatted listing fed back to the agent
+LIST_DIR_RESULT_MAX_CHARS = int(os.environ.get("GANGOF8_LIST_DIR_MAX_CHARS", "12000"))
+# How much of the folder listing the up-front overview shows every seat.
+OVERVIEW_TREE_MAX_CHARS = int(os.environ.get("GANGOF8_OVERVIEW_TREE_MAX_CHARS", "8000"))
+# The whole overview (tree + READMEs/manifests + source digests). Grown by the
+# same 5500 chars as the tree so the larger tree does not crowd out the READMEs.
+OVERVIEW_MAX_CHARS = int(os.environ.get("GANGOF8_OVERVIEW_MAX_CHARS", "19500"))
 
 # Web access: the coordinator reaches the internet for the council (web_search /
 # web_fetch skills). Read-only, no side effects on the host. NOTE: queries/URLs

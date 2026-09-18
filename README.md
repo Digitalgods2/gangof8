@@ -1285,6 +1285,9 @@ Common environment variables:
 | `GANGOF8_PROMOTE_SHRINK_FRACTION`, `GANGOF8_PROMOTE_SHRINK_MIN_BYTES` | Warn when a promote would shrink an existing file sharply | see `config.py` |
 | `GANGOF8_ASSEMBLY_FAULT_STREAK_LIMIT`, `GANGOF8_ASSEMBLY_FAULT_ESCALATE_AT` | Deterministic-assembly fault tolerance before escalation | see `config.py` |
 | `GANGOF8_RELEASE_VERIFIER_TRANSPORT_RETRIES`, `GANGOF8_RELEASE_VERIFIER_TRANSPORT_BACKOFF` | Retry policy for a release verifier lost to transport errors | see `config.py` |
+| `GANGOF8_MAX_SKILL_REQUESTS` | File/folder/web reads a seat may request per turn (they ride in the same model call; a seat gets up to 6 turns) | `16` |
+| `GANGOF8_LIST_DIR_MAX_ENTRIES`, `GANGOF8_LIST_DIR_MAX_CHARS` | Size of one folder listing returned to a seat | `1000`, `12000` |
+| `GANGOF8_OVERVIEW_TREE_MAX_CHARS`, `GANGOF8_OVERVIEW_MAX_CHARS` | Folder map, and the whole up-front overview, shown to every seat when a task names a folder | `8000`, `19500` |
 | `GANGOF8_REVISION_SOURCE_MAX_CHARS` | Source bytes shown to a follow-up revision | see `config.py` |
 | `GANGOF8_CLI_SCRATCH_MAX_AGE_HOURS` | Age at which local CLI seat scratch is swept | see `config.py` |
 | `GANGOF8_UNGOVERNED_ORPHAN_KEEP` | Ungoverned CLI writes retained for inspection | see `config.py` |

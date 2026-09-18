@@ -1903,7 +1903,7 @@ def _established_overview(session: Session, data_dir) -> str:
                            role=Role.researcher, args={"path": ".", "target": "established"}),
             Path(data_dir))
         if listing:
-            parts.append("Directory tree:\n" + listing[:2500])
+            parts.append("Directory tree:\n" + listing[:config.OVERVIEW_TREE_MAX_CHARS])
     except Exception:  # noqa: BLE001
         pass
 
@@ -2034,7 +2034,7 @@ def _established_overview(session: Session, data_dir) -> str:
     # their endings again with the generic project-overview cap.
     if cls and cls.match_source:
         return overview + directive
-    return overview[:14000] + directive
+    return overview[:config.OVERVIEW_MAX_CHARS] + directive
 
 
 def _conversation_overview(session: Session) -> str:
