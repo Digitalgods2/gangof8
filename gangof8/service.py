@@ -5518,12 +5518,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         # release. Frontier seats stay first; the fallback only matters when
         # they cannot answer (a live goal failed while its only independent
         # frontier seat sat behind a session limit and Gemini was idle).
+        # Drawn from every registered seat, like the deliverable review: the
+        # duo panel is [claude, codex], so a panel-only pool left a healthy
+        # Gemini out and the release paused anyway.
+        registered = self.registry.names()
         fallback_pool = [
-            seat for seat in self.panel
-            if seat in self.registry.names()
+            seat for seat in dict.fromkeys(
+                [*self.panel, *sorted(registered)])
+            if seat in registered
             and seat not in release_owners
             and seat not in verifier_pool
-            and seat != "system"
+            and seat not in ("system", "mock")
             and not self.seat_health.is_unavailable(seat)
         ]
         # Prefer seats that can actually answer; if health has marked every

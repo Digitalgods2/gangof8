@@ -116,6 +116,15 @@ that needed it.
   - Resolution: compile/produce/generate/assemble and named document formats
     count; a measurable quantity is still required.
 
+- **GO8-030 - The release fallback never reaches seats off the panel**
+  - Status: fixed on 2026-09-18.
+  - Benchmark item 7 (goal `g_78f2c0bf`): the GO8-028 fallback drew only from
+    the panel, which is `[claude, codex]` in duo mode. With Claude at its
+    session limit and Codex the author, a healthy registered Gemini, which had
+    just reviewed the package, was never asked, and the release paused.
+  - Resolution: the fallback draws from every registered (enabled) seat, as
+    the deliverable review already did; the regression test uses the duo panel.
+
 ## August 24 goal-release reconciliation incident
 
 - **GO8-014 - A completed council session is labeled as a successful goal**

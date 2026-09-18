@@ -3292,8 +3292,10 @@ def test_release_verifier_skips_quota_dead_seat_and_falls_back(tmp_path, monkeyp
     monkeypatch.setattr(
         service_module.browser_acceptance, "browser_acceptance",
         lambda path, **kw: _BrowserPass())
+    # The live duo panel: gemini is registered but not on the panel, and the
+    # fallback must still reach it (item 7 paused with gemini idle).
     service = GangOf8Service(
-        data_dir=tmp_path / "data", panel=["claude", "codex", "gemini"])
+        data_dir=tmp_path / "data", panel=["claude", "codex"])
     for seat in (_Author(), _QuotaDead(), _Fallback()):
         service.registry.register(seat)
     stage = tmp_path / "stage"
