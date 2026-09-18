@@ -5887,9 +5887,9 @@ def _deliberate(
                 "silently fall back to a single lead-authored result, and no file "
                 "was delivered."
                 if candidate_failure else
-                "The run was stopped because a required frontier implementation "
-                "did not complete or did not run. It was not silently replaced by "
-                "a weaker candidate or counted later as a judge. No file was delivered."
+                f"The run was stopped before delivery: {e}. It was not silently "
+                "replaced by a weaker candidate or counted later as a judge. No "
+                "file was delivered."
             ),
             confidence="low",
             assumptions=[],
@@ -7042,6 +7042,27 @@ def _independent_frontier_release_gate(
          if agent in unique and agent not in excluded),
         None,
     )
+    if verifier is None:
+        # With two frontier seats, one wins and the other chairs, so nobody
+        # frontier is left: a live Council run with six finished reports
+        # failed here while Gemini, which had just judged them, sat idle.
+        # Any other seat that worked in THIS run is still independent of the
+        # winner and the chair (a dropped seat's contribution is removed).
+        worked = {c.agent for c in session.contributions if c.agent}
+        verifier = next(
+            (member for member in council.members
+             if member.active and member.agent in worked
+             and member.agent not in excluded and member.agent != "system"),
+            None,
+        )
+        if verifier is not None:
+            store.log_event(
+                session.session_id, "release_verifier_fallback",
+                {"agent": verifier.agent,
+                 "reason": "no independent frontier seat remained after "
+                           f"excluding winner {winner_agent!r} and chair "
+                           f"{chair.agent if chair else 'none'!r}"},
+            )
     if verifier is None:
         raise QualityGateFailed(
             "no independent frontier release engineer remained after excluding "

@@ -197,6 +197,39 @@ def test_independent_frontier_gate_requires_every_acceptance_id(tmp_path):
     assert not session.quality_gate["missing_checks"]
 
 
+def test_release_check_falls_back_when_winner_and_chair_are_the_frontier(tmp_path):
+    """Live: a Council run's six reports were judged, codex won, claude chaired,
+    and the run failed with "no independent frontier release engineer
+    remained" while gemini, which had just judged them, was idle. Another seat
+    that worked in the run is independent of both; a dropped seat is not."""
+    session = _code_session()
+    session.required_frontier_authors = ["claude", "codex"]
+    session.frontier_author_seats = ["claude", "codex"]
+    members = [
+        CouncilMember(role=Role.lead, agent="codex", active=True),
+        CouncilMember(role=Role.panelist, agent="deepseek", active=True),
+        CouncilMember(role=Role.panelist, agent="gemini", active=True),
+        CouncilMember(role=Role.summarizer, agent="claude", active=True),
+    ]
+    council = Council(members=members)
+    session.council = council
+    # deepseek was dropped (no contribution); gemini worked in this run.
+    session.contributions.append(
+        Contribution(round=0, role=Role.panelist, agent="gemini", content="report"))
+
+    def call(member, prompt, timeout_s=None):
+        ids = re.findall(r"^R(\d+):", prompt, re.MULTILINE)
+        body = "\n".join(f"CHECK R{n}: PASS - verified" for n in ids) + "\nVERDICT: PASS"
+        return Contribution(round=0, role=member.role, agent=member.agent, content=body)
+
+    store = LogStore(tmp_path)
+    _, _, verifier = loop._independent_frontier_release_gate(
+        session, council, "codex", "report.txt", "the report", call, store)
+    assert verifier == "gemini"
+    assert "release_verifier_fallback" in store.session_log_path(
+        session.session_id).read_text(encoding="utf-8")
+
+
 def test_frontier_verdict_without_checks_is_never_a_pass():
     verdict, checks, defects = rounds.parse_frontier_verdict("VERDICT: PASS")
     assert verdict == "FAIL"

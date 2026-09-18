@@ -161,6 +161,19 @@ that needed it.
     reputable/external sources, source-backed); a research stop is reported
     as such, with its own next step.
 
+- **GO8-035 - A two-seat frontier leaves no release checker**
+  - Status: fixed on 2026-09-18.
+  - Session `s_20260918_24cb2147` (Council, seven seats): six reports were
+    written and judged, Codex won, and Claude chaired. The final check must
+    come from a frontier seat that is neither, and the frontier is only Claude
+    and Codex, so the run failed with "no independent frontier release engineer
+    remained" while Gemini, which had just judged, was idle. The chair's 18
+    fixes to the winner were lost with it. Same shape as GO8-030.
+  - Resolution: when no frontier seat remains, any other seat that worked in
+    the run checks the release (`release_verifier_fallback`). The failure text
+    now states the actual reason instead of "a required frontier
+    implementation did not complete".
+
 ## August 24 goal-release reconciliation incident
 
 - **GO8-014 - A completed council session is labeled as a successful goal**
