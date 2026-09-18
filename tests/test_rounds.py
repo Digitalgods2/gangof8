@@ -710,6 +710,34 @@ def test_cli_panel_appends_enabled_keyed_openrouter_seats(tmp_path, monkeypatch)
     assert svc.panel == ["claude", "codex", "deepseek"]
 
 
+def test_duo_rotates_its_reviewer_and_council_convenes_every_seat(tmp_path, monkeypatch):
+    """Live: with claude, codex, gemini installed, duo kept the first two list
+    entries, so gemini was never convened on an ordinary task, and choosing
+    the Council profile copied that duo. Position is not a reason."""
+    import shutil
+
+    monkeypatch.setattr(
+        shutil, "which",
+        lambda n: f"/bin/{n}" if n in ("claude", "codex", "gemini") else None)
+    svc = GangOf8Service(data_dir=tmp_path, backend="cli")
+    lead = svc.role_agents[Role.lead]
+    others = [s for s in ("claude", "codex", "gemini") if s != lead]
+
+    seen = set()
+    for turn in range(len(others)):
+        svc._duo_turn = turn
+        panel = svc._effective_panel()
+        assert len(panel) == config.DUO_PANEL_SIZE and panel[0] == lead
+        seen.update(panel[1:])
+    assert seen == set(others), "every seat takes the reviewer place in turn"
+
+    svc._duo_turn = 0
+    svc.seat_health.record_failure(others[0], "You've hit your session limit")
+    assert others[0] not in svc._effective_panel(), "an out-of-quota seat is skipped"
+
+    assert set(svc._council_panel()) == {"claude", "codex", "gemini"}
+
+
 def test_lead_recall_after_skill_results_keeps_the_lead_timeout(tmp_path):
     """Live failure: 'modify the existing game' had the lead read index.html,
     then time out at 120s regenerating it — the skill-resolution re-call ran on

@@ -173,7 +173,7 @@ under human control:
 |---|---|
 | `Auto` | Scores the eligible routes from task type, complexity, risk, build shape, and sufficiently sampled past evaluations |
 | `Focused` | One lead owns the result and calls specialist roles only as needed |
-| `Council` | Convenes the complete configured panel for independent takes and synthesis |
+| `Council` | Convenes every enabled seat (or your explicit Settings panel roster) for independent takes and synthesis. Costs up to one call per seat per round |
 | `Best-of-all` | Every enabled model attempts one complete single-artifact candidate; runnable candidates are validated, judged blindly, and the strongest is selected |
 | `Planned build` | Plans owned packages, runs independent packages in parallel when decomposition permits, then verifies one final-batch release |
 
@@ -568,7 +568,9 @@ provides three participation modes:
 Environment variables still control ordinary panels and owner eligibility:
 
 - `GANGOF8_PANEL_MODE=council` — convene every configured seat, plus enabled
-  OpenRouter seats, on ordinary tasks (default: `duo`).
+  OpenRouter seats, on ordinary tasks (default: `duo`). A duo keeps the lead's
+  seat and gives the other place to the remaining healthy seats in rotation,
+  one step per run, so no seat is shut out by its position in a list.
 - `GANGOF8_GOAL_FULL_ROSTER=1` — let enabled budget seats join build-team
   goals and allow multi-owner assembly of a single release artifact
   (default: frontier seats only, one owner per artifact).

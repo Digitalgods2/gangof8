@@ -413,7 +413,7 @@ class GangOf8Service:
                         if agent == "gemini" else None))
         else:
             self.registry.register(MockAdapter())
-        self.panel = self._effective_panel()
+        self.panel = self._computed_panel = self._effective_panel()
 
     def _disabled_cli_seats(self) -> set[str]:
         """Local CLI seats the user turned OFF in Settings (absent ⇒ enabled)."""
@@ -540,9 +540,42 @@ class GangOf8Service:
                         break
                     if seat not in seats:
                         seats.append(seat)
+        seats = [s for s in seats if s in self.registry.names()]
         if config.PANEL_MODE != "council":
-            seats = seats[:config.DUO_PANEL_SIZE]
-        return [s for s in seats if s in self.registry.names()]
+            seats = self._duo_panel(seats)
+        return seats
+
+    def _duo_panel(self, seats: list[str]) -> list[str]:
+        """The duo: the lead seat plus reviewers taken in ROTATION.
+
+        Duo used to keep the first DUO_PANEL_SIZE entries of a fixed list, so
+        with claude, codex, gemini configured gemini was never convened on an
+        ordinary task, whatever its health or the lead. Position is not a
+        reason. The lead's seat stays; hard-unavailable seats are skipped;
+        the remaining places rotate one step per new run (``_duo_turn``)."""
+        size = config.DUO_PANEL_SIZE
+        if len(seats) <= size:
+            return seats
+        health = getattr(self, "seat_health", None)
+        usable = [s for s in seats
+                  if not (health and health.is_unavailable(s))] or seats
+        lead = self.role_agents.get(Role.lead)
+        first = [lead] if lead in usable else []
+        others = [s for s in usable if s not in first]
+        if others:
+            turn = getattr(self, "_duo_turn", 0) % len(others)
+            others = others[turn:] + others[:turn]
+        return (first + others)[:size]
+
+    def _council_panel(self) -> list[str]:
+        """The Council profile convenes every enabled seat, as documented.
+
+        It used to copy the duo, so choosing Council on a two-seat duo ran two
+        seats. An explicit Settings panel roster is still the user's choice."""
+        if self._explicit_panel is not None or self.settings.panel_seats:
+            return list(self.panel)
+        roster = [s for s in self._effective_resource_roster() if s != "system"]
+        return roster or list(self.panel)
 
     def _default_build_roster(self) -> list[str]:
         """Frontier seats author goals by default (ARCHITECTURE-REVIEW.md P2).
@@ -1341,8 +1374,16 @@ class GangOf8Service:
             session.panel = []
         elif selected_route == "best_of_n":
             session.panel = self._effective_resource_roster()
+        elif selected_route == "council" and source != "goal":
+            # Goal packages inherit the goal's route but own their roster.
+            session.panel = self._council_panel()
         else:
             session.panel = list(self.panel)
+        # Rotate the duo's reviewer place for the next run, unless a caller
+        # pinned the panel itself.
+        self._duo_turn = getattr(self, "_duo_turn", 0) + 1
+        if self.panel == getattr(self, "_computed_panel", None):
+            self.panel = self._computed_panel = self._effective_panel()
         # Frontier-class membership follows the ENABLED roster, not a fixed list
         # of vendor names: switching claude and codex off hands the role to the
         # models that are actually running instead of leaving it unfilled.
