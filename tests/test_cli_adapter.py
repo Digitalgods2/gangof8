@@ -76,6 +76,15 @@ def stub_run(monkeypatch):
     return _set
 
 
+def _hide_agy(monkeypatch):
+    """Pin a gemini test to the machine without the Antigravity CLI, so it
+    neither depends on nor reaches a real install."""
+    real = cli_mod.shutil.which
+    monkeypatch.setattr(
+        cli_mod.shutil, "which",
+        lambda name: None if name == "agy" else real(name))
+
+
 def test_claude_returns_result_field(stub_run):
     calls = stub_run(_Proc(stdout=json.dumps({"subtype": "success", "is_error": False,
                                               "result": "from fastapi import FastAPI\n"})))
@@ -146,9 +155,10 @@ def test_stored_gemini_key_routes_the_sdk_path_without_env(monkeypatch):
     gemini SDK path — env vars are not the only way in."""
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    _hide_agy(monkeypatch)
     seen = {}
 
-    def fake_sdk(self, prompt, images, api_key=None):
+    def fake_sdk(self, prompt, images, api_key=None, model=None):
         seen["key"] = api_key
         return "sdk answer"
 
@@ -157,13 +167,14 @@ def test_stored_gemini_key_routes_the_sdk_path_without_env(monkeypatch):
     out = adapter.call(Role.researcher, "q", timeout_s=60)
     assert out.content == "sdk answer"
     assert seen["key"] == "stored-key-1", "the stored key reaches the SDK client"
-    assert out.model == "gemini-2.5-flash", "SDK default is attributed explicitly"
+    assert out.model == "gemini-2.5-flash (API key)", "paid route and model are named"
 
 
 def test_no_gemini_key_anywhere_falls_back_to_the_cli(stub_run, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     calls = stub_run(_Proc(stdout="cli answer"))
+    _hide_agy(monkeypatch)
     out = CliAdapter("gemini").call(Role.researcher, "q", timeout_s=60)
     assert out.content == "cli answer"
     assert calls["cmd"][0].endswith("gemini"), "went through the CLI, not the SDK"
@@ -343,6 +354,7 @@ def test_gemini_text_without_key_falls_back_to_cli(stub_run, monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     calls = stub_run(_Proc(stdout="cli answer"))
+    _hide_agy(monkeypatch)
     out = CliAdapter("gemini").call(Role.researcher, "x", timeout_s=30)  # no images
     assert out.content == "cli answer"
     assert calls["cmd"][0].endswith("gemini")
@@ -353,6 +365,7 @@ def test_gemini_text_uses_sdk_when_key_present(monkeypatch):
     # with a key, gemini text goes through the SDK (NOT the flaky CLI) — no
     # subprocess, no command-line-length limit, no headless hang.
     monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    _hide_agy(monkeypatch)
     from google import genai as genai_mod
 
     captured = {}
@@ -442,3 +455,76 @@ def test_exec_error_detail_falls_back_to_stdout(stub_run):
     stub_run(_Proc(returncode=2, stdout="real detail on stdout", stderr=""))
     with pytest.raises(AgentError, match="exited 2: real detail on stdout"):
         CliAdapter("codex")._exec(["codex"], "p", 30)
+
+
+def _agy_stream(*events):
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+def _agy_result(response, status="SUCCESS", error=""):
+    return {"event": "result", "result": {
+        "status": status, "response": response, "error": error}}
+
+
+def test_gemini_runs_on_antigravity_first_with_every_tool_denied(stub_run, monkeypatch):
+    """Google retired the gemini CLI for personal accounts; the seat runs on
+    the Antigravity CLI (the user's subscription) ahead of the paid API key.
+    The prompt goes on stdin, and the folder carrying the deny-all tool hook
+    is part of the workspace, because agy cannot switch its tools off."""
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(CliAdapter, "_run_gemini_sdk", lambda *a, **k: (
+        _ for _ in ()).throw(AssertionError("paid API used while agy works")))
+    calls = stub_run(_Proc(stdout=_agy_stream(
+        {"event": "init"},
+        {"event": "step_update", "step_update": {
+            "step_type": "tool", "tool_name": "search_web", "state": "ERROR"}},
+        _agy_result("PONG\n"))))
+    out = CliAdapter("gemini").call(Role.critic, "long prompt " * 5000, timeout_s=60)
+    assert out.content == "PONG"
+    assert out.model == "Antigravity default"
+    cmd = calls["cmd"]
+    assert cmd[0].endswith("agy") and cmd[-1] == "-p="
+    assert "long prompt" not in " ".join(cmd), "the prompt never goes on argv"
+    assert json.loads(calls["input"])["message"]["content"].startswith("long prompt")
+    guard = Path(cmd[cmd.index("--add-dir") + 1])
+    hooks = json.loads((guard / ".agents" / "hooks.json").read_text(encoding="utf-8"))
+    assert hooks["gangof8-no-tools"]["PreToolUse"][0]["matcher"] == "*"
+
+
+def test_gemini_tool_that_ran_discards_the_reply_and_falls_back(stub_run, monkeypatch):
+    """A tool step that COMPLETES means the deny hook did not load: the reply
+    is not trusted, and the call falls back to the API key, labelled so."""
+    monkeypatch.setenv("GEMINI_API_KEY", "testkey")
+    monkeypatch.setattr(CliAdapter, "_run_gemini_sdk",
+                        lambda self, prompt, images, key, model=None: "sdk answer")
+    monkeypatch.setattr(cli_mod, "agy_models", lambda *a, **k: ["gemini-3.1-pro-high"])
+    stub_run(_Proc(stdout=_agy_stream(
+        {"event": "step_update", "step_update": {
+            "step_type": "tool", "tool_name": "run_command", "state": "DONE"}},
+        _agy_result("did it with tools"))))
+    out = CliAdapter("gemini", model="gemini-3.1-pro-high").call(
+        Role.critic, "q", timeout_s=60)
+    assert out.content == "sdk answer"
+    assert out.model == "gemini-3.1-pro (API key fallback)"
+
+
+def test_gemini_antigravity_failure_without_a_key_is_an_error(stub_run, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    stub_run(_Proc(returncode=1, stdout=_agy_stream(
+        _agy_result("", status="ERROR", error="quota exhausted"))))
+    with pytest.raises(AgentError, match="quota exhausted"):
+        CliAdapter("gemini").call(Role.critic, "q", timeout_s=60)
+
+
+def test_gemini_pin_reaches_antigravity_only_when_it_lists_it(stub_run, monkeypatch):
+    monkeypatch.setattr(cli_mod, "agy_models", lambda *a, **k: ["gemini-3.1-pro-high"])
+    calls = stub_run(_Proc(stdout=_agy_stream(_agy_result("ok"))))
+    out = CliAdapter("gemini", model="gemini-3.1-pro-high").call(
+        Role.critic, "q", timeout_s=60)
+    assert calls["cmd"][calls["cmd"].index("--model") + 1] == "gemini-3.1-pro-high"
+    assert out.model == "gemini-3.1-pro-high (Antigravity)"
+    # An API-style pin agy would refuse runs on agy's default instead.
+    calls = stub_run(_Proc(stdout=_agy_stream(_agy_result("ok"))))
+    CliAdapter("gemini", model="gemini-3.5-flash").call(Role.critic, "q", timeout_s=60)
+    assert "--model" not in calls["cmd"]

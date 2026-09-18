@@ -10,7 +10,10 @@ into the normal ARTIFACT protocol and still pass Gang of 8's path, contract,
 validation, executor, and approval gates. Print mode is one-shot, so there is
 no awaiting_user_input/resume path here.
 
-Supported agents: claude (fully exercised), codex, gemini.
+Supported agents: claude (fully exercised), codex, gemini. The gemini seat runs
+on the Antigravity CLI (``agy``) first, the successor Google moved personal
+accounts to when it retired the gemini CLI on 2026-06-18, and falls back to the
+google-genai API key.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import shutil as _shutil
 import subprocess
@@ -205,6 +210,90 @@ def _quarantine_call_dir(d: Path, sid: Optional[str]) -> list[str]:
     return written
 
 
+_AGY_DENY_REASON = "Gang of 8 seats have no native tools; answer from the prompt only."
+_AGY_MODELS: Optional[list[str]] = None
+_AGY_LOCK = threading.Lock()
+_AGY_EFFORT_SUFFIX = re.compile(r"-(?:high|medium|low)$")
+
+
+def gemini_cli() -> Optional[str]:
+    """The gemini seat's local CLI: Antigravity when installed, else the
+    retired gemini CLI (still served for Code Assist Standard/Enterprise)."""
+    for name in ("agy", "gemini"):
+        if shutil.which(name):
+            return name
+    return None
+
+
+def cli_available(agent: str) -> bool:
+    """Is this seat's local CLI installed? The gemini seat's binary is no
+    longer named after the seat."""
+    if agent == "gemini":
+        return gemini_cli() is not None
+    return shutil.which(agent) is not None
+
+
+def agy_models(timeout_s: int = 30) -> list[str]:
+    """Gemini model ids the Antigravity CLI accepts for ``--model`` (cached).
+
+    Listing is not an inference call. Its ids differ from the API's (effort
+    suffixes such as ``-high``), and an unknown id is refused outright, so a
+    pin is passed only when it is on this list. Claude/GPT models that
+    Antigravity also offers are left out: this is the gemini seat."""
+    global _AGY_MODELS
+    with _AGY_LOCK:
+        if _AGY_MODELS is not None:
+            return list(_AGY_MODELS)
+    exe = shutil.which("agy")
+    if not exe:
+        return []
+    try:
+        proc = subprocess.run(
+            [exe, "models"], capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_s, cwd=_neutral_cwd())
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    models = [line.split("\t", 1)[0].strip() for line in proc.stdout.splitlines()
+              if "\t" in line and line.startswith("gemini")]
+    if models:
+        with _AGY_LOCK:
+            _AGY_MODELS = models
+    return models
+
+
+def _agy_guard_dir() -> Path:
+    """A workspace folder whose ``.agents/hooks.json`` denies EVERY tool.
+
+    Antigravity has no switch to turn its tools off, and headless it will
+    list folders and search the web without asking (verified live). Its
+    PreToolUse hook can hard-deny a tool before it runs; the folder is added
+    to each call's workspace so the hook loads. Rewritten when it drifts, as
+    the sandbox root is swept."""
+    agents = config.SANDBOX_ROOT / "agy-guard" / ".agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"decision": "deny", "reason": _AGY_DENY_REASON})
+    if os.name == "nt":
+        script = agents / "deny.cmd"
+        body = f"@echo {payload}\r\n"
+        command = str(script)
+    else:
+        script = agents / "deny.sh"
+        body = f"#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{payload}'\n"
+        command = f"sh {shlex.quote(str(script))}"
+    hooks = json.dumps({"gangof8-no-tools": {"PreToolUse": [{
+        "matcher": "*",
+        "hooks": [{"type": "command", "command": command, "timeout": 10}],
+    }]}})
+    for path, text in ((script, body), (agents / "hooks.json", hooks)):
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current != text:
+            path.write_text(text, encoding="utf-8", newline="")
+    return agents.parent
+
+
 class CliAdapter:
     # A heavy local subprocess: counts against the machine-wide CLI concurrency
     # bound (loop._agent_call). HTTP-backed adapters set this False and share a
@@ -321,19 +410,7 @@ class CliAdapter:
         elif self.agent == "codex":
             content = self._run_codex(role, prompt, timeout_s, images)  # --image=<path>
         elif self.agent == "gemini":
-            # Prefer the google-genai SDK for ALL gemini calls (text AND images)
-            # when an API key is present — from the env OR stored via Settings →
-            # API keys: a clean inference call that sidesteps the gemini CLI's
-            # headless problems — its long prompts overflow the Windows command
-            # line ('-p <prompt>' as argv), and plan-mode hangs. No key ⇒ fall
-            # back to the CLI (which still has those limitations).
-            key = (self._api_key_getter() if self._api_key_getter else None) \
-                or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-            if key:
-                content = self._run_gemini_sdk(prompt, images or [], key)
-                model = self.model or "gemini-2.5-flash"  # the SDK default is explicit
-            else:
-                content = self._run_gemini(prompt, timeout_s)
+            content, model = self._run_gemini_routes(prompt, images, timeout_s)
         else:
             raise AgentError(f"unknown CLI agent: {self.agent!r}")
         content = content.strip()
@@ -469,6 +546,83 @@ class CliAdapter:
                 result = ev.get("result") or result
         return result
 
+    def _run_gemini_routes(self, prompt: str, images: list[dict] | None,
+                           timeout_s: int) -> tuple[str, Optional[str]]:
+        """Subscription first, paid API key second, retired CLI last.
+
+        The Antigravity CLI runs on the user's Google subscription; the
+        google-genai SDK bills the API key per call, so it is the fallback
+        (and the route for images, which it sends inline). The model label
+        names the route so a paid call is visible wherever the model is."""
+        key = (self._api_key_getter() if self._api_key_getter else None) \
+            or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        agy_failure = ""
+        if shutil.which("agy") and not (images and key):
+            try:
+                return self._run_agy(prompt, timeout_s)
+            except (SessionCancelled, AgentCallStopped):
+                raise
+            except AgentError as e:
+                if not key:
+                    raise
+                agy_failure = str(e)
+        if key:
+            sdk_model = self._sdk_model()
+            content = self._run_gemini_sdk(prompt, images or [], key, sdk_model)
+            label = "API key fallback" if agy_failure else "API key"
+            return content, f"{sdk_model} ({label})"
+        # Only the old gemini CLI is left (Code Assist Standard/Enterprise).
+        # It overflows the Windows command line on long prompts.
+        return self._run_gemini(prompt, timeout_s), self.model
+
+    def _sdk_model(self) -> str:
+        """The pin in the API's form: Antigravity ids carry an effort suffix
+        (gemini-3.1-pro-high) that the API does not know."""
+        if self.model:
+            return _AGY_EFFORT_SUFFIX.sub("", self.model)
+        return "gemini-2.5-flash"
+
+    def _run_agy(self, prompt: str, timeout_s: int) -> tuple[str, Optional[str]]:
+        """One headless Antigravity turn, prompt on stdin, every tool denied.
+
+        ``-p <prompt>`` would put the prompt on the command line, which
+        overflows on Windows, so it goes as one stream-json message on stdin
+        (``-p=`` with an empty value is what print mode needs for that). A
+        denied tool step ends in state ERROR; one that reaches DONE means the
+        guard did not load, so the reply is discarded rather than trusted."""
+        pinned = self.model if self.model and self.model in agy_models() else None
+        deadline = f"{timeout_s}s" if timeout_s > 0 else "24h"
+        cmd = ["agy", "--add-dir", str(_agy_guard_dir()),
+               "--input-format", "stream-json", "--output-format", "stream-json",
+               "--print-timeout", deadline]
+        if pinned:
+            cmd += ["--model", pinned]
+        cmd.append("-p=")
+        message = json.dumps({"event": "user", "message": {"content": prompt}})
+        out, err, rc = self._exec_raw(cmd, message + "\n", timeout_s)
+        result: dict = {}
+        ran: set[str] = set()
+        for line in out.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "result":
+                result = event.get("result") or {}
+            step = event.get("step_update") or {}
+            if step.get("step_type") == "tool" and step.get("state") == "DONE":
+                ran.add(str(step.get("tool_name") or "unknown"))
+        if ran:
+            raise AgentError(
+                f"agy ran native tools ({', '.join(sorted(ran))}) despite the "
+                "deny hook; its reply was discarded")
+        if not result:
+            raise AgentError(f"agy CLI exited {rc}: {_err_tail(err.strip() or out.strip())}")
+        if result.get("status") != "SUCCESS":
+            raise AgentError(f"agy CLI error: {_err_tail(str(result.get('error') or result))}")
+        label = f"{pinned} (Antigravity)" if pinned else "Antigravity default"
+        return str(result.get("response") or ""), label
+
     def _run_gemini(self, prompt: str, timeout_s: int) -> str:
         # -p = non-interactive; plan approval-mode = read-only (no side effects).
         cmd = ["gemini", "-p", prompt, "-o", "text", "--approval-mode", "plan"]
@@ -477,7 +631,8 @@ class CliAdapter:
         return self._exec(cmd, "", timeout_s)
 
     def _run_gemini_sdk(self, prompt: str, images: list[dict],
-                        api_key: Optional[str] = None) -> str:
+                        api_key: Optional[str] = None,
+                        model: Optional[str] = None) -> str:
         """Gemini via the google-genai SDK: inline image Parts + the prompt in a
         single generate_content call. No tools, no file access — a pure
         inference request, governed like every other agent call."""
@@ -510,7 +665,7 @@ class CliAdapter:
         cancellation.register_canceler(sid, _abort)
         try:
             resp = client.models.generate_content(
-                model=self.model or "gemini-2.5-flash", contents=contents)
+                model=model or self._sdk_model(), contents=contents)
         except Exception as e:  # noqa: BLE001 — surface as a normal agent error
             if sid and cancellation.is_requested(sid):
                 raise SessionCancelled() from e

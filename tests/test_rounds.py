@@ -877,6 +877,9 @@ def _catalog_service(tmp_path, monkeypatch, get=None):
 
     monkeypatch.setattr(httpx, "get", fake_get)
     monkeypatch.setattr(GangOf8Service, "_gemini_sdk_models", lambda self: [])
+    # The Antigravity model list comes from a local CLI, not this web fetch.
+    from gangof8 import service as service_module
+    monkeypatch.setattr(service_module, "agy_models", lambda *a, **k: [])
     return GangOf8Service(data_dir=tmp_path), calls
 
 

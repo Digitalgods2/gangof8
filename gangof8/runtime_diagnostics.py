@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import config
+from .adapters.cli import cli_available, gemini_cli
 
 
 def _path_status(path: Path) -> dict:
@@ -41,8 +42,9 @@ def collect_runtime_diagnostics(
         "role_agents": {role.value: agent for role, agent in role_agents.items()},
         "cli": {
             name: {
-                "available": shutil.which(name) is not None,
-                "path": shutil.which(name),
+                "available": cli_available(name),
+                "path": shutil.which(gemini_cli() or name) if name == "gemini"
+                else shutil.which(name),
                 "enabled": (settings.cli_enabled or {}).get(name, True),
                 "model": (settings.cli_models or {}).get(name) or None,
                 "hard_timeout_s": config.agent_timeout(name),

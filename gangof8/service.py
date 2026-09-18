@@ -37,7 +37,7 @@ from . import (
     validation,
 )
 from .artifacts import parse_proposals
-from .adapters.cli import CliAdapter
+from .adapters.cli import CliAdapter, agy_models, cli_available
 from .adapters.mock import MockAdapter
 from .adapters.openrouter import OpenRouterAdapter
 from .secrets import SecretStore
@@ -506,8 +506,6 @@ class GangOf8Service:
         OpenRouter seats sat idle. Disabling every CLI must leave a working
         council, not an empty one.
         """
-        import shutil
-
         if self._explicit_panel is not None:
             # trusted as-is: the caller (tests, embedders) registers its own
             # adapters, possibly after construction
@@ -524,7 +522,7 @@ class GangOf8Service:
         seats = list(config.PANEL_SEATS_BY_BACKEND.get(self.backend, ["mock"]))
         if self.backend == "cli":
             disabled = self._disabled_cli_seats()
-            seats = [s for s in seats if shutil.which(s) and s not in disabled]
+            seats = [s for s in seats if cli_available(s) and s not in disabled]
             if config.PANEL_MODE == "council" and self.secrets.has("openrouter"):
                 seats += sorted(
                     n for n, on in (self.settings.openrouter_enabled or {}).items()
@@ -1969,6 +1967,13 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             sdk = self._gemini_sdk_models()
             if sdk:
                 catalog["gemini"] = sdk
+            # The gemini seat runs on the Antigravity CLI first, and it
+            # refuses ids it does not list, so its own ids lead the dropdown.
+            # The API fallback strips their effort suffix (gemini-3.1-pro-high).
+            agy = agy_models()
+            if agy:
+                catalog["gemini"] = agy + [
+                    m for m in catalog.get("gemini", []) if m not in agy]
         # The claude CLI's ids use DASHES, but OpenRouter's public catalog lists
         # Anthropic models with DOTS (claude-opus-4.8) — offering those verbatim
         # made the claude seat fail. Normalize claude ids to the CLI form, curated
@@ -2095,12 +2100,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         """All seats the council can use, with availability — used to populate the
         role→agent dropdowns. CLI seats are available when on PATH; OpenRouter
         seats when enabled AND an API key is present."""
-        import shutil
-
         catalog = self.cli_model_catalog(refresh=refresh)
         ce = self.settings.cli_enabled or {}
         cli = [
-            {"name": a, "available": shutil.which(a) is not None, "kind": "cli", "label": a,
+            {"name": a, "available": cli_available(a), "kind": "cli", "label": a,
              "enabled": ce.get(a, True),
              "model": (self.settings.cli_models or {}).get(a) or None,
              "models": catalog.get(a, [])}
