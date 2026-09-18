@@ -418,16 +418,19 @@ def test_deterministic_release_continues_into_semantic_frontier_review(tmp_path,
     assert session.quality_gate["deterministic_preflight"]["verdict"] == "PASS"
 
 
-def test_frontier_pass_with_edits_applies_then_requires_clean_confirmation(
+def test_frontier_pass_with_edits_is_refused_and_routed_to_the_producer(
     tmp_path, monkeypatch,
 ):
+    """GO8-010: release review is read-only. A reviewer that says PASS but also
+    emits an EDIT becomes a second, untracked author — the edit is not applied,
+    the checkpoint bytes stay as verified, and the issue goes to the owner."""
     stage = tmp_path / "stage"
     stage.mkdir()
     output = stage / "index.html"
-    output.write_text(
-        "<!doctype html><html><body><script>const player = { x: 0 };</script></body></html>",
-        encoding="utf-8",
+    original = (
+        "<!doctype html><html><body><script>const player = { x: 0 };</script></body></html>"
     )
+    output.write_text(original, encoding="utf-8")
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     package = GoalMilestone(
         index=0, package_id="wp_1", title="release", task_text="assemble",
@@ -468,12 +471,13 @@ def test_frontier_pass_with_edits_applies_then_requires_clean_confirmation(
 
     monkeypatch.setattr(service_module, "_agent_call", semantic_review)
 
-    assert service._verify_goal_release(goal, session)
-    assert len(calls) == 2
-    assert "const player = { x: 0, y: 10 };" in output.read_text(encoding="utf-8")
-    assert session.quality_gate["verdict"] == "PASS"
-    assert session.quality_gate["repairs_applied"] == 1
-    assert goal.release_defects == []
+    assert not service._verify_goal_release(goal, session)
+    assert len(calls) == 1
+    assert output.read_text(encoding="utf-8") == original
+    assert session.quality_gate["verdict"] == "FAIL"
+    assert session.quality_gate["repairs_applied"] == 0
+    assert any("accountable producer" in d for d in goal.release_defects)
+    assert session.status == SessionStatus.failed
 
 
 def test_semantic_frontier_can_block_clean_deterministic_assembly(tmp_path, monkeypatch):
@@ -515,18 +519,19 @@ def test_semantic_frontier_can_block_clean_deterministic_assembly(tmp_path, monk
     assert session.status == SessionStatus.failed
 
 
-def test_frontier_repair_accepts_whole_file_artifact_rewrite(tmp_path, monkeypatch):
-    """Phase 2 repair mandate: a verifier that sees a structural defect must be
-    able to ship a COMPLETE replacement file (ARTIFACT/END_ARTIFACT), not only
-    surgical OLD/NEW edits — a real verifier rejected a whole batch over
-    defects it could have rewritten in place, wasting the entire cycle."""
+def test_frontier_whole_file_rewrite_is_refused_and_routed_to_the_producer(
+    tmp_path, monkeypatch,
+):
+    """GO8-010: a reviewer that ships a complete replacement file
+    (ARTIFACT/END_ARTIFACT) does not overwrite the verified checkpoint. The
+    diagnosis becomes a blocking defect for the accountable producer to repair."""
     stage = tmp_path / "stage"
     stage.mkdir()
     output = stage / "index.html"
-    output.write_text(
-        "<!doctype html><html><body><script>const broken = true;</script></body></html>",
-        encoding="utf-8",
+    original = (
+        "<!doctype html><html><body><script>const broken = true;</script></body></html>"
     )
+    output.write_text(original, encoding="utf-8")
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     package = GoalMilestone(
         index=0, package_id="wp_1", title="release", task_text="assemble",
@@ -571,11 +576,11 @@ def test_frontier_repair_accepts_whole_file_artifact_rewrite(tmp_path, monkeypat
 
     monkeypatch.setattr(service_module, "_agent_call", semantic_review)
 
-    assert service._verify_goal_release(goal, session)
-    assert len(calls) == 2
-    assert output.read_text(encoding="utf-8") == replacement
-    assert session.quality_gate["verdict"] == "PASS"
-    assert session.quality_gate["repairs_applied"] == 1
-    # provenance names the repairing agent, not the original owner
-    assert package.output_provenance["index.html"]["agent"] == "codex"
-    assert package.output_provenance["index.html"]["method"] == "frontier_release_repair"
+    assert not service._verify_goal_release(goal, session)
+    assert len(calls) == 1
+    assert output.read_text(encoding="utf-8") == original
+    assert session.quality_gate["verdict"] == "FAIL"
+    assert session.quality_gate["repairs_applied"] == 0
+    assert any("accountable producer" in d for d in goal.release_defects)
+    # the reviewer never becomes the recorded author of the release bytes
+    assert package.output_provenance.get("index.html", {}).get("agent") != "codex"

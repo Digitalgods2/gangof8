@@ -77,8 +77,8 @@ def test_dashboard_page_served(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "Gang of 8" in r.text
-    # the header tagline: the human-approval guarantee stays on screen
-    assert "nothing executes without your approval" in r.text
+    # the header tagline: the execution policy stays on screen
+    assert "audited execution · manual or God mode" in r.text
 
 
 def test_header_lockup_is_served_and_referenced(client):
@@ -154,7 +154,7 @@ def test_dashboard_assets_served(client):
     assert "function enhancePrompt" in app_js.text
     assert "void enhancePrompt();" in app_js.text
     assert "const escAttr =" not in app_js.text, "shared helper must not be redeclared"
-    assert "this package has one accountable owner" in app_js.text
+    assert "one accountable owner integrates final bytes" in app_js.text
     assert "contract-linked to P" in app_js.text
     assert "Building package" in app_js.text
     assert "Export saved profile" in app_js.text

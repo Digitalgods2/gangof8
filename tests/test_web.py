@@ -92,20 +92,28 @@ def test_html_to_text_strips_tags_and_scripts():
 def test_web_overview_proactively_researches_factual_questions(tmp_path, monkeypatch):
     """Internet access being AVAILABLE isn't enough — the coordinator proactively
     web-searches a fact-needing question so the council has real data even if the
-    researcher seat fails. Skipped when a local source (established folder) exists."""
+    researcher seat fails. A linked local folder does not suppress it, and verified
+    research already retrieved is reused instead of searched again."""
     from gangof8 import loop
     from gangof8.models import Classification, Complexity, Risk, TaskType
 
-    monkeypatch.setattr(web, "web_search",
-                        lambda q, data_dir=None: "Current: M51 is well placed tonight.\nSources:\n- ex: http://e")
+    searches = []
+
+    def fake_search(q, data_dir=None):
+        searches.append(q)
+        return "Current: M51 is well placed tonight.\nSources:\n- ex: http://e"
+
+    monkeypatch.setattr(web, "web_search", fake_search)
     s = SessionManager(LogStore(tmp_path)).create("what galaxies are visible tonight?", source="test")
     s.classification = Classification(
         task_type=TaskType.question, complexity=Complexity.standard, risk=Risk.none, needs_facts=True)
+    s.established_root = str(tmp_path)
     ov = loop._web_overview(s, tmp_path)
     assert "WEB RESEARCH" in ov and "M51 is well placed" in ov
-    # a local source to examine ⇒ no web overview (the file overview applies instead)
-    s.established_root = str(tmp_path)
-    assert loop._web_overview(s, tmp_path) == ""
+    # a second pass reuses the verified research instead of paying for another search
+    again = loop._web_overview(s, tmp_path)
+    assert "VERIFIED RESEARCH REUSED" in again and "M51 is well placed" in again
+    assert len(searches) == 1
 
 
 def test_web_search_runs_mid_deliberation(session, tmp_path, monkeypatch):

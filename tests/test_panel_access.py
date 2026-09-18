@@ -50,9 +50,10 @@ def session(store):
 
 
 def test_agent_call_ignores_legacy_seat_timeout_and_uses_explicit_policy(session, store):
-    # The retired Settings value cannot silently cap work. Only a purpose-
-    # specific positive value is an explicit hard-deadline policy.
+    # The retired Settings value cannot silently cap work. A purpose-specific
+    # positive value is an explicit deadline; otherwise the buffered-call ceiling.
     from types import SimpleNamespace
+    from gangof8 import config
     session.cli_timeouts = {"claude": 500}
     session.budgets.max_agent_calls = 50
     seen = []
@@ -68,8 +69,9 @@ def test_agent_call_ignores_legacy_seat_timeout_and_uses_explicit_policy(session
     loop._agent_call(session, reg, store, claude, "p", timeout_s=300)   # focused call stays 300
     loop._agent_call(session, reg, store, claude, "p", timeout_s=800)   # explicit policy stays 800
     codex = CouncilMember(role=Role.panelist, agent="codex")
-    loop._agent_call(session, reg, store, codex, "p")                   # default is operator-supervised
-    assert seen == [0, 300, 800, 0]
+    loop._agent_call(session, reg, store, codex, "p")                   # default is the hard ceiling
+    ceiling = config.BUFFERED_CALL_HARD_TIMEOUT
+    assert seen == [ceiling, 300, 800, ceiling]
 
 
 def test_panel_one_uses_the_authoring_timeout(session, governance, store):

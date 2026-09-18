@@ -184,13 +184,14 @@ def test_refined_artifact_supersedes_the_earlier_one(tmp_path, store, governance
 
 def test_chain_is_bounded(tmp_path, store, governance, session):
     """A model that asks for a new file on every re-call stops after
-    MAX_SKILL_CHAIN_TURNS re-calls; the dangling request is returned so the
-    stub check can judge it."""
-    for i in range(6):
+    MAX_SKILL_CHAIN_TURNS re-calls plus one final-answer demand (GO8-001); a
+    request still dangling after that is returned so the stub check can judge it."""
+    turns = config.MAX_SKILL_CHAIN_TURNS
+    for i in range(turns + 2):
         _seed(tmp_path, session, f"f{i}.txt", f"body {i}")
     member = _member(Role.researcher)
     contribution = _contribution(Role.researcher, "SKILL: read_file f0.txt")
-    n = iter(range(1, 6))
+    n = iter(range(1, turns + 2))
     prompts: list[str] = []
 
     def call(m, prompt):
@@ -198,7 +199,8 @@ def test_chain_is_bounded(tmp_path, store, governance, session):
         return _contribution(m.role, f"SKILL: read_file f{next(n)}.txt")
 
     out = loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
-    assert len(prompts) == config.MAX_SKILL_CHAIN_TURNS
+    assert len(prompts) == turns + 1
+    assert "context-gathering phase is now complete" in prompts[-1]
     assert "SKILL" in out.content, "the unresolved request comes back for the stub check"
 
 
@@ -264,16 +266,17 @@ def test_non_read_skill_is_refused_midround(tmp_path, store, governance, session
 
 
 def test_requests_are_capped_per_turn(tmp_path, store, governance, session):
-    for i in (1, 2, 3):
+    cap = loop._skill_request_cap(session)
+    for i in range(1, cap + 2):
         _seed(tmp_path, session, f"f{i}.txt", f"body {i}")
     member = _member(Role.researcher)
-    content = "SKILL: read_file f1.txt\nSKILL: read_file f2.txt\nSKILL: read_file f3.txt"
+    content = "\n".join(f"SKILL: read_file f{i}.txt" for i in range(1, cap + 2))
     contribution = _contribution(Role.researcher, content)
     call, prompts = _recording_call()
 
     loop._resolve_skill_requests(session, member, "P", contribution, call, governance, store)
     executed = [a for a in session.proposed_actions if a.status == "executed"]
-    assert len(executed) == config.MAX_SKILL_REQUESTS_PER_TURN == 2
+    assert len(executed) == cap
 
 
 # --- on-demand delegation contract ------------------------------------------

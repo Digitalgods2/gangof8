@@ -60,7 +60,7 @@ def test_council_is_lead_plus_panel(council_session):
     # all roles are still listed, so the UI roster shows what's reachable;
     # the mock backend convenes a one-seat panel
     assert session.panel == ["mock"]
-    assert len(session.council.members) == 13 + len(session.panel)
+    assert len(session.council.members) == 14 + len(session.panel)
 
 
 def test_single_round_when_lead_declares_done(council_session):
