@@ -766,3 +766,14 @@ def test_source_code_is_not_a_request_for_sourced_research():
     assert asks("Write an essay using reputable sources")
     assert asks("Summarize the findings with sources cited")
     assert asks("Give a source-backed overview")
+
+
+def test_quoted_path_arguments_reach_the_file_skills_unquoted():
+    """Live: an app review asked for list_dir "Gemini Thumbnail Gen" and
+    read_file 'Kids4/README.md' dozens of times; the quotes were read as part
+    of the name, every such request failed, and the reports were incomplete."""
+    assert loop._unquote_path_arg('"Gemini Thumbnail Gen"') == "Gemini Thumbnail Gen"
+    assert loop._unquote_path_arg("'Kids4/README.md'") == "Kids4/README.md"
+    assert loop._unquote_path_arg("`chopgapv2`") == "chopgapv2"
+    assert loop._unquote_path_arg("C# Code") == "C# Code"
+    assert loop._unquote_path_arg("it's") == "it's"

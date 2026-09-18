@@ -2278,6 +2278,19 @@ _SKILL_REQUEST_MARKER = re.compile(
 )
 
 
+def _unquote_path_arg(arg: str) -> str:
+    """Drop one matching pair of quotes or backticks around a path argument.
+
+    Models quote names with spaces the way a shell would: a live app review
+    asked for `list_dir "Gemini Thumbnail Gen"` and `read_file 'Kids4/README.md'`
+    dozens of times, the quotes were taken as part of the name, and the reports
+    came back incomplete ("I couldn't read the folders directly")."""
+    arg = (arg or "").strip()
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"`":
+        return arg[1:-1].strip()
+    return arg
+
+
 # The lead pulls in a talent with a plain-text line 'CONSULT: <talent> - <q>' or
 # 'DELEGATE: <talent> - <subtask>' (bullets/bold tolerated, : - or — separators).
 _DELEGATION_MARKER = re.compile(
@@ -2834,6 +2847,8 @@ def _resolve_skill_requests(
             # map the single positional arg to the skill's first declared input
             # (read_file→filename, search_project→query)
             arg_key = skill.inputs[0] if skill.inputs else "filename"
+            if arg_key in ("filename", "path"):
+                arg = _unquote_path_arg(arg)
             action = ProposedAction(session_id=sid, kind=name, args={arg_key: arg}, role=member.role)
             governance.authorize_action(session, action)  # no-approval skill → None; may deny on role
             with _SESSION_LOCK:
