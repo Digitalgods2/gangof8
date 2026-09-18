@@ -1,5 +1,121 @@
 # Gang of Eight — Confirmed Defects
 
+## September 18 Escoffier PDF benchmark
+
+The live benchmark (goal `g_05c762d2`, God mode, full council, Planned build)
+released a verified 112-page PDF only after the defects below were fixed in
+`b53fa7d`. Most share one shape: a rule existed but never reached the path
+that needed it.
+
+- **GO8-016 - Hot-standby failover never executes the standby**
+  - Status: fixed on 2026-09-18.
+  - After the primary build failed, `_try_next_candidate` swapped in Kimi's
+    standby but re-armed the source write and BUILD as `captured`, a status
+    `_execute_actions` skips. The standby never ran, and the failed producer
+    was not sealed because its write was no longer `executed`.
+  - Resolution: failover re-arms both as `proposed`; a prior approval still
+    matches by action id.
+
+- **GO8-017 - A complete repair in a `BEGIN ARTIFACT` envelope is discarded**
+  - Status: fixed on 2026-09-18.
+  - The recovery supervisor returned a 45KB generator as `BEGIN ARTIFACT
+    <path>` ... `END ARTIFACT`. Only the BUILD line parsed, so the unchanged
+    broken producer ran again. The repair prompt never showed the envelope.
+  - Resolution: the parser accepts the upper-case variant with a space-free
+    path; the repair prompt spells out `ARTIFACT:` / `END_ARTIFACT` and the
+    surgical `EDIT` form.
+
+- **GO8-018 - Owner retries receive the symptom, not the cause**
+  - Status: fixed on 2026-09-18.
+  - Recovery fingerprinted the causal `build_command_failed` record, but the
+    owner's RETRY CORRECTION said only "no .pdf file was produced".
+  - Resolution: the correction leads with up to two distinct causal records
+    (traceback tail kept), then the symptom.
+
+- **GO8-019 - Sealed failed producers are never restored (GO8-007 gap)**
+  - Status: fixed on 2026-09-18.
+  - `_preserve_failed_producer` sealed the bytes, but nothing materialized
+    them. Every retry got an empty working set and re-authored an ~80KB
+    generator from scratch.
+  - Resolution: `_restore_failed_producer` copies the checkpoint into the new
+    session sandbox; the correction names it as the unverified repair baseline.
+
+- **GO8-020 - A restart loses the in-flight attempt and parks God mode**
+  - Status: fixed on 2026-09-18.
+  - A restart reconciled the package as cancelled: its producer and latest
+    failure were dropped, and even a God-mode goal paused for manual resume.
+  - Resolution: the cancelled branch preserves producer and failure; a
+    restart-interrupted God-mode goal is rescheduled automatically.
+
+- **GO8-021 - Session cancel leaves the real CLI running (665 s cancel)**
+  - Status: fixed on 2026-09-18.
+  - `_kill_procs` used `Popen.kill()`, which stops only the Windows `.cmd`
+    launcher; the agent kept stdout open and `communicate()` blocked until it
+    finished. Reproduced: still blocked after 45 s.
+  - Resolution: session cancel uses `kill_tree`, like per-call cancel (0.7 s).
+
+- **GO8-022 - A supervisor DELEGATE is ignored**
+  - Status: fixed on 2026-09-18.
+  - A supervisor that delegated a precise fix to the owner also echoed a BUILD
+    line, so its reply was accepted as the repair and the delegation dropped;
+    the named delegate was also cleared before its turn.
+  - Resolution: a DELEGATE with no source change hands off, and the delegate
+    is kept until its turn.
+
+- **GO8-023 - Build repairs see a truncated producer and cannot EDIT**
+  - Status: fixed on 2026-09-18.
+  - The repair prompt cut the producer at 40KB (plus a duplicate scratch copy),
+    so CLI seats without file tools saw half the generator; EDIT proposals were
+    discarded.
+  - Resolution: the complete latest producer is sent once (cap
+    `GANGOF8_REPAIR_PRODUCER_MAX_CHARS`, labelled when exceeded) and EDIT is
+    accepted.
+
+- **GO8-024 - The approved interpreter is refused when quoted or `.exe`**
+  - Status: fixed on 2026-09-18.
+  - Build evidence prints `'C:\...\python.exe'`; a repair echoed it and the
+    command check rejected it. Approved tools given as a full path also ran the
+    typed path.
+  - Resolution: one matching outer quote is stripped and `.exe` normalized;
+    approved tools always resolve by name on PATH.
+
+- **GO8-025 - Advisory release defects block a verified release**
+  - Status: fixed on 2026-09-18.
+  - A reviewer passed every check and ended `VERDICT: PASS` with two defects
+    it labelled NON-BLOCKING and COSMETIC; every DEFECT was parsed as blocking
+    and the PDF was sent back for a full rewrite.
+  - Resolution: under a PASS with all checks passing, defects are advisory
+    unless labelled BLOCKING; labelled advisory defects never block. The
+    prompt asks reviewers to label severity.
+
+- **GO8-026 - Release-review findings never reach the owner**
+  - Status: fixed on 2026-09-18.
+  - A rejected release reopened the owner with only "frontier final-batch
+    verification failed".
+  - Resolution: the retry text carries the reviewer's blocking findings.
+
+- **GO8-027 - Operator `retry_verifier` strands a reopened package**
+  - Status: fixed on 2026-09-18.
+  - When the re-run review reopened the producer, the recover path never
+    scheduled it; the goal sat `running` with no worker for 30 minutes.
+  - Resolution: the recover path starts pending packages like `resume_goal`.
+
+- **GO8-028 - A quota-exhausted release verifier fails the goal**
+  - Status: fixed on 2026-09-18.
+  - "You've hit your session limit" was not classified as quota, the only
+    independent frontier seat was retried three times, and the God-mode goal
+    failed while other seats were idle.
+  - Resolution: the wording is classified as quota; a dead seat is tried once;
+    the release falls back to any enabled non-author seat; a batch nobody can
+    review pauses instead of failing.
+
+- **GO8-029 - Document briefs never auto-route to Planned build**
+  - Status: fixed on 2026-09-18.
+  - "compile a ... PDF of 100 ... recipes" stayed focused: only software verbs
+    counted as an action and a PDF was not treated as a delivered file.
+  - Resolution: compile/produce/generate/assemble and named document formats
+    count; a measurable quantity is still required.
+
 ## August 24 goal-release reconciliation incident
 
 - **GO8-014 - A completed council session is labeled as a successful goal**
