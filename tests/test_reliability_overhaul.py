@@ -704,3 +704,48 @@ def test_a_lone_review_fail_does_not_veto_but_two_agreeing_ones_do(tmp_path, mon
     assert session.review["verdict"] == "fail"
     assert session.review["confirmed"] is True
     assert any("wrong kind of artifact" in u for u in session.unresolved)
+
+
+def _index_page(number: int, heading: str, body: list[str]) -> str:
+    return "\n".join(["THE COLLECTION", str(number), heading, "Recipe index", *body])
+
+
+def test_alphabetical_index_order_is_checked_by_code():
+    """Live: the released Escoffier PDF listed Bearnaise and Bechamel after
+    Braised Ham (raw code-point sort) and both reviewers passed it; benchmark
+    item 7 injected an index sorted on the French title. Code, not a
+    reviewer, decides index order."""
+    contents = "\n".join(["Contents", "Alphabetical index ... 108"])
+    good = [
+        contents,
+        _index_page(108, "ALPHABETICAL INDEX · 1 OF 2", [
+            "A", "Allemande Sauce", "Sauce Allemande", "13",
+            "B", "Béarnaise Sauce", "Sauce Béarnaise", "25",
+            "Béchamel", "Sauce Béchamel", "8",
+            "Braised Ham Madeira", "Jambon Braisé Madère", "69",
+            "C", "Cardinal Sauce", "Sauce Cardinal", "17"]),
+        # The letter repeats at the top of the continuation page.
+        _index_page(109, "ALPHABETICAL INDEX · 2 OF 2", [
+            "C", "Chocolate Mousse", "Mousse au Chocolat", "101",
+            "L", "Lobster Bisque ........ 32"]),
+        # A category index follows; it is not alphabetical and not judged.
+        _index_page(110, "CATEGORY INDEX · 1 OF 1", [
+            "SAUCES", "Béchamel", "8", "Allemande Sauce", "13"]),
+    ]
+    assert validation._alphabetical_index_problem(good) == ""
+
+    code_point = list(good)
+    code_point[1] = _index_page(108, "ALPHABETICAL INDEX · 1 OF 2", [
+        "B", "Braised Ham Madeira", "Jambon Braisé Madère", "69",
+        "Béarnaise Sauce", "Sauce Béarnaise", "25"])
+    assert "'Braised Ham Madeira' is listed before 'Béarnaise Sauce'" in (
+        validation._alphabetical_index_problem(code_point))
+
+    wrong_field = list(good)
+    wrong_field[2] = _index_page(109, "ALPHABETICAL INDEX · 2 OF 2", [
+        "L", "Lobster Bisque", "Bisque de Homard", "32",
+        "B", "Bombe Glacée", "Bombe Glacée", "107"])
+    assert validation._alphabetical_index_problem(wrong_field) == (
+        "letter heading B follows L")
+
+    assert validation._alphabetical_index_problem(["Contents\nRecipes"]) is None

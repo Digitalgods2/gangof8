@@ -878,9 +878,19 @@ class GangOf8Service:
                      "text": normalized},
                 )
                 return "goal", goal
+        waiting = len(approvals) + len(inputs)
+        if not waiting:
+            # "Does not identify exactly one" read as if the user had picked the
+            # wrong one, when there was nothing to acknowledge at all.
+            raise ValueError(
+                f"nothing is waiting for your approval or answer, so "
+                f"\"{normalized}\" had nothing to act on; send a concrete "
+                "instruction to start new work"
+            )
         raise ValueError(
-            "that acknowledgment does not identify exactly one pending action; "
-            "open the goal/session you mean or add a concrete instruction"
+            f"{waiting} items are waiting for your approval or answer, so "
+            f"\"{normalized}\" is ambiguous; open the one you mean or add a "
+            "concrete instruction"
         )
 
     def _sys_log(self, event: str, payload: Optional[dict] = None) -> None:

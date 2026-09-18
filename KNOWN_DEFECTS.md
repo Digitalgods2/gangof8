@@ -125,6 +125,31 @@ that needed it.
   - Resolution: the fallback draws from every registered (enabled) seat, as
     the deliverable review already did; the regression test uses the duo panel.
 
+- **GO8-031 - No deterministic check of index order; a misordered index shipped**
+  - Status: fixed on 2026-09-18.
+  - The released Escoffier PDF lists Béarnaise and Béchamel after Braised Ham
+    (a raw code-point sort); two model reviewers passed it. Only a reviewer
+    could have caught item 7's index sorted on the French title.
+  - Resolution: `contract.index_order` checks a PDF's alphabetical index
+    (letter headings ascending, entries under their letter, entries in order,
+    word-by-word or letter-by-letter, accent-folded). It runs when the contract
+    or the document calls the index alphabetical, and ignores a category index.
+
+- **GO8-032 - The mother-sauce order check uses a fixed order and prose**
+  - Status: fixed on 2026-09-18.
+  - The required order was hard-coded, so a contract naming all five would
+    reject Escoffier's own order (tomato before hollandaise), and the first
+    mention anywhere counted, so an introduction's "stocks, veloutés" came
+    first.
+  - Resolution: the order is the one the contract names them in, measured from
+    the first mention of the first sauce.
+
+- **GO8-033 - "agree" with nothing pending blames the user's choice**
+  - Status: fixed on 2026-09-18.
+  - With nothing waiting, the refusal said the acknowledgment "does not
+    identify exactly one pending action", as if one had to be picked.
+  - Resolution: separate messages for nothing waiting and several waiting.
+
 ## August 24 goal-release reconciliation incident
 
 - **GO8-014 - A completed council session is labeled as a successful goal**

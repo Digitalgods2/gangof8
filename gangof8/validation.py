@@ -292,6 +292,100 @@ _PLACEHOLDER_RE = re.compile(
 )
 
 
+_INDEX_HEAD_RE = re.compile(r"\bindex\b", re.IGNORECASE)
+_PAGE_REF_RE = re.compile(r"^\d{1,4}(?:\s*[,–-]\s*\d{1,4})*$")
+_TRAILING_REF_RE = re.compile(
+    r"^(?P<entry>.*?[^\W\d_].*?)[\s.·…]+\d{1,4}(?:\s*[,–-]\s*\d{1,4})*$")
+
+
+def _index_keys(entry: str) -> tuple[str, str]:
+    """Word-by-word and letter-by-letter sort keys, accent- and case-folded."""
+    folded = "".join(
+        char for char in unicodedata.normalize("NFKD", entry).casefold()
+        if not unicodedata.combining(char)
+    )
+    words = " ".join(re.sub(r"[^\w ]+", " ", folded).split())
+    return words, words.replace(" ", "")
+
+
+def _alphabetical_index_problem(page_texts: list[str]) -> Optional[str]:
+    """The first ordering fault in a PDF's alphabetical index, "" when it is in
+    order, or None when no index section was found.
+
+    The index is the LAST run of consecutive pages whose head names an index,
+    so a contents page that lists "Index ... 108" is not mistaken for it. An
+    entry is a line ending in its page reference, or the first line after a
+    letter heading or a bare page-number line (the layout where the entry, a
+    subtitle, and its page sit on separate lines). Either word-by-word or
+    letter-by-letter alphabetisation is accepted.
+    """
+    pages: list[Optional[list[str]]] = []
+    alphabetical: list[bool] = []
+    for text in page_texts:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        head = [i for i, line in enumerate(lines[:6])
+                if _INDEX_HEAD_RE.search(line) and len(line) <= 60]
+        pages.append(lines[head[-1] + 1:] if head else None)
+        alphabetical.append(bool(head) and any(
+            "alphabetical" in line.lower() for line in lines[:head[-1] + 1]))
+    # A book may carry a second, non-alphabetical index (by category); when a
+    # section names itself alphabetical, only that section is judged.
+    if any(alphabetical):
+        pages = [body if alpha else None for body, alpha in zip(pages, alphabetical)]
+    end = max((i for i, body in enumerate(pages) if body is not None), default=-1)
+    if end < 0:
+        return None
+    start = end
+    while start > 0 and pages[start - 1] is not None:
+        start -= 1
+    run = pages[start:end + 1]
+    # A running footer repeats at the foot of every index page. Only the last
+    # lines are considered: entries themselves may legitimately recur.
+    counts: dict[str, int] = {}
+    for body in run:
+        for line in set(body[-2:]):
+            counts[line] = counts.get(line, 0) + 1
+    repeated = {line for line, n in counts.items() if n > 1 and len(line) > 1} \
+        if len(run) > 1 else set()
+
+    letter = ""
+    previous = ""
+    expect_entry = True
+    for body in run:
+        for line in body:
+            if line in repeated:
+                continue
+            if len(line) == 1 and line.isalpha():
+                heading = line.upper()
+                # A heading repeated at the top of the next page continues it.
+                if letter and heading < letter:
+                    return f"letter heading {heading} follows {letter}"
+                letter, expect_entry = heading, True
+                continue
+            if _PAGE_REF_RE.match(line):
+                expect_entry = True
+                continue
+            trailing = _TRAILING_REF_RE.match(line)
+            if trailing:
+                entry = trailing.group("entry").rstrip(" .·…")
+            elif expect_entry:
+                entry = line
+            else:
+                continue
+            expect_entry = bool(trailing)
+            words, letters = _index_keys(entry)
+            if not words:
+                continue
+            if letter and words[0].isalpha() and words[0].upper() != letter:
+                return f"'{entry}' is listed under {letter}"
+            if previous:
+                prev_words, prev_letters = _index_keys(previous)
+                if prev_words > words and prev_letters > letters:
+                    return f"'{previous}' is listed before '{entry}'"
+            previous = entry
+    return ""
+
+
 def _assertion_text(assertions: Optional[list[str]]) -> str:
     return "\n".join(str(item) for item in (assertions or []) if item).lower()
 
@@ -352,18 +446,41 @@ def _validate_pdf(path: Path, assertions: Optional[list[str]]) -> ArtifactValida
                 result.fail(f"forbidden placeholder text found: {match.group(0)}")
         # A common document contract names the classical mother sauces and asks
         # for their order. Verify their observable text order deterministically.
+        # The required order is the order the CONTRACT names them in: a fixed
+        # list would reject a correct book that follows Escoffier (who put
+        # tomato before hollandaise) whenever a contract named all five.
         fold = lambda value: unicodedata.normalize("NFKD", value).encode(
             "ascii", "ignore").decode("ascii").lower()
         sauces = ["bechamel", "veloute", "espagnole", "hollandaise", "tomato"]
         requested_folded = fold(requested)
+        sauces.sort(key=requested_folded.find)
         if ("mother sauce" in requested_folded
                 and all(name in requested_folded for name in sauces)):
             result.validator_ids.append("contract.mother_sauce_order")
             normalized = fold(extracted)
-            positions = [normalized.find(name) for name in sauces]
+            # Measured from the first mention of the first sauce: an
+            # introduction that says "stocks, veloutes, demi-glace" before the
+            # list must not decide the order.
+            start = max(normalized.find(sauces[0]), 0)
+            positions = [normalized.find(name, start) for name in sauces]
             result.evidence["mother_sauce_positions"] = dict(zip(sauces, positions))
             if any(position < 0 for position in positions) or positions != sorted(positions):
                 result.fail("mother sauces are absent or out of the required order")
+
+        # An alphabetical index is checked by code, not left to a reviewer's
+        # eye: benchmark item 7 injected an index sorted on the wrong field and
+        # nothing deterministic would have noticed.
+        page_texts = [page.extract_text() or "" for page in reader.pages]
+        if "alphabetical" in requested or any(
+                _INDEX_HEAD_RE.search("\n".join(text.splitlines()[:6]))
+                and "alphabetical" in "\n".join(text.splitlines()[:6]).lower()
+                for text in page_texts):
+            index_problem = _alphabetical_index_problem(page_texts)
+            if index_problem is not None:
+                result.validator_ids.append("contract.index_order")
+                result.evidence["index_order"] = index_problem or "ok"
+                if index_problem:
+                    result.fail(f"alphabetical index is out of order: {index_problem}")
 
         # Quantified document contracts need machine-countable identifiers.
         # This is intentionally opt-in: ordinary prose numbers are not treated
