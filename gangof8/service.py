@@ -6176,7 +6176,6 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         self._count_goal_session(goal, session)
         if not verified:
             gate = dict(session.quality_gate or {})
-            defects = list(gate.get("remaining_defects") or [])
             blocking_defects = list(gate.get("blocking_defects") or [])
             release_packages = [
                 package for package in goal.milestones if package.release_files

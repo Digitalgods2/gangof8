@@ -4091,7 +4091,7 @@ def _integrated_package_problem(
             )
             if missing_refs:
                 return (
-                    f"integrated Python references undeclared local source(s): "
+                    "integrated Python references undeclared local source(s): "
                     + ", ".join(missing_refs[:8])
                     + "; make the producer self-contained or declare and stage each input"
                 )
