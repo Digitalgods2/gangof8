@@ -167,11 +167,12 @@ def unregister_proc(session_id: str | None, proc) -> None:
 def _kill_procs(session_id: str) -> None:
     with _lock:
         procs = list(_procs.get(session_id, ()))
+    # Whole tree, like request_call. A plain kill() stops only the Windows
+    # .cmd launcher; the real agent keeps the stdout pipe open, so the
+    # worker's communicate() blocks until that agent finishes on its own
+    # (reproduced: still blocked 45 s later; a live cancel took 665 s).
     for p in procs:
-        try:
-            p.kill()
-        except Exception:  # noqa: BLE001 — already dead / not killable: ignore
-            pass
+        kill_tree(p)
 
 
 # --- abort-callback registry --------------------------------------------------

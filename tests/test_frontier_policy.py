@@ -218,3 +218,44 @@ def test_markdown_wrapped_pass_is_a_valid_semantic_review():
     assert report.status == ReviewStatus.passed
     assert report.checkpoint_id == "cp_good"
     assert report.criteria[0].detail == "title found in extracted text"
+
+
+def test_labelled_advisory_defects_under_pass_do_not_block_release():
+    """Regression: a live reviewer passed every check, ended 'VERDICT: PASS' and
+    listed two defects it labelled NON-BLOCKING and COSMETIC. Every DEFECT was
+    parsed as blocking, which failed a verified 113-page PDF."""
+    criteria = [AcceptanceCriterion(criterion_id="R1", text="searchable")]
+    advisory = rounds.parse_frontier_review(
+        "CHECK R1: PASS - text layer present\n"
+        "DEFECT: NON-BLOCKING - could not open the outline dictionary\n"
+        "DEFECT: COSMETIC - placeholder CreationDate\n"
+        "VERDICT: PASS",
+        criteria,
+    )
+    assert advisory.status == ReviewStatus.nonblocking
+    assert not any(item["blocks_release"] for item in advisory.defects)
+
+    blocking = rounds.parse_frontier_review(
+        "CHECK R1: PASS - text layer present\n"
+        "DEFECT: BLOCKING - xref table is corrupt\n"
+        "VERDICT: PASS",
+        criteria,
+    )
+    assert blocking.status == ReviewStatus.blocking_fail
+
+    failed = rounds.parse_frontier_review(
+        "CHECK R1: FAIL - no text layer\nDEFECT: pages are images\nVERDICT: FAIL",
+        criteria,
+    )
+    assert failed.status == ReviewStatus.blocking_fail
+
+
+def test_compile_a_counted_pdf_auto_routes_but_small_asks_do_not():
+    """'compile' + a named PDF + a quantity is a build; neither a verb nor a
+    format alone is. The operator's Escoffier brief used 'compile a ... PDF'."""
+    assert goals.should_auto_route(
+        "research heavily the works of Auguste Escoffier and compile a searchable, "
+        "indexed PDF of 100 of his most notable and popular recipes"
+    )
+    assert not goals.should_auto_route("compile a short list of three facts about Paris")
+    assert not goals.should_auto_route("generate a haiku")

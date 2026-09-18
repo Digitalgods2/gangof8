@@ -110,6 +110,15 @@ def _split(command: str) -> list[str]:
         args = shlex.split(raw, posix=os.name != "nt")
     except ValueError as e:
         raise ValidationCommandError(f"invalid command quoting: {e}") from e
+    if os.name == "nt":
+        # Non-POSIX shlex keeps quotes. Build evidence shows the interpreter as
+        # 'C:\...\python.exe', and a live repair echoed that line back as its
+        # BUILD; the stray quote made the program name "python.exe'" and the
+        # approved interpreter was refused. Strip one matching outer pair only.
+        args = [
+            arg[1:-1] if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"" else arg
+            for arg in args
+        ]
     if not args:
         raise ValidationCommandError("a test command is required")
     return args
@@ -164,6 +173,8 @@ def approved_test_argv(command: str) -> list[str]:
     if any(any(char in _SHELL_META for char in arg) for arg in args):
         raise ValidationCommandError("shell operators are not allowed in RUNTESTS")
     program = Path(args[0]).name.lower()
+    if program.endswith(".exe") and program[:-4] in _APPROVED_PROGRAMS:
+        program = program[:-4]
     if program in _SHELLS or program not in _APPROVED_PROGRAMS:
         raise ValidationCommandError(
             "RUNTESTS must invoke an approved direct test tool, not a shell or arbitrary executable"
@@ -174,7 +185,9 @@ def approved_test_argv(command: str) -> list[str]:
             # may still approve pytest directly, which is clearer in the card.
             raise ValidationCommandError("use pytest directly; python -c/-m is not allowed in RUNTESTS")
         return [sys.executable, *args[1:]]
-    resolved = shutil.which(args[0])
+    # Resolve the approved NAME on PATH, never the path the model typed: a
+    # file merely named node(.exe) elsewhere on disk is not the approved tool.
+    resolved = shutil.which(program)
     if not resolved:
         raise ValidationCommandError(f"test tool is not on PATH: {args[0]!r}")
     return [resolved, *args[1:]]

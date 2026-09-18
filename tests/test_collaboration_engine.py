@@ -206,6 +206,12 @@ def test_implementation_lens_persists_and_activates_atomic_hot_standby(tmp_path)
     )
     assert owner_source.content == standby
     assert session.candidate_fallback_groups == []
+    # The swapped source and the reset BUILD must be executable again: the
+    # action sweep runs only proposed/approved actions, so 'captured' here
+    # meant the standby was shipped but never written or built.
+    assert owner_source.status == "proposed"
+    build = next(a for a in session.proposed_actions if a.kind == "build_artifact")
+    assert build.status == "proposed" and build.error == ""
 
 
 def test_unavailable_deepseek_is_visible_and_recovered_by_distinct_resource(

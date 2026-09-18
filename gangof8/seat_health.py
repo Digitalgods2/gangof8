@@ -34,7 +34,11 @@ UNAVAILABLE_STATES = ("quota_exhausted", "auth_expired", "offline")
 _CLASSIFIERS: tuple[tuple[str, re.Pattern], ...] = (
     ("quota_exhausted", re.compile(
         r"spend limit|usage limit|quota exceeded|out of credits|"
-        r"insufficient[_ ]quota|billing", re.IGNORECASE)),
+        r"insufficient[_ ]quota|billing|"
+        # claude CLI: "You've hit your session limit · resets 4:50am" — a live
+        # release verifier was retried three times against this and the goal
+        # failed instead of routing to another seat.
+        r"session limit|weekly limit|hit your (?:\w+ )?limit", re.IGNORECASE)),
     ("auth_expired", re.compile(
         r"not logged in|login required|unauthorized|authentication|"
         r"invalid api key|no .*api key|api key.*required|"

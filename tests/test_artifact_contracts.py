@@ -284,3 +284,25 @@ def test_prose_heuristic_still_applies_when_nothing_was_declared():
 
     assert loop._candidate_artifact_problem(session, "report.md") == ""
     assert ".md" in loop._candidate_artifact_problem(session, "report.txt")
+
+
+def test_begin_artifact_envelope_is_parsed_and_prose_is_not():
+    """A live recovery supervisor returned a complete generator as
+    'BEGIN ARTIFACT <path>' ... 'END ARTIFACT'. Dropping it silently re-ran the
+    broken producer, so the variant is accepted; lowercase prose is not."""
+    reply = (
+        "BEGIN ARTIFACT _gangof8/build.py\n"
+        "print('ok')\n"
+        "END ARTIFACT\n"
+        "BUILD: python _gangof8/build.py\n"
+        "PRODUCES: out.pdf\n"
+    )
+    actions = artifacts.parse_proposals("s", reply)
+    write = next(a for a in actions if a.kind == "write_file")
+    assert write.filename == "_gangof8/build.py"
+    assert write.content.strip() == "print('ok')"
+    assert any(a.kind == "build_artifact" for a in actions)
+    assert not any(
+        a.kind == "write_file"
+        for a in artifacts.parse_proposals("s", "Begin artifact review now\nlooks fine")
+    )

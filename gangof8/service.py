@@ -80,7 +80,7 @@ from .paths import extract_delivery_target, extract_established_root, prior_deli
 from .registry import AgentCallStopped, AgentError
 from .registry import AgentRegistry
 from .runtime_diagnostics import collect_runtime_diagnostics
-from .seat_health import SeatHealth
+from .seat_health import UNAVAILABLE_STATES, SeatHealth, classify_failure
 from .sessions import SessionManager
 from .settings import (
     Settings,
@@ -4506,8 +4506,42 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         milestone.status = "pending"
         milestone.resume_session_id = milestone.session_id or session.session_id
         milestone.session_id = None
+        # The owner's RETRY CORRECTION must carry the causal execution record,
+        # not the downstream symptom. A live retry was told only "no .pdf file
+        # was produced" while the recorded cause was its own generator raising
+        # at build time, so it re-authored blind. Keep the traceback's tail:
+        # that is where the exception message lives.
+        retry_detail = f"{category}: {detail}"
+        # Up to two distinct causal records, newest first: a repair's own
+        # rejected command must not hide the producer crash it failed to fix.
+        causal_records = []
+        seen_causes: set[str] = set()
+        for item in reversed(unresolved_failures):
+            key = (item.summary or "")[-300:]
+            if item.category in causal_categories and key not in seen_causes:
+                seen_causes.add(key)
+                causal_records.append(item)
+            if len(causal_records) == 2:
+                break
+        if causal_records:
+            parts = []
+            for item in causal_records:
+                causal = item.summary or ""
+                if len(causal) > 700:
+                    causal = causal[:150] + "\n...\n" + causal[-550:]
+                parts.append(f"{item.category}: {causal}")
+            retry_detail = (
+                "\n\nEarlier: ".join(parts)
+                + f"\nResulting symptom: {category}: {detail[:200]}"
+            )
+        if milestone.candidate_checkpoint_id:
+            retry_detail += (
+                "\nThe failed producer from that attempt is in your working set "
+                "as an UNVERIFIED repair baseline: fix the cause in it and emit "
+                "the complete corrected file rather than starting over."
+            )
         milestone.acceptance_detail = (
-            f"{category}: {detail}\nFault signature: {failure.fault_signature}. "
+            f"{retry_detail}\nFault signature: {failure.fault_signature}. "
             "Change the producing source or relevant implementation; do not "
             "repeat unchanged bytes."
         )[:1600]
@@ -4518,7 +4552,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             "failure_id": failure.failure_id,
             "fault_signature": failure.fault_signature,
             "category": failure.category,
-            "detail": detail[:1600],
+            "detail": retry_detail[:1600],
             "base_checkpoint_id": milestone.active_verified_checkpoint_id,
             "target_paths": list(failure.repair_scope),
             "repair_owner": decision.owner,
@@ -4547,6 +4581,49 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
              "fault_signature": failure.fault_signature},
         )
         return True
+
+    def _restore_failed_producer(
+        self, session: Session, milestone: GoalMilestone,
+    ) -> None:
+        """Hand a repair attempt the exact failed producer bytes to fix.
+
+        _preserve_failed_producer seals them, but nothing put them back: live
+        retries got an empty working set and re-authored an ~80KB generator
+        from scratch, discarding a producer that needed a one-line repair. The
+        bytes land in the session sandbox, which the package working set
+        already copies as the (unverified) repair baseline.
+        """
+        if not milestone.candidate_checkpoint_id:
+            return
+        planned = set(
+            milestone.materialization_plan.producing_files
+            if milestone.materialization_plan else []
+        )
+        try:
+            record = self.checkpoints.get(milestone.candidate_checkpoint_id)
+            names = [
+                name for name in (record or {}).get("manifest", {})
+                if not planned or name in planned
+            ]
+            if not names:
+                return
+            restored = self.checkpoints.materialize(
+                milestone.candidate_checkpoint_id,
+                executor.artifacts_dir(self.store.data_dir, session.session_id),
+                names=names,
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            self.store.log_event(
+                session.session_id, "failed_producer_restore_failed",
+                {"checkpoint_id": milestone.candidate_checkpoint_id,
+                 "reason": str(exc)[:300]},
+            )
+            return
+        self.store.log_event(
+            session.session_id, "failed_producer_restored",
+            {"checkpoint_id": milestone.candidate_checkpoint_id,
+             "files": sorted(restored)},
+        )
 
     def _preserve_failed_producer(
         self,
@@ -4757,6 +4834,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             milestone.participation_reports
         ) if session.repair_mode else []
         session.phase = "repairing" if session.repair_mode else "baseline_ready"
+        self._restore_failed_producer(session, milestone)
         if milestone.resume_session_id and not session.repair_mode:
             previous = self.manager.load(milestone.resume_session_id)
             if previous is not None and previous.work_package_id == milestone.package_id:
@@ -5436,10 +5514,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             seat for seat in verifier_pool
             if not self.seat_health.is_unavailable(seat)
         ]
+        # Independent fallback: any other enabled seat that did not author the
+        # release. Frontier seats stay first; the fallback only matters when
+        # they cannot answer (a live goal failed while its only independent
+        # frontier seat sat behind a session limit and Gemini was idle).
+        fallback_pool = [
+            seat for seat in self.panel
+            if seat in self.registry.names()
+            and seat not in release_owners
+            and seat not in verifier_pool
+            and seat != "system"
+            and not self.seat_health.is_unavailable(seat)
+        ]
         # Prefer seats that can actually answer; if health has marked every
         # candidate unavailable, keep the original pool so the transport
         # retry/UNAVAILABLE path reports honestly rather than aborting here.
-        verifier_pool = healthy_pool or verifier_pool
+        verifier_pool = (healthy_pool + fallback_pool) or verifier_pool
         verifier_name = verifier_pool[0] if verifier_pool else None
         if verifier_name is None:
             detail = (
@@ -5553,9 +5643,22 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
             # resume), never as a rejection.
             answer = None
             transport_error = ""
-            for transport_attempt in range(
-                    config.RELEASE_VERIFIER_TRANSPORT_RETRIES + 1):
-                seat = verifier_pool[transport_attempt % len(verifier_pool)]
+            # A hard-unavailable seat (quota, auth, missing CLI) is dropped for
+            # the rest of this release instead of being retried: a live goal
+            # spent all three attempts on a seat behind a session limit.
+            dead_seats: set[str] = set()
+            attempts = max(
+                config.RELEASE_VERIFIER_TRANSPORT_RETRIES + 1, len(verifier_pool))
+            for transport_attempt in range(attempts):
+                live_seats = [s for s in verifier_pool if s not in dead_seats]
+                if not live_seats:
+                    break
+                seat = live_seats[transport_attempt % len(live_seats)]
+                if seat not in enabled_frontier:
+                    self.store.log_event(
+                        session.session_id, "release_verifier_fallback",
+                        {"agent": seat, "reason": "no independent frontier seat could answer"},
+                    )
                 member = CouncilMember(role=Role.panelist, agent=seat, active=True)
                 try:
                     answer = _agent_call(
@@ -5576,7 +5679,10 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                         {"agent": seat, "attempt": transport_attempt + 1,
                          "detail": transport_error[:300]},
                     )
-                    if transport_attempt < config.RELEASE_VERIFIER_TRANSPORT_RETRIES:
+                    if classify_failure(transport_error) in UNAVAILABLE_STATES:
+                        dead_seats.add(seat)
+                        continue  # another seat may answer now; no backoff
+                    if transport_attempt < attempts - 1:
                         time.sleep(config.RELEASE_VERIFIER_TRANSPORT_BACKOFF)
             if answer is None:
                 session.quality_gate = {
@@ -5678,6 +5784,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 str(item.get("description") or "")
                 for item in report.defects if item.get("description")
             ]
+            # Advisory findings stay visible in remaining_defects but are never
+            # typed as release-blocking or routed to the producer as repairs.
+            advisory = {
+                str(item.get("description") or "")
+                for item in report.defects if not item.get("blocks_release", True)
+            }
             verdict = (
                 "PASS" if report.status in {
                     ReviewStatus.passed, ReviewStatus.nonblocking
@@ -5728,7 +5840,7 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 "blocks_release": True,
                 "observed_checkpoint_id": report.checkpoint_id,
                 "target_producer_paths": default_targets,
-            } for defect in defects)
+            } for defect in defects if defect not in advisory)
             session.quality_gate = {
                 "verifier": verifier_name,
                 "verdict": verdict,
@@ -6181,6 +6293,19 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                 package for package in goal.milestones if package.release_files
             ]
             diagnostic = session.stop_reason or "frontier final-batch verification failed"
+            # The owner must see WHAT the reviewer found, not only that it
+            # failed: a live repair was sent "verification failed" and rewrote
+            # a verified 80KB generator blind.
+            findings = [
+                (f"{item.get('criterion_id')}: " if item.get("criterion_id") else "")
+                + str(item.get("description") or "").strip()
+                for item in blocking_defects
+                if str(item.get("description") or "").strip()
+            ]
+            if findings:
+                diagnostic = (
+                    "release reviewer found: " + " | ".join(dict.fromkeys(findings))
+                )[:1200]
             target_package = next(
                 (
                     package for package in release_packages
@@ -6236,10 +6361,17 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                           "quality_gate": gate},
                 responsible_owner=str((session.quality_gate or {}).get("verifier") or ""),
             )
+            # A reviewer that could not RUN did not judge the batch: that is a
+            # capacity outage, retryable once a seat recovers, never an
+            # exhausted recovery. Only a real rejection fails a God-mode goal.
+            verifier_unavailable = gate.get("verdict") == "UNAVAILABLE"
             goal.status = (
-                "failed" if goal.approval_policy == ApprovalPolicy.god_mode else "paused"
+                "failed"
+                if goal.approval_policy == ApprovalPolicy.god_mode
+                and not verifier_unavailable
+                else "paused"
             )
-            if goal.approval_policy == ApprovalPolicy.god_mode:
+            if goal.status == "failed":
                 recovery.mark_exhausted(goal, failure)
             goal.release_status = "failed_verification"
             goal.last_error = session.stop_reason or "frontier final-batch verification failed"
@@ -7200,17 +7332,65 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
                                 {"goal_id": goal.goal_id, "reason": goal.last_error},
                             )
                 elif session.status == SessionStatus.cancelled:
+                    # A restart reconciles an in-flight package as cancelled.
+                    # Keep what that attempt learned: its failed producer and
+                    # its latest failure. Without this a resume re-authored
+                    # from scratch against a stale, symptom-only correction.
+                    pending_failure = next(
+                        (item for item in reversed(session.failure_records)
+                         if item.resolution_state != "resolved"),
+                        None,
+                    )
+                    if pending_failure is not None:
+                        self._preserve_failed_producer(
+                            goal, milestone, session, pending_failure)
+                        summary = pending_failure.summary or ""
+                        if len(summary) > 1100:
+                            summary = summary[:250] + "\n...\n" + summary[-850:]
+                        note = (
+                            "\nThe failed producer from that attempt is in your "
+                            "working set as an UNVERIFIED repair baseline: fix the "
+                            "cause in it and emit the complete corrected file "
+                            "rather than starting over."
+                            if milestone.candidate_checkpoint_id else ""
+                        )
+                        milestone.acceptance_detail = (
+                            f"{pending_failure.category}: {summary}{note}"
+                        )[:1600]
+                        if milestone.repair_context:
+                            milestone.repair_context["detail"] = (
+                                milestone.acceptance_detail)
                     milestone.status = "pending"
-                    sibling_running = any(
-                        item.status == "running" and item.index != idx
-                        for item in goal.milestones
+                    restart_interrupted = (
+                        session.stop_reason == "interrupted by a server restart"
                     )
-                    goal.status = "draining" if sibling_running else "paused"
-                    goal.last_error = f"milestone {idx + 1} was cancelled"
-                    self.goals.save_owned(goal, token)
-                    self._sys_log("goal_draining" if sibling_running else "goal_paused",
-                        {"goal_id": goal.goal_id, "reason": goal.last_error},
-                    )
+                    if (restart_interrupted
+                            and goal.approval_policy == ApprovalPolicy.god_mode
+                            and goal.status == "running"):
+                        # Nobody cancelled this: the server restarted under a
+                        # God-mode run, which is advance consent to keep going.
+                        # Parking it for a manual resume stalled live runs.
+                        goal.last_error = (
+                            f"milestone {idx + 1} interrupted by a server restart; "
+                            "resumed automatically"
+                        )
+                        if self.goals.save_owned(goal, token):
+                            schedule_ready = True
+                        self._sys_log("goal_restart_resumed",
+                            {"goal_id": goal.goal_id, "milestone": idx + 1},
+                        )
+                    else:
+                        sibling_running = any(
+                            item.status == "running" and item.index != idx
+                            for item in goal.milestones
+                        )
+                        goal.status = "draining" if sibling_running else "paused"
+                        goal.last_error = f"milestone {idx + 1} was cancelled"
+                        self.goals.save_owned(goal, token)
+                        self._sys_log(
+                            "goal_draining" if sibling_running else "goal_paused",
+                            {"goal_id": goal.goal_id, "reason": goal.last_error},
+                        )
             finally:
                 self.goals.release_worker_lease(goal.goal_id, token)
             if schedule_ready:
@@ -8471,6 +8651,12 @@ if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.Se
         if prepare_release:
             self._prepare_goal_release(current)
             self.goals.save(current)
+            if current.status == "running" and any(
+                    m.status == "pending" for m in current.milestones):
+                # The re-run release review routed a defect back to its
+                # producer. Like resume_goal, start that repair now; leaving
+                # it unscheduled parked a live goal with no worker.
+                self._start_ready_packages(current, background=background)
         elif schedule:
             self._start_ready_packages(current, background=background)
         return self.get_goal(goal_id) or current.model_dump()

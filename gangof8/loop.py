@@ -5701,7 +5701,16 @@ def _deliberate(
                     named = delegate_match.group(1).strip()
                     requested_delegate = named if named in candidates else ""
                     diagnosis = delegate_match.group(2).strip() + "\n\n" + diagnosis
-                if has_payload(reply):
+                # A supervisor that DELEGATEs and changes no source has not
+                # repaired anything, even if it echoed a BUILD line. Returning
+                # here re-ran the unchanged producer and dropped a precise live
+                # delegation; hand it to the named seat instead.
+                delegating = bool(requested_delegate) and not any(
+                    action.kind in {"write_file", "edit_file"}
+                    for action in _parse_proposals(
+                        session.session_id, reply.content or "")
+                )
+                if has_payload(reply) and not delegating:
                     event = {
                         "recorded_at": utcnow(),
                         "failure_id": causal.failure_id if causal else "",
@@ -5722,7 +5731,15 @@ def _deliberate(
                 )
                 requested_delegate = ""
                 continue
-            requested_delegate = ""
+            if delegating and agent != requested_delegate:
+                # Keep the named seat until its own turn; clearing it here made
+                # a delegation work only when that seat happened to be next.
+                store.log_event(
+                    session.session_id, "recovery_supervisor_delegated",
+                    {"from": agent, "to": requested_delegate},
+                )
+            else:
+                requested_delegate = ""
         event = {
             "recorded_at": utcnow(),
             "failure_id": causal.failure_id if causal else "",
@@ -6700,9 +6717,13 @@ def _try_next_candidate(session: Session, store: LogStore) -> bool:
         session.unresolved.append(
             "primary build failed; activated the council's atomic hot standby"
         )
+        # Re-arm as 'proposed', never 'captured': _execute_actions only drives
+        # proposed/approved actions, so a captured source or BUILD is silently
+        # skipped and the standby never runs. A prior approval still matches
+        # by action_id, so no new human decision is created.
         for action in session.proposed_actions:
             if action.kind == "build_artifact" and action.status == "failed":
-                action.status = "captured"
+                action.status = "proposed"
                 action.error = ""
                 action.failure_layer = ""
                 action.args["candidate_failover"] = ",".join(agents)
@@ -6732,7 +6753,7 @@ def _try_next_candidate(session: Session, store: LogStore) -> bool:
         # install for a wrong-import crash.
         for a in session.proposed_actions:
             if a.kind == "build_artifact" and a.status == "failed":
-                a.status = "captured"
+                a.status = "proposed"
                 a.error = ""
                 a.failure_layer = ""
                 a.args["candidate_failover"] = cand.get("agent")
@@ -6778,7 +6799,7 @@ def _ship_winner(session: Session, store: LogStore, base: str, content: str) -> 
         # the supposed fallback rerun the broken producer first.
         existing.content = content
         existing.args["content"] = content
-        existing.status = "captured"
+        existing.status = "proposed"
         existing.error = ""
         existing.failure_layer = ""
         if not any(
@@ -8070,13 +8091,26 @@ def _repair_missing_deliverable(
         if (action.kind in {"write_file", "edit_file"}
             and action.filename and (action.content or "").strip())
     }
-    producer_excerpt = "\n\n".join(
-        f"CURRENT PRODUCER {action.filename}:\n{(action.content or '')[:40000]}"
-        for action in session.proposed_actions
+    # The COMPLETE current producer, once per path (latest real write, never the
+    # captured namespaced scratch copy). CLI seats run without file tools, so a
+    # 40KB cut of an 80KB generator left a live supervisor unable to see half
+    # the file it was asked to repair. Truncation is stated, never silent.
+    current_producers: dict[str, ProposedAction] = {}
+    for action in session.proposed_actions:
         if (action.kind in {"write_file", "edit_file"}
-            and action.role != Role.panelist and action.filename
-            and (action.content or "").strip())
-    )[:60000]
+                and action.role != Role.panelist and action.filename
+                and action.status != "captured"
+                and (action.content or "").strip()):
+            current_producers[action.filename.replace("\\", "/")] = action
+    producer_excerpt = "\n\n".join(
+        f"CURRENT PRODUCER {name} (complete):\n{action.content}"
+        if len(action.content or "") <= config.REPAIR_PRODUCER_MAX_CHARS else
+        f"CURRENT PRODUCER {name} (TRUNCATED to the first "
+        f"{config.REPAIR_PRODUCER_MAX_CHARS} of {len(action.content)} chars; use "
+        "EDIT on text you can see, or replace the whole file):\n"
+        f"{action.content[:config.REPAIR_PRODUCER_MAX_CHARS]}"
+        for name, action in current_producers.items()
+    )
     prompt = (
         f"Task: {_execution_task(session)}\n\n"
         f"The deliverable of this task is a {wanted} file, and no {wanted} file "
@@ -8090,8 +8124,13 @@ def _repair_missing_deliverable(
         f"PRODUCES: <the {wanted} file that command writes>\n"
         f"PROMOTE: <the same {wanted} file>\n\n"
         "If no generator exists yet, emit it first as ONE complete ARTIFACT block, "
-        "then the lines above. If the previous build crashed, repair or replace "
-        "the producer as a complete ARTIFACT before repeating the build. Never "
+        "then the lines above. The block is exactly a line `ARTIFACT: <path>`, "
+        "the complete file, then a line `END_ARTIFACT`; any other wrapper is "
+        "ignored. If the previous build crashed, repair the producer before "
+        "repeating the build: for a local fix, emit a surgical edit\n"
+        "EDIT: <producer path>\n<<<<<<< OLD\n<text occurring exactly once>\n"
+        "=======\n<replacement>\n>>>>>>> NEW\n"
+        "otherwise replace it as a complete ARTIFACT. Never "
         "reference a local file that is absent from the working set; make the "
         "producer self-contained or emit every required local input. The command "
         "must write its output into the sandbox "
@@ -8118,7 +8157,7 @@ def _repair_missing_deliverable(
         )
         return False
     proposals = [a for a in _parse_proposals(session.session_id, reply.content)
-                 if a.kind in ("write_file", "install_deps", "build_artifact", "promote")]
+                 if a.kind in ("write_file", "edit_file", "install_deps", "build_artifact", "promote")]
     if not any(a.kind == "build_artifact" for a in proposals):
         recovery.finish_repair(session, repair_record, verified=False)
         store.log_event(session.session_id, "deliverable_build_failed",

@@ -605,7 +605,10 @@ _CONTRACTS_RE = re.compile(r"^\s*CONTRACTS?\s*:\s*(.*)$", re.IGNORECASE)
 _INTERFACE_RE = re.compile(r"^\s*INTERFACE\s*:\s*(.*)$", re.IGNORECASE)
 _BUILD_HINT_RE = re.compile(
     r"\b(?:build|implement|create|write|code|app|application|website|web|html|"
-    r"javascript|python|api|service|game|module|file|repo|project)\b",
+    r"javascript|python|api|service|game|module|file|repo|project|"
+    # A named document format is a delivered file too; without these a
+    # researched 100-recipe PDF was treated as a prose answer.
+    r"pdf|docx|xlsx|pptx|epub|odt)\b",
     re.IGNORECASE,
 )
 
@@ -633,7 +636,12 @@ def should_auto_route(goal_text: str, has_attachments: bool = False) -> bool:
     low = text.lower()
     if not text or low.startswith("/goal") or not requires_delivery_contract(text):
         return False
-    action = re.search(r"\b(?:build|implement|create|write|develop|overhaul)\b", low)
+    # "compile/produce/generate/assemble" are how people ask for documents: the
+    # operator's own Escoffier brief ("compile a pdf of ... recipes") never
+    # auto-routed because only software verbs counted as an action.
+    action = re.search(
+        r"\b(?:build|implement|create|write|develop|overhaul|"
+        r"compile|produce|generate|assemble)\b", low)
     if not action:
         return False
     signals = (

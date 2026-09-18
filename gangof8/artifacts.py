@@ -19,9 +19,15 @@ _BINARY_ARTIFACT_SUFFIXES = {
 }
 
 
-# 'ARTIFACT: <filename>' followed by raw file contents.
+# 'ARTIFACT: <filename>' followed by raw file contents. A live recovery
+# supervisor returned a complete 45KB generator as 'BEGIN ARTIFACT <path>' ...
+# 'END ARTIFACT'; the dropped body silently re-ran the broken producer. That
+# variant is accepted only in upper case with a space-free path, so prose such
+# as "Begin artifact review" can never open a file.
 ARTIFACT_MARKER = re.compile(
-    r"^\s*(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*(?:\*\*)?\s*(.+?)\s*(?:\*\*)?\s*$",
+    r"^\s*(?:(?:\*\*)?ARTIFACT(?:\*\*)?\s*:\s*(?:\*\*)?"
+    r"|(?-i:BEGIN[ _]ARTIFACT)[ \t]*:?[ \t]*(?=\S+[ \t]*$))"
+    r"\s*(.+?)\s*(?:\*\*)?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -30,7 +36,7 @@ ARTIFACT_MARKER = re.compile(
 # explanation became JavaScript bytes.  The terminator makes file boundaries
 # independent of whatever the model says afterwards.
 ARTIFACT_END_MARKER = re.compile(
-    r"^[ \t]*(?:<<<\s*)?END_ARTIFACT(?:\s*>>>)?[ \t]*$",
+    r"^[ \t]*(?:<<<\s*)?END[_ ]ARTIFACT(?:\s*>>>)?[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

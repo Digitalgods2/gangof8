@@ -566,6 +566,10 @@ MATCHED_SOURCE_MAX_CHARS = 40000
 # lead with the 2000-char window — it paid to produce them and couldn't review
 # a single one ("every draft is truncated mid-file", looping on re-reads).
 SKILL_RESULT_SANDBOX_MAX_CHARS = 40000
+# A build repair must see the producer it is fixing. CLI seats have no file
+# tools, so the prompt is the only copy; a live 80KB generator cut at 40KB left
+# the recovery supervisor blind to half of it. Beyond this the cut is labelled.
+REPAIR_PRODUCER_MAX_CHARS = int(os.environ.get("GANGOF8_REPAIR_PRODUCER_MAX_CHARS", "200000"))
 MAX_ESCALATION_REQUESTS_PER_TURN = 2
 ESCALATION_RESULT_MAX_CHARS = 2500
 

@@ -3214,3 +3214,217 @@ def test_resume_of_budget_paused_goal_grants_another_block(tmp_path, monkeypatch
     extended = service.goals.get(goal.goal_id)
     assert extended.model_calls_budget == 20
     assert "budget reached" not in (extended.last_error or "")
+
+
+def test_repair_attempt_receives_the_sealed_failed_producer(tmp_path):
+    """GO8-007 sealed the failed producer but nothing restored it, so live
+    retries re-authored an 80KB generator from scratch. A new attempt must
+    find the exact failed bytes in its sandbox as the repair baseline."""
+    from gangof8 import executor
+    from gangof8.models import MaterializationMode, MaterializationPlan
+
+    service = GangOf8Service(data_dir=tmp_path / "data")
+    failed = tmp_path / "build.py"
+    failed.write_text("raise RuntimeError('broken self-check')\n", encoding="utf-8")
+    record = service.checkpoints.seal_paths(
+        goal_id="g_restore", package_id="wp_1", session_id="s_old",
+        paths={"_gangof8/build.py": failed}, state="failed_candidate",
+    )
+    milestone = GoalMilestone(
+        index=0, package_id="wp_1", title="pdf", task_text="build the pdf",
+        owner="codex", required_files=["out.pdf", "_gangof8/build.py"],
+        candidate_checkpoint_id=record["checkpoint_id"],
+        materialization_plan=MaterializationPlan(
+            mode=MaterializationMode.build,
+            producing_files=["_gangof8/build.py"], release_files=["out.pdf"],
+        ),
+    )
+    session = Session(
+        session_id="s_new", repair_mode=True,
+        task=Task(task_id="t", session_id="s_new", text="repair"),
+    )
+
+    service._restore_failed_producer(session, milestone)
+
+    restored = executor.artifacts_dir(service.store.data_dir, "s_new") / "_gangof8" / "build.py"
+    assert restored.read_text(encoding="utf-8") == failed.read_text(encoding="utf-8")
+
+
+def test_release_verifier_skips_quota_dead_seat_and_falls_back(tmp_path, monkeypatch):
+    """Live: the only independent frontier seat hit "You've hit your session
+    limit", was retried three times, and the God-mode goal FAILED while another
+    enabled seat sat idle. A quota-dead seat is tried once, the release falls
+    back to any other enabled non-author seat, and a batch nobody could review
+    pauses (retryable) instead of failing."""
+    from gangof8 import service as service_module
+
+    monkeypatch.setattr(config, "RELEASE_VERIFIER_TRANSPORT_BACKOFF", 0.0)
+    calls: list[str] = []
+
+    class _Author:
+        name = "codex"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            return AdapterResult(content="ok", duration_ms=1)
+
+    class _QuotaDead:
+        name = "claude"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            calls.append("claude")
+            raise RuntimeError("claude CLI error: You've hit your session limit · resets 4:50am")
+
+    class _Fallback:
+        name = "gemini"
+
+        def call(self, role, prompt, timeout_s, images=None):
+            calls.append("gemini")
+            raise RuntimeError("gemini transient network reset")
+
+    class _BrowserPass:
+        passed = True
+        interactive = True
+        testable = True
+        detail = "passed"
+        browser = "chrome"
+        errors = ()
+
+    monkeypatch.setattr(
+        service_module.browser_acceptance, "browser_acceptance",
+        lambda path, **kw: _BrowserPass())
+    service = GangOf8Service(
+        data_dir=tmp_path / "data", panel=["claude", "codex", "gemini"])
+    for seat in (_Author(), _QuotaDead(), _Fallback()):
+        service.registry.register(seat)
+    stage = tmp_path / "stage"
+    stage.mkdir(parents=True)
+    (stage / "game.html").write_text(
+        "<html><body><script>window.ok=1;</script></body></html>", encoding="utf-8")
+    goal = Goal(
+        text="build a single-file game", status="running", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage), approval_policy=ApprovalPolicy.god_mode,
+        milestones=[
+            GoalMilestone(
+                index=0, package_id="wp_1", owner="codex", title="game",
+                task_text="author the game", status="done",
+                contract_declared=True, requires_delivery=True,
+                required_files=["game.html"], release_files=["game.html"],
+                release_declared=True,
+                accepted_hashes={"game.html": hashlib.sha256(
+                    (stage / "game.html").read_bytes()).hexdigest()},
+            ),
+        ],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    assert calls.count("claude") == 1, calls
+    assert "gemini" in calls
+    assert goal.status == "paused"
+    release = service.manager.load(goal.release_session_id)
+    assert release.quality_gate["verdict"] == "UNAVAILABLE"
+
+
+def test_restart_resumes_god_mode_package_instead_of_pausing(tmp_path, monkeypatch):
+    """A restart is not a human cancel. Under God mode the interrupted package
+    is rescheduled automatically; live runs used to park as 'milestone 1 was
+    cancelled' and wait for a manual resume."""
+    data = tmp_path / "data"
+    service = GangOf8Service(data_dir=data)
+    goal = Goal(
+        text="god mode build", status="running",
+        approval_policy=ApprovalPolicy.god_mode,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="codex", title="pdf",
+            task_text="build the pdf", status="running",
+            session_id="s_interrupted_pkg", contract_declared=True,
+        )],
+    )
+    package = Session(
+        session_id="s_interrupted_pkg", status=SessionStatus.deliberating,
+        goal_id=goal.goal_id, goal_milestone=0, goal_epoch=goal.epoch,
+        task=Task(task_id="t_pkg", session_id="s_interrupted_pkg", text="build"),
+    )
+    service.goals.save(goal)
+    service.store.save_session(package)
+    started: list[str] = []
+    monkeypatch.setattr(
+        GangOf8Service, "_start_ready_packages",
+        lambda self, g, background=True: started.append(g.goal_id),
+    )
+
+    restarted = GangOf8Service(data_dir=data)
+
+    import time
+    deadline = time.monotonic() + 10
+    while not started and time.monotonic() < deadline:
+        time.sleep(0.05)  # the terminal transition replays on the worker pool
+    resumed = restarted.goals.get(goal.goal_id)
+    assert resumed.status == "running", resumed.last_error
+    assert "resumed automatically" in resumed.last_error
+    assert started == [goal.goal_id]
+
+
+def test_release_rejection_sends_the_reviewers_findings_to_the_owner(tmp_path, monkeypatch):
+    """A live release repair was told only 'frontier final-batch verification
+    failed' and rewrote a verified generator blind. The owner's retry text
+    must carry what the reviewer actually found."""
+    from gangof8 import service as service_module
+    from gangof8.models import Contribution
+
+    monkeypatch.setattr(config, "RELEASE_VERIFIER_TRANSPORT_BACKOFF", 0.0)
+
+    class _BrowserPass:
+        passed = True
+        interactive = True
+        testable = True
+        detail = "passed"
+        browser = "chrome"
+        errors = ()
+
+    monkeypatch.setattr(
+        service_module.browser_acceptance, "browser_acceptance",
+        lambda path, **kw: _BrowserPass())
+
+    def reviewer(current, _registry, _store, member, prompt, timeout_s=None, **_kw):
+        ids = sorted(set(re.findall(r"\bR(\d+)\b", prompt)), key=int) or ["1"]
+        checks = [f"CHECK R{ids[0]}: FAIL - pressing P does nothing"] + [
+            f"CHECK R{i}: PASS - fine" for i in ids[1:]
+        ]
+        return Contribution(
+            round=0, role=member.role, agent=member.agent,
+            content="\n".join(checks)
+            + "\nDEFECT: BLOCKING - no keydown handler toggles the paused flag\n"
+            "VERDICT: FAIL",
+        )
+
+    monkeypatch.setattr(service_module, "_agent_call", reviewer)
+    service = GangOf8Service(data_dir=tmp_path / "data", panel=["claude", "codex"])
+    monkeypatch.setattr(service.registry, "names", lambda: ["claude", "codex"])
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "game.html").write_text(
+        "<html><body><script>let paused=false;</script></body></html>", encoding="utf-8")
+    goal = Goal(
+        text="The pause control must work", status="running", current_index=0,
+        collaboration_mode="build_team", delivery_mode="final_batch",
+        staging_root=str(stage),
+        milestones=[GoalMilestone(
+            index=0, package_id="wp_1", owner="codex", title="game",
+            task_text="author the game", status="done", contract_declared=True,
+            requires_delivery=True, required_files=["game.html"],
+            release_files=["game.html"], release_declared=True,
+            accepted_hashes={"game.html": hashlib.sha256(
+                (stage / "game.html").read_bytes()).hexdigest()},
+        )],
+    )
+    service.goals.save(goal)
+
+    service._prepare_goal_release(goal)
+
+    detail = goal.milestones[0].acceptance_detail
+    release = service.manager.load(goal.release_session_id)
+    assert "no keydown handler toggles the paused flag" in detail, (goal.status, goal.last_error, release.quality_gate if release else None)

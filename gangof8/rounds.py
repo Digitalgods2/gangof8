@@ -1288,6 +1288,12 @@ _WINNER_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?WINNER\s*[:—–-]\s*(?:C
                         re.IGNORECASE | re.MULTILINE)
 _DEFECT_RE = re.compile(r"^\s*(?:[-*•]\s*)?(?:\*\*)?DEFECT\s*[:—–-]\s*(.+?)\s*$",
                         re.IGNORECASE | re.MULTILINE)
+# Severity labels a reviewer may put at the start of a DEFECT description.
+_ADVISORY_DEFECT_RE = re.compile(
+    r"^\W*(?:NON[\s_-]?BLOCKING|COSMETIC|MINOR|ADVISORY|NIT|SUGGESTION|INFO)\b",
+    re.IGNORECASE,
+)
+_BLOCKING_DEFECT_RE = re.compile(r"^\W*BLOCKING\b", re.IGNORECASE)
 
 
 def parse_candidate_scores(text: str, n: int) -> tuple[dict[int, int], int | None, list[str]]:
@@ -1533,7 +1539,9 @@ def frontier_release_prompt(
         "every registered defect is demonstrably closed. Emit exactly one line "
         "for EVERY R-number: 'CHECK R1: PASS - <specific evidence>' or "
         "'CHECK R1: FAIL - <specific evidence>'. Then emit DEFECT lines for "
-        "every remaining problem. End with exactly 'VERDICT: PASS' only if all "
+        "every remaining problem; start the description with 'BLOCKING -' or "
+        "'NON-BLOCKING -' so the coordinator knows whether it may stop the "
+        "release. End with exactly 'VERDICT: PASS' only if all "
         "explicit requirements pass and no material defect remains; otherwise end "
         "with 'VERDICT: FAIL'. Missing R-number checks invalidate a PASS. Do not "
         "emit EDIT, ARTIFACT, BUILD, or PROMOTE instructions: reviewer ownership "
@@ -1574,15 +1582,28 @@ def parse_frontier_review(
         )
         for m in _CHECK_RE.finditer(text or "")
     ]
-    defects = [
-        {
-            "description": item.strip().strip("* "),
-            "severity": "error",
-            "blocks_release": True,
-        }
-        for item in _DEFECT_RE.findall(text or "")
-        if item.strip() and item.strip().lower() != "none"
-    ]
+    # The release contract says VERDICT: PASS means "no material defect
+    # remains", so DEFECT lines under a PASS with every check passing are
+    # advisory unless explicitly labelled BLOCKING. A live reviewer returned
+    # three PASS checks, 'VERDICT: PASS' and two defects it labelled
+    # NON-BLOCKING and COSMETIC; treating them as blocking failed a verified
+    # 113-page PDF and bought a full producer rewrite.
+    verdict_pass = bool(match) and match.group(1).upper() == "PASS" and not any(
+        item.status == "fail" for item in checks
+    )
+    defects = []
+    for item in _DEFECT_RE.findall(text or ""):
+        description = item.strip().strip("* ")
+        if not description or description.lower() == "none":
+            continue
+        labelled_advisory = bool(_ADVISORY_DEFECT_RE.match(description))
+        labelled_blocking = bool(_BLOCKING_DEFECT_RE.match(description))
+        blocks = labelled_blocking or not (labelled_advisory or verdict_pass)
+        defects.append({
+            "description": description,
+            "severity": "error" if blocks else "warning",
+            "blocks_release": blocks,
+        })
     expected = {item.criterion_id for item in criteria}
     observed = {item.criterion_id for item in checks if item.criterion_id}
     missing = sorted(expected - observed)

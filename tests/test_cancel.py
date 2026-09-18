@@ -255,3 +255,28 @@ def test_cancel_aborts_while_a_panel_seat_is_stuck(tmp_path):
     finally:
         release.set()  # let the abandoned seat thread finish and exit
         worker.join(timeout=10)
+
+
+def test_session_cancel_kills_the_whole_process_tree(monkeypatch):
+    """A plain kill() stops only a Windows .cmd launcher; the real agent kept
+    the stdout pipe open and a live cancel took 665 s to land. Session-level
+    cancel must use the same tree kill as per-call cancel."""
+    from gangof8 import cancellation
+
+    killed = []
+    monkeypatch.setattr(cancellation, "kill_tree", killed.append)
+
+    class Proc:
+        pid = 4242
+
+        def kill(self):
+            raise AssertionError("session cancel used a direct kill")
+
+    proc = Proc()
+    cancellation.register_proc("s_tree", proc)
+    try:
+        cancellation.request("s_tree")
+    finally:
+        cancellation.unregister_proc("s_tree", proc)
+        cancellation.clear("s_tree") if hasattr(cancellation, "clear") else None
+    assert killed == [proc]
